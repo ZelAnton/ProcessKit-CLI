@@ -217,14 +217,45 @@ by default (`AGENTS.md`, "Argv is redacted by default"):
 |---------------|--------------------------|-----------------------------------------------------------------------|
 | `redacted`    | boolean                  | `true` by default; `false` only under `--argv-raw`.                   |
 | `argv`        | array of string, nullable| The raw argv, present only when `redacted` is `false`; `null` otherwise. |
-| `argv_sha256` | string, nullable         | Hex SHA-256 of argv — see below.                                      |
-| `hint`        | string, nullable         | Classified worker-shape hint (e.g. an MSBuild node-reuse shape) — see below. |
+| `argv_sha256` | string, nullable         | Lowercase-hex SHA-256 fingerprint of argv — see "Fingerprint". Filled on every run. |
+| `hint`        | string, nullable         | Worker-shape hint for a recognized argv, else `null` — see "Hint classifier". |
 
-**Status in v1.** The redaction *machinery* — computing `argv_sha256` and the
-worker-shape `hint` classifier — lands in a later task (T-005). The fields are
-declared now so the event shape does not change when that machinery arrives: in
-v1 `argv_sha256` and `hint` are always `null`, and `--argv-raw` already records
-`argv` verbatim. T-005 fills the two reserved fields without reshaping the event.
+The redaction is deliberately one-directional: `argv_sha256` and `hint` are
+derived from argv but cannot reveal it (a one-way hash and a fixed category
+label), so they are filled on **every** run — redacted or not. `--argv-raw` *adds*
+the raw `argv` array; it never changes the fingerprint or the hint. A consumer can
+therefore correlate and classify a run without ever seeing its command line.
+
+### Fingerprint (`argv_sha256`)
+
+`argv_sha256` is the SHA-256 of a canonical encoding of argv, rendered as
+lowercase hex (64 characters). The canonical encoding is **the argv elements
+joined by a single NUL byte (`0x00`)** — each element as its UTF-8 bytes, with no
+leading or trailing separator and no terminator. A NUL cannot occur inside a real
+argv element on any supported platform, so element boundaries are unambiguous:
+`["ab", "c"]` and `["a", "bc"]` fingerprint differently. An adapter that re-emits
+this schema reproduces the exact digest by hashing the same encoding. (The
+reference implementation is `events::argv_sha256_hex`.)
+
+### Hint classifier
+
+`hint` names a recognized *worker shape* — a process form worth identifying (for
+example a build worker left running after a build) without disclosing its command
+line. It is one of a small, documented catalog of category labels, or `null` when
+the argv matches no known shape (the common case). A rule matches when **all** of
+its marker substrings appear somewhere in the argv, compared case-insensitively;
+the first matching rule in catalog order wins.
+
+| `hint`               | Markers (all must be present)                    | Shape |
+|----------------------|--------------------------------------------------|-------|
+| `msbuild_node_reuse` | `MSBuild.dll`, `/nodemode:1`, `/nodeReuse:true`  | An MSBuild reusable worker node (`/nodeReuse:true`) — the long-lived build-node process that lingers after a build. |
+
+**Adding a shape.** The catalog is plain data — the `HINT_RULES` table in
+`src/events.rs`. Add one entry (a new `hint` label plus the marker substrings that
+identify the shape) and mirror it as a row in the table above; no control-flow
+change is needed. Choose a stable, snake_case `hint` label: consumers may match on
+it, so an existing label is part of this contract (changing or removing one is a
+breaking change — see "Versioning").
 
 ## Enriched member fields
 
@@ -244,6 +275,11 @@ value — is a **major** bump of `schema_version` (and a matching `Cargo.toml`
 version bump; `docs/exit-codes.md` and `AGENTS.md` treat the surface as a whole).
 A future version lands under a new `fixtures/schema/vN/` directory. Additive,
 backward-compatible clarifications that do not change any existing shape do not bump
-the version. Filling a field that was reserved-as-`null` (the T-005 argv machinery,
-the enriched member fields) is **not** a breaking change: the field already exists
-and its type is unchanged.
+the version. Filling a field that was reserved-as-`null` is **not** a breaking
+change: the field already exists and its type is unchanged. The `argv_sha256` and
+`hint` fields were filled this way — they now carry values on every run instead of
+always `null`; the enriched member fields remain reserved and `null` until
+ProcessKit ships `members_info()`. Adding a new `hint` label to the classifier
+catalog is likewise additive, but renaming or removing an existing `hint` label, or
+changing the fingerprint's canonical encoding, changes the meaning of a value and
+so is a breaking change.

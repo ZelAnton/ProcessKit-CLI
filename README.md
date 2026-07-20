@@ -118,9 +118,10 @@ child's own code even when the runner itself fails — so a child's code is neve
 lost or aliased.
 
 The command line is **redacted by default** (`argv` is recorded only under
-`--argv-raw`); the redaction hash and worker-shape hint are reserved fields filled
-by a later task. Member snapshots are PID-only today, with the richer per-member
-fields declared but absent until ProcessKit-rs ships them.
+`--argv-raw`); in its place a one-way SHA-256 fingerprint of argv (`argv_sha256`)
+and, for recognized worker shapes, a categorical `hint` are recorded on every run —
+neither can reveal the command line. Member snapshots are PID-only today, with the
+richer per-member fields declared but absent until ProcessKit-rs ships them.
 
 - Normative field reference: [`docs/schema.md`](docs/schema.md).
 - Golden sample stream for adapters:
@@ -152,5 +153,5 @@ cargo fmt --all --check
 
 - No reimplementation of ProcessKit containment or lifecycle behavior.
 - No shell mode, PTY support, or global cleanup by executable/process name.
-- Raw command arguments are opt-in only; the default diagnostics contract will
-  use redaction-safe hashes and worker hints.
+- Raw command arguments are opt-in only; the default diagnostics contract uses
+  redaction-safe hashes and worker hints.
