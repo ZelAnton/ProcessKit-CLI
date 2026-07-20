@@ -1,4 +1,5 @@
-{"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"run_started","run_id":"run-000","root_pid":4242,"mechanism":"job_object","cwd":"/work/project","command":{"redacted":true,"argv":null,"argv_sha256":null,"hint":null}}
+{"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"run_started","run_id":"run-000","root_pid":4242,"mechanism":"job_object","cwd":"/work/project","command":{"redacted":true,"argv":null,"argv_sha256":"c50c07732c7cb6ac13a276e99f9091b3b393d7339b260ea3c0329d975d35d17d","hint":"msbuild_node_reuse"}}
+{"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"run_started","run_id":"run-001","root_pid":4242,"mechanism":"job_object","cwd":"/work/project","command":{"redacted":false,"argv":["C:\\Program Files\\dotnet\\sdk\\MSBuild.dll","/nodemode:1","/nodeReuse:true"],"argv_sha256":"c50c07732c7cb6ac13a276e99f9091b3b393d7339b260ea3c0329d975d35d17d","hint":"msbuild_node_reuse"}}
 {"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"members_snapshot","members":[{"pid":4242,"ppid":null,"name":null,"start_time":null},{"pid":4243,"ppid":null,"name":null,"start_time":null}]}
 {"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"root_exited","outcome":"exited","code":0,"signal":null}
 {"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"cleanup_started","members_before":2}
