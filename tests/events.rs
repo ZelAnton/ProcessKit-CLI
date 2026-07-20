@@ -40,6 +40,22 @@ fn event_types(events: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// Whether `v` is a JSON string of 64 lowercase-hex characters — the shape of an
+/// `argv_sha256` fingerprint.
+fn is_sha256_hex(v: &Value) -> bool {
+    v.as_str()
+        .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
+/// The `command` object of the (first) `run_started` event in `dir`'s stream.
+fn run_started_command(dir: &Path) -> Value {
+    read_events(dir)
+        .iter()
+        .find(|e| e["event"] == "run_started")
+        .map(|e| e["command"].clone())
+        .expect("a run_started event")
+}
+
 /// A completed run writes its lifecycle events to the `--jsonl` file, every line
 /// carries `schema_version`, and none of it leaks onto the child's stdout.
 #[test]
@@ -114,25 +130,24 @@ fn run_started_reports_root_pid_mechanism_and_redacts_the_command() {
     assert_eq!(command["redacted"], true, "argv is redacted by default");
     assert!(command["argv"].is_null(), "no raw argv without --argv-raw");
     assert!(
-        command["argv_sha256"].is_null() && command["hint"].is_null(),
-        "the redaction machinery (hash/hint) is reserved for T-005: {command}"
+        is_sha256_hex(&command["argv_sha256"]),
+        "a redacted command still carries a hex argv fingerprint: {command}"
+    );
+    assert!(
+        command["hint"].is_null(),
+        "a plain shell command is not a recognized worker shape: {command}"
     );
 }
 
-/// `--argv-raw` records the raw argv verbatim while the reserved hash/hint fields
-/// stay null.
+/// `--argv-raw` records the raw argv verbatim while the fingerprint is still
+/// computed (it never depends on disclosure); a plain command carries no hint.
 #[test]
 fn argv_raw_records_the_raw_command() {
     let dir = scratch("argv-raw");
     let out = run_with_flags(&dir, &[], &["--argv-raw"], shell_inline("exit 0"));
     assert_eq!(out.status.code(), Some(0));
 
-    let events = read_events(&dir);
-    let command = events
-        .iter()
-        .find(|e| e["event"] == "run_started")
-        .map(|e| e["command"].clone())
-        .expect("a run_started event");
+    let command = run_started_command(&dir);
     assert_eq!(command["redacted"], false, "--argv-raw disables redaction");
     let argv = command["argv"].as_array().expect("raw argv array");
     assert!(
@@ -140,8 +155,53 @@ fn argv_raw_records_the_raw_command() {
         "raw argv is recorded as strings: {command}"
     );
     assert!(
-        command["argv_sha256"].is_null() && command["hint"].is_null(),
-        "hash/hint remain reserved even with --argv-raw"
+        is_sha256_hex(&command["argv_sha256"]),
+        "the fingerprint is computed even under --argv-raw: {command}"
+    );
+    assert!(
+        command["hint"].is_null(),
+        "a plain shell command is not a recognized worker shape even raw: {command}"
+    );
+}
+
+/// The `run_started` command `hint` classifies a recognized worker shape (an
+/// MSBuild reusable-worker argv) and leaves an ordinary command unclassified, while
+/// `argv_sha256` is filled in both cases. The marker tokens ride along as inert
+/// arguments to a shell no-op (`rem` on Windows, `:` elsewhere), so the child exits
+/// cleanly on both platforms while the runner still records them in argv.
+#[test]
+fn run_started_hint_classifies_msbuild_and_leaves_unknown_shapes_null() {
+    let msbuild = if cfg!(windows) {
+        shell_inline("rem MSBuild.dll /nodemode:1 /nodeReuse:true")
+    } else {
+        shell_inline(": MSBuild.dll /nodemode:1 /nodeReuse:true")
+    };
+    let dir = scratch("hint-msbuild");
+    let out = run(&dir, &[], msbuild);
+    assert_eq!(out.status.code(), Some(0), "the no-op child exits cleanly");
+
+    let command = run_started_command(&dir);
+    assert_eq!(
+        command["hint"], "msbuild_node_reuse",
+        "an MSBuild reusable-worker argv is classified: {command}"
+    );
+    assert!(
+        is_sha256_hex(&command["argv_sha256"]),
+        "the fingerprint is filled alongside the hint: {command}"
+    );
+
+    // An ordinary command shares the fingerprint contract but has no hint.
+    let plain = scratch("hint-plain");
+    let out = run(&plain, &[], shell_inline("exit 0"));
+    assert_eq!(out.status.code(), Some(0));
+    let command = run_started_command(&plain);
+    assert!(
+        command["hint"].is_null(),
+        "an unrecognized shape leaves the hint null: {command}"
+    );
+    assert!(
+        is_sha256_hex(&command["argv_sha256"]),
+        "...while the fingerprint is still filled: {command}"
     );
 }
 
