@@ -402,7 +402,7 @@ fn cancel_via_ctrl_c_reports_the_cancel_code_and_tears_down_the_tree() {
     let grandchild = write_grandchild_script(&dir);
     let root = write_sleeping_root_script(&dir);
 
-    let mut child = common::command_with_flags(
+    let child = common::command_with_flags(
         &dir,
         &[
             ("HB", heartbeat.as_path()),
