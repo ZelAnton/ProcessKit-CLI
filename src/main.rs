@@ -1,14 +1,17 @@
 //! processkit-cli — run one shell-free command inside ProcessKit's containment
 //! boundary and report its lifecycle.
 //!
-//! This task fixes two thirds of the project's compatibility surface: the CLI
-//! flags (see [`cli`]) and the runner exit-code contract (see [`exit`] and
-//! `docs/exit-codes.md`). The runner itself — spawning, IPC, and the JSONL
-//! schema — is implemented in later tasks; every subcommand currently reports a
-//! runner-range "not implemented" error rather than panicking or exiting 0.
+//! The `run` subcommand is implemented here (see [`run`]): it spawns the child
+//! into a ProcessKit container this process owns, echoes the child's output
+//! live, and forwards its exit code faithfully. The control plane
+//! (`inspect`/`cancel`/`kill`) and the JSONL schema land in later tasks; those
+//! subcommands still report a runner-range "not implemented" error rather than
+//! panicking or exiting 0. The compatibility surface — CLI flags (see [`cli`])
+//! and the exit-code contract (see [`exit`] and `docs/exit-codes.md`) — is fixed.
 
 mod cli;
 mod exit;
+mod run;
 
 use std::process::ExitCode;
 
@@ -24,12 +27,18 @@ fn main() -> ExitCode {
         Err(err) => return report_parse_error(err),
     };
 
-    match dispatch(cli) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("processkit-cli: {err}");
-            ExitCode::from(err.code())
-        }
+    // `run` owns the process's exit path: on a completed container it hard-exits
+    // with the child's exact (full-width) code, so it never returns here. The
+    // remaining subcommands share the runner-error reporting below.
+    match cli.command {
+        Command::Run(args) => run::execute(args),
+        other => match dispatch(other) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("processkit-cli: {err}");
+                ExitCode::from(err.code())
+            }
+        },
     }
 }
 
@@ -48,11 +57,12 @@ fn report_parse_error(err: clap::Error) -> ExitCode {
     }
 }
 
-/// Route a parsed command to its handler. Every path is unimplemented in this
-/// task; each returns a runner-range "not implemented" error so downstream tasks
-/// can replace the stub without touching the exit-code contract.
-fn dispatch(cli: Cli) -> Result<(), RunnerError> {
-    match cli.command {
+/// Route a control-plane command to its handler. These paths are unimplemented
+/// in this task; each returns a runner-range "not implemented" error so
+/// downstream tasks can replace the stub without touching the exit-code contract.
+/// `run` is handled directly in [`main`] and never reaches here.
+fn dispatch(command: Command) -> Result<(), RunnerError> {
+    match command {
         Command::Run(_) => Err(RunnerError::not_implemented("run")),
         Command::Inspect(_) => Err(RunnerError::not_implemented("inspect")),
         Command::Cancel(_) => Err(RunnerError::not_implemented("cancel")),

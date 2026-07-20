@@ -27,8 +27,17 @@ processkit-cli cancel  --run-id <id>
 processkit-cli kill    --run-id <id>
 ```
 
-The command is intentionally shell-free. Child stdout and stderr will be
-echoed unchanged; runner diagnostics and JSONL events never use stdout.
+The command is intentionally shell-free: `run` executes `<program> <args...>`
+directly, with no shell to expand or re-interpret anything after `--`. Child
+stdout and stderr are echoed through unchanged; runner diagnostics and JSONL
+events never use stdout.
+
+Live output is **pipe + echo, not a real inherited terminal**: ProcessKit reads
+the child's stdout/stderr through pipes and this runner re-emits them onto its
+own stdout/stderr. A deliberate, honest consequence is that the child sees **no
+TTY**, so terminal-dependent behavior can degrade — colors, progress bars, and
+other cursor tricks may render as plain, line-oriented text. A true PTY is not
+implemented here (PTY support is deferred in the core crate).
 
 `inspect`, `cancel`, and `kill` will communicate with a live `run` process over
 local IPC. If the runner dies, ProcessKit's kill-on-drop containment ends that
@@ -42,13 +51,27 @@ The runner's exit code **is** the child's exit code; the runner's own failures
 so they can never be mistaken for a child result. This is part of the project's
 compatibility surface — see [the exit-code contract](docs/exit-codes.md).
 
+## Windows console
+
+`--create-no-window` maps directly onto ProcessKit's
+`Command::create_no_window()` (the `CREATE_NO_WINDOW` creation flag on Windows; a
+no-op elsewhere). **It defaults to off.** A bare `run` should behave as much like
+launching the child directly as possible, so the runner does not force the flag —
+doing so unconditionally would diverge from a direct launch and could hide a
+child that legitimately wants its own console. The runner itself never allocates
+a console, so it spawns no extra console host on its own account. Headless
+Windows deployments (such as Orchestra) that want to suppress a stray `conhost`
+window for the child pass `--create-no-window` explicitly.
+
 ## Status
 
-Repository scaffolding is complete. The command surface above is parsed and
-validated, and the exit-code contract is fixed; the runner that executes each
-subcommand is not implemented yet — every subcommand currently reports a
-runner-range "not implemented" error. See [the roadmap](docs/ROADMAP.md) for the
-intended delivery order.
+`run` is implemented: it spawns the child into a ProcessKit container the runner
+owns, echoes the child's output live, and forwards the child's exit code exactly.
+The control-plane subcommands (`inspect`, `cancel`, `kill`) and the JSONL event
+stream are not implemented yet — those subcommands still report a runner-range
+"not implemented" error, and `run`'s `--jsonl`, `--timeout`, `--grace`, and
+related flags are parsed but not yet consumed. See [the roadmap](docs/ROADMAP.md)
+for the intended delivery order.
 
 ## Development
 

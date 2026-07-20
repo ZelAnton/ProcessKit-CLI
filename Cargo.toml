@@ -31,9 +31,15 @@ rust-version = "1.88"
 clap = { version = "4", features = ["derive"] }
 # ProcessKit's public API: the kernel-backed containment and teardown boundary
 # this runner is built on (the single source of truth for lifecycle semantics).
-# Wired in now so the command surface is fixed against it; the `run` and
-# control-plane paths that actually call it land in later tasks (docs/ROADMAP.md).
+# `run` owns a `ProcessGroup` and streams the child through it; the control-plane
+# paths that also call it land in later tasks (docs/ROADMAP.md).
 processkit = "2"
+# Async runtime that drives the tokio-based `processkit` API. A small
+# current-thread runtime hosts the run; `io-std` provides the async stdout/stderr
+# sinks the child's output is teed to. The child-pipe I/O and time drivers that
+# `enable_all` arms are compiled in via `processkit`'s own tokio `process`/`net`/
+# `time` features (Cargo unifies feature flags across the one tokio build).
+tokio = { version = "1", features = ["rt", "io-std"] }
 
 [dev-dependencies]
 
