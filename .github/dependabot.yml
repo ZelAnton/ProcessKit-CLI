@@ -1,0 +1,33 @@
+version: 2
+
+# Keep GitHub Actions and Cargo dependencies current. The github-actions
+# ecosystem bumps the action SHAs pinned in .github/workflows/*.yml (updating the
+# trailing version comment); the cargo ecosystem bumps crate versions in
+# Cargo.toml / Cargo.lock.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: CI
+    groups:
+      # One PR per weekly run for all action bumps, instead of one PR per action.
+      github-actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: Update
+    groups:
+      # One PR per weekly run for routine bumps keeps the changelog auto-fill tidy.
+      cargo-dependencies:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
