@@ -15,6 +15,13 @@ pub fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_processkit-cli")
 }
 
+/// The `--jsonl` events file a `run` invocation for `dir` writes to. The
+/// [`command_with_flags`] builder points `--jsonl` here, so a test reads this path
+/// to inspect the emitted JSONL event stream.
+pub fn events_path(dir: &Path) -> PathBuf {
+    dir.join("events.jsonl")
+}
+
 /// A unique, empty scratch directory under the OS temp dir. Unique per (pid,
 /// sequence) so concurrent tests never collide; the caller may leave it behind
 /// (the OS temp dir is transient).
@@ -33,9 +40,9 @@ pub fn scratch(tag: &str) -> PathBuf {
 /// Build a `run` invocation of the binary: `run --jsonl <tmp> <flags…> --
 /// <program> <args…>`, with `envs` set on the child.
 ///
-/// A throwaway `--jsonl` path is always supplied — it is required by the parser
-/// but not consumed in this task, so nothing is written there. `flags` are extra
-/// runner options placed *before* `--` (e.g. `--timeout`, `2s`); everything in
+/// The `--jsonl` path is always [`events_path`] under `dir`; a test that inspects
+/// the JSONL event stream reads that same path. `flags` are extra runner options
+/// placed *before* `--` (e.g. `--timeout`, `2s`); everything in
 /// `program_and_args` lands verbatim after `--`. `envs` are set on the child; the
 /// runner inherits its own environment onto the spawned program, which is how the
 /// teardown fixtures pass file paths down to a grandchild. The caller decides
@@ -50,7 +57,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let jsonl = dir.join("events.jsonl");
+    let jsonl = events_path(dir);
     let mut cmd = Command::new(bin());
     cmd.arg("run").arg("--jsonl").arg(&jsonl);
     cmd.args(flags);

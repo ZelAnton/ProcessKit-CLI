@@ -57,20 +57,22 @@ child's stdout) that also states, truthfully, how the tree was torn down — inc
 that on Windows there is no soft-terminate tier yet, so the grace window elapses and
 the Job Object is then killed atomically (see `README.md`, "Timeouts, cancel, and
 grace"). As with every runner-own code, the numeric value is a best-effort signal;
-the authoritative, machine-readable form of these outcomes arrives with the JSONL
-event schema (a later task), which will carry timeout/cancellation events explicitly.
+the authoritative, machine-readable form of these outcomes is the `timeout` /
+`cancelled` event (and the terminal `runner_exit`) in the versioned JSONL stream —
+see `docs/schema.md`.
 
 ## Why a band is not enough on its own
 
 Exit codes are a single small integer, and a child can, in principle, exit with
 a number that happens to fall inside `100`–`119` too. The reserved band is
 therefore a best-effort signal for shells and scripts, **not** the authoritative
-channel. The authority is the JSONL event stream: every runner-own failure also
-emits a `runner_exit` event (defined by the JSONL schema, delivered in a later
-task), so a consumer reading `--jsonl` can always tell a runner failure apart
-from a child that merely exited with the same number. A child's own code is
-never lost or aliased, because the runner's failures are additionally recorded
-out of band.
+channel. The authority is the JSONL event stream: every run ends with a
+`runner_exit` event (defined by the JSONL schema — see `docs/schema.md`) that
+carries the returned code, names why the runner exited, and preserves the child's
+own code in a separate `child_code` field, so a consumer reading `--jsonl` can
+always tell a runner failure apart from a child that merely exited with the same
+number. A child's own code is never lost or aliased, because the runner's failures
+are additionally recorded out of band.
 
 ## Stability
 

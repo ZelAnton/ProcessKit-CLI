@@ -1,0 +1,11 @@
+{"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"run_started","run_id":"run-000","root_pid":4242,"mechanism":"job_object","cwd":"/work/project","command":{"redacted":true,"argv":null,"argv_sha256":null,"hint":null}}
+{"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"members_snapshot","members":[{"pid":4242,"ppid":null,"name":null,"start_time":null},{"pid":4243,"ppid":null,"name":null,"start_time":null}]}
+{"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"root_exited","outcome":"exited","code":0,"signal":null}
+{"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"cleanup_started","members_before":2}
+{"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"cleanup_finished","remaining":0,"remaining_pids":[],"soft_terminate":null}
+{"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"limit_hit","limit":"processes","detail":"exceeded the 64-process cap"}
+{"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"timeout","timeout_ms":5000,"grace_ms":2000}
+{"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"cancelled","source":"ctrl_c","grace_ms":2000}
+{"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"spawn_failed","code":101,"message":"could not start the program: program not found"}
+{"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"container_failed","phase":"create","code":102,"message":"could not create the ProcessKit container"}
+{"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"runner_exit","code":0,"source":"child_exit","child_code":0}

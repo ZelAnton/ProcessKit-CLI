@@ -29,6 +29,12 @@ rust-version = "1.88"
 # the four subcommands, their flags, and the verbatim `-- <program> <args...>`
 # tail — that AGENTS.md counts as part of the compatibility surface.
 clap = { version = "4", features = ["derive"] }
+# (De)serialize the versioned JSONL event schema — this project's public,
+# golden-tested event contract. `derive` gives each event struct its `Serialize`
+# impl; `serde_json` writes one compact JSON object per line to the `--jsonl`
+# file (and parses lines back in the through-the-binary tests).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # ProcessKit's public API: the kernel-backed containment and teardown boundary
 # this runner is built on (the single source of truth for lifecycle semantics).
 # `run` owns a `ProcessGroup` and streams the child through it; the control-plane

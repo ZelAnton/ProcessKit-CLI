@@ -41,12 +41,29 @@ to a dated version section.
 - Documented runner exit-code contract (`docs/exit-codes.md`) that keeps the
   runner's own failures in a reserved code band, separate from the child's
   exit code, and now assigns `TIMEOUT` (106) and `CANCELLED` (107).
+- Versioned JSONL event schema (v1): `run` now writes a stream of lifecycle
+  events to the `--jsonl` file — one JSON object per line, each with a
+  `schema_version`, and never to stdout. The stream covers `run_started` (run id,
+  root PID, containment mechanism, working directory), `members_snapshot`,
+  `root_exited`, the `cleanup_started` / `cleanup_finished` teardown pair,
+  `timeout` / `cancelled`, launch and container errors, and a terminal
+  `runner_exit` that preserves the child's own code even on the runner's own
+  failure — so a child's code is never lost or aliased. The command line is
+  redacted by default (raw argv only under `--argv-raw`; the redaction hash and
+  worker-shape hint are reserved fields), and member snapshots are PID-only with
+  the richer per-member fields declared but absent until ProcessKit-rs ships them.
+  Normative reference in `docs/schema.md`; golden sample stream published at
+  `fixtures/schema/v1/events.jsonl` and gated by a golden test. `--run-id` and
+  `--argv-raw` are now consumed.
 - Dependencies on `processkit` (the containment backbone), `tokio` (its async
-  runtime), and `clap` (CLI parsing).
+  runtime), `clap` (CLI parsing), and `serde` / `serde_json` (the JSONL event
+  schema).
 
 ### Changed
 - `inspect`, `cancel`, and `kill` remain unimplemented and still exit with the
   runner-range "not implemented" code; `run` no longer does.
+- `run`'s `--jsonl` is now consumed (the JSONL event stream above); only
+  `--capture-dir` remains parsed but not yet consumed.
 
 ### Fixed
 -

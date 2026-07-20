@@ -3,13 +3,16 @@
 //!
 //! The `run` subcommand is implemented here (see [`run`]): it spawns the child
 //! into a ProcessKit container this process owns, echoes the child's output
-//! live, and forwards its exit code faithfully. The control plane
-//! (`inspect`/`cancel`/`kill`) and the JSONL schema land in later tasks; those
+//! live, forwards its exit code faithfully, and writes the versioned JSONL
+//! lifecycle events (see [`events`] and `docs/schema.md`) to the `--jsonl` file.
+//! The control plane (`inspect`/`cancel`/`kill`) lands in a later task; those
 //! subcommands still report a runner-range "not implemented" error rather than
-//! panicking or exiting 0. The compatibility surface — CLI flags (see [`cli`])
-//! and the exit-code contract (see [`exit`] and `docs/exit-codes.md`) — is fixed.
+//! panicking or exiting 0. The compatibility surface — CLI flags (see [`cli`]),
+//! the exit-code contract (see [`exit`] and `docs/exit-codes.md`), and the JSONL
+//! `schema_version` (see [`events`] and `docs/schema.md`) — is fixed.
 
 mod cli;
+mod events;
 mod exit;
 mod run;
 

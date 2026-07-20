@@ -26,8 +26,9 @@
 //!   deadline elapsed, or the operator pressed `Ctrl-C` — the child did not choose
 //!   to stop, so its code is not forwarded: the run reports a reserved-band code
 //!   ([`exit::TIMEOUT`] / [`exit::CANCELLED`]) and an explanatory stderr line, kept
-//!   distinct from each other and from any child result. (Their machine-readable
-//!   JSONL form lands with the event schema — see `docs/ROADMAP.md` §2 / T-004.)
+//!   distinct from each other and from any child result. Their machine-readable
+//!   JSONL form is the `timeout` / `cancelled` (plus terminal `runner_exit`) event
+//!   written to `--jsonl` (see [`crate::events`] and `docs/schema.md`).
 //! - **One teardown path for every ending, honest per platform.** The deadline
 //!   and the cancel share a single termination path: attempt a *soft* stop
 //!   (`SIGTERM` to the whole tree on Unix), wait out `--grace`, then let the owning
@@ -44,6 +45,7 @@ use std::time::Duration;
 use processkit::{Command as PkCommand, Error as PkError, Outcome, ProcessGroup, Signal};
 
 use crate::cli::RunArgs;
+use crate::events::{self, Emitter, Event, Member};
 use crate::exit::{self, RunnerError};
 
 /// Execute the `run` subcommand and turn the result into a process exit code.
@@ -122,9 +124,14 @@ enum SoftTerminate {
     Failed,
 }
 
-/// Own a group, spawn the child into it, stream its output live, and report how
-/// the run ended. The group drops when this future completes — on success or on
-/// any error path — which is what tears the container down.
+/// Own a group, spawn the child into it, stream its output live, write the JSONL
+/// lifecycle events, and report how the run ended. The group drops when this
+/// future completes — on success or on any error path — which is what tears the
+/// container down.
+///
+/// **Event invariant.** Every return path emits exactly one terminal
+/// [`Event::RunnerExit`] as its last event, so a child's code is recorded out of
+/// band even on the runner's own failure (`AGENTS.md`, "Exit-code fidelity").
 async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     // clap guarantees at least one token (`num_args = 1..`, `required = true`).
     let (program, program_args) = args
@@ -132,16 +139,40 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
         .split_first()
         .expect("clap enforces a non-empty command after `--`");
 
+    // Open the event stream *first*, before anything is spawned. `--jsonl` is a
+    // required, first-class output, so a file we cannot even create is a
+    // fail-closed setup error reported before the child runs — no child code can
+    // be lost to a logging failure. Once open, later write failures are
+    // best-effort (see `Emitter`), never a reason to abort a healthy run.
+    let mut emitter = Emitter::create(&args.jsonl).map_err(|err| {
+        RunnerError::new(
+            exit::INTERNAL,
+            format!(
+                "could not open the JSONL events file `{}`: {err}",
+                args.jsonl.display()
+            ),
+        )
+    })?;
+
     // We own this group; the child — and anything it spawns — is a member. When
     // `group` drops at the end of this scope (every path below), the kernel reaps
     // the whole tree. Containment/teardown is the group's job; we never duplicate
     // it (`AGENTS.md`, "Never clean up by process name").
-    let group = ProcessGroup::new().map_err(|err| {
-        RunnerError::new(
-            exit::BACKEND,
-            format!("could not create the ProcessKit container: {err}"),
-        )
-    })?;
+    let group = match ProcessGroup::new() {
+        Ok(group) => group,
+        Err(err) => {
+            let error = RunnerError::new(
+                exit::BACKEND,
+                format!("could not create the ProcessKit container: {err}"),
+            );
+            emitter.emit(&Event::ContainerFailed {
+                phase: "create",
+                code: error.code(),
+                message: err.to_string(),
+            });
+            return Err(finish(&mut emitter, "container_error", None, error));
+        }
+    };
 
     let mut command = PkCommand::new(program).args(program_args);
     // Default cwd is the runner's own current directory (processkit leaves it
@@ -174,7 +205,26 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     // the cancel are *not* handed to the child handle (via `Command::timeout` /
     // `cancel_on`); we run the race ourselves so both endings share one grace +
     // kill-on-drop teardown, exactly as this task requires.
-    let running = group.start(&command).await.map_err(map_launch_error)?;
+    let running = match group.start(&command).await {
+        Ok(running) => running,
+        Err(err) => {
+            let error = map_launch_error(&err);
+            emitter.emit(&launch_failure_event(&err, &error));
+            let source = launch_failure_source(&error);
+            return Err(finish(&mut emitter, source, None, error));
+        }
+    };
+
+    // The root PID must be read *before* the race moves `running` into `wait()`.
+    let root_pid = running.pid();
+    emitter.emit(&Event::RunStarted {
+        run_id: events::resolve_run_id(args.run_id.as_deref()),
+        root_pid,
+        mechanism: events::mechanism_str(group.mechanism()),
+        cwd: resolve_cwd(&args),
+        command: events::CommandInfo::for_argv(&args.command, args.argv_raw),
+    });
+    emit_members_snapshot(&mut emitter, &group);
 
     let timeout = args.timeout;
     let grace = args.grace;
@@ -199,27 +249,175 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
 
     match ending {
         Ending::Exited(outcome) => {
-            let outcome = outcome.map_err(|err| {
-                RunnerError::new(
-                    exit::INTERNAL,
-                    format!("waiting for the child to exit failed: {err}"),
-                )
-            })?;
-            exit_code_for(outcome)
-            // `group` drops here → the container, including any leaked grandchild,
-            // is torn down before we return the child's code.
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    let error = RunnerError::new(
+                        exit::INTERNAL,
+                        format!("waiting for the child to exit failed: {err}"),
+                    );
+                    return Err(finish(&mut emitter, "internal", None, error));
+                }
+            };
+            let (outcome_str, code, signal) = events::outcome_fields(&outcome);
+            emitter.emit(&Event::RootExited {
+                outcome: outcome_str,
+                code,
+                signal,
+            });
+            let child_code = match exit_code_for(outcome) {
+                Ok(child_code) => child_code,
+                Err(error) => return Err(finish(&mut emitter, "internal", None, error)),
+            };
+            // Reap any descendant the exited child leaked behind. No soft stop is
+            // attempted on the natural-exit path, so the two cleanup events bracket
+            // only the hard kill.
+            emit_cleanup_started(&mut emitter, &group);
+            emit_cleanup_finished(&mut emitter, &group, None);
+            emitter.emit(&Event::RunnerExit {
+                code: child_code,
+                source: "child_exit",
+                child_code: Some(child_code),
+            });
+            Ok(child_code)
+            // `group` drops here (a no-op after the explicit kill above).
         }
         Ending::TimedOut => {
             let limit = timeout.expect("the deadline arm only fires when --timeout is set");
+            emitter.emit(&Event::Timeout {
+                timeout_ms: duration_ms(limit),
+                grace_ms: grace.map(duration_ms),
+            });
+            // `cleanup_started` brackets the whole teardown — soft stop, grace, and
+            // hard kill — so `members_before` is the full tree, not a post-soft remnant.
+            emit_cleanup_started(&mut emitter, &group);
             let soft = soft_terminate_then_grace(&group, grace).await;
-            Err(termination_error(Termination::Timeout(limit), soft, grace))
-            // `group` drops here → kill-on-drop hard-tears-down any survivor.
+            emit_cleanup_finished(&mut emitter, &group, Some(soft_terminate_label(soft)));
+            let error = termination_error(Termination::Timeout(limit), soft, grace);
+            Err(finish(&mut emitter, "timeout", None, error))
         }
         Ending::Cancelled => {
+            emitter.emit(&Event::Cancelled {
+                source: "ctrl_c",
+                grace_ms: grace.map(duration_ms),
+            });
+            emit_cleanup_started(&mut emitter, &group);
             let soft = soft_terminate_then_grace(&group, grace).await;
-            Err(termination_error(Termination::Cancelled, soft, grace))
-            // `group` drops here → kill-on-drop hard-tears-down any survivor.
+            emit_cleanup_finished(&mut emitter, &group, Some(soft_terminate_label(soft)));
+            let error = termination_error(Termination::Cancelled, soft, grace);
+            Err(finish(&mut emitter, "cancelled", None, error))
         }
+    }
+}
+
+/// Emit the terminal [`Event::RunnerExit`] for a runner-own failure and return the
+/// error unchanged, so each failing path reads as one expression. `source` names
+/// the ending and `child_code` carries the child's own code when one exists (it is
+/// `None` for every runner-own failure, where the child never produced one).
+fn finish(
+    emitter: &mut Emitter,
+    source: &'static str,
+    child_code: Option<i32>,
+    error: RunnerError,
+) -> RunnerError {
+    emitter.emit(&Event::RunnerExit {
+        code: i32::from(error.code()),
+        source,
+        child_code,
+    });
+    error
+}
+
+/// The child's working directory as recorded in `run_started`: the explicit
+/// `--cwd`, else the runner's own current directory (which processkit inherits),
+/// rendered lossily to a string, or `None` if it cannot be resolved.
+fn resolve_cwd(args: &RunArgs) -> Option<String> {
+    args.cwd
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+/// Snapshot the container's members and emit a PID-only `members_snapshot`. A read
+/// failure is a diagnostics gap, not a run failure, so it warns and skips the event.
+fn emit_members_snapshot(emitter: &mut Emitter, group: &ProcessGroup) {
+    match group.members() {
+        Ok(pids) => emitter.emit(&Event::MembersSnapshot {
+            members: pids.into_iter().map(Member::from_pid).collect(),
+        }),
+        Err(err) => {
+            eprintln!("processkit-cli: warning: could not snapshot container members: {err}");
+        }
+    }
+}
+
+/// Mark the start of container teardown with the full tree size about to be
+/// reaped. Emitted before any termination action (including the soft stop on a
+/// runner-imposed ending), so `members_before` is the whole tree, not a post-soft
+/// remnant.
+fn emit_cleanup_started(emitter: &mut Emitter, group: &ProcessGroup) {
+    let members_before = group.members().map(|pids| pids.len()).unwrap_or(0);
+    emitter.emit(&Event::CleanupStarted { members_before });
+}
+
+/// Hard-kill the container and mark teardown finished with a post-kill member
+/// snapshot. The hard kill is [`ProcessGroup::kill_all`] — the group's own kernel
+/// teardown, the same mechanism its drop would run — invoked explicitly so
+/// `remaining_pids` reflects the post-kill state rather than a pre-drop guess. Any
+/// kill error is best-effort: the group's drop is still a backstop. `soft` labels
+/// the soft-stop tier of a runner-imposed ending, or `None` on the natural-exit
+/// path where no soft stop was attempted.
+fn emit_cleanup_finished(emitter: &mut Emitter, group: &ProcessGroup, soft: Option<&'static str>) {
+    let _ = group.kill_all();
+    let remaining_pids = group.members().unwrap_or_default();
+    emitter.emit(&Event::CleanupFinished {
+        remaining: remaining_pids.len(),
+        remaining_pids,
+        soft_terminate: soft,
+    });
+}
+
+/// The machine label for a soft-stop tier, mirroring the honest stderr message.
+fn soft_terminate_label(soft: SoftTerminate) -> &'static str {
+    match soft {
+        SoftTerminate::Signalled => "signalled",
+        SoftTerminate::Unsupported => "unsupported",
+        SoftTerminate::Failed => "failed",
+    }
+}
+
+/// A duration as whole milliseconds for the JSONL timing fields (`u64` is ample
+/// for any deadline a run could carry; the source `Duration` is already bounded by
+/// the CLI parser).
+fn duration_ms(d: Duration) -> u64 {
+    d.as_millis() as u64
+}
+
+/// The launch-failure event for a backend error, chosen by the runner-own code
+/// rather than by re-matching the backend error: [`exit::SPAWN`] is a
+/// `spawn_failed`, anything else a `container_failed` at the `attach` phase.
+fn launch_failure_event(err: &PkError, error: &RunnerError) -> Event {
+    if error.code() == exit::SPAWN {
+        Event::SpawnFailed {
+            code: error.code(),
+            message: err.to_string(),
+        }
+    } else {
+        Event::ContainerFailed {
+            phase: "attach",
+            code: error.code(),
+            message: err.to_string(),
+        }
+    }
+}
+
+/// The `runner_exit` `source` for a launch failure, paired with
+/// [`launch_failure_event`].
+fn launch_failure_source(error: &RunnerError) -> &'static str {
+    if error.code() == exit::SPAWN {
+        "spawn_error"
+    } else {
+        "container_error"
     }
 }
 
@@ -336,7 +534,7 @@ fn format_duration(d: Duration) -> String {
 /// A locate/start failure is [`exit::SPAWN`] — the child never ran; every other
 /// backend/containment failure is [`exit::BACKEND`]. A child's own exit is never
 /// routed through here (it is an [`Outcome`], not an [`Err`]).
-fn map_launch_error(err: PkError) -> RunnerError {
+fn map_launch_error(err: &PkError) -> RunnerError {
     match err {
         PkError::NotFound { .. } | PkError::Spawn { .. } => {
             RunnerError::new(exit::SPAWN, format!("could not start the program: {err}"))
@@ -412,7 +610,7 @@ mod tests {
         // here; the SPAWN mapping is proved through the binary instead (running a
         // program that does not exist — see `tests/run.rs`). Every remaining
         // launch failure lands on the BACKEND code.
-        let io = map_launch_error(PkError::Io(std::io::Error::from(
+        let io = map_launch_error(&PkError::Io(std::io::Error::from(
             std::io::ErrorKind::AddrInUse,
         )));
         assert_eq!(io.code(), exit::BACKEND);

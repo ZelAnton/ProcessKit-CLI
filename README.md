@@ -84,9 +84,10 @@ soft-terminate happened when it could not — the stderr line for a Windows
 timeout/cancel says plainly that the tree was hard-killed via the Job Object after
 the grace delay. On Unix the soft stop is a real `SIGTERM` to the tree.
 
-The machine-readable form of these outcomes (timeout/cancellation events in the
-versioned JSONL stream) arrives with the event schema in a later task; today they
-are expressed through the exit code and the stderr message.
+The machine-readable form of these outcomes is the `timeout` / `cancelled` event
+(and the terminal `runner_exit`) in the versioned JSONL stream written to
+`--jsonl` — see [the JSONL event schema](#jsonl-event-schema) — alongside the exit
+code and the stderr message.
 
 ## Windows console
 
@@ -100,17 +101,43 @@ a console, so it spawns no extra console host on its own account. Headless
 Windows deployments (such as Orchestra) that want to suppress a stray `conhost`
 window for the child pass `--create-no-window` explicitly.
 
+## JSONL event schema
+
+`run` writes a versioned stream of **JSONL lifecycle events** to the file named by
+`--jsonl` — one JSON object per line, each carrying a `schema_version`, and
+**never** to stdout (the child's streams stay pristine). This repository owns that
+contract as a public API: adapters such as the processkit-py CLI pin
+`schema_version` and reimplement the shapes, so it is versioned, documented, and
+golden-tested.
+
+The stream covers the run lifecycle: `run_started` (run id, root PID, containment
+mechanism, working directory), `members_snapshot`, `root_exited`, the
+`cleanup_started` / `cleanup_finished` teardown pair, `timeout` / `cancelled`,
+launch and container errors, and a terminal `runner_exit` that preserves the
+child's own code even when the runner itself fails — so a child's code is never
+lost or aliased.
+
+The command line is **redacted by default** (`argv` is recorded only under
+`--argv-raw`); the redaction hash and worker-shape hint are reserved fields filled
+by a later task. Member snapshots are PID-only today, with the richer per-member
+fields declared but absent until ProcessKit-rs ships them.
+
+- Normative field reference: [`docs/schema.md`](docs/schema.md).
+- Golden sample stream for adapters:
+  [`fixtures/schema/v1/events.jsonl`](fixtures/schema/v1/events.jsonl).
+
 ## Status
 
 `run` is implemented: it spawns the child into a ProcessKit container the runner
-owns, echoes the child's output live, forwards the child's exit code exactly, and
+owns, echoes the child's output live, forwards the child's exit code exactly,
 enforces `--timeout`, `--grace`, and `Ctrl-C` cancellation with a guaranteed
-teardown of the whole tree (see "Timeouts, cancel, and grace"). The control-plane
-subcommands (`inspect`, `cancel`, `kill`) and the JSONL event stream are not
-implemented yet — those subcommands still report a runner-range "not implemented"
-error, and `run`'s remaining flags (`--jsonl`, `--capture-dir`, `--run-id`,
-`--argv-raw`) are parsed but not yet consumed. See [the roadmap](docs/ROADMAP.md)
-for the intended delivery order.
+teardown of the whole tree (see "Timeouts, cancel, and grace"), and writes the
+versioned JSONL event stream to `--jsonl` (see "JSONL event schema"). `--run-id`
+and `--argv-raw` are consumed by that stream. The control-plane subcommands
+(`inspect`, `cancel`, `kill`) are not implemented yet — those still report a
+runner-range "not implemented" error — and `--capture-dir` is parsed but not yet
+consumed (bounded diagnostic capture is a later task). See
+[the roadmap](docs/ROADMAP.md) for the intended delivery order.
 
 ## Development
 

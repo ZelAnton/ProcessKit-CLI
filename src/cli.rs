@@ -41,11 +41,10 @@ pub enum Command {
 /// [--timeout <duration>] [--grace <duration>] [--capture-dir <dir>] [--argv-raw]
 /// -- <program> <args...>`
 //
-// `cwd`, `create_no_window`, `timeout`, `grace`, and `command` are consumed by
-// `run`; the rest (`run_id`, `jsonl`, `capture_dir`, `argv_raw`) are parsed and
-// validated now but not yet read — the tasks that consume them land later — so the
-// binary crate would flag those as never-read without this allow.
-#[allow(dead_code)]
+// `run` now consumes `cwd`, `create_no_window`, `timeout`, `grace`, `command`,
+// `jsonl`, `run_id`, and `argv_raw` (the JSONL schema, T-004). Only `capture_dir`
+// remains parsed-but-unread until bounded diagnostic capture lands (T-003); it
+// carries a field-level allow below so the binary crate does not flag it.
 #[derive(Debug, Args)]
 pub struct RunArgs {
     /// Identifier for this run; a value is generated when omitted.
@@ -80,6 +79,7 @@ pub struct RunArgs {
     pub grace: Option<Duration>,
 
     /// Directory for bounded stdout/stderr capture files.
+    #[allow(dead_code)] // Consumed once bounded diagnostic capture lands (T-003).
     #[arg(long, value_name = "dir")]
     pub capture_dir: Option<PathBuf>,
 
