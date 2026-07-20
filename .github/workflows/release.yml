@@ -15,7 +15,7 @@ name: Release
 # git history via git-cliff, promote the curated changelog, verify the crate
 # publishes (dry run), publish to crates.io, then tag `v<version>` and publish a
 # GitHub Release. Publishing comes BEFORE the tag, so a failed publish strands
-# nothing (just re-run). See AGENTS.md "Releasing and the changelog". For a
+# nothing (just re-run). See CONTRIBUTING.md "Changelog". For a
 # workspace of several independently-versioned crates, model
 # this on vcs-toolkit-rs's release.yml instead (per-crate `crate`/`version`
 # inputs and `<crate>-v<version>` tags).

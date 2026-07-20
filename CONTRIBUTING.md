@@ -49,12 +49,11 @@ cargo deny check advisories bans
   they feed the changelog auto-fill via [`cliff.toml`](cliff.toml).
 - **Language** — write source, comments, documentation, configuration, commit
   messages, and all other repository artifacts in English.
-- **Publishing** — external contributors and automated services may use branches
-  and pull requests. AI coding agents work directly on `main` as specified in
-  [`AGENTS.md`](AGENTS.md). AI agents do not add co-author trailers or other AI
-  attribution.
-- See [`AGENTS.md`](AGENTS.md) for the full, authoritative set of conventions
-  (code style, dependency management, supply chain/MSRV, version control).
+- **Publishing** — contributors and automated services use branches and pull
+  requests; pushing directly to `main` is reserved for the repository owner.
+- **Comments explain the *why*, not the *what*.** The code already states what it
+  does; a comment earns its place by recording the non-obvious reason — a
+  workaround, a wire contract, a performance trade-off.
 
 ## Changelog
 

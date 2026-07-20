@@ -7,9 +7,12 @@ task_plan.md
 findings.md
 progress.md
 
-# Agent instructions — local-only to this repo, never committed.
+# Contributor-agent instructions and internal design briefs — local to this
+# checkout, never committed. Public conventions live in CONTRIBUTING.md.
+/AGENTS.md
 /CLAUDE.md
 /.claude/
+/PROCESSKIT_CLI_DEVELOPMENT_BRIEF.md
 
 # Rust
 **/*.rs.bk
