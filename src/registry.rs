@@ -698,32 +698,39 @@ mod platform {
     }
 
     /// Test-only: does `dir`'s DACL restrict it to the current user alone — protected
-    /// (no inheritance), granting the current user, and granting no world/Everyone
-    /// ACE? Verified by reading the DACL back as SDDL.
+    /// (no inheritance) and granting access to the current user, with no ACE for any
+    /// other account (Everyone included)?
+    ///
+    /// The DACL is verified against the current user's **binary** SID (via [`EqualSid`],
+    /// through [`dacl_is_owner_only`]), *not* by string-matching a read-back SDDL. The
+    /// production side builds the ACE from the full `S-1-...` SID string
+    /// ([`ConvertSidToStringSidW`] never abbreviates), but the read-back converter
+    /// [`ConvertSecurityDescriptorToStringSecurityDescriptorW`] renders *well-known* SIDs
+    /// as their two-letter SDDL alias. On a normal interactive developer account the user
+    /// SID (`S-1-5-21-…-<RID ≥ 1000>`) has no alias, so an old substring match on the
+    /// numeric SID happened to pass; but under an account whose SID is well-known — e.g.
+    /// the built-in local Administrator (`…-500` → alias `LA`), which is the kind of
+    /// elevated account a GitHub Actions `windows-latest` runner executes as — the
+    /// read-back SDDL carries the alias instead of the numeric SID and the substring match
+    /// spuriously failed, even though the DACL applied to the directory is correct. A
+    /// binary SID comparison is account-agnostic and holds for both contexts.
+    ///
+    /// [`EqualSid`]: windows_sys::Win32::Security::EqualSid
+    /// [`ConvertSidToStringSidW`]: windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW
+    /// [`ConvertSecurityDescriptorToStringSecurityDescriptorW`]: windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW
     #[cfg(test)]
     pub fn is_owner_only(dir: &Path) -> io::Result<bool> {
-        let sddl = dacl_sddl(dir)?;
-        let sid = current_user_sid_string()?;
-        let protected = sddl.starts_with("D:P");
-        let grants_user = sddl.contains(&sid);
-        // `WD` is the SDDL alias for the Everyone/World SID; its presence in the DACL
-        // would mean the directory is not owner-only.
-        let grants_world = sddl.contains(";WD)") || sddl.contains(";WD;");
-        Ok(protected && grants_user && !grants_world)
-    }
+        use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
+        use windows_sys::Win32::Security::{ACL, GetSecurityDescriptorControl};
 
-    /// Test-only: read `dir`'s DACL back as an SDDL string.
-    #[cfg(test)]
-    fn dacl_sddl(dir: &Path) -> io::Result<String> {
-        use windows_sys::Win32::Security::Authorization::{
-            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
-        };
+        let user_sid = current_user_sid_bytes()?;
 
         let path = to_wide(&dir.to_string_lossy());
         let mut descriptor: *mut core::ffi::c_void = std::ptr::null_mut();
-        let mut dacl = std::ptr::null_mut();
-        // SAFETY: `path` is NUL-terminated; on success `descriptor`/`dacl` receive
-        // pointers into a LocalAlloc'd descriptor freed below. Returns a WIN32_ERROR.
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        // SAFETY: `path` is NUL-terminated; on success `dacl` points into the
+        // LocalAlloc'd `descriptor` (freed below) and stays valid until then.
+        // GetNamedSecurityInfoW returns a WIN32_ERROR (0 == success), not last-error.
         let status = unsafe {
             GetNamedSecurityInfoW(
                 path.as_ptr(),
@@ -740,32 +747,147 @@ mod platform {
             return Err(io::Error::from_raw_os_error(status as i32));
         }
 
-        let mut raw: *mut u16 = std::ptr::null_mut();
-        // SAFETY: `descriptor` is the descriptor just read; on success `raw` receives
-        // a LocalAlloc'd string freed below.
+        let mut control: u16 = 0;
+        let mut revision: u32 = 0;
+        // SAFETY: `descriptor` is the security descriptor just read; the out-params
+        // receive its control word and revision (always written on success).
+        let control_ok =
+            unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) };
+        let verdict = if control_ok == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(dacl_is_owner_only(control, dacl, &user_sid))
+        };
+
+        // SAFETY: `descriptor` came from GetNamedSecurityInfoW (LocalAlloc'd).
+        unsafe { LocalFree(descriptor as HLOCAL) };
+        verdict
+    }
+
+    /// Test-only: is `dacl` (with security-descriptor `control` flags) an owner-only
+    /// grant to `user_sid` — present, protected (no inherited ACEs), and composed solely
+    /// of allow-ACEs naming that one SID? An absent/null DACL (grants everyone), an
+    /// unprotected DACL (could inherit wider ACEs), an empty DACL (denies even the
+    /// owner), any non-allow ACE, or any ACE for a different account (Everyone included)
+    /// all fail the check — making it strictly stronger than the old SDDL scan.
+    #[cfg(test)]
+    fn dacl_is_owner_only(
+        control: u16,
+        dacl: *const windows_sys::Win32::Security::ACL,
+        user_sid: &[u8],
+    ) -> bool {
+        use windows_sys::Win32::Security::{
+            ACCESS_ALLOWED_ACE, EqualSid, GetAce, SE_DACL_PRESENT, SE_DACL_PROTECTED,
+        };
+
+        // The allow-ACE type tag (`ACCESS_ALLOWED_ACE_TYPE`, 0). windows-sys 0.61 does
+        // not re-export the constant; the value is a stable part of the ACE ABI.
+        const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+
+        if dacl.is_null() || control & SE_DACL_PRESENT == 0 || control & SE_DACL_PROTECTED == 0 {
+            return false;
+        }
+
+        // SAFETY: `dacl` is present and non-null per the guard above.
+        let ace_count = unsafe { (*dacl).AceCount };
+        // The DACL we apply is exactly one allow-ACE; an empty DACL is not owner-only.
+        if ace_count == 0 {
+            return false;
+        }
+
+        for index in 0..u32::from(ace_count) {
+            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: `dacl` is valid and `index` is within `0..AceCount`.
+            let got = unsafe { GetAce(dacl, index, &mut ace) };
+            if got == 0 || ace.is_null() {
+                return false;
+            }
+            let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
+            // SAFETY: `ace` points at a valid ACE inside the live DACL; reading its
+            // header and taking the address of its in-place `SidStart` stays within it.
+            let (ace_type, ace_sid) =
+                unsafe { ((*ace).Header.AceType, &raw const (*ace).SidStart) };
+            if ace_type != ACCESS_ALLOWED_ACE_TYPE {
+                // A non-allow ACE (deny/audit/…) means the DACL is more than a plain grant.
+                return false;
+            }
+            // SAFETY: `ace_sid` is the ACE's in-place SID and `user_sid` is our owned copy
+            // of the current user's SID; EqualSid only reads both.
+            let equal = unsafe {
+                EqualSid(
+                    ace_sid as *mut core::ffi::c_void,
+                    user_sid.as_ptr() as *mut core::ffi::c_void,
+                )
+            };
+            if equal == 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Test-only: the current user's binary SID copied into an owned buffer, so it
+    /// outlives the process token it was read from.
+    #[cfg(test)]
+    fn current_user_sid_bytes() -> io::Result<Vec<u8>> {
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: `GetCurrentProcess` is a pseudo-handle needing no close; `token`
+        // receives a real handle closed below.
+        let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let result = token_user_sid_bytes(token);
+        // SAFETY: `token` is a valid handle from OpenProcessToken.
+        unsafe { CloseHandle(token) };
+        result
+    }
+
+    /// Test-only: read the `TokenUser` SID out of `token` and copy its bytes into an
+    /// owned buffer (sized with [`GetLengthSid`]).
+    ///
+    /// [`GetLengthSid`]: windows_sys::Win32::Security::GetLengthSid
+    #[cfg(test)]
+    fn token_user_sid_bytes(token: HANDLE) -> io::Result<Vec<u8>> {
+        use windows_sys::Win32::Security::GetLengthSid;
+
+        let mut needed = 0u32;
+        // SAFETY: the documented sizing call — a null buffer of length 0 fails and
+        // writes the required byte count to `needed`.
+        let _ =
+            unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+        if needed == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut buffer = vec![0u8; needed as usize];
+        // SAFETY: `buffer` holds `needed` bytes; TokenUser fills a `TOKEN_USER` at its
+        // head.
         let ok = unsafe {
-            ConvertSecurityDescriptorToStringSecurityDescriptorW(
-                descriptor,
-                SDDL_REVISION_1,
-                DACL_SECURITY_INFORMATION,
-                &mut raw,
-                std::ptr::null_mut(),
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
             )
         };
-        let result = if ok != 0 {
-            // SAFETY: `raw` is a NUL-terminated UTF-16 string from the converter.
-            Ok(unsafe { wide_to_string(raw) })
-        } else {
-            Err(io::Error::last_os_error())
-        };
-        // SAFETY: both allocations came from the Win32 calls above (LocalAlloc'd).
-        unsafe {
-            if !raw.is_null() {
-                LocalFree(raw as HLOCAL);
-            }
-            LocalFree(descriptor as HLOCAL);
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
         }
-        result
+
+        // SAFETY: `buffer` now holds a `TOKEN_USER` whose `User.Sid` points within it;
+        // `GetLengthSid` reads only the SID's own header to size it.
+        let (sid, len) = unsafe {
+            let sid = (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid;
+            (sid, GetLengthSid(sid) as usize)
+        };
+        if len == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `sid..sid+len` is the SID's own storage inside the live `buffer`.
+        let bytes = unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), len) };
+        Ok(bytes.to_vec())
     }
 }
 
