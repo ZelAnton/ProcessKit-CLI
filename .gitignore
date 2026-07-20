@@ -1,0 +1,17 @@
+/target
+
+# Per-user scratch notes — never committed. Use these names freely for
+# throwaway planning/working files.
+*.local.md
+task_plan.md
+findings.md
+progress.md
+
+# Agent instructions — local-only to this repo, never committed.
+/AGENTS.md
+/CLAUDE.md
+/.claude/
+
+# Rust
+**/*.rs.bk
+*.pdb
