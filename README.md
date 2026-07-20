@@ -35,10 +35,20 @@ local IPC. If the runner dies, ProcessKit's kill-on-drop containment ends that
 run's tree; the registry entry is then stale rather than an invitation to
 address processes by PID.
 
+## Exit codes
+
+The runner's exit code **is** the child's exit code; the runner's own failures
+(bad arguments, spawn failure, backend error) use a distinct, reserved code band
+so they can never be mistaken for a child result. This is part of the project's
+compatibility surface — see [the exit-code contract](docs/exit-codes.md).
+
 ## Status
 
-Repository scaffolding is complete; the runner has not been implemented yet.
-See [the roadmap](docs/ROADMAP.md) for the intended delivery order.
+Repository scaffolding is complete. The command surface above is parsed and
+validated, and the exit-code contract is fixed; the runner that executes each
+subcommand is not implemented yet — every subcommand currently reports a
+runner-range "not implemented" error. See [the roadmap](docs/ROADMAP.md) for the
+intended delivery order.
 
 ## Development
 

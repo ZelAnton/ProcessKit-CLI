@@ -13,6 +13,15 @@ to a dated version section.
 
 ### Added
 - Initial project skeleton.
+- Command-line surface: the `run`, `inspect`, `cancel`, and `kill` subcommands
+  are parsed and validated, including `run`'s verbatim `-- <program> <args...>`
+  tail. Execution is not implemented yet — each subcommand exits with a
+  runner-range "not implemented" code.
+- Documented runner exit-code contract (`docs/exit-codes.md`) that keeps the
+  runner's own failures in a reserved code band, separate from the child's
+  exit code.
+- Dependencies on `processkit` (the containment backbone) and `clap` (CLI
+  parsing).
 
 ### Changed
 -
