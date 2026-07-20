@@ -15,6 +15,76 @@ The project owns the versioned JSONL event contract used by runner clients and
 future adapters, including `processkit-py`. ProcessKit-rs remains the sole
 owner of containment, teardown, PID-reuse discipline, and lifecycle semantics.
 
+## Installation
+
+`processkit-cli` ships as a single self-contained binary — running it needs
+neither a source build nor a Python or development virtualenv, which is the whole
+point of the project.
+
+### Prebuilt binaries (recommended)
+
+Every release attaches a prebuilt archive per platform to its
+[GitHub Release](https://github.com/ZelAnton/ProcessKit-CLI/releases). Download
+the archive for your platform, extract the single `processkit-cli` binary
+(`processkit-cli.exe` on Windows), and put it on your `PATH`:
+
+```sh
+# Linux x86_64 (glibc), for the vX.Y.Z release:
+curl -sSL -o processkit-cli.tar.gz \
+  https://github.com/ZelAnton/ProcessKit-CLI/releases/download/vX.Y.Z/processkit-cli-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf processkit-cli.tar.gz
+```
+
+Archives are named `processkit-cli-v<version>-<target-triple>.<ext>` — `.tar.gz`
+for Linux and macOS, `.zip` for Windows.
+
+### From crates.io
+
+The prebuilt binaries do not replace `cargo install` — building from source stays
+a first-class path:
+
+```sh
+cargo install processkit-cli
+```
+
+### Platform matrix
+
+Prebuilt binaries are published for the targets below. The **Container mechanism**
+column is the kernel-backed containment the runner *actually* reports in the
+`run_started` event's `mechanism` field on that platform (see the
+[JSONL event schema](#jsonl-event-schema)) — not a generic promise:
+
+| Platform | Target triple | Container mechanism |
+| --- | --- | --- |
+| Windows x86_64 | `x86_64-pc-windows-msvc` | Job Object (`job_object`) |
+| Windows aarch64 | `aarch64-pc-windows-msvc` | Job Object (`job_object`) |
+| Linux x86_64 (glibc) | `x86_64-unknown-linux-gnu` | cgroup v2 (`cgroup_v2`) |
+| Linux aarch64 (glibc) | `aarch64-unknown-linux-gnu` | cgroup v2 (`cgroup_v2`) |
+| Linux x86_64 (musl, static) | `x86_64-unknown-linux-musl` | cgroup v2 (`cgroup_v2`) |
+| macOS x86_64 (Intel) | `x86_64-apple-darwin` | process group (`process_group`) |
+| macOS aarch64 (Apple Silicon) | `aarch64-apple-darwin` | process group (`process_group`) |
+
+The **musl** build links libc statically, so it runs on minimal, glibc-less
+container images (Alpine, distroless) as a single dependency-free file. It is
+shipped **alongside** the glibc Linux build, not as a replacement.
+
+The three mechanisms are not equally strong, and the runner reports which one is
+in force rather than papering over the difference:
+
+- **Windows — Job Object.** The whole process tree is reaped even if the runner
+  itself dies abruptly (the OS closes the Job on its last handle). This is the
+  strongest guarantee.
+- **Linux — cgroup v2.** The run's cgroup bounds the entire tree and teardown
+  reaps every member. It requires cgroup v2 (the unified hierarchy — standard on
+  modern distros). Where cgroup v2 delegation is unavailable, the runner honestly
+  falls back to the POSIX **process-group** mechanism below and reports
+  `process_group`; it never claims a cgroup it did not get.
+- **macOS and other Unix — process group.** Teardown signals the process group;
+  a descendant that deliberately leaves it (`setsid` / double-fork) can escape,
+  and a just-exited child may still be listed in the post-kill snapshot. A
+  guaranteed whole-tree reap on *abrupt* owner death is a Windows-Job-Object
+  property and is not promised here.
+
 ## Planned interface
 
 ```text

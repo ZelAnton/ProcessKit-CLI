@@ -58,6 +58,16 @@ to a dated version section.
 - Dependencies on `processkit` (the containment backbone), `tokio` (its async
   runtime), `clap` (CLI parsing), and `serde` / `serde_json` (the JSONL event
   schema).
+- Prebuilt release binaries: the manual `release.yml` workflow now fans out a
+  downstream `build-artifacts` matrix that builds a `--release` binary for
+  Windows, Linux, and macOS across x86_64 and aarch64 — plus a statically linked
+  `x86_64-unknown-linux-musl` build for minimal/container images — and attaches
+  each archive to the same GitHub Release. It runs strictly after the existing
+  crates.io publish + tag, so the release ordering is unchanged and there is still
+  a single release path; `cargo install processkit-cli` remains a first-class
+  install. `README.md` gains an Installation section with a platform matrix that
+  states the actual kernel container mechanism reported per platform (Job Object
+  on Windows, cgroup v2 on Linux, POSIX process group on macOS/other Unix).
 
 ### Changed
 - `inspect`, `cancel`, and `kill` remain unimplemented and still exit with the

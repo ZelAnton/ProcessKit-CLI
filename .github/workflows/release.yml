@@ -19,6 +19,18 @@ name: Release
 # workspace of several independently-versioned crates, model
 # this on vcs-toolkit-rs's release.yml instead (per-crate `crate`/`version`
 # inputs and `<crate>-v<version>` tags).
+#
+# Prebuilt binaries: once the `release` job has published + tagged + created the
+# GitHub Release, a downstream `build-artifacts` matrix fans out across the
+# supported platforms (Windows/Linux/macOS x x86_64/aarch64, plus a static
+# musl Linux build), builds each `--release` binary from the freshly-tagged
+# commit, and attaches it to that SAME Release. It is a strictly-downstream
+# enhancement, NOT a second release path: it never bumps, publishes to
+# crates.io, tags, or creates a Release. Because it runs AFTER the sole
+# irreversible step (crates.io), a build failure on one target strands nothing —
+# `cargo install processkit-cli` and the Release still work, and the missing
+# asset can be built + `gh release upload`ed by hand (or the job re-run; upload
+# is `--clobber`-idempotent). This does not change the release ordering above.
 
 on:
   workflow_dispatch:
@@ -44,6 +56,11 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    # Expose the computed version/tag so the downstream `build-artifacts` job can
+    # check out the exact tagged commit and name its archives after the version.
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       # Mint a short-lived GitHub App installation token. Pushing the release commit
       # to `main` with it makes the **App** the actor — and the App sits in the
@@ -427,3 +444,113 @@ jobs:
             echo "::warning::GitHub Release attempt ${attempt} failed; retrying in 15s..."
             sleep 15
           done
+
+  # Build the prebuilt binaries and attach them to the Release the `release` job
+  # just created. Strictly downstream (`needs: release`) so the tag + Release
+  # already exist; it only uploads assets — never bumps/publishes/tags/creates a
+  # Release, so there is still exactly one release path. `fail-fast: false` means
+  # one platform failing to build does not cancel the others or strand the
+  # Release (the successful assets still upload; a missing one is a manual
+  # `cargo build --release --target <triple>` + `gh release upload` away).
+  build-artifacts:
+    needs: release
+    name: artifact (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows: native x86_64, plus aarch64 cross-linked with the ARM64 MSVC
+          # tools present on the hosted windows runner.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+          # Linux glibc: native x86_64, plus aarch64 cross-compiled with the
+          # gcc-aarch64-linux-gnu cross linker.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            apt: gcc-aarch64-linux-gnu
+          # Static Linux: the musl target links libc statically, yielding a single
+          # dependency-free binary for containers/minimal images. Shipped ALONGSIDE
+          # the glibc build above, not instead of it.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            apt: musl-tools
+          # macOS: Intel on the x86_64 runner image, Apple Silicon on the arm64 one
+          # (both native, no cross toolchain needed).
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    steps:
+      # Build from the exact commit the release just tagged, so the binary embeds
+      # the released version and matches what `cargo install` produces.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable # rolling toolchain selector — intentionally unpinned
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Cross toolchains for the Linux targets that need one: the aarch64 glibc
+      # linker, or musl's libc for the static build. Native targets skip this.
+      - name: Install Linux cross toolchain
+        if: ${{ matrix.apt != '' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }}
+
+      # `--locked` asserts the just-bumped Cargo.lock is authoritative (no silent
+      # re-resolve). The aarch64 glibc linker override is keyed to that exact
+      # triple, so cargo ignores it for every other target.
+      - name: Build release binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Package the single binary into a per-target archive named with the version
+      # and the full target triple (so the musl build is self-describing:
+      # …-x86_64-unknown-linux-musl.tar.gz). .zip on Windows, .tar.gz elsewhere.
+      - name: Package archive (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: bash
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          name="processkit-cli-v${VERSION}-${TARGET}"
+          # Stage the binary in the CWD first so the archive holds it at the root
+          # (bare `processkit-cli.exe`), not under a nested target/<triple>/ path.
+          cp "target/${TARGET}/release/processkit-cli.exe" processkit-cli.exe
+          7z a "${name}.zip" processkit-cli.exe
+          echo "ASSET=${name}.zip" >> "$GITHUB_ENV"
+
+      - name: Package archive (Unix)
+        if: ${{ runner.os != 'Windows' }}
+        shell: bash
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          name="processkit-cli-v${VERSION}-${TARGET}"
+          tar -czf "${name}.tar.gz" -C "target/${TARGET}/release" processkit-cli
+          echo "ASSET=${name}.tar.gz" >> "$GITHUB_ENV"
+
+      # Attach the archive to the Release the `release` job created. `--clobber`
+      # replaces rather than duplicates on a re-run, keeping upload idempotent.
+      - name: Upload artifact to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: gh release upload "$TAG" "$ASSET" --clobber
