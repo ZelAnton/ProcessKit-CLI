@@ -25,9 +25,22 @@ to a dated version section.
   the container is torn down by the group's kernel-backed kill-on-drop, so leaked
   descendants do not survive. `--create-no-window` is proxied to
   `Command::create_no_window()` (default off).
+- `run` now enforces `--timeout` and `--grace` and handles `Ctrl-C`, all as
+  **distinguishable** endings that share one teardown path. A `--timeout` that
+  elapses exits with the reserved `TIMEOUT` code (106); a `Ctrl-C` cancel exits
+  with the reserved `CANCELLED` code (107) — each distinct from the other and from
+  a forwarded child code — with an explanatory line on stderr. Both first ask the
+  tree to stop, wait out `--grace`, then let the owning container's kill-on-drop
+  hard-tear-down the whole tree, so no descendant survives either ending.
+  `--timeout`/`--grace` accept a small duration grammar (`ms`/`s`/`m`/`h`, integer,
+  default `s`); a malformed value is a usage error (100). On Windows, where the
+  ProcessKit kernel has no soft-terminate tier yet, no soft signal is sent — the
+  grace window elapses and the Job Object is then killed atomically, and the runner
+  reports this honestly rather than implying a graceful stop. (The machine-readable
+  JSONL form of these outcomes lands with the event schema.)
 - Documented runner exit-code contract (`docs/exit-codes.md`) that keeps the
   runner's own failures in a reserved code band, separate from the child's
-  exit code.
+  exit code, and now assigns `TIMEOUT` (106) and `CANCELLED` (107).
 - Dependencies on `processkit` (the containment backbone), `tokio` (its async
   runtime), and `clap` (CLI parsing).
 

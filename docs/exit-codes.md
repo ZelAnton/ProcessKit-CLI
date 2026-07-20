@@ -28,15 +28,37 @@ failure is not mistaken for a child result.
 
 | Code | Name              | Meaning                                                                                     |
 |------|-------------------|---------------------------------------------------------------------------------------------|
-| 100  | `USAGE`           | Invalid command line: unknown flag, missing required option, malformed value, or bad subcommand form. |
+| 100  | `USAGE`           | Invalid command line: unknown flag, missing required option, malformed value (including a bad `--timeout`/`--grace` duration), or bad subcommand form. |
 | 101  | `SPAWN`           | The target program could not be started (not found, not executable, bad `--cwd`, permission denied). |
 | 102  | `BACKEND`         | ProcessKit backend/containment failure: kernel container, job object, IPC endpoint, or run registry could not be established. |
 | 103  | `CONTROL`         | An `inspect` / `cancel` / `kill` command could not reach its target run: no such run id, a stale/dead registry entry, or an IPC failure. |
 | 104  | `INTERNAL`        | Unexpected runner fault (an invariant was violated). Reported with this code instead of panicking. |
 | 105  | `NOT_IMPLEMENTED` | A defined-but-not-yet-built code path. **Transitional** — present only while the runner is being implemented, and retired as each path lands. |
+| 106  | `TIMEOUT`         | The run exceeded its `--timeout`: the runner enforced the deadline and tore the process tree down. A runner-*imposed outcome*, not a child exit. |
+| 107  | `CANCELLED`       | The run was cancelled interactively (`Ctrl-C`): the runner tore the process tree down. Distinct from `TIMEOUT` and from any child result. |
 
-Codes `106`–`119` are **reserved** for future runner-own conditions. `--help`
+Codes `108`–`119` are **reserved** for future runner-own conditions. `--help`
 and `--version` are not failures: they print to stdout and exit `0`.
+
+## Timeout and cancel: runner-imposed outcomes
+
+`TIMEOUT` (106) and `CANCELLED` (107) are not *failures* of the runner and not the
+child's own exit — they are outcomes the runner **imposes** when it ends a run that
+did not stop on its own. The child did not choose to exit, so forwarding "its" code
+would be a lie; instead each takes a reserved-band code so a caller can tell three
+things apart:
+
+- the child exited by itself (its exact code, forwarded — possibly `0`),
+- the runner ended it because the `--timeout` deadline elapsed (`106`), and
+- the runner ended it because the operator pressed `Ctrl-C` (`107`).
+
+Alongside the code, the runner writes an explanatory line to **stderr** (never the
+child's stdout) that also states, truthfully, how the tree was torn down — including
+that on Windows there is no soft-terminate tier yet, so the grace window elapses and
+the Job Object is then killed atomically (see `README.md`, "Timeouts, cancel, and
+grace"). As with every runner-own code, the numeric value is a best-effort signal;
+the authoritative, machine-readable form of these outcomes arrives with the JSONL
+event schema (a later task), which will carry timeout/cancellation events explicitly.
 
 ## Why a band is not enough on its own
 

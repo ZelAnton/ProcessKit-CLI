@@ -7,6 +7,7 @@
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 
@@ -40,9 +41,10 @@ pub enum Command {
 /// [--timeout <duration>] [--grace <duration>] [--capture-dir <dir>] [--argv-raw]
 /// -- <program> <args...>`
 //
-// The fields are parsed and validated in this task but not yet consumed — the
-// runner that reads them lands in later tasks — so the binary crate would flag
-// them as never-read without this allow.
+// `cwd`, `create_no_window`, `timeout`, `grace`, and `command` are consumed by
+// `run`; the rest (`run_id`, `jsonl`, `capture_dir`, `argv_raw`) are parsed and
+// validated now but not yet read — the tasks that consume them land later — so the
+// binary crate would flag those as never-read without this allow.
 #[allow(dead_code)]
 #[derive(Debug, Args)]
 pub struct RunArgs {
@@ -63,14 +65,19 @@ pub struct RunArgs {
     pub create_no_window: bool,
 
     /// Hard deadline for the whole run; the tree is torn down when it elapses.
-    // Kept as an opaque string here: the duration grammar is not part of the
-    // form fixed by this task and is parsed when timeouts are implemented.
-    #[arg(long, value_name = "duration")]
-    pub timeout: Option<String>,
+    // Parsed and validated *here*, at the CLI layer, rather than deferred to the
+    // runner: a malformed duration is a form error like any other bad flag, so it
+    // belongs with the parsing surface (this module) and surfaces as the same
+    // documented `USAGE` (100) exit, not a mid-run failure. `run` then receives an
+    // already-validated `Duration` and never re-parses a string. See
+    // [`parse_duration`] for the accepted grammar.
+    #[arg(long, value_name = "duration", value_parser = parse_duration)]
+    pub timeout: Option<Duration>,
 
-    /// Grace period between a cancel/timeout and the hard kill.
-    #[arg(long, value_name = "duration")]
-    pub grace: Option<String>,
+    /// Grace period between a cancel/timeout and the hard kill. Same grammar and
+    /// parse-time validation as `--timeout` (see [`parse_duration`]).
+    #[arg(long, value_name = "duration", value_parser = parse_duration)]
+    pub grace: Option<Duration>,
 
     /// Directory for bounded stdout/stderr capture files.
     #[arg(long, value_name = "dir")]
@@ -108,6 +115,55 @@ pub struct TargetArgs {
     /// The run to act on.
     #[arg(long, value_name = "id")]
     pub run_id: String,
+}
+
+/// Parse a human duration for `--timeout` / `--grace`.
+///
+/// Grammar: a base-10, non-negative integer with an optional unit suffix — `ms`,
+/// `s` (the default when the suffix is omitted), `m`, or `h`. Examples: `30`
+/// (= 30 seconds), `500ms`, `5s`, `2m`, `1h`. Deliberately strict — a sign, a
+/// fraction, surrounding whitespace, or an unknown unit is rejected rather than
+/// silently reinterpreted, so a typo fails loudly at parse time instead of arming
+/// a surprising deadline. The value is capped only by `u64` milliseconds; an
+/// overflow is reported, not wrapped.
+///
+/// Returns the message that clap renders on failure (which the binary maps to the
+/// `USAGE` exit code); on success it hands `run` a ready `Duration`.
+fn parse_duration(raw: &str) -> Result<Duration, String> {
+    if raw.is_empty() {
+        return Err("empty duration; expected e.g. `30`, `500ms`, `5s`, `2m`, or `1h`".to_string());
+    }
+
+    // Split the leading digit run from the unit suffix. A value that does not
+    // start with a digit (a sign, a bare unit, letters) leaves `number` empty.
+    let split = raw.find(|c: char| !c.is_ascii_digit()).unwrap_or(raw.len());
+    let (number, unit) = raw.split_at(split);
+    if number.is_empty() {
+        return Err(format!(
+            "duration `{raw}` must start with a non-negative number; \
+             expected e.g. `30`, `500ms`, `5s`, `2m`, or `1h`"
+        ));
+    }
+
+    let value: u64 = number
+        .parse()
+        .map_err(|_| format!("duration `{raw}` is out of range for a 64-bit millisecond count"))?;
+
+    let millis = match unit {
+        "" | "s" => value.checked_mul(1_000),
+        "ms" => Some(value),
+        "m" => value.checked_mul(60_000),
+        "h" => value.checked_mul(3_600_000),
+        other => {
+            return Err(format!(
+                "duration `{raw}` has an unknown unit `{other}`; use ms, s, m, or h"
+            ));
+        }
+    };
+
+    let millis = millis
+        .ok_or_else(|| format!("duration `{raw}` is too large to represent in milliseconds"))?;
+    Ok(Duration::from_millis(millis))
 }
 
 #[cfg(test)]
@@ -188,5 +244,77 @@ mod tests {
         assert!(Cli::try_parse_from(["processkit-cli", "kill", "--run-id", "r1"]).is_ok());
         assert!(Cli::try_parse_from(["processkit-cli", "cancel"]).is_err());
         assert!(Cli::try_parse_from(["processkit-cli", "kill"]).is_err());
+    }
+
+    #[test]
+    fn parse_duration_accepts_the_documented_grammar() {
+        assert_eq!(parse_duration("30").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_duration("0").unwrap(), Duration::ZERO);
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_duration("5s").unwrap(), Duration::from_secs(5));
+        assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
+        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn parse_duration_rejects_malformed_values() {
+        // Empty, non-numeric, signed, fractional, unknown unit, and whitespace all
+        // fail loudly rather than being silently reinterpreted.
+        for bad in ["", "abc", "-5", "5x", "1.5s", "s", "5 s", " 5s", "ms"] {
+            assert!(
+                parse_duration(bad).is_err(),
+                "expected `{bad}` to be rejected as a duration"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_duration_reports_overflow_instead_of_wrapping() {
+        // A value that would overflow the millisecond count is an error, never a
+        // wrapped-around tiny duration.
+        assert!(parse_duration("99999999999999999999h").is_err());
+        assert!(parse_duration(&format!("{}h", u64::MAX)).is_err());
+    }
+
+    #[test]
+    fn run_parses_timeout_and_grace_into_durations() {
+        let cli = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--timeout",
+            "5s",
+            "--grace",
+            "500ms",
+            "--",
+            "true",
+        ])
+        .expect("a valid run invocation");
+        let Command::Run(args) = cli.command else {
+            panic!("expected the run subcommand");
+        };
+        assert_eq!(args.timeout, Some(Duration::from_secs(5)));
+        assert_eq!(args.grace, Some(Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn run_rejects_a_malformed_timeout() {
+        // A bad duration is a form error, so parsing fails (mapped to USAGE by the
+        // binary) rather than reaching the runner.
+        assert!(
+            Cli::try_parse_from([
+                "processkit-cli",
+                "run",
+                "--jsonl",
+                "events.jsonl",
+                "--timeout",
+                "soon",
+                "--",
+                "true",
+            ])
+            .is_err(),
+            "a malformed --timeout must fail at parse time"
+        );
     }
 }

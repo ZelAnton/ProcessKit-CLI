@@ -30,25 +30,62 @@ pub fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
-/// Invoke `run <program> <args…>` through the binary and wait for it to finish.
+/// Build a `run` invocation of the binary: `run --jsonl <tmp> <flags…> --
+/// <program> <args…>`, with `envs` set on the child.
 ///
 /// A throwaway `--jsonl` path is always supplied — it is required by the parser
-/// but not consumed in this task, so nothing is written there. `envs` are set on
-/// the child; the runner inherits its own environment onto the spawned program,
-/// which is how the teardown fixture passes file paths down to a grandchild.
-pub fn run<I, S>(dir: &Path, envs: &[(&str, &Path)], program_and_args: I) -> Output
+/// but not consumed in this task, so nothing is written there. `flags` are extra
+/// runner options placed *before* `--` (e.g. `--timeout`, `2s`); everything in
+/// `program_and_args` lands verbatim after `--`. `envs` are set on the child; the
+/// runner inherits its own environment onto the spawned program, which is how the
+/// teardown fixtures pass file paths down to a grandchild. The caller decides
+/// whether to `.output()` (wait) or `.spawn()` (drive it interactively).
+pub fn command_with_flags<I, S>(
+    dir: &Path,
+    envs: &[(&str, &Path)],
+    flags: &[&str],
+    program_and_args: I,
+) -> Command
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
     let jsonl = dir.join("events.jsonl");
     let mut cmd = Command::new(bin());
-    cmd.arg("run").arg("--jsonl").arg(&jsonl).arg("--");
+    cmd.arg("run").arg("--jsonl").arg(&jsonl);
+    cmd.args(flags);
+    cmd.arg("--");
     cmd.args(program_and_args);
     for (key, value) in envs {
         cmd.env(key, value);
     }
-    cmd.output().expect("spawn the runner binary")
+    cmd
+}
+
+/// Invoke `run <program> <args…>` through the binary and wait for it to finish.
+pub fn run<I, S>(dir: &Path, envs: &[(&str, &Path)], program_and_args: I) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_with_flags(dir, envs, &[], program_and_args)
+}
+
+/// Invoke `run` with extra runner `flags` (e.g. `--timeout`/`--grace`) and wait
+/// for it to finish.
+pub fn run_with_flags<I, S>(
+    dir: &Path,
+    envs: &[(&str, &Path)],
+    flags: &[&str],
+    program_and_args: I,
+) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    command_with_flags(dir, envs, flags, program_and_args)
+        .output()
+        .expect("spawn the runner binary")
 }
 
 /// The platform shell invocation (`program` + first arg) that runs `script` as a

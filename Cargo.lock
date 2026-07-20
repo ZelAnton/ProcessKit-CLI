@@ -230,6 +230,7 @@ name = "processkit-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
  "processkit",
  "tokio",
 ]

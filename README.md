@@ -47,9 +47,46 @@ address processes by PID.
 ## Exit codes
 
 The runner's exit code **is** the child's exit code; the runner's own failures
-(bad arguments, spawn failure, backend error) use a distinct, reserved code band
-so they can never be mistaken for a child result. This is part of the project's
-compatibility surface — see [the exit-code contract](docs/exit-codes.md).
+(bad arguments, spawn failure, backend error) and the two runner-*imposed*
+endings — a `--timeout` (`106`) and a `Ctrl-C` cancel (`107`) — use a distinct,
+reserved code band so they can never be mistaken for a child result. This is part
+of the project's compatibility surface — see
+[the exit-code contract](docs/exit-codes.md).
+
+## Timeouts, cancel, and grace
+
+`run` bounds a run two ways, and both end in the **same** teardown path:
+
+- `--timeout <duration>` is a hard deadline for the whole run. When it elapses the
+  runner ends the run and exits with the reserved `TIMEOUT` code (`106`) — never
+  the child's own code, because the child did not choose to stop.
+- **`Ctrl-C`** cancels a run in progress. The runner ends it and exits with the
+  reserved `CANCELLED` code (`107`), distinct from a timeout and from any child
+  code, so "I interrupted it" is never confused with "it ran too long" or with a
+  child that merely returned non-zero.
+
+`--grace <duration>` sets the pause between the *soft* stop and the *hard* kill on
+both paths: the runner first asks the process tree to stop, waits up to the grace
+window, and only then hard-kills whatever remains. The hard kill is always the
+owning container's kernel-backed **kill-on-drop** (a Windows Job Object close, a
+Linux cgroup / POSIX-group teardown), so the whole tree — including any leaked
+grandchild — is reaped on every ending.
+
+Durations use a small grammar: a non-negative integer with an optional unit —
+`ms`, `s` (the default), `m`, or `h` (e.g. `30`, `500ms`, `5s`, `2m`, `1h`). A
+malformed value is a usage error (exit `100`), not a surprise at runtime.
+
+**Honest degradation on Windows.** The soft-stop tier is not yet implemented in the
+ProcessKit kernel on Windows (tracked in ProcessKit-rs's backlog). Until it lands,
+the runner sends **no** soft signal on Windows: the grace window still elapses, and
+then the Job Object is killed atomically. The runner never pretends a graceful
+soft-terminate happened when it could not — the stderr line for a Windows
+timeout/cancel says plainly that the tree was hard-killed via the Job Object after
+the grace delay. On Unix the soft stop is a real `SIGTERM` to the tree.
+
+The machine-readable form of these outcomes (timeout/cancellation events in the
+versioned JSONL stream) arrives with the event schema in a later task; today they
+are expressed through the exit code and the stderr message.
 
 ## Windows console
 
@@ -66,11 +103,13 @@ window for the child pass `--create-no-window` explicitly.
 ## Status
 
 `run` is implemented: it spawns the child into a ProcessKit container the runner
-owns, echoes the child's output live, and forwards the child's exit code exactly.
-The control-plane subcommands (`inspect`, `cancel`, `kill`) and the JSONL event
-stream are not implemented yet — those subcommands still report a runner-range
-"not implemented" error, and `run`'s `--jsonl`, `--timeout`, `--grace`, and
-related flags are parsed but not yet consumed. See [the roadmap](docs/ROADMAP.md)
+owns, echoes the child's output live, forwards the child's exit code exactly, and
+enforces `--timeout`, `--grace`, and `Ctrl-C` cancellation with a guaranteed
+teardown of the whole tree (see "Timeouts, cancel, and grace"). The control-plane
+subcommands (`inspect`, `cancel`, `kill`) and the JSONL event stream are not
+implemented yet — those subcommands still report a runner-range "not implemented"
+error, and `run`'s remaining flags (`--jsonl`, `--capture-dir`, `--run-id`,
+`--argv-raw`) are parsed but not yet consumed. See [the roadmap](docs/ROADMAP.md)
 for the intended delivery order.
 
 ## Development

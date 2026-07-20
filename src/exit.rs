@@ -44,6 +44,16 @@ pub const INTERNAL: u8 = 104;
 /// A defined-but-not-yet-built code path. Transitional: it exists only while the
 /// runner is being implemented and is retired as each path lands.
 pub const NOT_IMPLEMENTED: u8 = 105;
+/// The run exceeded its `--timeout`: the runner enforced the deadline and tore
+/// the process tree down. A **runner-imposed outcome**, not a child exit — the
+/// child did not choose to stop — so it takes a reserved-band code rather than a
+/// forwarded child code. Distinct from [`CANCELLED`] and from any child result.
+pub const TIMEOUT: u8 = 106;
+/// The run was cancelled interactively (`Ctrl-C`): the runner tore the process
+/// tree down. Like [`TIMEOUT`] this is a runner-imposed outcome, kept in the
+/// reserved band so it is never mistaken for a child's own exit — and distinct
+/// from a timeout, so a caller can tell "I interrupted it" from "it ran too long".
+pub const CANCELLED: u8 = 107;
 
 /// A runner-own failure carrying the exit code it should surface and a
 /// human-readable message. Distinct from a child's exit — a child's code is
@@ -93,11 +103,41 @@ mod tests {
 
     #[test]
     fn assigned_codes_stay_within_the_runner_band() {
-        for code in [USAGE, SPAWN, BACKEND, CONTROL, INTERNAL, NOT_IMPLEMENTED] {
+        for code in [
+            USAGE,
+            SPAWN,
+            BACKEND,
+            CONTROL,
+            INTERNAL,
+            NOT_IMPLEMENTED,
+            TIMEOUT,
+            CANCELLED,
+        ] {
             assert!(
                 (RUNNER_RANGE_START..=RUNNER_RANGE_END).contains(&code),
                 "exit code {code} escaped the runner band {RUNNER_RANGE_START}..={RUNNER_RANGE_END}"
             );
+        }
+    }
+
+    #[test]
+    fn timeout_and_cancelled_are_distinct_and_distinct_from_the_other_codes() {
+        // The whole point of the two new outcomes is that a caller can tell them
+        // apart — from each other and from every other runner-own code.
+        let all = [
+            USAGE,
+            SPAWN,
+            BACKEND,
+            CONTROL,
+            INTERNAL,
+            NOT_IMPLEMENTED,
+            TIMEOUT,
+            CANCELLED,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "two runner-own codes collided on {a}");
+            }
         }
     }
 
