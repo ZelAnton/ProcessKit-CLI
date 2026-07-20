@@ -32,10 +32,46 @@ same gates CI enforces pass locally — CI treats clippy warnings as errors, so 
 clean run is required:
 
 ```sh
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 cargo deny check advisories bans
 ```
+
+## End-to-end tests
+
+Beyond the unit and through-the-binary integration tests, a heavier
+**end-to-end containment tier** lives in [`tests/e2e.rs`]. It drives the built
+`processkit-cli` binary against real, multi-level process trees and proves
+ProcessKit's teardown guarantees *from outside* the runner — observing process
+liveness through the OS process table (an independent PID probe), not the
+runner's own bookkeeping. It covers:
+
+- a leaked grandchild not surviving a **clean** root exit;
+- the same guarantee for a **nonzero** root, with the child's exact code
+  forwarded unclamped;
+- an **abrupt** runner death still reaping the tree (the Windows Job Object
+  kill-on-close; the scenario skips loudly on platforms without that
+  kernel-enforced guarantee);
+- a descendant that **holds the stdout handle** after the root exits not hanging
+  the runner (proven with an upper time bound);
+- a rapid launch → exit → relaunch storm not misattributing or killing an
+  unrelated bystander as **PIDs recycle**.
+
+The tier is gated behind the `e2e` Cargo feature (with its `e2e_helper` worker),
+so it is **off** in the default `cargo test` — those scenarios spawn real process
+trees and run longer. Run it explicitly:
+
+```sh
+cargo test --features e2e --test e2e -- --nocapture
+```
+
+`--nocapture` surfaces the explicit `SKIP …` line a scenario prints when its
+platform primitive is unavailable. A scenario that would leak a worker on
+failure is self-healing: the helper workers self-terminate on a bounded timer,
+and the harness never kills by (recyclable) PID. CI runs this tier as a separate
+`e2e` job on Linux, Windows, and macOS.
+
+[`tests/e2e.rs`]: tests/e2e.rs
 
 ## Conventions
 

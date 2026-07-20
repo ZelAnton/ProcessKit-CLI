@@ -49,14 +49,39 @@ processkit = "2"
 # (Cargo unifies feature flags across the one tokio build).
 tokio = { version = "1", features = ["rt", "io-std", "time", "signal", "macros"] }
 
+[features]
+# Opt-in end-to-end containment tier (`tests/e2e.rs`) plus its `e2e_helper`
+# worker. Off by default so `cargo test` stays fast; these spawn real, multi-level
+# process trees and run longer. The dedicated CI `e2e` job enables it. Empty
+# feature set — it only gates which targets build (see the `[[test]]` / `[[bin]]`
+# `required-features` below).
+e2e = []
+
 [dev-dependencies]
 
 # Unix-only: the cancel integration test needs to deliver a real SIGINT (the
 # `Ctrl-C` the runner listens for) to the spawned runner process, which the std
-# library cannot do. Behind a `cfg(unix)` target table so Windows builds — where
-# an isolated Ctrl-C cannot be sent to a single child — never pull it.
+# library cannot do. Also backs the e2e tier's external PID-liveness probe
+# (`kill(pid, 0)`, no signal delivered). Behind a `cfg(unix)` target table so
+# Windows builds — where an isolated Ctrl-C cannot be sent to a single child, and
+# the PID probe uses `tasklist` — never pull it.
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
+
+# The end-to-end tier and its helper worker are gated behind the `e2e` feature so
+# a default `cargo test`, a plain `cargo build`, and `cargo publish` never build
+# or ship them. Cargo skips a target whose `required-features` are unmet, and sets
+# `CARGO_BIN_EXE_e2e_helper` for the tier only when the helper is built alongside
+# it (i.e. under `--features e2e`).
+[[bin]]
+name = "e2e_helper"
+path = "src/bin/e2e_helper.rs"
+required-features = ["e2e"]
+
+[[test]]
+name = "e2e"
+path = "tests/e2e.rs"
+required-features = ["e2e"]
 
 # Platform-specific dependencies go under a cfg target table, e.g.:
 # [target.'cfg(windows)'.dependencies]

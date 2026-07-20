@@ -55,7 +55,10 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo clippy --all-targets -- -D warnings
+      # `--all-features` so the `e2e`-gated tier and its helper worker
+      # (tests/e2e.rs, src/bin/e2e_helper.rs) are linted here too, including their
+      # cfg(unix) paths on this Linux runner.
+      - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
     name: test (${{ matrix.os }})
@@ -70,6 +73,27 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo build --all-targets
       - run: cargo test
+
+  e2e:
+    name: e2e (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # The tier spawns real, multi-level process trees and polls for teardown, so
+    # it runs longer than the unit tests; bound the whole job well above that.
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@stable # rolling toolchain selector — intentionally unpinned
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # The opt-in end-to-end containment tier (tests/e2e.rs, `e2e` feature):
+      # leaked-grandchild reaping through the built binary, abrupt runner death,
+      # a descendant holding the stdout pipe, and rapid PID-reuse churn. Kept out
+      # of the default `cargo test` job above (heavier, real process trees);
+      # `--nocapture` surfaces each platform skip.
+      - run: cargo test --features e2e --test e2e -- --nocapture
 
   audit:
     name: cargo-deny
