@@ -27,8 +27,9 @@ Run a single test (substring match on the test name) with:
 cargo test <name>
 ```
 
-Before opening a pull request, make sure the same gates CI enforces pass
-locally — CI treats clippy warnings as errors, so a clean run is required:
+Before opening a pull request or publishing directly to `main`, make sure the
+same gates CI enforces pass locally — CI treats clippy warnings as errors, so a
+clean run is required:
 
 ```sh
 cargo clippy --all-targets -- -D warnings
@@ -46,6 +47,12 @@ cargo deny check advisories bans
   features you use. `Cargo.lock` is committed for reproducible builds.
 - **Commit subjects** are conventional-commit style (`type(scope): summary`) —
   they feed the changelog auto-fill via [`cliff.toml`](cliff.toml).
+- **Language** — write source, comments, documentation, configuration, commit
+  messages, and all other repository artifacts in English.
+- **Publishing** — external contributors and automated services may use branches
+  and pull requests. AI coding agents work directly on `main` as specified in
+  [`AGENTS.md`](AGENTS.md). AI agents do not add co-author trailers or other AI
+  attribution.
 - See [`AGENTS.md`](AGENTS.md) for the full, authoritative set of conventions
   (code style, dependency management, supply chain/MSRV, version control).
 
@@ -55,9 +62,8 @@ Every user-visible change ships its [`CHANGELOG.md`](CHANGELOG.md) entry in the
 same change set, under `## [Unreleased]`. Write the bullet for a consumer of the
 crate, not the implementer. Pure internal refactors are exempt.
 
-## Pull requests
+## Contributions and direct publishing
 
-- Keep changes focused; unrelated cleanups belong in their own PR.
-- Ensure CI (fmt, clippy, build/test on Linux, Windows, and macOS, cargo-deny,
-  MSRV) passes.
-- Fill in the pull-request checklist.
+Keep changes focused and ensure CI (fmt, clippy, build/test on Linux, Windows,
+macOS, cargo-deny, and MSRV) passes after each pull request or direct
+publication to `main`.
