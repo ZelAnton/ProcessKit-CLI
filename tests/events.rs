@@ -235,6 +235,71 @@ fn runner_exit_records_the_child_code() {
     );
 }
 
+/// With `--capture-dir`, an `output_captured` event lands after the teardown pair
+/// and before the terminal `runner_exit`, carrying per-stream capture metadata; and
+/// **without** the flag no such event appears — a plain run's stream is unchanged
+/// (backward compatibility).
+#[test]
+fn capture_dir_adds_output_captured_and_its_absence_is_unchanged() {
+    // A run that captures.
+    let dir = scratch("events-capture");
+    let capture_dir = dir.join("cap");
+    let capture_flag = capture_dir.to_string_lossy().into_owned();
+    let out = run_with_flags(
+        &dir,
+        &[],
+        &["--capture-dir", &capture_flag],
+        shell_inline("echo captured-line"),
+    );
+    assert_eq!(out.status.code(), Some(0));
+
+    let events = read_events(&dir);
+    let types = event_types(&events);
+    assert!(
+        types.iter().any(|t| t == "output_captured"),
+        "capture must emit output_captured: {types:?}"
+    );
+    // Positioned after cleanup_finished and before the terminal runner_exit.
+    let captured_at = types.iter().position(|t| t == "output_captured").unwrap();
+    let cleanup_at = types
+        .iter()
+        .position(|t| t == "cleanup_finished")
+        .expect("cleanup_finished present");
+    assert!(
+        cleanup_at < captured_at && captured_at < types.len() - 1,
+        "output_captured sits after cleanup and before runner_exit: {types:?}"
+    );
+    assert_eq!(types.last().map(String::as_str), Some("runner_exit"));
+
+    let captured = events
+        .iter()
+        .find(|e| e["event"] == "output_captured")
+        .unwrap();
+    assert!(
+        captured["stdout"]["path"]
+            .as_str()
+            .is_some_and(|p| p.ends_with("stdout.log")),
+        "the stdout capture path is reported: {captured}"
+    );
+    assert!(
+        is_sha256_hex(&captured["stdout"]["sha256"]),
+        "the stdout capture carries a content hash: {captured}"
+    );
+    assert_eq!(captured["stdout"]["truncated"], false);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The same run without --capture-dir emits no output_captured at all.
+    let plain = scratch("events-no-capture");
+    let out = run(&plain, &[], shell_inline("echo captured-line"));
+    assert_eq!(out.status.code(), Some(0));
+    let plain_types = event_types(&read_events(&plain));
+    assert!(
+        !plain_types.iter().any(|t| t == "output_captured"),
+        "a run without --capture-dir must not emit output_captured: {plain_types:?}"
+    );
+    let _ = std::fs::remove_dir_all(&plain);
+}
+
 /// A spawn failure records `spawn_failed` and a `runner_exit` whose `child_code`
 /// is null (the child never ran), and writes nothing to the child's stdout.
 #[test]

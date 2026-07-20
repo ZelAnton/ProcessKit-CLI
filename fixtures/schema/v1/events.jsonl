@@ -4,6 +4,7 @@
 {"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"root_exited","outcome":"exited","code":0,"signal":null}
 {"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"cleanup_started","members_before":2}
 {"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"cleanup_finished","remaining":0,"remaining_pids":[],"soft_terminate":null}
+{"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"output_captured","stdout":{"path":"/work/project/capture/stdout.log","bytes":3,"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","truncated":false},"stderr":{"path":"/work/project/capture/stderr.log","bytes":0,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","truncated":false}}
 {"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"limit_hit","limit":"processes","detail":"exceeded the 64-process cap"}
 {"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"timeout","timeout_ms":5000,"grace_ms":2000}
 {"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"cancelled","source":"ctrl_c","grace_ms":2000}

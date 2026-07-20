@@ -41,10 +41,9 @@ pub enum Command {
 /// [--timeout <duration>] [--grace <duration>] [--capture-dir <dir>] [--argv-raw]
 /// -- <program> <args...>`
 //
-// `run` now consumes `cwd`, `create_no_window`, `timeout`, `grace`, `command`,
-// `jsonl`, `run_id`, and `argv_raw` (the JSONL schema, T-004). Only `capture_dir`
-// remains parsed-but-unread until bounded diagnostic capture lands (T-003); it
-// carries a field-level allow below so the binary crate does not flag it.
+// `run` consumes every field: `cwd`, `create_no_window`, `timeout`, `grace`,
+// `command`, `jsonl`, `run_id`, `argv_raw` (the JSONL schema, T-004), and now
+// `capture_dir` — bounded stdout/stderr capture to files (see `src/capture.rs`).
 #[derive(Debug, Args)]
 pub struct RunArgs {
     /// Identifier for this run; a value is generated when omitted.
@@ -78,8 +77,10 @@ pub struct RunArgs {
     #[arg(long, value_name = "duration", value_parser = parse_duration)]
     pub grace: Option<Duration>,
 
-    /// Directory for bounded stdout/stderr capture files.
-    #[allow(dead_code)] // Consumed once bounded diagnostic capture lands (T-003).
+    /// Directory for bounded stdout/stderr capture files (`stdout.log`,
+    /// `stderr.log`). When set, the child's output is teed into these files
+    /// alongside the live echo; each stream's byte count, content hash, and
+    /// truncation flag are reported in the `output_captured` JSONL event.
     #[arg(long, value_name = "dir")]
     pub capture_dir: Option<PathBuf>,
 

@@ -55,6 +55,19 @@ to a dated version section.
   Normative reference in `docs/schema.md`; golden sample stream published at
   `fixtures/schema/v1/events.jsonl` and gated by a golden test. `--run-id` and
   `--argv-raw` are now consumed.
+- Bounded output capture (`--capture-dir <dir>`): the child's stdout and stderr are
+  teed into `<dir>/stdout.log` and `<dir>/stderr.log` alongside the unchanged live
+  echo, kept separate per stream. A new `output_captured` JSONL event records, for
+  each stream, the file path, a full byte counter, a SHA-256 of the captured bytes
+  (the same digest primitive as the argv fingerprint), and an explicit truncation
+  flag — so a consumer distinguishes "captured in full" from "clipped at the limit"
+  without inferring it from the file's size. The capture is bounded by ProcessKit's
+  byte-capped `OutputBufferPolicy` (the pump's in-flight memory) plus a per-stream
+  file ceiling; the runner adds no draining or limiting of its own, and the
+  held-descriptor teardown bound is preserved (a descendant keeping an output handle
+  open past the root's exit cannot hang the runner). A run without `--capture-dir`
+  is byte-for-byte unchanged (no files, no event). Additive schema v1 change,
+  reflected in `docs/schema.md` and the golden fixture.
 - Dependencies on `processkit` (the containment backbone), `tokio` (its async
   runtime), `clap` (CLI parsing), and `serde` / `serde_json` (the JSONL event
   schema).
@@ -62,8 +75,8 @@ to a dated version section.
 ### Changed
 - `inspect`, `cancel`, and `kill` remain unimplemented and still exit with the
   runner-range "not implemented" code; `run` no longer does.
-- `run`'s `--jsonl` is now consumed (the JSONL event stream above); only
-  `--capture-dir` remains parsed but not yet consumed.
+- `run` now consumes every flag it parses: `--jsonl` (the JSONL event stream) and
+  `--capture-dir` (bounded output capture) are both wired up.
 
 ### Fixed
 -

@@ -10,9 +10,10 @@ mod common;
 
 use std::path::Path;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use common::{bin, run, run_with_flags, scratch, shell_inline};
+use common::{bin, events_path, run, run_with_flags, scratch, shell_inline};
+use serde_json::Value;
 
 /// The core rule: a completed run forwards the child's exact code (see
 /// `docs/exit-codes.md`). Zero stays zero.
@@ -145,6 +146,152 @@ fn tears_down_a_leaked_descendant() {
 /// Size of `path` in bytes, or 0 when it does not exist yet.
 fn file_len(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// `--capture-dir` records the child's stdout/stderr to `stdout.log`/`stderr.log`
+/// **without** breaking the live echo, keeps the two streams separate, and — the
+/// load-bearing property for this task (K-005) — still cannot hang when a leaked
+/// descendant keeps an output handle open past the root's exit: the pump drain
+/// stays time-bounded, so `run` returns promptly rather than blocking on the
+/// grandchild's whole lifetime. The `output_captured` event reports each stream's
+/// path, full byte counter, content hash, and an explicit (here `false`) truncation
+/// flag.
+#[test]
+fn capture_records_streams_without_hanging_on_a_leaked_descendant() {
+    let dir = scratch("capture");
+    let heartbeat = dir.join("heartbeat.txt");
+    let capture_dir = dir.join("capture");
+    let grandchild = write_grandchild_script(&dir);
+    let root = write_capture_root_script(&dir);
+
+    let program_and_args: Vec<String> = if cfg!(windows) {
+        vec!["cmd".into(), "/c".into(), path_arg(&root)]
+    } else {
+        vec!["/bin/sh".into(), path_arg(&root)]
+    };
+
+    let capture_flag = path_arg(&capture_dir);
+    let start = Instant::now();
+    let out = run_with_flags(
+        &dir,
+        &[
+            ("HB", heartbeat.as_path()),
+            ("GRANDCHILD", grandchild.as_path()),
+        ],
+        &["--capture-dir", &capture_flag],
+        program_and_args,
+    );
+    let elapsed = start.elapsed();
+
+    // The root echoes and leaks the grandchild, then exits cleanly; the runner
+    // forwards that 0 through the capture path.
+    assert_eq!(out.status.code(), Some(0), "the root child exits cleanly");
+
+    // No hang: the grandchild holds the child's stdout pipe and lives ~30s, but the
+    // bounded pump drain lets `run` return in a small multiple of the ~5s teardown
+    // window — nowhere near the grandchild's lifetime.
+    assert!(
+        elapsed < Duration::from_secs(25),
+        "capture must not wait out the leaked descendant: run took {elapsed:?}"
+    );
+
+    // Live echo is preserved with capture on: the child's stdout still reaches the
+    // runner's stdout, strictly separated from stderr.
+    let live_stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        live_stdout.contains("CAPTURED_OUT"),
+        "live echo of stdout must survive capture: {live_stdout:?}"
+    );
+    assert!(
+        !live_stdout.contains("CAPTURED_ERR"),
+        "child stderr must not bleed into the runner's stdout: {live_stdout:?}"
+    );
+
+    // The capture files hold the same output, separated per stream.
+    let stdout_log =
+        std::fs::read_to_string(capture_dir.join("stdout.log")).expect("stdout.log must exist");
+    let stderr_log =
+        std::fs::read_to_string(capture_dir.join("stderr.log")).expect("stderr.log must exist");
+    assert!(
+        stdout_log.contains("CAPTURED_OUT") && !stdout_log.contains("CAPTURED_ERR"),
+        "stdout.log captures only stdout: {stdout_log:?}"
+    );
+    assert!(
+        stderr_log.contains("CAPTURED_ERR") && !stderr_log.contains("CAPTURED_OUT"),
+        "stderr.log captures only stderr: {stderr_log:?}"
+    );
+
+    // The `output_captured` event reports coherent per-stream metadata.
+    let events = read_run_events(&dir);
+    let captured = events
+        .iter()
+        .find(|e| e["event"] == "output_captured")
+        .expect("an output_captured event when --capture-dir is set");
+    let stdout_meta = &captured["stdout"];
+    assert!(
+        stdout_meta["path"]
+            .as_str()
+            .is_some_and(|p| p.ends_with("stdout.log")),
+        "the event names the stdout capture file: {captured}"
+    );
+    assert_eq!(
+        stdout_meta["bytes"].as_u64(),
+        Some(file_len(&capture_dir.join("stdout.log"))),
+        "an untruncated stream's byte counter equals its file size"
+    );
+    assert!(
+        is_sha256_hex(&stdout_meta["sha256"]),
+        "the stdout capture carries a hex content hash: {captured}"
+    );
+    assert_eq!(
+        stdout_meta["truncated"], false,
+        "a small stream is captured in full, not truncated: {captured}"
+    );
+    assert_eq!(captured["stderr"]["truncated"], false);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Parse the emitted JSONL event stream for `dir`, one object per non-empty line.
+fn read_run_events(dir: &Path) -> Vec<Value> {
+    let path = events_path(dir);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("read events file {}: {err}", path.display()));
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).expect("each event line is valid JSON"))
+        .collect()
+}
+
+/// Whether `v` is a JSON string of 64 lowercase-hex characters (a SHA-256 digest).
+fn is_sha256_hex(v: &Value) -> bool {
+    v.as_str()
+        .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
+/// Write a root script that echoes a marker to stdout *and* stderr, launches the
+/// detached heartbeat grandchild (which keeps the inherited stdout handle open past
+/// the root's exit — the leaked-descendant shape), and exits. Used to prove capture
+/// records both streams without hanging on the survivor.
+fn write_capture_root_script(dir: &Path) -> std::path::PathBuf {
+    if cfg!(windows) {
+        let path = dir.join("capture_root.bat");
+        let body = "@echo off\r\n\
+             echo CAPTURED_OUT\r\n\
+             echo CAPTURED_ERR 1>&2\r\n\
+             start \"\" /b \"%GRANDCHILD%\"\r\n";
+        std::fs::write(&path, body).expect("write capture_root.bat");
+        path
+    } else {
+        let path = dir.join("capture_root.sh");
+        let body = "#!/bin/sh\n\
+             echo CAPTURED_OUT\n\
+             echo CAPTURED_ERR 1>&2\n\
+             sh \"$GRANDCHILD\" &\n\
+             exit 0\n";
+        std::fs::write(&path, body).expect("write capture_root.sh");
+        path
+    }
 }
 
 /// A program argument as a lossless platform string (paths are never re-parsed by
