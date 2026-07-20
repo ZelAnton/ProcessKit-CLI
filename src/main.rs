@@ -14,6 +14,7 @@
 mod cli;
 mod events;
 mod exit;
+mod registry;
 mod run;
 
 use std::process::ExitCode;

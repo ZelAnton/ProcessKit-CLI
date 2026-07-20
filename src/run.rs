@@ -40,13 +40,14 @@
 //!   platform did (see [`describe_teardown`]).
 
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use processkit::{Command as PkCommand, Error as PkError, Outcome, ProcessGroup, Signal};
 
 use crate::cli::RunArgs;
 use crate::events::{self, Emitter, Event, Member};
 use crate::exit::{self, RunnerError};
+use crate::registry;
 
 /// Execute the `run` subcommand and turn the result into a process exit code.
 ///
@@ -174,6 +175,15 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
         }
     };
 
+    // Announce this run in the per-user registry *before* the child spawns, so a
+    // control-plane client (T-008+) can find the live runner for the whole run. The
+    // record is keyed by `run_id`, never by PID. Kept in scope until teardown: it
+    // holds the liveness lock that lets clients tell a live entry from a stale one,
+    // and its `Drop` is a backstop that removes the entry on the early error returns
+    // below. `run_id` is resolved once here and reused for the `run_started` event.
+    let run_id = events::resolve_run_id(args.run_id.as_deref());
+    let registration = open_registration(&run_id);
+
     let mut command = PkCommand::new(program).args(program_args);
     // Default cwd is the runner's own current directory (processkit leaves it
     // unset), so only override when `--cwd` was given.
@@ -218,7 +228,7 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     // The root PID must be read *before* the race moves `running` into `wait()`.
     let root_pid = running.pid();
     emitter.emit(&Event::RunStarted {
-        run_id: events::resolve_run_id(args.run_id.as_deref()),
+        run_id: run_id.clone(),
         root_pid,
         mechanism: events::mechanism_str(group.mechanism()),
         cwd: resolve_cwd(&args),
@@ -274,6 +284,9 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             // only the hard kill.
             emit_cleanup_started(&mut emitter, &group);
             emit_cleanup_finished(&mut emitter, &group, None);
+            // Remove the registry entry at the same teardown site as the container
+            // reap: a clean exit leaves no entry behind.
+            clear_registration(&registration);
             emitter.emit(&Event::RunnerExit {
                 code: child_code,
                 source: "child_exit",
@@ -293,6 +306,9 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             emit_cleanup_started(&mut emitter, &group);
             let soft = soft_terminate_then_grace(&group, grace).await;
             emit_cleanup_finished(&mut emitter, &group, Some(soft_terminate_label(soft)));
+            // The registry entry is removed on every decided ending, not just the
+            // happy path: a timeout tears the run down cleanly too.
+            clear_registration(&registration);
             let error = termination_error(Termination::Timeout(limit), soft, grace);
             Err(finish(&mut emitter, "timeout", None, error))
         }
@@ -304,6 +320,8 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             emit_cleanup_started(&mut emitter, &group);
             let soft = soft_terminate_then_grace(&group, grace).await;
             emit_cleanup_finished(&mut emitter, &group, Some(soft_terminate_label(soft)));
+            // A Ctrl-C cancel tears the run down cleanly too — its entry goes with it.
+            clear_registration(&registration);
             let error = termination_error(Termination::Cancelled, soft, grace);
             Err(finish(&mut emitter, "cancelled", None, error))
         }
@@ -326,6 +344,41 @@ fn finish(
         child_code,
     });
     error
+}
+
+/// Announce this run in the per-user registry so future control-plane clients
+/// (`inspect`/`cancel`/`kill`, T-008+) can find the live runner.
+///
+/// **Best-effort by design.** A registry failure is reported on stderr but never
+/// aborts an otherwise-healthy run: the registry is control-plane *discovery*
+/// infrastructure, separate from the containment the run depends on, and its clients
+/// are not shipped yet. Losing an entry only makes this run un-inspectable — it must
+/// never cost the child its faithfully forwarded exit code (`AGENTS.md`, "Exit-code
+/// fidelity"; the same degradation as [`emit_members_snapshot`]). The connection
+/// endpoint is reserved (`None`) until the local transport lands in T-008.
+fn open_registration(run_id: &str) -> Option<registry::Registration> {
+    let registry = match registry::Registry::open() {
+        Ok(registry) => registry,
+        Err(err) => {
+            eprintln!("processkit-cli: warning: could not open the run registry: {err}");
+            return None;
+        }
+    };
+    match registry.register(run_id, None, SystemTime::now()) {
+        Ok(registration) => Some(registration),
+        Err(err) => {
+            eprintln!("processkit-cli: warning: could not create the run registry entry: {err}");
+            None
+        }
+    }
+}
+
+/// Remove the registry entry on a decided ending. A no-op when registration was
+/// skipped (best-effort) or already removed (idempotent).
+fn clear_registration(registration: &Option<registry::Registration>) {
+    if let Some(registration) = registration {
+        registration.remove();
+    }
 }
 
 /// The child's working directory as recorded in `run_started`: the explicit

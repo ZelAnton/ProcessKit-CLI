@@ -333,7 +333,10 @@ fn now_rfc3339() -> String {
 /// (`YYYY-MM-DDTHH:MM:SS.sssZ`). Hand-rolled to avoid a date-library dependency
 /// for a single field; the civil-date conversion is Howard Hinnant's standard
 /// `civil_from_days` algorithm (validated in [`tests::timestamp_matches_known_vectors`]).
-fn format_rfc3339_utc(time: SystemTime) -> String {
+///
+/// `pub(crate)` so the run registry ([`crate::registry`]) stamps its record's
+/// `started_at` with the same formatter rather than duplicating the civil-date math.
+pub(crate) fn format_rfc3339_utc(time: SystemTime) -> String {
     let dur = time
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or(Duration::ZERO);

@@ -49,6 +49,28 @@ processkit = "2"
 # (Cargo unifies feature flags across the one tokio build).
 tokio = { version = "1", features = ["rt", "io-std", "time", "signal", "macros"] }
 
+# Unix-only: the run registry (src/registry.rs) restricts its directory to `0700`
+# via std, but the per-run liveness lock — a BSD `flock` whose OS-released-on-death
+# semantics make an orphaned entry detectably stale — has no std wrapper, so it
+# calls `flock`/`LOCK_EX`/`EWOULDBLOCK` through libc directly.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Windows-only: the run registry (src/registry.rs) needs two Win32 facilities with
+# no std equivalent — a *protected* owner-only DACL (the equivalent of unix `0700`;
+# built and applied via the Authorization/Security APIs) and the `LockFileEx`
+# liveness lock. Only the security, file-locking, token, and memory surfaces are
+# enabled. windows-sys is already in the tree transitively (tokio/processkit).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 
 # Unix-only: the cancel integration test needs to deliver a real SIGINT (the
@@ -57,7 +79,3 @@ tokio = { version = "1", features = ["rt", "io-std", "time", "signal", "macros"]
 # an isolated Ctrl-C cannot be sent to a single child — never pull it.
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
-
-# Platform-specific dependencies go under a cfg target table, e.g.:
-# [target.'cfg(windows)'.dependencies]
-# winapi-util = "0.1"  # <why this Windows-only dependency is needed>
