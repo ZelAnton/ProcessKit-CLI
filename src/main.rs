@@ -11,9 +11,11 @@
 //! the exit-code contract (see [`exit`] and `docs/exit-codes.md`), and the JSONL
 //! `schema_version` (see [`events`] and `docs/schema.md`) — is fixed.
 
+mod capture;
 mod cli;
 mod events;
 mod exit;
+mod hash;
 mod registry;
 mod run;
 

@@ -196,6 +196,38 @@ When `source` is `child_exit`, `code` equals `child_code`. For a runner-imposed
 ending (`timeout` / `cancelled`) or a pre-run failure (`spawn_error` /
 `container_error`), `child_code` is `null` and `code` is the runner-band value.
 
+### `output_captured`
+
+Bounded stdout/stderr capture finished. Emitted **only** when `run` was given
+`--capture-dir <dir>`: the child's stdout and stderr are teed into
+`<dir>/stdout.log` and `<dir>/stderr.log` alongside the unchanged live echo, and
+this event records, per stream, what was captured. A run without `--capture-dir`
+does not emit it (the stream is otherwise byte-for-byte identical).
+
+| Field    | Type   | Notes                                     |
+|----------|--------|-------------------------------------------|
+| `stdout` | object | Capture result for standard output (below). |
+| `stderr` | object | Capture result for standard error (below).  |
+
+A **capture** object (one per stream):
+
+| Field       | Type    | Notes                                                                                     |
+|-------------|---------|-------------------------------------------------------------------------------------------|
+| `path`      | string  | The file the stream was written to (`<dir>/stdout.log` or `<dir>/stderr.log`).             |
+| `bytes`     | integer | **Full** byte counter — every decoded byte the stream produced; exceeds the file size when the stream was truncated. |
+| `sha256`    | string  | Lowercase-hex SHA-256 of the bytes actually written to `path` — verify the file against it. Same digest primitive as `argv_sha256`. |
+| `truncated` | boolean | **Explicit** flag: `true` when the stream outran the per-stream capture ceiling and the tail was not written. Never inferred from the file's size. |
+
+The point of the explicit `truncated` flag is that a consumer distinguishes
+"captured in full" from "clipped at the limit" from the flag alone — not by
+comparing the file's size against a ceiling it would have to know. When
+`truncated` is `false`, `bytes` equals the file's size and `sha256` covers the
+whole stream; when `true`, `bytes` is the full amount produced while the file
+holds (and `sha256` covers) the first ceiling's worth. The two streams are
+independent: one may be truncated while the other is complete. On a runner-imposed
+ending (`timeout` / `cancelled`) the event reports whatever was captured before the
+teardown.
+
 ## Ordering
 
 A normal run emits, in order: `run_started`, `members_snapshot`, then either
@@ -205,8 +237,14 @@ A normal run emits, in order: `run_started`, `members_snapshot`, then either
 - **runner-imposed ending** — `timeout` *or* `cancelled`, `cleanup_started`,
   `cleanup_finished`, `runner_exit`.
 
+When `--capture-dir` is set, an `output_captured` event is inserted after
+`cleanup_finished` and before the terminal `runner_exit`, on every ending that ran
+the child (natural exit, timeout, and cancel alike). Without `--capture-dir` it is
+absent.
+
 A failure before the child runs emits its error event (`container_failed` or
-`spawn_failed`) and then `runner_exit`, with no `run_started`.
+`spawn_failed`) and then `runner_exit`, with no `run_started` (and no
+`output_captured` — the child never produced output).
 
 ## Command redaction
 
@@ -275,8 +313,11 @@ value — is a **major** bump of `schema_version` (and a matching `Cargo.toml`
 version bump; `docs/exit-codes.md` and `AGENTS.md` treat the surface as a whole).
 A future version lands under a new `fixtures/schema/vN/` directory. Additive,
 backward-compatible clarifications that do not change any existing shape do not bump
-the version. Filling a field that was reserved-as-`null` is **not** a breaking
-change: the field already exists and its type is unchanged. The `argv_sha256` and
+the version. Adding a **new event type** (as `output_captured` was added) is
+likewise additive: it introduces no change to any existing event's shape, and a
+consumer that pins the events it knows simply ignores one it does not. Filling a
+field that was reserved-as-`null` is **not** a breaking change: the field already
+exists and its type is unchanged. The `argv_sha256` and
 `hint` fields were filled this way — they now carry values on every run instead of
 always `null`; the enriched member fields remain reserved and `null` until
 ProcessKit ships `members_info()`. Adding a new `hint` label to the classifier

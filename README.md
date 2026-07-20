@@ -171,6 +171,30 @@ a console, so it spawns no extra console host on its own account. Headless
 Windows deployments (such as Orchestra) that want to suppress a stray `conhost`
 window for the child pass `--create-no-window` explicitly.
 
+## Bounded output capture
+
+`--capture-dir <dir>` records a transcript of the child's output to files —
+`<dir>/stdout.log` and `<dir>/stderr.log` — **alongside** the live echo, which is
+unchanged: the same output still streams to the runner's own stdout/stderr. The
+child's stdout and stderr are captured to separate files, never interleaved.
+
+The capture is **bounded**. ProcessKit's line pump drains the child's pipes under a
+byte-capped [`OutputBufferPolicy`](https://docs.rs/processkit) — so the runner
+writes no draining or volume-limiting of its own — and each file is held to a
+per-stream ceiling. For each stream the runner records, in the `output_captured`
+JSONL event (see [the schema](docs/schema.md)):
+
+- a **full byte counter** — every byte the stream produced, so it stays honest even
+  when the file was clipped;
+- a **SHA-256** of the bytes written to the file (the same one-way digest used for
+  the argv fingerprint), so a consumer can verify the file it holds; and
+- an **explicit truncation flag** — set when the stream outran the ceiling, so
+  "captured in full" is told from "clipped at the limit" by the flag, not by
+  guessing from the file's size.
+
+Without `--capture-dir`, nothing changes: no capture files, no `output_captured`
+event, and the event stream is byte-for-byte identical to a plain run.
+
 ## JSONL event schema
 
 `run` writes a versioned stream of **JSONL lifecycle events** to the file named by
@@ -183,7 +207,8 @@ golden-tested.
 The stream covers the run lifecycle: `run_started` (run id, root PID, containment
 mechanism, working directory), `members_snapshot`, `root_exited`, the
 `cleanup_started` / `cleanup_finished` teardown pair, `timeout` / `cancelled`,
-launch and container errors, and a terminal `runner_exit` that preserves the
+launch and container errors, an `output_captured` event when `--capture-dir` is
+set (see "Bounded output capture"), and a terminal `runner_exit` that preserves the
 child's own code even when the runner itself fails — so a child's code is never
 lost or aliased.
 
@@ -204,11 +229,12 @@ owns, echoes the child's output live, forwards the child's exit code exactly,
 enforces `--timeout`, `--grace`, and `Ctrl-C` cancellation with a guaranteed
 teardown of the whole tree (see "Timeouts, cancel, and grace"), and writes the
 versioned JSONL event stream to `--jsonl` (see "JSONL event schema"). `--run-id`
-and `--argv-raw` are consumed by that stream. The control-plane subcommands
-(`inspect`, `cancel`, `kill`) are not implemented yet — those still report a
-runner-range "not implemented" error — and `--capture-dir` is parsed but not yet
-consumed (bounded diagnostic capture is a later task). See
-[the roadmap](docs/ROADMAP.md) for the intended delivery order.
+and `--argv-raw` are consumed by that stream, and `--capture-dir` records a bounded
+stdout/stderr transcript with per-stream byte counts, hashes, and truncation flags
+(see "Bounded output capture"). The control-plane subcommands (`inspect`, `cancel`,
+`kill`) are not implemented yet — those still report a runner-range "not
+implemented" error. See [the roadmap](docs/ROADMAP.md) for the intended delivery
+order.
 
 ## Development
 

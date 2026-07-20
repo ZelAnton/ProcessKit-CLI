@@ -42,8 +42,12 @@
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
-use processkit::{Command as PkCommand, Error as PkError, Outcome, ProcessGroup, Signal};
+use processkit::{
+    Command as PkCommand, Error as PkError, Outcome, OutputBufferPolicy, ProcessGroup,
+    RunningProcess, Signal,
+};
 
+use crate::capture::{CAPTURE_INFLIGHT_MAX_BYTES, Capture};
 use crate::cli::RunArgs;
 use crate::events::{self, Emitter, Event, Member};
 use crate::exit::{self, RunnerError};
@@ -155,6 +159,29 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
         )
     })?;
 
+    // Open the bounded capture files (`--capture-dir`) before anything is spawned.
+    // Like `--jsonl`, a capture the operator explicitly asked for but that cannot be
+    // created is a fail-closed setup error reported here — no child code is at risk
+    // yet — rather than a silently-dropped diagnostic. Left `None` when the flag is
+    // absent, so a run without capture is byte-for-byte unchanged (no policy, no
+    // extra event, no capture files).
+    let capture = match args.capture_dir.as_deref() {
+        Some(dir) => match Capture::create(dir) {
+            Ok(capture) => Some(capture),
+            Err(err) => {
+                let error = RunnerError::new(
+                    exit::INTERNAL,
+                    format!(
+                        "could not set up output capture in `{}`: {err}",
+                        dir.display()
+                    ),
+                );
+                return Err(finish(&mut emitter, "internal", None, error));
+            }
+        },
+        None => None,
+    };
+
     // We own this group; the child — and anything it spawns — is a member. When
     // `group` drops at the end of this scope (every path below), the kernel reaps
     // the whole tree. Containment/teardown is the group's job; we never duplicate
@@ -205,9 +232,23 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     // decoded line to our own stdout/stderr. This is the live-output mechanism —
     // not true fd inheritance — so the child gets no TTY, and the two streams are
     // never crossed or mixed with runner diagnostics.
-    command = command
-        .stdout_tee(tokio::io::stdout())
-        .stderr_tee(tokio::io::stderr());
+    //
+    // With `--capture-dir` the *same* tee also mirrors each stream into a bounded
+    // capture file, and the child is drained under a byte-capped
+    // `OutputBufferPolicy` so the pump's in-flight line assembly is bounded by the
+    // kernel — the runner adds no output-draining or volume-limiting of its own
+    // (see `src/capture.rs`). The live echo is unchanged either way.
+    command = match &capture {
+        Some(capture) => command
+            .output_buffer(
+                OutputBufferPolicy::bounded(0).with_max_bytes(CAPTURE_INFLIGHT_MAX_BYTES),
+            )
+            .stdout_tee(capture.stdout_tee(tokio::io::stdout()))
+            .stderr_tee(capture.stderr_tee(tokio::io::stderr())),
+        None => command
+            .stdout_tee(tokio::io::stdout())
+            .stderr_tee(tokio::io::stderr()),
+    };
 
     // `ProcessGroup::start` joins the child to the group *we* own and hands back a
     // handle that deliberately does not own the group, so dropping the handle
@@ -250,10 +291,11 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     // because this is a shared-group handle that does not kill on drop, the child
     // stays alive for the grace path below, and its output pumps stop (teardown is
     // underway).
+    let capturing = capture.is_some();
     let ending = tokio::select! {
         biased;
         () = wait_for_ctrl_c() => Ending::Cancelled,
-        outcome = running.wait() => Ending::Exited(outcome),
+        outcome = drive_to_outcome(running, capturing) => Ending::Exited(outcome),
         () = deadline(timeout) => Ending::TimedOut,
     };
 
@@ -284,6 +326,9 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             // only the hard kill.
             emit_cleanup_started(&mut emitter, &group);
             emit_cleanup_finished(&mut emitter, &group, None);
+            // Report the bounded capture (paths, byte counts, hashes, truncation)
+            // once the pumps have settled, before the terminal event.
+            emit_output_captured(&mut emitter, &capture);
             // Remove the registry entry at the same teardown site as the container
             // reap: a clean exit leaves no entry behind.
             clear_registration(&registration);
@@ -306,6 +351,8 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             emit_cleanup_started(&mut emitter, &group);
             let soft = soft_terminate_then_grace(&group, grace).await;
             emit_cleanup_finished(&mut emitter, &group, Some(soft_terminate_label(soft)));
+            // A forced ending still reports whatever was captured before teardown.
+            emit_output_captured(&mut emitter, &capture);
             // The registry entry is removed on every decided ending, not just the
             // happy path: a timeout tears the run down cleanly too.
             clear_registration(&registration);
@@ -320,6 +367,8 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             emit_cleanup_started(&mut emitter, &group);
             let soft = soft_terminate_then_grace(&group, grace).await;
             emit_cleanup_finished(&mut emitter, &group, Some(soft_terminate_label(soft)));
+            // A forced ending still reports whatever was captured before teardown.
+            emit_output_captured(&mut emitter, &capture);
             // A Ctrl-C cancel tears the run down cleanly too — its entry goes with it.
             clear_registration(&registration);
             let error = termination_error(Termination::Cancelled, soft, grace);
@@ -344,6 +393,36 @@ fn finish(
         child_code,
     });
     error
+}
+
+/// Drive the child to its exit, returning the raw wait result the race resolves
+/// to.
+///
+/// With capture on the child is drained through [`RunningProcess::output_string`]
+/// so the byte-capped [`OutputBufferPolicy`] set on the command is actually honored
+/// (the discarding [`RunningProcess::wait`] applies its own fixed discard policy and
+/// ignores the command's); the retained text is discarded — the transcript is the
+/// capturing tee's job — and only the [`Outcome`] is kept. Without capture it is the
+/// plain `wait`, exactly as before. **Both paths share one bounded teardown spine**
+/// (ProcessKit's `PUMP_TEARDOWN`): a descendant that keeps a stdout/stderr handle
+/// open past the root's exit cannot hang the runner in either mode — the pump drain
+/// is time-bounded, not the runner's to police.
+async fn drive_to_outcome(running: RunningProcess, capturing: bool) -> processkit::Result<Outcome> {
+    if capturing {
+        running.output_string().await.map(|result| result.outcome())
+    } else {
+        running.wait().await
+    }
+}
+
+/// Emit the terminal [`Event::OutputCaptured`] for a run that had `--capture-dir`,
+/// finalizing both streams' files and metadata first. A no-op without capture, so a
+/// run that did not request it emits no such event (backward compatibility).
+fn emit_output_captured(emitter: &mut Emitter, capture: &Option<Capture>) {
+    if let Some(capture) = capture {
+        let (stdout, stderr) = capture.finalize();
+        emitter.emit(&Event::OutputCaptured { stdout, stderr });
+    }
 }
 
 /// Announce this run in the per-user registry so future control-plane clients
