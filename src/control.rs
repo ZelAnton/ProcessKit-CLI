@@ -24,9 +24,10 @@
 //! users. Access is restricted to the current user, mirroring the owner-only
 //! registry:
 //!
-//! - **Unix:** the socket is created *inside* the `0700` registry directory and its
-//!   own mode is tightened to `0600`, so only the owner can traverse to it and
-//!   connect.
+//! - **Unix:** the socket is created in a short, per-run `0700` directory below
+//!   `/tmp` (falling back to the platform temp directory) and its own mode is
+//!   tightened to `0600`. Keeping it separate from a potentially long registry path
+//!   stays within `sockaddr_un::sun_path` on macOS without weakening owner isolation.
 //! - **Windows:** the pipe is created with a **protected** DACL granting full access
 //!   to the current user alone (`D:P(A;;FA;;;<current-user-SID>)`, built from the
 //!   same SID the registry restricts to — see
@@ -397,9 +398,10 @@ fn unique_token() -> String {
 
 #[cfg(unix)]
 mod imp {
-    //! Unix transport: a `0600` unix-domain socket inside the `0700` registry dir.
+    //! Unix transport: a `0600` socket inside a short per-run `0700` directory.
 
-    use std::os::unix::fs::PermissionsExt;
+    use std::fs::DirBuilder;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::path::{Path, PathBuf};
 
     use tokio::net::{UnixListener, UnixStream};
@@ -410,34 +412,42 @@ mod imp {
     /// path so it can be removed on a clean teardown (when this is dropped).
     pub struct ControlServer {
         listener: UnixListener,
+        dir: PathBuf,
         path: PathBuf,
         endpoint: String,
     }
 
     impl ControlServer {
-        /// Bind a fresh, uniquely-named socket inside `dir` and tighten it to the
-        /// owner. `dir` is the `0700` registry directory, so the socket already sits
-        /// behind an owner-only gate; its own mode is set to `0600` as well.
-        pub fn bind(dir: &Path) -> io::Result<Self> {
-            let path = dir.join(format!("ctl-{}.sock", unique_token()));
-            // The endpoint is advertised as a JSON string, so it must be UTF-8. A
-            // non-UTF-8 registry path is vanishingly rare; degrade rather than store a
-            // lossy address a client could not reproduce.
-            let endpoint = path
-                .to_str()
-                .ok_or_else(|| {
-                    io::Error::new(
+        /// Bind a fresh socket in a short owner-only directory. The registry path is
+        /// deliberately not used: test/project paths routinely exceed macOS's
+        /// `sockaddr_un::sun_path` limit before a socket filename is appended.
+        pub fn bind(_registry_dir: &Path) -> io::Result<Self> {
+            let dir = create_private_socket_dir()?;
+            let path = dir.join("c.sock");
+            let endpoint = match path.to_str() {
+                Some(endpoint) => endpoint.to_string(),
+                None => {
+                    let _ = std::fs::remove_dir(&dir);
+                    return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "the registry path is not valid UTF-8, so no socket endpoint can be published",
-                    )
-                })?
-                .to_string();
-            let listener = UnixListener::bind(&path)?;
+                        "the control socket path is not valid UTF-8",
+                    ));
+                }
+            };
+            let listener = match UnixListener::bind(&path) {
+                Ok(listener) => listener,
+                Err(err) => {
+                    let _ = std::fs::remove_dir(&dir);
+                    return Err(err);
+                }
+            };
             // Restrict the socket itself to the owner (connect needs write on the
-            // socket + search on the dir). Best-effort: the 0700 dir already gates it.
+            // socket + search on the directory). The directory was atomically created
+            // as 0700, so it already gates the chmod window.
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
             Ok(Self {
                 listener,
+                dir,
                 path,
                 endpoint,
             })
@@ -467,7 +477,45 @@ mod imp {
             // skips this and leaks the socket, exactly like the registry record/lock —
             // a client detects that run as stale via the registry and never connects.
             let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_dir(&self.dir);
         }
+    }
+
+    /// Atomically reserve a short owner-only directory. A pre-created path is never
+    /// trusted: `create` must succeed for this process, otherwise a fresh unique token
+    /// is tried. `/tmp` keeps the advertised socket comfortably below SUN_LEN even
+    /// when the registry lives under a deeply nested CI workspace.
+    fn create_private_socket_dir() -> io::Result<PathBuf> {
+        let mut bases = vec![PathBuf::from("/tmp")];
+        let platform_temp = std::env::temp_dir();
+        if platform_temp != bases[0] {
+            bases.push(platform_temp);
+        }
+        let mut last_error = None;
+        for base in bases {
+            if !base.is_dir() {
+                continue;
+            }
+            for _ in 0..16 {
+                let dir = base.join(format!("pkc-{}", unique_token()));
+                match DirBuilder::new().mode(0o700).create(&dir) {
+                    Ok(()) => return Ok(dir),
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                        last_error = Some(err);
+                    }
+                    Err(err) => {
+                        last_error = Some(err);
+                        break;
+                    }
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "no usable temporary directory for the control socket",
+            )
+        }))
     }
 
     /// Connect to a runner's unix socket endpoint.
@@ -752,5 +800,38 @@ mod tests {
         let a = unique_token();
         let b = unique_token();
         assert_ne!(a, b, "each transport endpoint gets a distinct name");
+    }
+
+    /// A deeply nested registry must not leak into the Unix socket address: macOS
+    /// allows only a short `sun_path`, which is much smaller than normal CI paths.
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_path_stays_short_and_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let long_registry = std::env::temp_dir().join("r".repeat(180));
+        let server = imp::ControlServer::bind(&long_registry)
+            .expect("a long registry path does not prevent binding the control socket");
+        let endpoint = std::path::Path::new(server.endpoint());
+        assert!(
+            endpoint.as_os_str().as_encoded_bytes().len() < 100,
+            "endpoint stays below the portable macOS sun_path budget: {endpoint:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(endpoint.parent().expect("socket has a parent"))
+                .expect("private control directory exists")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(endpoint)
+                .expect("control socket exists")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 }

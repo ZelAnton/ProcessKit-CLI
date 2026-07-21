@@ -97,6 +97,8 @@ to a dated version section.
   `--capture-dir` (bounded output capture) are both wired up.
 
 ### Fixed
--
+- Unix control sockets now use a short owner-only temporary directory instead of
+  inheriting the registry's full path, so deeply nested macOS CI/workspace paths
+  cannot exceed `sockaddr_un::sun_path` and silently disable `inspect`.
 
 [Unreleased]: https://github.com/ZelAnton/processkit-cli/commits/HEAD

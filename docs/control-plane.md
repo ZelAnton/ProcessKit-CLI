@@ -30,10 +30,11 @@ transport — the channel this document describes.
 Each run stands up one local IPC endpoint, restricted to the current user, and
 publishes its address in the run's registry record:
 
-- **Unix:** a **unix domain socket**. The socket file is created *inside* the
-  owner-only (`0700`) registry directory and its own mode is tightened to `0600`, so
-  only the owner can traverse to it and connect. The endpoint address is the socket's
-  absolute path.
+- **Unix:** a **unix domain socket**. The socket file is created in a short per-run
+  owner-only (`0700`) directory under `/tmp` (with the platform temp directory as a
+  fallback), and its own mode is tightened to `0600`. The short path is independent
+  of the registry location so deeply nested CI/project paths cannot exceed macOS's
+  `sun_path` limit. The endpoint address is the socket's absolute path.
 - **Windows:** a **named pipe** (`\\.\pipe\processkit-cli-<unique>`), created with a
   **protected** DACL that grants full access to the current user alone
   (`D:P(A;;FA;;;<current-user-SID>)`, built from the same SID the registry restricts
@@ -62,12 +63,12 @@ code (`AGENTS.md`, "Exit-code fidelity").
 ### Cleanup and leaks
 
 On a clean teardown (a normal child exit, a `--timeout`, or a `Ctrl-C`) the transport
-is torn down with the run — on unix the socket file is removed. An **abrupt** runner
-death (crash, `SIGKILL`, a parent's Job Object terminate) skips that removal, leaking
-the socket file exactly as it leaks the registry record and lock. That leak is inert:
-a client detects the run as stale through the registry *before* it ever connects, so
-it never touches the orphaned socket. On Windows the pipe simply vanishes with the
-process.
+is torn down with the run — on unix the socket file and its private directory are
+removed. An **abrupt** runner death (crash, `SIGKILL`, a parent's Job Object
+terminate) skips that removal, leaking the socket directory exactly as it leaks the
+registry record and lock. That leak is inert: a client detects the run as stale
+through the registry *before* it ever connects, so it never touches the orphaned
+socket. On Windows the pipe simply vanishes with the process.
 
 ## Wire protocol
 
