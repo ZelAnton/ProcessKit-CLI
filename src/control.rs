@@ -805,8 +805,8 @@ mod tests {
     /// A deeply nested registry must not leak into the Unix socket address: macOS
     /// allows only a short `sun_path`, which is much smaller than normal CI paths.
     #[cfg(unix)]
-    #[test]
-    fn unix_socket_path_stays_short_and_owner_only() {
+    #[tokio::test]
+    async fn unix_socket_path_stays_short_and_owner_only() {
         use std::os::unix::fs::PermissionsExt;
 
         let long_registry = std::env::temp_dir().join("r".repeat(180));
