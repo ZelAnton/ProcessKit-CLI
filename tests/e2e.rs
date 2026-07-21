@@ -329,7 +329,6 @@ fn rapid_run_churn_does_not_touch_an_unrelated_bystander() {
         wait_for_file_nonempty(&heartbeat, Duration::from_secs(20)),
         "the bystander never started heartbeating"
     );
-    let heartbeat_before = file_len(&heartbeat);
 
     // The storm: many quick runs whose leaf exits at once, recycling PIDs.
     let iterations = 40;
@@ -354,16 +353,27 @@ fn rapid_run_churn_does_not_touch_an_unrelated_bystander() {
         );
     }
 
+    // The bystander — never a member of any run's container — must be untouched:
+    // still alive and still heartbeating after the churn. `pid_is_alive` alone does
+    // not prove "alive": on Unix the bystander is a direct child of the test process,
+    // reaped only at the very end, so had a run's teardown collaterally killed it, it
+    // would linger as a zombie and `kill(pid, 0)` would still report it as alive. The
+    // real liveness proof is that the heartbeat file keeps *growing from here on out* —
+    // a zombie or a suspended process cannot advance it. So take a fresh baseline now,
+    // after the storm has settled, and require the file to grow past it; growth measured
+    // against a pre-storm baseline would be trivially satisfied by bytes written during
+    // the churn.
     assert!(
         pid_is_alive(bystander_pid),
         "the bystander (PID {bystander_pid}) was collaterally killed during run churn"
     );
+    let heartbeat_after = file_len(&heartbeat);
     assert!(
         wait_until(
-            || file_len(&heartbeat) > heartbeat_before,
+            || file_len(&heartbeat) > heartbeat_after,
             Duration::from_secs(10),
         ),
-        "the bystander stopped heartbeating during run churn (suspended or killed?)"
+        "the bystander stopped heartbeating during run churn (suspended, killed, or a zombie?)"
     );
 
     bystander.kill_now();
@@ -751,7 +761,6 @@ fn control_verb_reaps_only_the_target(
         wait_for_file_nonempty(&heartbeat, Duration::from_secs(20)),
         "the bystander never started heartbeating"
     );
-    let heartbeat_before = file_len(&heartbeat);
 
     // The target run: a long-lived root leaking a long-lived grandchild, registered
     // under `run_id` in the scratch registry the control client will consult.
@@ -833,16 +842,25 @@ fn control_verb_reaps_only_the_target(
         "the target run's grandchild (PID {grandchild}) survived the {verb} teardown"
     );
     // …but the standalone bystander is untouched: still alive and still heartbeating.
+    // `pid_is_alive` alone does not prove "alive": on Unix the bystander is a direct
+    // child of the test process, reaped only at the very end, so had the {verb}'s
+    // teardown collaterally killed it, it would linger as a zombie and `kill(pid, 0)`
+    // would still report it as alive. The real liveness proof is that the heartbeat
+    // file keeps *growing from here on out* — a zombie or a suspended process cannot
+    // advance it. So take a fresh baseline now, after the teardown has settled, and
+    // require the file to grow past it; growth measured against a pre-teardown baseline
+    // would be trivially satisfied by bytes written before the {verb} ever ran.
     assert!(
         pid_is_alive(bystander_pid),
         "the bystander (PID {bystander_pid}) was collaterally reaped by the {verb}"
     );
+    let heartbeat_after = file_len(&heartbeat);
     assert!(
         wait_until(
-            || file_len(&heartbeat) > heartbeat_before,
+            || file_len(&heartbeat) > heartbeat_after,
             Duration::from_secs(10)
         ),
-        "the bystander stopped heartbeating after the {verb} (suspended or killed?)"
+        "the bystander stopped heartbeating after the {verb} (suspended, killed, or a zombie?)"
     );
 
     // The stream records an externally-initiated ending an outside observer can read.
