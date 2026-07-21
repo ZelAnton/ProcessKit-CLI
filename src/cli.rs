@@ -111,7 +111,6 @@ pub struct InspectArgs {
 }
 
 /// Shared argument for the by-run-id control commands (`cancel`, `kill`).
-#[allow(dead_code)] // Parsed now, consumed once the control plane lands (see RunArgs).
 #[derive(Debug, Args)]
 pub struct TargetArgs {
     /// The run to act on.

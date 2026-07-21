@@ -54,6 +54,20 @@ pub const TIMEOUT: u8 = 106;
 /// reserved band so it is never mistaken for a child's own exit — and distinct
 /// from a timeout, so a caller can tell "I interrupted it" from "it ran too long".
 pub const CANCELLED: u8 = 107;
+/// The run was cancelled by a control-plane `cancel` command: a client reached the
+/// live runner over its local control channel and asked it to end the run, so the
+/// runner ran the **same** soft-stop → grace → hard-kill teardown as a `Ctrl-C`
+/// cancel — only triggered over the network instead of by a local signal. A
+/// runner-imposed outcome, distinct from [`CANCELLED`] (a local `Ctrl-C`) so a
+/// caller can tell "a control client cancelled it" apart from "the operator pressed
+/// Ctrl-C", and distinct from [`TIMEOUT`] and from any child result.
+pub const CONTROL_CANCELLED: u8 = 108;
+/// The run was killed by a control-plane `kill` command: a client asked the live
+/// runner to hard-kill the whole tree **immediately** — no soft stop and no grace.
+/// Kept in the reserved band and distinct from every other runner-imposed ending
+/// ([`TIMEOUT`], [`CANCELLED`], [`CONTROL_CANCELLED`]) so "it was force-killed by
+/// command" is never confused with a graceful cancel or a child's own exit.
+pub const CONTROL_KILLED: u8 = 109;
 
 /// A runner-own failure carrying the exit code it should surface and a
 /// human-readable message. Distinct from a child's exit — a child's code is
@@ -112,6 +126,8 @@ mod tests {
             NOT_IMPLEMENTED,
             TIMEOUT,
             CANCELLED,
+            CONTROL_CANCELLED,
+            CONTROL_KILLED,
         ] {
             assert!(
                 (RUNNER_RANGE_START..=RUNNER_RANGE_END).contains(&code),
@@ -122,8 +138,8 @@ mod tests {
 
     #[test]
     fn timeout_and_cancelled_are_distinct_and_distinct_from_the_other_codes() {
-        // The whole point of the two new outcomes is that a caller can tell them
-        // apart — from each other and from every other runner-own code.
+        // The whole point of the runner-imposed outcomes is that a caller can tell
+        // them apart — from each other and from every other runner-own code.
         let all = [
             USAGE,
             SPAWN,
@@ -133,10 +149,24 @@ mod tests {
             NOT_IMPLEMENTED,
             TIMEOUT,
             CANCELLED,
+            CONTROL_CANCELLED,
+            CONTROL_KILLED,
         ];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {
                 assert_ne!(a, b, "two runner-own codes collided on {a}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_four_runner_imposed_endings_are_all_distinct() {
+        // A caller must be able to tell every runner-imposed ending apart by code:
+        // a --timeout, a Ctrl-C, a control-plane cancel, and a control-plane kill.
+        let endings = [TIMEOUT, CANCELLED, CONTROL_CANCELLED, CONTROL_KILLED];
+        for (i, a) in endings.iter().enumerate() {
+            for b in &endings[i + 1..] {
+                assert_ne!(a, b, "two runner-imposed endings collided on {a}");
             }
         }
     }

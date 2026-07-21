@@ -36,21 +36,30 @@ failure is not mistaken for a child result.
 | 105  | `NOT_IMPLEMENTED` | A defined-but-not-yet-built code path. **Transitional** — present only while the runner is being implemented, and retired as each path lands. |
 | 106  | `TIMEOUT`         | The run exceeded its `--timeout`: the runner enforced the deadline and tore the process tree down. A runner-*imposed outcome*, not a child exit. |
 | 107  | `CANCELLED`       | The run was cancelled interactively (`Ctrl-C`): the runner tore the process tree down. Distinct from `TIMEOUT` and from any child result. |
+| 108  | `CONTROL_CANCELLED` | The run was cancelled by a control-plane `cancel` command (over the local control channel): the runner ran the same soft-stop → grace → hard-kill teardown as a Ctrl-C. Distinct from `CANCELLED` so "a control client cancelled it" is told from "the operator pressed Ctrl-C". |
+| 109  | `CONTROL_KILLED`  | The run was killed by a control-plane `kill` command: the runner hard-killed the whole tree immediately (no soft stop, no grace). Distinct from every other runner-imposed ending. |
 
-Codes `108`–`119` are **reserved** for future runner-own conditions. `--help`
+Codes `110`–`119` are **reserved** for future runner-own conditions. `--help`
 and `--version` are not failures: they print to stdout and exit `0`.
 
-## Timeout and cancel: runner-imposed outcomes
+## Timeout, cancel, and kill: runner-imposed outcomes
 
-`TIMEOUT` (106) and `CANCELLED` (107) are not *failures* of the runner and not the
-child's own exit — they are outcomes the runner **imposes** when it ends a run that
-did not stop on its own. The child did not choose to exit, so forwarding "its" code
-would be a lie; instead each takes a reserved-band code so a caller can tell three
-things apart:
+`TIMEOUT` (106), `CANCELLED` (107), `CONTROL_CANCELLED` (108), and `CONTROL_KILLED`
+(109) are not *failures* of the runner and not the child's own exit — they are
+outcomes the runner **imposes** when it ends a run that did not stop on its own. The
+child did not choose to exit, so forwarding "its" code would be a lie; instead each
+takes a distinct reserved-band code so a caller can tell them apart:
 
 - the child exited by itself (its exact code, forwarded — possibly `0`),
-- the runner ended it because the `--timeout` deadline elapsed (`106`), and
-- the runner ended it because the operator pressed `Ctrl-C` (`107`).
+- the runner ended it because the `--timeout` deadline elapsed (`106`),
+- the runner ended it because the operator pressed `Ctrl-C` (`107`),
+- a control-plane `cancel` command ended it — the same graceful teardown as a Ctrl-C,
+  but triggered over the network (`108`), and
+- a control-plane `kill` command force-killed it immediately, no grace (`109`).
+
+The two control-plane codes are what make a *remote* end-of-run distinguishable from a
+*local* one, and a graceful `cancel` from an immediate `kill` — by code alone, before
+even reading the event stream.
 
 Alongside the code, the runner writes an explanatory line to **stderr** (never the
 child's stdout) that also states, truthfully, how the tree was torn down — including
@@ -58,8 +67,8 @@ that on Windows there is no soft-terminate tier yet, so the grace window elapses
 the Job Object is then killed atomically (see `README.md`, "Timeouts, cancel, and
 grace"). As with every runner-own code, the numeric value is a best-effort signal;
 the authoritative, machine-readable form of these outcomes is the `timeout` /
-`cancelled` event (and the terminal `runner_exit`) in the versioned JSONL stream —
-see `docs/schema.md`.
+`cancelled` / `killed` event (and the terminal `runner_exit`) in the versioned JSONL
+stream — see `docs/schema.md`.
 
 ## Why a band is not enough on its own
 

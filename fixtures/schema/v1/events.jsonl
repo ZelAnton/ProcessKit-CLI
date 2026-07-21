@@ -11,3 +11,7 @@
 {"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"spawn_failed","code":101,"message":"could not start the program: program not found"}
 {"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"container_failed","phase":"create","code":102,"message":"could not create the ProcessKit container"}
 {"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"runner_exit","code":0,"source":"child_exit","child_code":0}
+{"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"cancelled","source":"control_cancel","grace_ms":2000}
+{"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"killed","source":"control_kill"}
+{"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"runner_exit","code":108,"source":"control_cancel","child_code":null}
+{"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"runner_exit","code":109,"source":"control_kill","child_code":null}

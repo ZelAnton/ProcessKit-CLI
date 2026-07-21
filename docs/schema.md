@@ -160,13 +160,35 @@ events; the run's terminal code is the reserved `TIMEOUT` (106) — see
 
 ### `cancelled`
 
-The run was cancelled interactively (`Ctrl-C`). Terminal code is the reserved
-`CANCELLED` (107).
+The run was cancelled and torn down through the shared soft-stop → grace → hard-kill
+path. `source` names the trigger, and the terminal `runner_exit` carries the matching
+reserved code:
 
-| Field      | Type              | Notes                                      |
-|------------|-------------------|--------------------------------------------|
-| `source`   | string            | `ctrl_c`.                                  |
-| `grace_ms` | integer, nullable | The `--grace` window, ms; `null` if unset. |
+- `ctrl_c` — a local interactive `Ctrl-C`; terminal code `CANCELLED` (107).
+- `control_cancel` — a `cancel` command that reached the live runner over its control
+  plane (see [`docs/control-plane.md`](control-plane.md)); terminal code
+  `CONTROL_CANCELLED` (108).
+
+Both share this event because they share the teardown; only the `source` and the
+terminal code tell them apart.
+
+| Field      | Type              | Notes                                            |
+|------------|-------------------|--------------------------------------------------|
+| `source`   | string            | `ctrl_c` or `control_cancel`.                    |
+| `grace_ms` | integer, nullable | The `--grace` window, ms; `null` if unset.       |
+
+### `killed`
+
+The run was killed by a control-plane `kill` command: an **immediate** hard kill of
+the whole tree, with no soft stop and no grace (unlike `cancelled`, which waits out
+the grace window first). The teardown it triggers is described by the following
+`cleanup_started` / `cleanup_finished` events — where `soft_terminate` is `null`,
+because no soft stop was attempted — and the run's terminal code is the reserved
+`CONTROL_KILLED` (109). See [`docs/control-plane.md`](control-plane.md).
+
+| Field    | Type   | Notes           |
+|----------|--------|-----------------|
+| `source` | string | `control_kill`. |
 
 ### `spawn_failed`
 
@@ -198,12 +220,13 @@ is never lost or aliased even when the process returns a runner-band code
 | Field        | Type              | Notes                                                                       |
 |--------------|-------------------|-----------------------------------------------------------------------------|
 | `code`       | integer           | The exit code the runner process returns (child's code, or a runner-band code). |
-| `source`     | string            | Why the runner exited: `child_exit`, `timeout`, `cancelled`, `spawn_error`, `container_error`, or `internal`. |
+| `source`     | string            | Why the runner exited: `child_exit`, `timeout`, `cancelled`, `control_cancel`, `control_kill`, `spawn_error`, `container_error`, or `internal`. |
 | `child_code` | integer, nullable | The child's own exit code when it exited on its own; `null` for a runner-imposed ending or a child that never produced one. |
 
 When `source` is `child_exit`, `code` equals `child_code`. For a runner-imposed
-ending (`timeout` / `cancelled`) or a pre-run failure (`spawn_error` /
-`container_error`), `child_code` is `null` and `code` is the runner-band value.
+ending (`timeout` / `cancelled` / `control_cancel` / `control_kill`) or a pre-run
+failure (`spawn_error` / `container_error`), `child_code` is `null` and `code` is the
+runner-band value.
 
 ### `output_captured`
 
@@ -243,13 +266,17 @@ A normal run emits, in order: `run_started`, `members_snapshot`, then either
 
 - **natural exit** — `root_exited`, `cleanup_started`, `cleanup_finished`,
   `runner_exit`; or
-- **runner-imposed ending** — `timeout` *or* `cancelled`, `cleanup_started`,
-  `cleanup_finished`, `runner_exit`.
+- **runner-imposed ending** — the reason event (`timeout`, `cancelled`, or `killed`),
+  `cleanup_started`, `cleanup_finished`, `runner_exit`.
+
+The reason event names *which* ending it was: `timeout` for a `--timeout`, `cancelled`
+(with `source` `ctrl_c` or `control_cancel`) for a Ctrl-C or a control-plane cancel,
+and `killed` (`source` `control_kill`) for a control-plane kill.
 
 When `--capture-dir` is set, an `output_captured` event is inserted after
 `cleanup_finished` and before the terminal `runner_exit`, on every ending that ran
-the child (natural exit, timeout, and cancel alike). Without `--capture-dir` it is
-absent.
+the child (natural exit, timeout, cancel, and kill alike). Without `--capture-dir` it
+is absent.
 
 A failure before the child runs emits its error event (`container_failed` or
 `spawn_failed`) and then `runner_exit`, with no `run_started` (and no

@@ -122,11 +122,24 @@ pub enum Event {
         timeout_ms: u64,
         grace_ms: Option<u64>,
     },
-    /// The run was cancelled interactively (`Ctrl-C`). `source` is `ctrl_c`.
+    /// The run was cancelled and torn down through the shared soft-stop → grace →
+    /// hard-kill path. `source` names the trigger: `ctrl_c` for a local `Ctrl-C`, or
+    /// `control_cancel` for a `cancel` command that reached the live runner over its
+    /// control plane (`docs/schema.md`, "cancelled"). Both share this event because
+    /// they share the teardown; the `source` tells them apart (and the terminal
+    /// `runner_exit` carries the matching reserved code — `CANCELLED` vs
+    /// `CONTROL_CANCELLED`).
     Cancelled {
         source: &'static str,
         grace_ms: Option<u64>,
     },
+    /// The run was killed by a control-plane `kill` command: an **immediate** hard
+    /// kill of the whole tree with no soft stop and no grace (unlike `cancelled`,
+    /// which waits out grace first). `source` is `control_kill`. The teardown it
+    /// triggers is described by the following `cleanup_started` / `cleanup_finished`
+    /// events; the run's terminal code is the reserved `CONTROL_KILLED` (109). There
+    /// is no `grace_ms` field — a kill never waits.
+    Killed { source: &'static str },
     /// The program could not be started (not found / not executable / bad cwd):
     /// the child never ran. `code` is the runner-band exit code (`SPAWN`).
     SpawnFailed { code: u8, message: String },
@@ -143,9 +156,10 @@ pub enum Event {
     /// Always emitted — including on the runner's own failure — so a child's code
     /// is never lost or aliased (`AGENTS.md`, "Exit-code fidelity"). `source`
     /// names why the runner exited (`child_exit` | `timeout` | `cancelled` |
-    /// `spawn_error` | `container_error` | `internal`); `child_code` carries the
-    /// child's own code when it exited on its own, and is `null` for a
-    /// runner-imposed ending or a child that never produced one.
+    /// `control_cancel` | `control_kill` | `spawn_error` | `container_error` |
+    /// `internal`); `child_code` carries the child's own code when it exited on its
+    /// own, and is `null` for a runner-imposed ending or a child that never produced
+    /// one.
     RunnerExit {
         code: i32,
         source: &'static str,
@@ -622,6 +636,27 @@ mod tests {
                 source: "child_exit",
                 child_code: Some(0),
             },
+            // Control-plane endings, appended so the existing catalog lines above
+            // stay byte-for-byte identical (an additive schema change never rewrites
+            // a shipped golden case). `control_cancel` reuses the `cancelled` event
+            // with its own trigger; `control_kill` is the dedicated no-grace event.
+            Event::Cancelled {
+                source: "control_cancel",
+                grace_ms: Some(2_000),
+            },
+            Event::Killed {
+                source: "control_kill",
+            },
+            Event::RunnerExit {
+                code: 108,
+                source: "control_cancel",
+                child_code: None,
+            },
+            Event::RunnerExit {
+                code: 109,
+                source: "control_kill",
+                child_code: None,
+            },
         ]
     }
 
@@ -849,6 +884,54 @@ mod tests {
             serde_json::from_str(&serialize_record(&timeout, fixed_time()).unwrap()).unwrap();
         assert_eq!(value["code"], 106);
         assert!(value["child_code"].is_null());
+    }
+
+    /// The control-plane endings are distinguishable in the stream. A control-plane
+    /// `cancel` reuses the `cancelled` event but carries its own `source`
+    /// (`control_cancel`, not `ctrl_c`); a `kill` is the dedicated `killed` event
+    /// with `source` `control_kill` and no `grace_ms` (a kill never waits). The
+    /// terminal `runner_exit` for each carries the matching reserved code.
+    #[test]
+    fn control_plane_endings_are_distinguishable_in_the_stream() {
+        // A control cancel is a `cancelled` event, told apart from a Ctrl-C by source.
+        let cancel = Event::Cancelled {
+            source: "control_cancel",
+            grace_ms: Some(2_000),
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&serialize_record(&cancel, fixed_time()).unwrap()).unwrap();
+        assert_eq!(value["event"], "cancelled");
+        assert_eq!(
+            value["source"], "control_cancel",
+            "a control-plane cancel is not a Ctrl-C: {value}"
+        );
+
+        // A kill is its own event: no grace field, its own source.
+        let kill = Event::Killed {
+            source: "control_kill",
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&serialize_record(&kill, fixed_time()).unwrap()).unwrap();
+        assert_eq!(value["event"], "killed");
+        assert_eq!(value["source"], "control_kill");
+        assert!(
+            value.get("grace_ms").is_none(),
+            "a kill has no grace window: {value}"
+        );
+
+        // The terminal events carry the distinct reserved codes with no child code.
+        for (source, code) in [("control_cancel", 108), ("control_kill", 109)] {
+            let exit = Event::RunnerExit {
+                code,
+                source,
+                child_code: None,
+            };
+            let value: serde_json::Value =
+                serde_json::from_str(&serialize_record(&exit, fixed_time()).unwrap()).unwrap();
+            assert_eq!(value["code"], code);
+            assert_eq!(value["source"], source);
+            assert!(value["child_code"].is_null());
+        }
     }
 
     /// `output_captured` carries per-stream capture metadata: a file path, the full

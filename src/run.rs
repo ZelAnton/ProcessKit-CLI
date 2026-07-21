@@ -23,12 +23,17 @@
 //! - **Exit-code fidelity, with distinguishable runner-imposed endings.** On a
 //!   completed run the process exits with the child's *exact* code (full width,
 //!   never clamped). When the runner instead *ends* the run — the `--timeout`
-//!   deadline elapsed, or the operator pressed `Ctrl-C` — the child did not choose
-//!   to stop, so its code is not forwarded: the run reports a reserved-band code
-//!   ([`exit::TIMEOUT`] / [`exit::CANCELLED`]) and an explanatory stderr line, kept
-//!   distinct from each other and from any child result. Their machine-readable
-//!   JSONL form is the `timeout` / `cancelled` (plus terminal `runner_exit`) event
-//!   written to `--jsonl` (see [`crate::events`] and `docs/schema.md`).
+//!   deadline elapsed, the operator pressed `Ctrl-C`, or a control-plane
+//!   `cancel`/`kill` command reached the live runner — the child did not choose to
+//!   stop, so its code is not forwarded: the run reports a reserved-band code
+//!   ([`exit::TIMEOUT`] / [`exit::CANCELLED`] / [`exit::CONTROL_CANCELLED`] /
+//!   [`exit::CONTROL_KILLED`]) and an explanatory stderr line, kept distinct from
+//!   each other and from any child result. Their machine-readable JSONL form is the
+//!   `timeout` / `cancelled` / `killed` (plus terminal `runner_exit`) event written
+//!   to `--jsonl` (see [`crate::events`] and `docs/schema.md`). The control-plane
+//!   endings reuse the *same* teardown as the local ones — `cancel` runs the shared
+//!   soft-stop → grace → hard-kill path, `kill` hard-kills the tree at once — so a
+//!   remote command never invents a parallel termination mechanism.
 //! - **One teardown path for every ending, honest per platform.** The deadline
 //!   and the cancel share a single termination path: attempt a *soft* stop
 //!   (`SIGTERM` to the whole tree on Unix), wait out `--grace`, then let the owning
@@ -106,14 +111,23 @@ enum Ending {
     TimedOut,
     /// The operator pressed `Ctrl-C`.
     Cancelled,
+    /// A control-plane `cancel` command reached the live runner: the same soft-stop →
+    /// grace → hard-kill teardown as `Ctrl-C`, only triggered over the network.
+    ControlCancelled,
+    /// A control-plane `kill` command reached the live runner: an immediate hard kill
+    /// of the whole tree, no soft stop and no grace.
+    ControlKilled,
 }
 
-/// A runner-imposed ending — the child did not exit on its own.
+/// A runner-imposed ending that shares the soft-stop → grace → hard-kill teardown
+/// (the `kill` verb is *not* one — it hard-kills immediately, handled separately).
 enum Termination {
     /// The `--timeout` deadline (the elapsed limit) was exceeded.
     Timeout(Duration),
     /// The run was cancelled interactively (`Ctrl-C`).
     Cancelled,
+    /// The run was cancelled by a control-plane `cancel` command.
+    ControlCancelled,
 }
 
 /// What the *soft* stop actually did, recorded so the outcome is reported
@@ -319,6 +333,13 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     let snapshot_source =
         SnapshotSource::new(&run_id, mechanism, root_pid, started, &members_provider);
 
+    // The channel the control server signals a mutating `cancel`/`kill` verb through.
+    // The server (in the `select!` below) writes its client ack first, then sends the
+    // command here; this loop's `recv` arm then wins the race and drives teardown. The
+    // sender lives for the whole `select!`, so `recv` only yields `None` at teardown.
+    let (command_tx, mut command_rx) =
+        tokio::sync::mpsc::unbounded_channel::<control::ControlCommand>();
+
     let timeout = args.timeout;
     let grace = args.grace;
 
@@ -326,23 +347,34 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     // fires first *decides* the outcome; only then does teardown begin, so the
     // owning group is never dropped before the outcome is known.
     //
-    // `biased` order — cancel, natural exit, deadline, then the control server —
-    // makes the tie-breaks deliberate: a `Ctrl-C` always wins, and a child that exits
-    // in the very poll its deadline fires is reported as its own exit rather than a
-    // timeout. When the cancel/deadline branch wins, `running` (moved into `wait()`)
-    // is dropped; because this is a shared-group handle that does not kill on drop,
-    // the child stays alive for the grace path below, and its output pumps stop
-    // (teardown is underway). The control-server branch **never resolves** (its output
-    // is `Infallible`): it serves `inspect` clients concurrently with the output pump,
-    // so it neither delays the child's exit nor blocks teardown — when another branch
-    // wins, this future is dropped, tearing the transport down with it.
+    // `biased` order — Ctrl-C, natural exit, control command, deadline, then the
+    // control server — makes the tie-breaks deliberate: a `Ctrl-C` always wins, and a
+    // child that exits in the very poll a deadline or a control command fires is
+    // reported as its own exit rather than a runner-imposed ending (natural exit is
+    // polled before both). When a cancel/kill/deadline branch wins, `running` (moved
+    // into `wait()`) is dropped; because this is a shared-group handle that does not
+    // kill on drop, the child stays alive for the teardown path below, and its output
+    // pumps stop (teardown is underway). The `command_rx` branch resolves when the
+    // control server routes a `cancel`/`kill` verb (having already acked the client);
+    // the control-server branch itself **never resolves** (its output is `Infallible`)
+    // — it serves clients concurrently with the output pump, so it neither delays the
+    // child's exit nor blocks teardown, and is dropped (tearing the transport down)
+    // when another branch wins.
     let capturing = capture.is_some();
     let ending = tokio::select! {
         biased;
         () = wait_for_ctrl_c() => Ending::Cancelled,
         outcome = drive_to_outcome(running, capturing) => Ending::Exited(outcome),
+        command = command_rx.recv() => match command {
+            Some(control::ControlCommand::Cancel) => Ending::ControlCancelled,
+            Some(control::ControlCommand::Kill) => Ending::ControlKilled,
+            // The sender lives as long as the serve future in this same `select!`, so
+            // a closed channel cannot happen while this arm is racing; park if it ever
+            // did rather than misreport an ending.
+            None => std::future::pending().await,
+        },
         () = deadline(timeout) => Ending::TimedOut,
-        never = control::serve(control_server, &snapshot_source) => match never {},
+        never = control::serve(control_server, &snapshot_source, &command_tx) => match never {},
     };
 
     match ending {
@@ -419,6 +451,38 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             clear_registration(&registration);
             let error = termination_error(Termination::Cancelled, soft, grace);
             Err(finish(&mut emitter, "cancelled", None, error))
+        }
+        Ending::ControlCancelled => {
+            // A control-plane cancel is the network analogue of Ctrl-C: the *same*
+            // `cancelled` event and teardown, told apart only by its `source` and its
+            // own reserved exit code (`CONTROL_CANCELLED`, 108).
+            emitter.emit(&Event::Cancelled {
+                source: "control_cancel",
+                grace_ms: grace.map(duration_ms),
+            });
+            emit_cleanup_started(&mut emitter, &group);
+            let soft = soft_terminate_then_grace(&group, grace).await;
+            emit_cleanup_finished(&mut emitter, &group, Some(soft_terminate_label(soft)));
+            emit_output_captured(&mut emitter, &capture);
+            clear_registration(&registration);
+            let error = termination_error(Termination::ControlCancelled, soft, grace);
+            Err(finish(&mut emitter, "control_cancel", None, error))
+        }
+        Ending::ControlKilled => {
+            // A control-plane kill is immediate: no soft stop, no grace. The dedicated
+            // `killed` event marks the reason; `cleanup_finished` carries `None` for
+            // `soft_terminate`, exactly like the natural-exit path where no soft stop
+            // is attempted. The single hard kill is the container's kill-on-drop, run
+            // explicitly via `emit_cleanup_finished`.
+            emitter.emit(&Event::Killed {
+                source: "control_kill",
+            });
+            emit_cleanup_started(&mut emitter, &group);
+            emit_cleanup_finished(&mut emitter, &group, None);
+            emit_output_captured(&mut emitter, &capture);
+            clear_registration(&registration);
+            let error = control_kill_error();
+            Err(finish(&mut emitter, "control_kill", None, error))
         }
     }
 }
@@ -671,10 +735,27 @@ fn termination_error(
             format!("run timed out after {}", format_duration(limit)),
         ),
         Termination::Cancelled => (exit::CANCELLED, "run cancelled (Ctrl-C)".to_string()),
+        Termination::ControlCancelled => (
+            exit::CONTROL_CANCELLED,
+            "run cancelled by a control-plane command".to_string(),
+        ),
     };
     RunnerError::new(
         code,
         format!("{headline}: {}", describe_teardown(soft, grace)),
+    )
+}
+
+/// The error a control-plane `kill` surfaces: the reserved [`exit::CONTROL_KILLED`]
+/// and a message stating, truthfully, that the whole tree was hard-killed at once —
+/// no soft stop, no grace. Unlike [`termination_error`] there is no soft-terminate
+/// tier or grace window to describe, because a kill has neither.
+fn control_kill_error() -> RunnerError {
+    RunnerError::new(
+        exit::CONTROL_KILLED,
+        "run killed by a control-plane command: hard-killed the whole process tree \
+         immediately via the container's kill-on-drop (no soft stop, no grace)"
+            .to_string(),
     )
 }
 
@@ -846,6 +927,75 @@ mod tests {
             "message should say cancelled: {msg}"
         );
         assert!(msg.contains("Ctrl-C"), "message should name Ctrl-C: {msg}");
+    }
+
+    #[test]
+    fn the_four_runner_imposed_endings_carry_distinct_codes() {
+        // Every runner-imposed ending must be tellable apart by exit code: a timeout,
+        // a Ctrl-C, a control-plane cancel, and a control-plane kill.
+        let timeout = termination_error(
+            Termination::Timeout(Duration::from_secs(5)),
+            SoftTerminate::Signalled,
+            None,
+        );
+        let ctrl_c = termination_error(Termination::Cancelled, SoftTerminate::Signalled, None);
+        let control_cancel = termination_error(
+            Termination::ControlCancelled,
+            SoftTerminate::Signalled,
+            None,
+        );
+        let control_kill = control_kill_error();
+        let codes = [
+            timeout.code(),
+            ctrl_c.code(),
+            control_cancel.code(),
+            control_kill.code(),
+        ];
+        assert_eq!(control_cancel.code(), exit::CONTROL_CANCELLED);
+        assert_eq!(control_kill.code(), exit::CONTROL_KILLED);
+        for (i, a) in codes.iter().enumerate() {
+            for b in &codes[i + 1..] {
+                assert_ne!(a, b, "two runner-imposed endings collided on code {a}");
+            }
+        }
+    }
+
+    #[test]
+    fn control_cancel_message_names_the_command_and_describes_teardown() {
+        // A control-plane cancel shares the honest teardown wording (it is the same
+        // path as Ctrl-C) but names the *command* as the trigger, not the keyboard.
+        let err = termination_error(
+            Termination::ControlCancelled,
+            SoftTerminate::Signalled,
+            Some(Duration::from_secs(2)),
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("control-plane command"),
+            "message should name the control command: {msg}"
+        );
+        assert!(
+            !msg.contains("Ctrl-C"),
+            "a control cancel is not a Ctrl-C: {msg}"
+        );
+        assert!(
+            msg.contains("SIGTERM"),
+            "the shared teardown is described: {msg}"
+        );
+        assert!(msg.contains("2s"), "the grace is echoed: {msg}");
+    }
+
+    #[test]
+    fn control_kill_message_is_immediate_and_ungraceful() {
+        let err = control_kill_error();
+        let msg = err.to_string();
+        assert!(msg.contains("killed"), "message should say killed: {msg}");
+        assert!(msg.contains("immediately"), "a kill is immediate: {msg}");
+        assert!(
+            msg.contains("no soft stop") && msg.contains("no grace"),
+            "a kill waits for nothing: {msg}"
+        );
+        assert!(msg.contains("hard-killed"), "the hard kill is named: {msg}");
     }
 
     #[test]

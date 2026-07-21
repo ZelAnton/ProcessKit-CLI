@@ -46,9 +46,12 @@ processkit = "2"
 # and the `--grace` window, `signal` the `Ctrl-C` listener, and `macros` the
 # `select!` that races them against the child's own exit. `net` provides the local
 # control-plane transport (unix domain socket / Windows named pipe, see
-# `src/control.rs`) and `io-util` its line-oriented request/response codec. The
-# child-pipe I/O driver is compiled in via `processkit`'s own tokio `process`/`net`
-# features (Cargo unifies feature flags across the one tokio build).
+# `src/control.rs`) and `io-util` its line-oriented request/response codec. `sync`
+# provides the `mpsc` channel the control server signals a `cancel`/`kill` verb
+# through to the run's `select!` loop (the loop owns teardown; the server never tears
+# a run down itself). The child-pipe I/O driver is compiled in via `processkit`'s own
+# tokio `process`/`net` features (Cargo unifies feature flags across the one tokio
+# build).
 tokio = { version = "1", features = [
     "rt",
     "io-std",
@@ -56,6 +59,7 @@ tokio = { version = "1", features = [
     "net",
     "time",
     "signal",
+    "sync",
     "macros",
 ] }
 

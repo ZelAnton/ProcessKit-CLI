@@ -1,11 +1,13 @@
-//! Through-the-binary tests for the per-user run registry and its first control-plane
-//! client (`AGENTS.md`, "Testing tiers"): a normal run creates a registry entry while
-//! it is live and removes it on a clean exit, a runner-imposed ending (a `--timeout`)
-//! tears the entry down too, and `inspect` reaches a live run over the registry +
-//! local transport (or fails with the reserved `CONTROL` code when the run cannot be
-//! reached). These prove the *binary's* registry/control lifecycle end-to-end; the
-//! fine-grained mechanics — owner-only permissions, stale detection, concurrency, the
-//! wire snapshot — are unit-tested in `src/registry.rs` and `src/control.rs`.
+//! Through-the-binary tests for the per-user run registry and its control-plane
+//! clients (`AGENTS.md`, "Testing tiers"): a normal run creates a registry entry
+//! while it is live and removes it on a clean exit, a runner-imposed ending (a
+//! `--timeout`) tears the entry down too, `inspect` reaches a live run over the
+//! registry + local transport, and the mutating `cancel`/`kill` verbs reach the same
+//! live runner and end it with their own reserved exit codes — each falling back to
+//! the reserved `CONTROL` code when the run cannot be reached. These prove the
+//! *binary's* registry/control lifecycle end-to-end; the fine-grained mechanics —
+//! owner-only permissions, stale detection, concurrency, the wire snapshot, verb
+//! routing — are unit-tested in `src/registry.rs` and `src/control.rs`.
 //!
 //! Each test points the runner *and* the inspect client at an isolated scratch
 //! registry via the `PROCESSKIT_CLI_REGISTRY_DIR` override so they never touch the
@@ -276,6 +278,136 @@ fn inspect_reports_no_such_run_with_the_control_code() {
         stderr.contains("ghost"),
         "the failure names the run: {stderr}"
     );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Run a mutating control verb (`cancel`/`kill --run-id <id>`) against the same
+/// scratch registry as the run under test, and wait for it to finish.
+fn control_client(registry: &Path, verb: &str, run_id: &str) -> Output {
+    Command::new(bin())
+        .args([verb, "--run-id", run_id])
+        .env("PROCESSKIT_CLI_REGISTRY_DIR", registry)
+        .output()
+        .expect("spawn the control client")
+}
+
+/// A `cancel` command reaches the live runner over the control plane and ends the
+/// run through the shared soft-stop → grace → hard-kill teardown: the client is
+/// acked (exit 0) and the *run* exits with the reserved `CONTROL_CANCELLED` code
+/// (108) — distinct from a Ctrl-C (107) and a timeout (106). The teardown removes
+/// the registry entry, like every other decided ending.
+#[test]
+fn cancel_ends_a_live_run_with_the_control_cancel_code() {
+    let dir = scratch("control-cancel");
+    let registry = registry_dir(&dir);
+    let mut child = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "cancel-me"],
+        long_child(),
+    )
+    .spawn()
+    .expect("spawn the runner");
+
+    // The run is reachable once its record (and thus its endpoint) is published.
+    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+
+    let out = control_client(&registry, "cancel", "cancel-me");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "cancelling a live run succeeds; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let status = child.wait().expect("the runner exits after the cancel");
+    assert_eq!(
+        status.code(),
+        Some(108),
+        "a control-plane cancel ends the run with CONTROL_CANCELLED (108)"
+    );
+    assert_eq!(
+        record_count(&registry),
+        0,
+        "a control cancel teardown must remove the registry entry"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A `kill` command reaches the live runner and hard-kills the whole tree
+/// immediately: the client is acked (exit 0) and the run exits with the reserved
+/// `CONTROL_KILLED` code (109), distinct from every other ending.
+#[test]
+fn kill_ends_a_live_run_with_the_control_kill_code() {
+    let dir = scratch("control-kill");
+    let registry = registry_dir(&dir);
+    let mut child = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "kill-me"],
+        long_child(),
+    )
+    .spawn()
+    .expect("spawn the runner");
+
+    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+
+    let out = control_client(&registry, "kill", "kill-me");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "killing a live run succeeds; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let status = child.wait().expect("the runner exits after the kill");
+    assert_eq!(
+        status.code(),
+        Some(109),
+        "a control-plane kill ends the run with CONTROL_KILLED (109)"
+    );
+    assert_eq!(
+        record_count(&registry),
+        0,
+        "a control kill teardown must remove the registry entry"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// An unknown run id is the same distinguishable failure for the mutating verbs as
+/// for `inspect`: the reserved `CONTROL` code (103), a message naming the action and
+/// the run on stderr, and no ack on stdout — never a hang.
+#[test]
+fn cancel_and_kill_report_no_such_run_with_the_control_code() {
+    let dir = scratch("control-missing");
+    let registry = registry_dir(&dir);
+
+    for verb in ["cancel", "kill"] {
+        let out = control_client(&registry, verb, "ghost");
+        assert_eq!(
+            out.status.code(),
+            Some(103),
+            "an unknown run id is a CONTROL failure for {verb}; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "a failed {verb} prints no ack: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("ghost"),
+            "the {verb} failure names the run: {stderr}"
+        );
+        assert!(
+            stderr.contains(verb),
+            "the failure names the action `{verb}`: {stderr}"
+        );
+    }
 
     let _ = fs::remove_dir_all(&dir);
 }

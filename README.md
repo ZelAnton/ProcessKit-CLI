@@ -91,7 +91,7 @@ Every `run_started` event reports this separate abrupt-owner-death contract as
 `none` on macOS/other Unix. Normal completion, timeout, and Ctrl-C still run the
 owned container's ordinary teardown path on every supported platform.
 
-## Planned interface
+## Command interface
 
 ```text
 processkit-cli run     [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl>
@@ -115,19 +115,29 @@ TTY**, so terminal-dependent behavior can degrade — colors, progress bars, and
 other cursor tricks may render as plain, line-oriented text. A true PTY is not
 implemented here (PTY support is deferred in the core crate).
 
-`inspect` communicates with a live `run` process over local IPC; `cancel` and
-`kill` will use the same control plane. If the runner dies, the registry entry is
-stale rather than an invitation to address processes by PID. Cleanup after that
-abrupt death follows the platform-specific `abrupt_cleanup` guarantee above;
-only Windows currently guarantees the whole tree.
+`inspect`, `cancel`, and `kill` all communicate with a live `run` process over the
+same local IPC control plane, addressing it by `run_id` through the per-user registry
+— never by PID. `inspect` is read-only; `cancel` ends the run through the *same*
+soft-stop → grace → hard-kill teardown a `Ctrl-C` uses (exiting the run with the
+reserved code `108`), and `kill` hard-kills the whole tree immediately with no grace
+(code `109`). The scope of a cancel/kill is only the target run's ProcessKit
+container — never processes matched by executable name. Both outcomes are also written
+to the run's JSONL stream (a `cancelled` / `killed` event and a terminal
+`runner_exit`), so an external observer reading the event file sees the command too,
+not just the control client. If the runner has already died, the registry entry is
+stale rather than an invitation to address processes by PID, and a cancel/kill against
+it is a bounded `CONTROL` (103) failure — never a hang. Cleanup after an abrupt runner
+death follows the platform-specific `abrupt_cleanup` guarantee above; only Windows
+currently guarantees the whole tree.
 
 ## Exit codes
 
 The runner's exit code **is** the child's exit code; the runner's own failures
-(bad arguments, spawn failure, backend error) and the two runner-*imposed*
-endings — a `--timeout` (`106`) and a `Ctrl-C` cancel (`107`) — use a distinct,
-reserved code band so they can never be mistaken for a child result. This is part
-of the project's compatibility surface — see
+(bad arguments, spawn failure, backend error) and the four runner-*imposed*
+endings — a `--timeout` (`106`), a `Ctrl-C` cancel (`107`), a control-plane `cancel`
+(`108`), and a control-plane `kill` (`109`) — use a distinct, reserved code band so
+they can never be mistaken for a child result, and so each ending is tellable from the
+others by code alone. This is part of the project's compatibility surface — see
 [the exit-code contract](docs/exit-codes.md).
 
 ## Timeouts, cancel, and grace
@@ -238,10 +248,13 @@ teardown of the whole tree (see "Timeouts, cancel, and grace"), and writes the
 versioned JSONL event stream to `--jsonl` (see "JSONL event schema"). `--run-id`
 and `--argv-raw` are consumed by that stream, and `--capture-dir` records a bounded
 stdout/stderr transcript with per-stream byte counts, hashes, and truncation flags
-(see "Bounded output capture"). `inspect` reaches live runs through the local
-control plane; `cancel` and `kill` are not implemented yet and still report a
-runner-range "not implemented" error. See [the roadmap](docs/ROADMAP.md) for the
-intended delivery order.
+(see "Bounded output capture"). `inspect`, `cancel`, and `kill` all reach live runs
+through the local control plane: `inspect` prints a snapshot, `cancel` ends a run
+gracefully (its shared soft-stop → grace → hard-kill teardown, exit `108`), and `kill`
+force-kills the whole tree immediately (exit `109`) — each a distinguishable outcome in
+the JSONL stream and by exit code, and each a bounded `CONTROL` (103) failure when the
+run cannot be reached. See [the roadmap](docs/ROADMAP.md) for the intended delivery
+order.
 
 ## Development
 

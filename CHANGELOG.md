@@ -69,6 +69,26 @@ to a dated version section.
   open past the root's exit cannot hang the runner). A run without `--capture-dir`
   is byte-for-byte unchanged (no files, no event). Additive schema v1 change,
   reflected in `docs/schema.md` and the golden fixture.
+- Control-plane `cancel` and `kill` subcommands: `cancel --run-id <id>` and
+  `kill --run-id <id>` reach the live runner over the same local transport and
+  registry discovery as `inspect` (by `run_id`, never a PID) and end the run. `cancel`
+  runs the runner's **shared** soft-stop → grace → hard-kill teardown — the same path
+  a `--timeout` or a `Ctrl-C` drives, honest Windows hard-kill fallback included — and
+  the run exits with the new reserved code `CONTROL_CANCELLED` (108); `kill` hard-kills
+  the whole tree immediately (no soft stop, no grace) and the run exits with
+  `CONTROL_KILLED` (109). Both are distinguishable from a Ctrl-C, a timeout, and each
+  other by exit code *and* in the JSONL stream: `cancel` writes a `cancelled` event
+  with `source` `control_cancel`, `kill` writes a new `killed` event with `source`
+  `control_kill`, and each closes with a terminal `runner_exit` carrying the matching
+  `source` — so an external observer reading `--jsonl` sees the external command, not
+  just the control client. The kill scope is only the target run's ProcessKit
+  container (discovered via the registry); nothing is ever killed by executable name.
+  The wire protocol gains the two verbs without reshaping its one-request/one-JSON-line
+  framing, each answered with a `{"accepted":…,"action":…,"run_id":…}` ack, and an
+  unreachable/stale runner is the same bounded `CONTROL` (103) failure as `inspect`.
+  Additive schema v1 change (new `source` values and the `killed` event), reflected in
+  `docs/control-plane.md`, `docs/schema.md`, `docs/exit-codes.md`, and the golden
+  fixture.
 - Abrupt runner-death hardening and proof: every spawned command opts into
   ProcessKit's public parent-death primitive. The versioned `run_started` event
   now reports the actual surviving guarantee as `abrupt_cleanup` (`whole_tree`
@@ -90,9 +110,9 @@ to a dated version section.
   on Windows, cgroup v2 on Linux, POSIX process group on macOS/other Unix).
 
 ### Changed
-- `inspect` now reaches a live runner over the local control plane; `cancel` and
-  `kill` remain unimplemented and still exit with the runner-range "not
-  implemented" code.
+- The control plane's three clients — `inspect`, `cancel`, and `kill` — all reach a
+  live runner over the local transport now; no subcommand returns the runner-range
+  "not implemented" code any longer.
 - `run` now consumes every flag it parses: `--jsonl` (the JSONL event stream) and
   `--capture-dir` (bounded output capture) are both wired up.
 

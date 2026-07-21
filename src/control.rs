@@ -54,8 +54,23 @@
 //!
 //! Line-oriented and deliberately tiny. A client writes one request verb line
 //! (`inspect\n`; an empty line is also treated as `inspect`) and reads back one JSON
-//! line, then the server closes the connection. Today `inspect` is the only verb;
-//! `cancel`/`kill` (T-009) add verbs to the same framing without reshaping it.
+//! line, then the server closes the connection. Three verbs share this one framing:
+//!
+//! - **`inspect`** — read-only; the reply is a [`Snapshot`].
+//! - **`cancel`** — mutating; the runner runs its shared soft-stop → grace →
+//!   hard-kill teardown (the same one a `Ctrl-C` uses) and the run exits with the
+//!   reserved [`exit::CONTROL_CANCELLED`] (108). The reply is a [`ControlAck`].
+//! - **`kill`** — mutating; the runner hard-kills the whole tree immediately (no
+//!   soft stop, no grace) and the run exits with [`exit::CONTROL_KILLED`] (109). The
+//!   reply is a [`ControlAck`].
+//!
+//! The mutating verbs never reshape the framing: the runner writes its ack line and
+//! only **then** signals its main loop to tear down (via a [`ControlCommandSink`]),
+//! so a `cancel`/`kill` client always receives its confirmation even though the run
+//! ends at once. Everything the outside world needs is also in the JSONL stream — a
+//! `cancelled` / `killed` event and a terminal `runner_exit` with the matching
+//! `source` — so an observer reading `--jsonl` sees the external command, not just
+//! the control client.
 
 use std::convert::Infallible;
 use std::io;
@@ -79,9 +94,60 @@ pub use imp::ControlServer;
 /// axis.
 pub const SNAPSHOT_VERSION: u32 = 1;
 
-/// The only request verb today. An empty request line is treated as this too, so a
+/// The read-only request verb. An empty request line is treated as this too, so a
 /// bare connect-and-read probe still gets a snapshot.
 const INSPECT_REQUEST: &str = "inspect";
+
+/// The mutating verb that ends a run through the shared soft-stop → grace →
+/// hard-kill teardown (the network analogue of a `Ctrl-C`).
+const CANCEL_REQUEST: &str = "cancel";
+
+/// The mutating verb that hard-kills a run's whole tree immediately (no grace).
+const KILL_REQUEST: &str = "kill";
+
+/// A mutating control-plane command, delivered from a `cancel`/`kill` client to the
+/// live run's own `select!` loop (which owns teardown — this module never tears a
+/// run down itself). The verb text is the on-the-wire request and the ack `action`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlCommand {
+    /// Soft-stop → grace → hard-kill teardown, over the network instead of a signal.
+    Cancel,
+    /// Immediate hard kill of the whole tree — no soft stop and no grace.
+    Kill,
+}
+
+impl ControlCommand {
+    /// The verb this command is spelled as on the wire and echoed in the ack.
+    fn verb(self) -> &'static str {
+        match self {
+            ControlCommand::Cancel => CANCEL_REQUEST,
+            ControlCommand::Kill => KILL_REQUEST,
+        }
+    }
+}
+
+/// The channel the control server pushes a mutating command into, handed to the
+/// run's main loop. An **unbounded** sender so the server's send is synchronous and
+/// cannot yield or block between writing its ack and signaling teardown: the ack is
+/// fully flushed first, then the run tears down at once. The run holds the sole
+/// receiver for its whole life, so a send from a live serve loop always lands.
+pub type ControlCommandSink = tokio::sync::mpsc::UnboundedSender<ControlCommand>;
+
+/// The one-line reply to a `cancel`/`kill` verb: the runner accepted the command and
+/// began tearing the run down. `Serialize` on the server, `Deserialize` on the
+/// client (which parses it back and checks it names the action it asked for, so a
+/// garbled or foreign reply is a distinguishable failure rather than a false
+/// success — the same discipline `inspect` applies to its [`Snapshot`]).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ControlAck {
+    /// Whether the runner accepted the command and started teardown.
+    pub accepted: bool,
+    /// The action taken — `cancel` or `kill` — echoed so the client can confirm the
+    /// runner answered the verb it sent.
+    pub action: String,
+    /// The run the command targeted (the id the client matched in the registry).
+    pub run_id: String,
+}
 
 /// How long the client waits to *connect* to a runner's endpoint before giving up —
 /// a runner that has just died cannot make the client hang.
@@ -173,6 +239,16 @@ impl<'a> SnapshotSource<'a> {
             members: (self.members)(),
         }
     }
+
+    /// The acknowledgement for a mutating verb: the runner accepted `action` for this
+    /// run. Built from the same settled `run_id` the snapshot names.
+    fn ack(&self, action: &str) -> ControlAck {
+        ControlAck {
+            accepted: true,
+            action: action.to_string(),
+            run_id: self.run_id.to_string(),
+        }
+    }
 }
 
 /// Stand up the local control transport for a run, bound in `dir` (the owner-only
@@ -197,9 +273,13 @@ pub fn open_server(dir: &Path) -> Option<ControlServer> {
 /// without it ever winning the race — the run ends when the *child* does, and this
 /// future is dropped (tearing the transport down) at that point. With no transport it
 /// parks forever, so the caller's race is unaffected.
-pub async fn serve(server: Option<ControlServer>, source: &SnapshotSource<'_>) -> Infallible {
+pub async fn serve(
+    server: Option<ControlServer>,
+    source: &SnapshotSource<'_>,
+    commands: &ControlCommandSink,
+) -> Infallible {
     match server {
-        Some(server) => server.serve(source).await,
+        Some(server) => server.serve(source, commands).await,
         None => std::future::pending().await,
     }
 }
@@ -208,15 +288,26 @@ pub async fn serve(server: Option<ControlServer>, source: &SnapshotSource<'_>) -
 /// close. Bounded by [`CONNECTION_DEADLINE`] so a client that connects and stalls
 /// cannot wedge the accept loop. Errors are swallowed — a broken client connection is
 /// never the run's problem.
-async fn handle_connection<S>(stream: S, source: &SnapshotSource<'_>)
+async fn handle_connection<S>(stream: S, source: &SnapshotSource<'_>, commands: &ControlCommandSink)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let _ = tokio::time::timeout(CONNECTION_DEADLINE, serve_one(stream, source)).await;
+    let _ = tokio::time::timeout(CONNECTION_DEADLINE, serve_one(stream, source, commands)).await;
 }
 
 /// The request/response exchange for one connection.
-async fn serve_one<S>(stream: S, source: &SnapshotSource<'_>) -> io::Result<()>
+///
+/// A mutating verb (`cancel`/`kill`) writes its ack **before** it signals the run's
+/// main loop through `commands`: the ack is fully flushed and the write half
+/// half-closed first, so the client always receives its confirmation even though the
+/// run tears down the moment the signal lands. If the ack cannot even be written (a
+/// broken client), no command is signaled — an unconfirmed cancel does not silently
+/// end the run.
+async fn serve_one<S>(
+    stream: S,
+    source: &SnapshotSource<'_>,
+    commands: &ControlCommandSink,
+) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -224,14 +315,39 @@ where
     let mut reader = BufReader::new(read_half);
     let mut request = String::new();
     reader.read_line(&mut request).await?;
-    let response = match request.trim() {
-        INSPECT_REQUEST | "" => serialize_snapshot(&source.snapshot()),
-        other => serialize_error(&format!("unknown control request `{other}`")),
-    };
+    match request.trim() {
+        INSPECT_REQUEST | "" => {
+            write_response(&mut write_half, &serialize_snapshot(&source.snapshot())).await?;
+        }
+        CANCEL_REQUEST => {
+            write_response(&mut write_half, &serialize_ack(&source.ack(CANCEL_REQUEST))).await?;
+            // Ack delivered — now ask the run's main loop to tear down. The send is
+            // synchronous (unbounded) and best-effort: a dropped receiver only means
+            // the run is already ending.
+            let _ = commands.send(ControlCommand::Cancel);
+        }
+        KILL_REQUEST => {
+            write_response(&mut write_half, &serialize_ack(&source.ack(KILL_REQUEST))).await?;
+            let _ = commands.send(ControlCommand::Kill);
+        }
+        other => {
+            let error = serialize_error(&format!("unknown control request `{other}`"));
+            write_response(&mut write_half, &error).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Write one JSON response line and end the response: flush it, then half-close the
+/// write side (best-effort — some transports have no half-close) so the client's
+/// read completes at once.
+async fn write_response<W>(write_half: &mut W, response: &str) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     write_half.write_all(response.as_bytes()).await?;
     write_half.write_all(b"\n").await?;
     write_half.flush().await?;
-    // Signal end-of-response; best-effort (some transports have no half-close).
     let _ = write_half.shutdown().await;
     Ok(())
 }
@@ -247,6 +363,13 @@ fn serialize_snapshot(snapshot: &Snapshot) -> String {
 fn serialize_error(message: &str) -> String {
     serde_json::to_string(&ErrorResponse { error: message })
         .unwrap_or_else(|_| String::from(r#"{"error":"control error"}"#))
+}
+
+/// Serialize a `cancel`/`kill` acknowledgement for the wire. A struct of owned
+/// strings and a bool cannot fail to serialize; the fallback is defensive only.
+fn serialize_ack(ack: &ControlAck) -> String {
+    serde_json::to_string(ack)
+        .unwrap_or_else(|_| String::from(r#"{"accepted":false,"action":"error","run_id":""}"#))
 }
 
 /// Client entry for `inspect --run-id <id> --json`: find the live runner through the
@@ -268,11 +391,119 @@ pub fn inspect(run_id: &str) -> Result<(), RunnerError> {
 
 /// The async body of [`inspect`]: registry lookup, connect, converse, print.
 async fn inspect_async(run_id: &str) -> Result<(), RunnerError> {
+    let endpoint = resolve_live_endpoint("inspect", run_id).await?;
+
+    // Connect under a deadline: a runner that died between the liveness probe and now
+    // fails fast here instead of hanging the client.
+    let stream = connect_live(&endpoint, "inspect", run_id).await?;
+
+    // Converse under a deadline: a runner that died mid-write, or accepted but never
+    // answers, is bounded here — a distinguishable CONTROL result, not a hang.
+    let snapshot = tokio::time::timeout(CONVERSATION_DEADLINE, converse(stream))
+        .await
+        .map_err(|_| {
+            unreachable_run(
+                "inspect",
+                run_id,
+                "the runner did not answer in time".into(),
+            )
+        })?
+        .map_err(|err| unreachable_run("inspect", run_id, err.to_string()))?;
+
+    let json = serde_json::to_string(&snapshot).map_err(|err| {
+        RunnerError::new(
+            exit::INTERNAL,
+            format!("could not render the inspect snapshot: {err}"),
+        )
+    })?;
+    println!("{json}");
+    Ok(())
+}
+
+/// Client entry for `cancel --run-id <id>`: reach the live runner through the
+/// registry and ask it to end the run through its shared soft-stop → grace →
+/// hard-kill teardown. On success the runner acks and its run exits with
+/// [`exit::CONTROL_CANCELLED`] (108); the outcome is also written to the run's JSONL
+/// stream. An unreachable/stale runner is the same distinguishable [`exit::CONTROL`]
+/// (103) failure `inspect` reports — never a hang.
+pub fn cancel(run_id: &str) -> Result<(), RunnerError> {
+    run_mutation(run_id, ControlCommand::Cancel)
+}
+
+/// Client entry for `kill --run-id <id>`: reach the live runner and ask it to
+/// hard-kill the whole tree immediately (no grace). On success the run exits with
+/// [`exit::CONTROL_KILLED`] (109). An unreachable runner is an [`exit::CONTROL`]
+/// (103) failure, exactly like [`cancel`] and [`inspect`].
+pub fn kill(run_id: &str) -> Result<(), RunnerError> {
+    run_mutation(run_id, ControlCommand::Kill)
+}
+
+/// Shared driver for the mutating clients ([`cancel`] / [`kill`]): stand up the same
+/// small current-thread runtime `inspect` uses and run the exchange.
+fn run_mutation(run_id: &str, command: ControlCommand) -> Result<(), RunnerError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| {
+            RunnerError::new(
+                exit::INTERNAL,
+                format!("could not start the async runtime: {err}"),
+            )
+        })?;
+    runtime.block_on(mutate_async(run_id, command))
+}
+
+/// The async body of [`cancel`] / [`kill`]: registry lookup, connect, send the verb,
+/// read and verify the ack, print it. Every runner-loss path is a bounded
+/// [`exit::CONTROL`] failure, mirroring [`inspect_async`].
+async fn mutate_async(run_id: &str, command: ControlCommand) -> Result<(), RunnerError> {
+    let action = command.verb();
+    let endpoint = resolve_live_endpoint(action, run_id).await?;
+    let stream = connect_live(&endpoint, action, run_id).await?;
+
+    let ack = tokio::time::timeout(CONVERSATION_DEADLINE, converse_mutation(stream, command))
+        .await
+        .map_err(|_| unreachable_run(action, run_id, "the runner did not answer in time".into()))?
+        .map_err(|err| unreachable_run(action, run_id, err.to_string()))?;
+
+    // A well-behaved runner acks the exact action; a rejected or mismatched reply is a
+    // CONTROL failure, never a false success (the same parse-back discipline inspect
+    // applies to its snapshot).
+    if !ack.accepted || ack.action != action {
+        return Err(unreachable_run(
+            action,
+            run_id,
+            "the runner did not acknowledge the command".to_string(),
+        ));
+    }
+
+    let json = serde_json::to_string(&ack).map_err(|err| {
+        RunnerError::new(
+            exit::INTERNAL,
+            format!("could not render the control ack: {err}"),
+        )
+    })?;
+    println!("{json}");
+    Ok(())
+}
+
+/// Find the endpoint of the *live* run named `run_id`, or a distinguishable
+/// [`exit::CONTROL`] failure that says *why* it cannot be reached. Shared by every
+/// client (`inspect`/`cancel`/`kill`); `action` names the verb in the message.
+async fn resolve_live_endpoint(action: &str, run_id: &str) -> Result<String, RunnerError> {
     let registry = registry::Registry::open().map_err(|err| {
-        unreachable_run(run_id, format!("could not open the run registry: {err}"))
+        unreachable_run(
+            action,
+            run_id,
+            format!("could not open the run registry: {err}"),
+        )
     })?;
     let entries = registry.entries().map_err(|err| {
-        unreachable_run(run_id, format!("could not read the run registry: {err}"))
+        unreachable_run(
+            action,
+            run_id,
+            format!("could not read the run registry: {err}"),
+        )
     })?;
 
     let matches: Vec<registry::Entry> = entries
@@ -281,6 +512,7 @@ async fn inspect_async(run_id: &str) -> Result<(), RunnerError> {
         .collect();
     if matches.is_empty() {
         return Err(unreachable_run(
+            action,
             run_id,
             "no run with that id is registered".to_string(),
         ));
@@ -295,54 +527,50 @@ async fn inspect_async(run_id: &str) -> Result<(), RunnerError> {
     else {
         if matches.iter().any(|entry| entry.health == Health::Live) {
             return Err(unreachable_run(
+                action,
                 run_id,
                 "the run is live but exposes no control endpoint".to_string(),
             ));
         }
         return Err(unreachable_run(
+            action,
             run_id,
             "its registry entry is stale — the runner is gone (it exited without cleaning up)"
                 .to_string(),
         ));
     };
-    let endpoint = entry
+    Ok(entry
         .record
         .endpoint
         .as_deref()
-        .expect("filtered for an entry whose endpoint is Some");
+        .expect("filtered for an entry whose endpoint is Some")
+        .to_string())
+}
 
-    // Connect under a deadline: a runner that died between the liveness probe and now
-    // fails fast here instead of hanging the client.
-    let stream = tokio::time::timeout(CONNECT_DEADLINE, imp::connect(endpoint))
+/// Connect to a live runner's endpoint under [`CONNECT_DEADLINE`]: a runner that
+/// died between the liveness probe and now fails fast as a bounded [`exit::CONTROL`]
+/// error instead of hanging the client.
+async fn connect_live(
+    endpoint: &str,
+    action: &str,
+    run_id: &str,
+) -> Result<imp::Stream, RunnerError> {
+    tokio::time::timeout(CONNECT_DEADLINE, imp::connect(endpoint))
         .await
         .map_err(|_| {
             unreachable_run(
+                action,
                 run_id,
-                "timed out connecting to the live runner".to_string(),
+                "timed out connecting to the live runner".into(),
             )
         })?
         .map_err(|err| {
             unreachable_run(
+                action,
                 run_id,
                 format!("could not reach the live runner (it may have just exited): {err}"),
             )
-        })?;
-
-    // Converse under a deadline: a runner that died mid-write, or accepted but never
-    // answers, is bounded here — a distinguishable CONTROL result, not a hang.
-    let snapshot = tokio::time::timeout(CONVERSATION_DEADLINE, converse(stream))
-        .await
-        .map_err(|_| unreachable_run(run_id, "the runner did not answer in time".to_string()))?
-        .map_err(|err| unreachable_run(run_id, err.to_string()))?;
-
-    let json = serde_json::to_string(&snapshot).map_err(|err| {
-        RunnerError::new(
-            exit::INTERNAL,
-            format!("could not render the inspect snapshot: {err}"),
-        )
-    })?;
-    println!("{json}");
-    Ok(())
+        })
 }
 
 /// Ask the connected runner for a snapshot and parse its reply. A closed connection
@@ -374,12 +602,43 @@ where
     })
 }
 
+/// Send a mutating verb (`cancel`/`kill`) and parse the runner's [`ControlAck`]. A
+/// closed connection before a complete line (runner died mid-conversation) or an
+/// unparseable line surfaces as an error the caller maps to [`exit::CONTROL`] — the
+/// same shape as [`converse`], but for the ack rather than a snapshot.
+async fn converse_mutation<S>(stream: S, command: ControlCommand) -> io::Result<ControlAck>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (read_half, mut write_half) = split(stream);
+    write_half.write_all(command.verb().as_bytes()).await?;
+    write_half.write_all(b"\n").await?;
+    write_half.flush().await?;
+
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    let read = reader.read_line(&mut line).await?;
+    if read == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "the runner closed the connection before answering (it may have just exited)",
+        ));
+    }
+    serde_json::from_str::<ControlAck>(line.trim()).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("the runner sent an unreadable response: {err}"),
+        )
+    })
+}
+
 /// A "cannot reach the target run" error carrying the reserved [`exit::CONTROL`] code
-/// and a message naming the run and the reason.
-fn unreachable_run(run_id: &str, detail: String) -> RunnerError {
+/// and a message naming the `action` (`inspect`/`cancel`/`kill`), the run, and the
+/// reason.
+fn unreachable_run(action: &str, run_id: &str, detail: String) -> RunnerError {
     RunnerError::new(
         exit::CONTROL,
-        format!("cannot inspect run `{run_id}`: {detail}"),
+        format!("cannot {action} run `{run_id}`: {detail}"),
     )
 }
 
@@ -406,7 +665,13 @@ mod imp {
 
     use tokio::net::{UnixListener, UnixStream};
 
-    use super::{Infallible, SnapshotSource, handle_connection, io, unique_token};
+    use super::{
+        ControlCommandSink, Infallible, SnapshotSource, handle_connection, io, unique_token,
+    };
+
+    /// The connected client stream type on this platform — a unix domain socket
+    /// stream. Named so the platform-agnostic client can hold it without a `cfg`.
+    pub type Stream = UnixStream;
 
     /// A run's bound control transport: a listening unix socket. Holds the socket
     /// path so it can be removed on a clean teardown (when this is dropped).
@@ -459,10 +724,14 @@ mod imp {
         }
 
         /// Accept and serve clients forever (never returns — see [`super::serve`]).
-        pub async fn serve(self, source: &SnapshotSource<'_>) -> Infallible {
+        pub async fn serve(
+            self,
+            source: &SnapshotSource<'_>,
+            commands: &ControlCommandSink,
+        ) -> Infallible {
             loop {
                 match self.listener.accept().await {
-                    Ok((stream, _addr)) => handle_connection(stream, source).await,
+                    Ok((stream, _addr)) => handle_connection(stream, source, commands).await,
                     // A transient accept error (e.g. a fd limit) must not spin the
                     // loop; pause briefly, then keep serving.
                     Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
@@ -540,7 +809,13 @@ mod imp {
     };
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 
-    use super::{Infallible, SnapshotSource, handle_connection, io, unique_token};
+    use super::{
+        ControlCommandSink, Infallible, SnapshotSource, handle_connection, io, unique_token,
+    };
+
+    /// The connected client stream type on this platform — a named-pipe client. Named
+    /// so the platform-agnostic client can hold it without a `cfg`.
+    pub type Stream = NamedPipeClient;
 
     /// A run's bound control transport: an owner-only named pipe. Holds the owner-only
     /// security descriptor (kept alive for every instance it creates) and the first
@@ -573,7 +848,11 @@ mod imp {
         }
 
         /// Accept and serve clients forever (never returns — see [`super::serve`]).
-        pub async fn serve(mut self, source: &SnapshotSource<'_>) -> Infallible {
+        pub async fn serve(
+            mut self,
+            source: &SnapshotSource<'_>,
+            commands: &ControlCommandSink,
+        ) -> Infallible {
             // Move out the instance created at bind; thereafter each iteration stands
             // up the *next* instance before servicing the current one, so the pipe
             // always has a waiting instance and no client hits a momentary "no pipe".
@@ -596,12 +875,12 @@ mod imp {
                     // Cannot stand up the next instance: serve this last client, then
                     // park forever (no more can be accepted, but the run is fine).
                     Err(_) => {
-                        handle_connection(server, source).await;
+                        handle_connection(server, source, commands).await;
                         park_forever().await
                     }
                 };
                 let connected = std::mem::replace(&mut server, next);
-                handle_connection(connected, source).await;
+                handle_connection(connected, source, commands).await;
             }
         }
     }
@@ -769,6 +1048,121 @@ mod tests {
         assert_eq!(calls.get(), 2, "members are queried on every snapshot");
     }
 
+    /// A control ack round-trips through JSON: the server serializes exactly what the
+    /// `cancel`/`kill` client parses back to confirm the runner answered its verb.
+    #[test]
+    fn ack_round_trips_through_json() {
+        let line = serialize_ack(&ControlAck {
+            accepted: true,
+            action: "kill".to_string(),
+            run_id: "run-k".to_string(),
+        });
+        let parsed: ControlAck = serde_json::from_str(&line).expect("an ack line parses back");
+        assert!(parsed.accepted);
+        assert_eq!(parsed.action, "kill");
+        assert_eq!(parsed.run_id, "run-k");
+    }
+
+    #[test]
+    fn command_verbs_are_the_on_the_wire_spelling() {
+        assert_eq!(ControlCommand::Cancel.verb(), "cancel");
+        assert_eq!(ControlCommand::Kill.verb(), "kill");
+    }
+
+    /// Drive one server-side exchange for `verb` over an in-memory duplex stream, and
+    /// return the response line the client read plus the command (if any) the server
+    /// routed to the run's main loop. The shared harness for the routing tests below.
+    async fn serve_verb(verb: &str) -> (String, Option<ControlCommand>) {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let members = || vec![Member::from_pid(1)];
+        let source = SnapshotSource::new(
+            "run-t",
+            "job_object",
+            Some(1),
+            SystemTime::UNIX_EPOCH,
+            &members,
+        );
+
+        client
+            .write_all(format!("{verb}\n").as_bytes())
+            .await
+            .expect("write the request verb");
+        serve_one(server, &source, &tx)
+            .await
+            .expect("serve one connection");
+
+        let mut reader = BufReader::new(&mut client);
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .expect("read the response");
+        (line.trim().to_string(), rx.try_recv().ok())
+    }
+
+    /// The server routes a `cancel` verb into a `Cancel` command *and* answers with an
+    /// ack naming the run and the action — the wire contract the `cancel` client
+    /// depends on.
+    #[tokio::test]
+    async fn cancel_verb_acks_and_routes_a_command() {
+        let (response, command) = serve_verb("cancel").await;
+        let ack: ControlAck = serde_json::from_str(&response).expect("the reply is an ack");
+        assert!(ack.accepted, "the runner accepts the cancel: {response}");
+        assert_eq!(ack.action, "cancel");
+        assert_eq!(ack.run_id, "run-t");
+        assert_eq!(
+            command,
+            Some(ControlCommand::Cancel),
+            "a cancel verb routes a Cancel command to the run's loop"
+        );
+    }
+
+    /// The `kill` verb routes a distinct `Kill` command and acks it — distinguishable
+    /// from cancel on both the command and the ack's `action`.
+    #[tokio::test]
+    async fn kill_verb_acks_and_routes_a_distinct_command() {
+        let (response, command) = serve_verb("kill").await;
+        let ack: ControlAck = serde_json::from_str(&response).expect("the reply is an ack");
+        assert!(ack.accepted);
+        assert_eq!(ack.action, "kill");
+        assert_eq!(
+            command,
+            Some(ControlCommand::Kill),
+            "a kill verb routes a Kill command, distinct from cancel"
+        );
+    }
+
+    /// `inspect` stays read-only: it answers with a snapshot and routes **no**
+    /// teardown command — the mutating verbs did not regress the query path.
+    #[tokio::test]
+    async fn inspect_verb_answers_a_snapshot_and_routes_no_command() {
+        let (response, command) = serve_verb("inspect").await;
+        let snapshot: Snapshot = serde_json::from_str(&response).expect("the reply is a snapshot");
+        assert_eq!(snapshot.run_id, "run-t");
+        assert!(
+            command.is_none(),
+            "inspect must never signal a teardown command"
+        );
+    }
+
+    /// An unrecognized verb is a structured error and routes no command — a foreign
+    /// client cannot end a run by sending garbage.
+    #[tokio::test]
+    async fn unknown_verb_errors_and_routes_no_command() {
+        let (response, command) = serve_verb("frobnicate").await;
+        let value: serde_json::Value = serde_json::from_str(&response).expect("valid JSON");
+        assert!(
+            value.get("error").and_then(|v| v.as_str()).is_some(),
+            "an unknown verb yields an error object: {response}"
+        );
+        assert!(
+            command.is_none(),
+            "an unknown verb must never signal a teardown command"
+        );
+    }
+
     /// An unrecognized request gets a structured error line, never a snapshot.
     #[test]
     fn unknown_request_serializes_a_structured_error() {
@@ -783,12 +1177,14 @@ mod tests {
     }
 
     /// A "cannot reach the run" error takes the reserved CONTROL code and names the
-    /// run — the distinguishable result for a stale/dead runner.
+    /// action and the run — the distinguishable result for a stale/dead runner, the
+    /// same for every client verb.
     #[test]
     fn unreachable_run_uses_the_control_code() {
-        let err = unreachable_run("run-9", "its registry entry is stale".to_string());
+        let err = unreachable_run("cancel", "run-9", "its registry entry is stale".to_string());
         assert_eq!(err.code(), exit::CONTROL);
         let message = err.to_string();
+        assert!(message.contains("cancel"), "names the action: {message}");
         assert!(message.contains("run-9"), "names the run: {message}");
         assert!(message.contains("stale"), "carries the reason: {message}");
     }
