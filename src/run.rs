@@ -232,6 +232,12 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
         .and_then(|registry| register_run(registry, &run_id, endpoint.as_deref(), started));
 
     let mut command = PkCommand::new(program).args(program_args);
+    // Abrupt runner death skips ProcessGroup::drop. ProcessKit can still harden the
+    // direct child on Linux via PR_SET_PDEATHSIG; Windows already gets the stronger
+    // whole-tree guarantee from Job Object kill-on-close, while macOS/BSD document a
+    // no-op. This is deliberately unconditional so the actual platform capability is
+    // always enabled without pretending it covers Unix grandchildren.
+    command = command.kill_on_parent_death();
     // Default cwd is the runner's own current directory (processkit leaves it
     // unset), so only override when `--cwd` was given.
     if let Some(cwd) = &args.cwd {
@@ -295,6 +301,7 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
         run_id: run_id.clone(),
         root_pid,
         mechanism,
+        abrupt_cleanup: events::abrupt_cleanup_str(),
         cwd: resolve_cwd(&args),
         command: events::CommandInfo::for_argv(&args.command, args.argv_raw),
     });

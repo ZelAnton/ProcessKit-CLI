@@ -44,7 +44,8 @@ to a dated version section.
 - Versioned JSONL event schema (v1): `run` now writes a stream of lifecycle
   events to the `--jsonl` file — one JSON object per line, each with a
   `schema_version`, and never to stdout. The stream covers `run_started` (run id,
-  root PID, containment mechanism, working directory), `members_snapshot`,
+  root PID, containment mechanism, abrupt-owner-death cleanup scope, working
+  directory), `members_snapshot`,
   `root_exited`, the `cleanup_started` / `cleanup_finished` teardown pair,
   `timeout` / `cancelled`, launch and container errors, and a terminal
   `runner_exit` that preserves the child's own code even on the runner's own
@@ -68,6 +69,12 @@ to a dated version section.
   open past the root's exit cannot hang the runner). A run without `--capture-dir`
   is byte-for-byte unchanged (no files, no event). Additive schema v1 change,
   reflected in `docs/schema.md` and the golden fixture.
+- Abrupt runner-death hardening and proof: every spawned command opts into
+  ProcessKit's public parent-death primitive. The versioned `run_started` event
+  now reports the actual surviving guarantee as `abrupt_cleanup` (`whole_tree`
+  on Windows, `direct_child_only` on Linux, `none` on macOS/other Unix), and the
+  E2E tier force-kills the runner with a live child/grandchild to verify each
+  platform's behavior without unsafe kill-by-PID cleanup.
 - Dependencies on `processkit` (the containment backbone), `tokio` (its async
   runtime), `clap` (CLI parsing), and `serde` / `serde_json` (the JSONL event
   schema).
@@ -83,8 +90,9 @@ to a dated version section.
   on Windows, cgroup v2 on Linux, POSIX process group on macOS/other Unix).
 
 ### Changed
-- `inspect`, `cancel`, and `kill` remain unimplemented and still exit with the
-  runner-range "not implemented" code; `run` no longer does.
+- `inspect` now reaches a live runner over the local control plane; `cancel` and
+  `kill` remain unimplemented and still exit with the runner-range "not
+  implemented" code.
 - `run` now consumes every flag it parses: `--jsonl` (the JSONL event stream) and
   `--capture-dir` (bounded output capture) are both wired up.
 

@@ -43,3 +43,12 @@ The CLI will consume, rather than duplicate, the core's forthcoming
 `ProcessGroup::members_info()` snapshots and Windows graceful shutdown support.
 Until then, member snapshots may be PID-only and Windows cancellation must
 report its hard-kill fallback honestly.
+
+Whole-tree cleanup after an abrupt runner death is also a core dependency on
+Unix. The current public primitive kills only the direct child on Linux and is a
+no-op on macOS/BSD; cgroups and process groups do not disappear with their owner.
+Until ProcessKit exposes an additive, identity-safe whole-tree owner-death
+primitive, the CLI reports `direct_child_only` or `none` in `run_started` and
+does not claim the Windows guarantee on those platforms. The core work is
+tracked as ProcessKit-rs task T-151 and must include cross-platform abrupt-death
+proof before this contract can be strengthened.

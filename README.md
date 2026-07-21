@@ -78,12 +78,18 @@ in force rather than papering over the difference:
   reaps every member. It requires cgroup v2 (the unified hierarchy — standard on
   modern distros). Where cgroup v2 delegation is unavailable, the runner honestly
   falls back to the POSIX **process-group** mechanism below and reports
-  `process_group`; it never claims a cgroup it did not get.
+  `process_group`; it never claims a cgroup it did not get. If the runner itself
+  dies abruptly, the enabled parent-death signal kills the direct child, but the
+  cgroup persists and does not automatically kill grandchildren.
 - **macOS and other Unix — process group.** Teardown signals the process group;
   a descendant that deliberately leaves it (`setsid` / double-fork) can escape,
-  and a just-exited child may still be listed in the post-kill snapshot. A
-  guaranteed whole-tree reap on *abrupt* owner death is a Windows-Job-Object
-  property and is not promised here.
+  and a just-exited child may still be listed in the post-kill snapshot. The
+  current ProcessKit API provides no parent-death cleanup on these targets.
+
+Every `run_started` event reports this separate abrupt-owner-death contract as
+`abrupt_cleanup`: `whole_tree` on Windows, `direct_child_only` on Linux, and
+`none` on macOS/other Unix. Normal completion, timeout, and Ctrl-C still run the
+owned container's ordinary teardown path on every supported platform.
 
 ## Planned interface
 
@@ -109,10 +115,11 @@ TTY**, so terminal-dependent behavior can degrade — colors, progress bars, and
 other cursor tricks may render as plain, line-oriented text. A true PTY is not
 implemented here (PTY support is deferred in the core crate).
 
-`inspect`, `cancel`, and `kill` will communicate with a live `run` process over
-local IPC. If the runner dies, ProcessKit's kill-on-drop containment ends that
-run's tree; the registry entry is then stale rather than an invitation to
-address processes by PID.
+`inspect` communicates with a live `run` process over local IPC; `cancel` and
+`kill` will use the same control plane. If the runner dies, the registry entry is
+stale rather than an invitation to address processes by PID. Cleanup after that
+abrupt death follows the platform-specific `abrupt_cleanup` guarantee above;
+only Windows currently guarantees the whole tree.
 
 ## Exit codes
 
@@ -231,10 +238,10 @@ teardown of the whole tree (see "Timeouts, cancel, and grace"), and writes the
 versioned JSONL event stream to `--jsonl` (see "JSONL event schema"). `--run-id`
 and `--argv-raw` are consumed by that stream, and `--capture-dir` records a bounded
 stdout/stderr transcript with per-stream byte counts, hashes, and truncation flags
-(see "Bounded output capture"). The control-plane subcommands (`inspect`, `cancel`,
-`kill`) are not implemented yet — those still report a runner-range "not
-implemented" error. See [the roadmap](docs/ROADMAP.md) for the intended delivery
-order.
+(see "Bounded output capture"). `inspect` reaches live runs through the local
+control plane; `cancel` and `kill` are not implemented yet and still report a
+runner-range "not implemented" error. See [the roadmap](docs/ROADMAP.md) for the
+intended delivery order.
 
 ## Development
 

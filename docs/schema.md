@@ -53,13 +53,22 @@ apply they are the JSON literal `null` (explicitly absent), never omitted.
 
 The run has begun: the child is spawned into the container.
 
-| Field       | Type              | Notes                                                                 |
-|-------------|-------------------|-----------------------------------------------------------------------|
-| `run_id`    | string            | The `--run-id` value, or a generated `run-<pid>-<unix_nanos>`.         |
-| `root_pid`  | integer, nullable | The root child's PID; `null` if the backend exposed none.             |
-| `mechanism` | string            | Containment mechanism: `job_object`, `cgroup_v2`, or `process_group`. |
-| `cwd`       | string, nullable  | The child's working directory; `null` if it could not be resolved.    |
-| `command`   | object            | The command, redacted by default — see "Command redaction".           |
+| Field            | Type              | Notes                                                                 |
+|------------------|-------------------|-----------------------------------------------------------------------|
+| `run_id`         | string            | The `--run-id` value, or a generated `run-<pid>-<unix_nanos>`.         |
+| `root_pid`       | integer, nullable | The root child's PID; `null` if the backend exposed none.             |
+| `mechanism`      | string            | Containment mechanism: `job_object`, `cgroup_v2`, or `process_group`. |
+| `abrupt_cleanup` | string            | Cleanup surviving abrupt runner death: `whole_tree`, `direct_child_only`, or `none`. |
+| `cwd`            | string, nullable  | The child's working directory; `null` if it could not be resolved.    |
+| `command`        | object            | The command, redacted by default — see "Command redaction".           |
+
+`abrupt_cleanup` is distinct from `mechanism` and from ordinary teardown. It is
+`whole_tree` on Windows because closing the runner's last Job Object handle kills
+all members; `direct_child_only` on Linux because the runner enables ProcessKit's
+parent-death signal for the root child while cgroups themselves persist; and
+`none` on macOS/other Unix because the current public API has no parent-death
+primitive there. Normal completion, timeout, and cancellation still invoke the
+reported container mechanism's regular teardown.
 
 ### `members_snapshot`
 

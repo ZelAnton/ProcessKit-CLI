@@ -134,25 +134,13 @@ fn leaked_grandchild_is_reaped_and_a_nonzero_code_survives_unclamped() {
     );
 }
 
-/// After an **abrupt** runner death (no destructors, so no kill-on-drop), the
-/// kernel container must still reap the tree. That guarantee is the Windows Job
-/// Object's kill-on-close; on Unix the equivalent hardening is opt-in and
-/// direct-child-only (`processkit`'s `Command::kill_on_parent_death`), which this
-/// runner does not use — so there is no whole-tree guarantee to assert, and the
-/// scenario skips loudly rather than pretend one exists.
+/// Force-kill the runner while its child and grandchild are alive, then prove the
+/// exact platform contract reported in `run_started`: Windows reaps the whole
+/// Job, Linux's enabled PDEATHSIG kills only the direct child, and macOS/other
+/// Unix currently provides no abrupt-owner-death cleanup. Unix survivors are
+/// bounded helpers and self-terminate; the test never kills an observed PID.
 #[test]
-fn abrupt_runner_death_still_reaps_the_tree() {
-    if !cfg!(windows) {
-        eprintln!(
-            "SKIP abrupt_runner_death_still_reaps_the_tree: whole-tree reaping after an \
-             abrupt runner kill is the Windows Job Object kill-on-close guarantee; on {} it \
-             is not kernel-enforced for a leaked grandchild (that would need opt-in, \
-             direct-child-only kill_on_parent_death), so there is nothing to assert here.",
-            std::env::consts::OS
-        );
-        return;
-    }
-
+fn abrupt_runner_death_reports_and_enforces_platform_scope() {
     let scenario = Scenario::new("e2e-abrupt");
     let pidfile = scenario.path("grandchild.pid");
     let pidfile_arg = pidfile.to_string_lossy().into_owned();
@@ -169,9 +157,9 @@ fn abrupt_runner_death_still_reaps_the_tree() {
                 "--pidfile",
                 &pidfile_arg,
                 "--root-sleep-secs",
-                "120",
+                "12",
                 "--grandchild-sleep-secs",
-                "120",
+                "12",
             ],
         ),
     )
@@ -187,20 +175,66 @@ fn abrupt_runner_death_still_reaps_the_tree() {
         "the root never recorded a grandchild PID"
     );
     let grandchild = read_pid(&pidfile).expect("the root recorded the grandchild PID");
+    let events = read_events(&events_path(&scenario.dir));
+    let started = events
+        .iter()
+        .find(|event| event["event"] == "run_started")
+        .expect("the runner flushed run_started before the helper wrote its pidfile");
+    let root = started["root_pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .expect("run_started carries a valid root PID");
     assert!(
-        pid_is_alive(grandchild),
-        "the grandchild (PID {grandchild}) should be alive before the runner is killed"
+        pid_is_alive(root) && pid_is_alive(grandchild),
+        "the root (PID {root}) and grandchild (PID {grandchild}) should both be alive before \
+         the runner is killed"
     );
 
-    // Abrupt kill: `TerminateProcess` of the runner — no clean shutdown, no `Drop`.
-    // Its sole Job Object handle closes with it, so the kernel reaps the tree.
+    // Abrupt, identity-safe kill through the Child handle: no clean shutdown and
+    // no ProcessGroup::drop. From here on PID probes only observe; they never kill.
     runner.kill_now();
 
-    assert!(
-        wait_until(|| !pid_is_alive(grandchild), Duration::from_secs(15)),
-        "the leaked grandchild (PID {grandchild}) survived an abrupt runner death — the \
-         Job Object kill-on-close did not reap the tree"
-    );
+    if cfg!(windows) {
+        assert_eq!(started["abrupt_cleanup"], "whole_tree");
+        assert!(
+            wait_until(
+                || !pid_is_alive(root) && !pid_is_alive(grandchild),
+                Duration::from_secs(15)
+            ),
+            "the root (PID {root}) or grandchild (PID {grandchild}) survived abrupt runner \
+             death despite the reported whole_tree guarantee"
+        );
+    } else if cfg!(target_os = "linux") {
+        assert_eq!(started["abrupt_cleanup"], "direct_child_only");
+        assert!(
+            wait_until(|| !pid_is_alive(root), Duration::from_secs(5)),
+            "the direct child (PID {root}) survived abrupt runner death despite PDEATHSIG"
+        );
+        assert!(
+            pid_is_alive(grandchild),
+            "the grandchild (PID {grandchild}) unexpectedly died; the test must expose the \
+             documented direct-child-only limitation"
+        );
+        assert!(
+            wait_until(|| !pid_is_alive(grandchild), Duration::from_secs(15)),
+            "the bounded grandchild (PID {grandchild}) did not self-terminate"
+        );
+    } else {
+        assert_eq!(started["abrupt_cleanup"], "none");
+        assert!(
+            pid_is_alive(root) && pid_is_alive(grandchild),
+            "the root (PID {root}) or grandchild (PID {grandchild}) unexpectedly died; the \
+             test must expose the documented lack of abrupt cleanup"
+        );
+        assert!(
+            wait_until(
+                || !pid_is_alive(root) && !pid_is_alive(grandchild),
+                Duration::from_secs(15)
+            ),
+            "the bounded root (PID {root}) or grandchild (PID {grandchild}) did not \
+             self-terminate"
+        );
+    }
 }
 
 /// A descendant that keeps the inherited stdout handle open after the root exits

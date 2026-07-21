@@ -102,8 +102,8 @@ fn events_go_to_the_jsonl_file_and_never_stdout() {
     );
 }
 
-/// `run_started` reports the child's root PID, the containment mechanism, and a
-/// redacted command by default (no raw argv, no fabricated hash).
+/// `run_started` reports the child's root PID, containment mechanism, the
+/// platform's abrupt-owner-death guarantee, and a redacted command by default.
 #[test]
 fn run_started_reports_root_pid_mechanism_and_redacts_the_command() {
     let dir = scratch("run-started");
@@ -124,6 +124,17 @@ fn run_started_reports_root_pid_mechanism_and_redacts_the_command() {
     assert!(
         ["job_object", "cgroup_v2", "process_group"].contains(&mechanism),
         "mechanism must be one of the documented values, got {mechanism:?}"
+    );
+    let expected_abrupt_cleanup = if cfg!(windows) {
+        "whole_tree"
+    } else if cfg!(target_os = "linux") {
+        "direct_child_only"
+    } else {
+        "none"
+    };
+    assert_eq!(
+        started["abrupt_cleanup"], expected_abrupt_cleanup,
+        "run_started must report the guarantee that survives abrupt runner death: {started}"
     );
 
     let command = &started["command"];

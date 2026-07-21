@@ -70,6 +70,9 @@ pub enum Event {
         root_pid: Option<u32>,
         /// `job_object` | `cgroup_v2` | `process_group` (see [`mechanism_str`]).
         mechanism: &'static str,
+        /// `whole_tree` | `direct_child_only` | `none`: the cleanup guarantee that
+        /// remains if the runner itself dies without running destructors.
+        abrupt_cleanup: &'static str,
         /// Working directory the child runs in, or `null` if it could not be
         /// resolved.
         cwd: Option<String>,
@@ -436,6 +439,29 @@ pub fn mechanism_str(mechanism: Mechanism) -> &'static str {
     }
 }
 
+/// The containment guarantee that survives an abrupt runner death on this target.
+/// This is deliberately OS-derived rather than inferred from [`Mechanism`]: Linux
+/// cgroups persist after their creator dies, so the enabled PDEATHSIG still covers
+/// only the direct child; a Windows Job handle close reaps the whole tree.
+pub fn abrupt_cleanup_str() -> &'static str {
+    #[cfg(windows)]
+    {
+        "whole_tree"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "direct_child_only"
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        "none"
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        "none"
+    }
+}
+
 /// Decompose a completed run's [`Outcome`] into the `root_exited` fields:
 /// `(outcome, code, signal)`. `Outcome` is `#[non_exhaustive]`; an unrecognized
 /// variant is reported as `"unknown"` with neither a code nor a signal.
@@ -527,6 +553,7 @@ mod tests {
                 run_id: "run-000".to_string(),
                 root_pid: Some(4242),
                 mechanism: mechanism_str(Mechanism::JobObject),
+                abrupt_cleanup: "whole_tree",
                 cwd: Some("/work/project".to_string()),
                 command: CommandInfo::for_argv(msbuild_argv, false),
             },
@@ -534,6 +561,7 @@ mod tests {
                 run_id: "run-001".to_string(),
                 root_pid: Some(4242),
                 mechanism: mechanism_str(Mechanism::JobObject),
+                abrupt_cleanup: "whole_tree",
                 cwd: Some("/work/project".to_string()),
                 command: CommandInfo::for_argv(msbuild_argv, true),
             },
