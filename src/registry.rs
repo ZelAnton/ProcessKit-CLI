@@ -27,9 +27,10 @@
 //!   lock: it can only succeed when no live runner holds it, i.e. the entry is
 //!   stale (see [`Registry::entries`] and [`Health`]).
 //!
-//! The connection *endpoint* is reserved but unset here: the local transport lands
-//! in T-008, so [`Record::endpoint`] is `None` today and future work fills it
-//! without reshaping the record.
+//! The connection *endpoint* names the run's local control transport (a unix socket
+//! path, or a Windows named-pipe name — see [`crate::control`]). A live runner
+//! publishes it here so a client can reach it; it is `None` only when the transport
+//! could not be stood up (best-effort degradation, the run still works).
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -68,9 +69,10 @@ pub struct Record {
     /// The run's identifier (`--run-id` or a generated value); the key clients match
     /// on. Not a PID.
     pub run_id: String,
-    /// The local transport connection address. **Reserved**: the transport is set up
-    /// in T-008, so this is `None` today. The field exists now so filling it later
-    /// does not reshape the record.
+    /// The run's local control-transport connection address — a unix socket path, or
+    /// a Windows named-pipe name (see [`crate::control`]). A live runner publishes it
+    /// so `inspect`/`cancel`/`kill` clients can reach it; `None` only when the
+    /// transport could not be stood up (best-effort degradation).
     pub endpoint: Option<String>,
     /// Run start time, RFC 3339 UTC with millisecond precision (same formatter as the
     /// JSONL events, see [`events::format_rfc3339_utc`]).
@@ -103,16 +105,17 @@ pub enum Health {
 }
 
 /// A scanned registry entry: its parsed [`Record`], its probed [`Health`], and the
-/// path of the record file (so a client can act on or reap it).
-// The read side is exercised by the unit tests now and consumed by the
-// control-plane clients (`inspect`/`cancel`/`kill`, T-008/T-009); the write side
-// (create/remove) is what the runner uses today, so the reader is not yet called
-// from the binary itself.
-#[allow(dead_code)]
+/// path of the record file (so a client can act on or reap it). Consumed by the
+/// control-plane client ([`crate::control`], `inspect`), which matches on `run_id`
+/// and connects only to a [`Health::Live`] entry's endpoint.
 #[derive(Debug)]
 pub struct Entry {
     pub record: Record,
     pub health: Health,
+    /// The record file's path — how a client acts on or reaps the entry. Read by the
+    /// reaping clients (`cancel`/`kill`, T-009); `inspect` matches on `run_id` and
+    /// health alone, so it does not touch it yet.
+    #[allow(dead_code)]
     pub path: PathBuf,
 }
 
@@ -137,8 +140,8 @@ impl Registry {
         Ok(Self { dir })
     }
 
-    /// The registry directory on disk.
-    #[allow(dead_code)] // Used by the tests; consumed by control-plane clients (T-008/T-009).
+    /// The registry directory on disk. The control transport places its unix socket
+    /// here so the owner-only (`0700`) directory gates access to it too.
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -148,8 +151,9 @@ impl Registry {
     /// run's lifetime; dropping it (or calling [`Registration::remove`]) tears the
     /// entry down.
     ///
-    /// `endpoint` is the local transport address, or `None` until the transport
-    /// lands (T-008). `started` is the run's start time.
+    /// `endpoint` is the local transport address the runner published (a unix socket
+    /// path / Windows pipe name), or `None` when no transport could be stood up.
+    /// `started` is the run's start time.
     pub fn register(
         &self,
         run_id: &str,
@@ -186,10 +190,9 @@ impl Registry {
     /// Scan every entry, classifying each as [`Health::Live`] or [`Health::Stale`]
     /// by probing its lock file. Unreadable or malformed files are skipped rather
     /// than failing the whole scan — a corrupt entry must not blind a client to the
-    /// healthy ones. This is the read side future clients (`inspect`/`cancel`/`kill`)
-    /// build on: find the run whose `record.run_id` matches, then act only if it is
-    /// live.
-    #[allow(dead_code)] // Exercised by the tests; consumed by the clients in T-008/T-009.
+    /// healthy ones. This is the read side the control-plane client
+    /// (`inspect`, T-008; `cancel`/`kill`, T-009) builds on: find the run whose
+    /// `record.run_id` matches, then act only if it is live.
     pub fn entries(&self) -> io::Result<Vec<Entry>> {
         let read_dir = match fs::read_dir(&self.dir) {
             Ok(read_dir) => read_dir,
@@ -342,7 +345,6 @@ impl Drop for Registration {
 /// definition. When the probe acquires the lock it drops it immediately (the entry
 /// is stale, not being claimed) — a client that means to *reclaim* a stale entry
 /// would instead keep the lock held.
-#[allow(dead_code)] // Called by `entries` (the read side); see its note.
 fn probe_health(lock_path: &Path) -> io::Result<Health> {
     let lock = match OpenOptions::new().read(true).write(true).open(lock_path) {
         Ok(lock) => lock,
@@ -387,6 +389,16 @@ fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+/// The current user's SID in its string form (`S-1-5-…`). The registry restricts
+/// its directory to exactly this identity; the local control transport
+/// ([`crate::control`]) reuses it to build the owner-only DACL for its named pipe,
+/// so the pipe and the registry are locked to the same single user. Windows-only —
+/// the unix transport gates access through `0700`/`0600` file modes instead.
+#[cfg(windows)]
+pub(crate) fn current_user_sid_string() -> io::Result<String> {
+    platform::current_user_sid_string()
 }
 
 #[cfg(unix)]
@@ -558,7 +570,10 @@ mod platform {
     }
 
     /// The current user's SID as its string form (e.g. `S-1-5-21-...`).
-    fn current_user_sid_string() -> io::Result<String> {
+    ///
+    /// `pub(super)` so the crate-level re-export ([`super::current_user_sid_string`])
+    /// can hand the same identity to the control transport's owner-only pipe DACL.
+    pub(super) fn current_user_sid_string() -> io::Result<String> {
         let mut token: HANDLE = std::ptr::null_mut();
         // SAFETY: `GetCurrentProcess` is a pseudo-handle needing no close; `token`
         // receives a real handle closed below.
@@ -923,9 +938,9 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A registered run writes a well-formed record: the run id, a reserved (null)
-    /// endpoint, the start timestamp, and the advisory-lock liveness signal — and
-    /// carries no PID.
+    /// A registered run writes a well-formed record: the run id, the endpoint it was
+    /// given (here `None`), the start timestamp, and the advisory-lock liveness
+    /// signal — and carries no PID.
     #[test]
     fn register_writes_a_record_without_a_pid() {
         let dir = scratch("record");
@@ -939,7 +954,10 @@ mod tests {
         let record: Record = serde_json::from_str(&text).expect("parse record");
         assert_eq!(record.run_id, "run-42");
         assert_eq!(record.registry_version, REGISTRY_VERSION);
-        assert!(record.endpoint.is_none(), "endpoint is reserved for T-008");
+        assert!(
+            record.endpoint.is_none(),
+            "register stores the endpoint it is given verbatim — here None"
+        );
         assert_eq!(record.started_at, events::format_rfc3339_utc(started));
         assert_eq!(record.liveness.kind, LIVENESS_ADVISORY_LOCK);
         assert!(record.liveness.lock_file.ends_with(".lock"));

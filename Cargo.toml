@@ -44,10 +44,20 @@ processkit = "2"
 # current-thread runtime hosts the run; `io-std` provides the async stdout/stderr
 # sinks the child's output is teed to. `time` arms the `--timeout` deadline timer
 # and the `--grace` window, `signal` the `Ctrl-C` listener, and `macros` the
-# `select!` that races them against the child's own exit. The child-pipe I/O
-# driver is compiled in via `processkit`'s own tokio `process`/`net` features
-# (Cargo unifies feature flags across the one tokio build).
-tokio = { version = "1", features = ["rt", "io-std", "time", "signal", "macros"] }
+# `select!` that races them against the child's own exit. `net` provides the local
+# control-plane transport (unix domain socket / Windows named pipe, see
+# `src/control.rs`) and `io-util` its line-oriented request/response codec. The
+# child-pipe I/O driver is compiled in via `processkit`'s own tokio `process`/`net`
+# features (Cargo unifies feature flags across the one tokio build).
+tokio = { version = "1", features = [
+    "rt",
+    "io-std",
+    "io-util",
+    "net",
+    "time",
+    "signal",
+    "macros",
+] }
 
 [features]
 # Opt-in end-to-end containment tier (`tests/e2e.rs`) plus its `e2e_helper`

@@ -10,8 +10,8 @@ run.
 
 This document is the normative description of the registry's **location**, **record
 format**, and **staleness signal**. The transport those clients speak over, and the
-clients themselves, are separate tasks (`docs/ROADMAP.md`, "Live-run control
-plane"); here we define only the registry.
+`inspect` client itself, are described in [`docs/control-plane.md`](control-plane.md);
+here we define only the registry.
 
 ## Location
 
@@ -52,7 +52,7 @@ file** (`<opaque-stem>.lock`). The record is a single JSON object:
 {
   "registry_version": 1,
   "run_id": "run-1234-...",
-  "endpoint": null,
+  "endpoint": "\\\\.\\pipe\\processkit-cli-1234-...",
   "started_at": "2026-07-20T21:00:00.000Z",
   "liveness": {
     "kind": "advisory_lock",
@@ -65,7 +65,7 @@ file** (`<opaque-stem>.lock`). The record is a single JSON object:
 | ------------------ | ------- |
 | `registry_version` | Record format version (currently `1`). Independent of the JSONL event `schema_version` — the registry is a private per-user contract, not the public event stream, so it versions on its own axis. |
 | `run_id`           | The run's identifier (`--run-id`, or a generated one). **This is the key** clients match on. |
-| `endpoint`         | The run's local transport connection address. **Reserved** — the transport lands in T-008, so it is `null` today. The field exists now so filling it later does not reshape the record. |
+| `endpoint`         | The run's local control-transport connection address — a unix socket path, or a Windows named-pipe name (see [`docs/control-plane.md`](control-plane.md)). A live runner publishes it here so a client can reach it; `null` only when the transport could not be stood up (best-effort degradation — the run still works, it is just not inspectable). |
 | `started_at`       | Run start time, RFC 3339 UTC with millisecond precision. |
 | `liveness`         | How to decide whether the record is live or stale (see below). |
 

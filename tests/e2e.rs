@@ -334,3 +334,110 @@ fn rapid_run_churn_does_not_touch_an_unrelated_bystander() {
 
     bystander.kill_now();
 }
+
+/// How many record files (`*.json`) the registry directory holds right now.
+fn registry_record_count(dir: &std::path::Path) -> usize {
+    match std::fs::read_dir(dir) {
+        Ok(read_dir) => read_dir
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .count(),
+        Err(_) => 0,
+    }
+}
+
+/// Run `inspect --run-id <id> --json` against a scratch registry, and wait for it.
+fn inspect(registry: &std::path::Path, run_id: &str) -> std::process::Output {
+    Command::new(bin())
+        .args(["inspect", "--run-id", run_id, "--json"])
+        .env("PROCESSKIT_CLI_REGISTRY_DIR", registry)
+        .output()
+        .expect("spawn the inspect client")
+}
+
+/// The control plane end to end: `inspect` reaches a live containment run over the
+/// local transport and reports the *real* container — its root PID and a non-empty
+/// member list — and, once the runner dies abruptly (its `Drop`/cleanup skipped),
+/// detects the run is gone with the reserved `CONTROL` code rather than hanging on a
+/// dead endpoint. The helper root self-bounds, so nothing leaks if the test aborts.
+#[test]
+fn inspect_reads_a_live_run_and_detects_an_abrupt_death() {
+    let scenario = Scenario::new("e2e-inspect");
+    let registry = scenario.path("registry");
+    let pidfile = scenario.path("grandchild.pid");
+    let pidfile_arg = pidfile.to_string_lossy().into_owned();
+
+    let runner = command_with_flags(
+        &scenario.dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "e2e-run"],
+        helper(
+            "root",
+            &[
+                "--pidfile",
+                &pidfile_arg,
+                "--root-sleep-secs",
+                "120",
+                "--grandchild-sleep-secs",
+                "120",
+            ],
+        ),
+    )
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .expect("spawn the runner");
+    let mut runner = ChildGuard::new(runner);
+
+    // The run is inspectable once it has published its registry record + endpoint.
+    assert!(
+        wait_until(
+            || registry_record_count(&registry) == 1,
+            Duration::from_secs(20)
+        ),
+        "the run never registered, so it could not be inspected"
+    );
+
+    // Inspect the live run: it reports the run id, a mechanism, the root PID, and a
+    // non-empty member list — the live container, reached over the local transport.
+    let out = inspect(&registry, "e2e-run");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "inspecting a live run succeeds; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("inspect prints a JSON snapshot line");
+    assert_eq!(
+        snapshot["run_id"], "e2e-run",
+        "the snapshot names the run: {snapshot}"
+    );
+    assert!(
+        snapshot["mechanism"].is_string(),
+        "the snapshot names the containment mechanism: {snapshot}"
+    );
+    assert!(
+        snapshot["root_pid"].as_u64().is_some(),
+        "the snapshot carries the live root PID: {snapshot}"
+    );
+    assert!(
+        snapshot["members"]
+            .as_array()
+            .is_some_and(|members| !members.is_empty()),
+        "the snapshot lists the live container's members: {snapshot}"
+    );
+
+    // Abrupt death: kill the runner. Its `Drop`/cleanup never runs, so the entry is
+    // left behind, but the OS releases its liveness lock. `inspect` must detect the
+    // run is gone (a bounded CONTROL failure), never hang on the dead endpoint.
+    runner.kill_now();
+    assert!(
+        wait_until(
+            || inspect(&registry, "e2e-run").status.code() == Some(103),
+            Duration::from_secs(15),
+        ),
+        "inspect must detect the dead runner as a CONTROL (103) failure, not hang"
+    );
+}

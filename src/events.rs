@@ -33,7 +33,7 @@ use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use processkit::{Mechanism, Outcome};
 
@@ -163,7 +163,12 @@ pub enum Event {
 /// One entry of a [`Event::MembersSnapshot`]. Only `pid` is populated today; the
 /// enriched fields are declared for the schema but filled `null` until ProcessKit
 /// ships `members_info()` (module docs).
-#[derive(Debug, Serialize)]
+///
+/// `Deserialize` as well as `Serialize`: the same PID-only member shape is reused
+/// by the control-plane `inspect` snapshot ([`crate::control::Snapshot`]), whose
+/// client parses the response back — so the two "container member" views never
+/// drift.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Member {
     pub pid: u32,
     pub ppid: Option<u32>,

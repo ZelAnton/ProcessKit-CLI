@@ -96,7 +96,6 @@ pub struct RunArgs {
 }
 
 /// `inspect --run-id <id> --json`
-#[allow(dead_code)] // Parsed now, consumed once the control plane lands (see RunArgs).
 #[derive(Debug, Args)]
 pub struct InspectArgs {
     /// The run to inspect.
@@ -104,7 +103,9 @@ pub struct InspectArgs {
     pub run_id: String,
 
     /// Emit the snapshot as JSON. Required to match the fixed form; JSON is
-    /// currently the only supported output format.
+    /// currently the only supported output format, so the flag is not branched on —
+    /// clap enforces its presence and `inspect` always prints JSON.
+    #[allow(dead_code)] // Part of the fixed CLI form; enforced by clap, never read.
     #[arg(long, required = true)]
     pub json: bool,
 }

@@ -49,6 +49,7 @@ use processkit::{
 
 use crate::capture::{CAPTURE_INFLIGHT_MAX_BYTES, Capture};
 use crate::cli::RunArgs;
+use crate::control::{self, SnapshotSource};
 use crate::events::{self, Emitter, Event, Member};
 use crate::exit::{self, RunnerError};
 use crate::registry;
@@ -202,14 +203,33 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
         }
     };
 
-    // Announce this run in the per-user registry *before* the child spawns, so a
-    // control-plane client (T-008+) can find the live runner for the whole run. The
-    // record is keyed by `run_id`, never by PID. Kept in scope until teardown: it
-    // holds the liveness lock that lets clients tell a live entry from a stale one,
-    // and its `Drop` is a backstop that removes the entry on the early error returns
-    // below. `run_id` is resolved once here and reused for the `run_started` event.
+    // Stand up the control plane *before* the child spawns, so a control-plane client
+    // (`inspect`, T-008) can find and reach the live runner for the whole run:
+    //
+    // 1. open the per-user registry (keyed by `run_id`, never a PID),
+    // 2. bind the local transport (unix socket / Windows named pipe, owner-only), and
+    // 3. publish the transport's endpoint in the run's registry record.
+    //
+    // All three are best-effort discovery infrastructure: a failure warns and
+    // degrades (no endpoint / no server / no entry) but never costs the child its
+    // faithfully forwarded exit code. `registration` holds the liveness lock for the
+    // whole run (so clients tell a live entry from a stale one) and its `Drop` is a
+    // backstop that removes the entry on the early error returns below;
+    // `control_server` is served concurrently with the output pump in the race below.
+    // `started` and `run_id` are resolved once here and reused for the registry
+    // record, the `run_started` event, and the control snapshot.
+    let started = SystemTime::now();
     let run_id = events::resolve_run_id(args.run_id.as_deref());
-    let registration = open_registration(&run_id);
+    let registry_handle = open_registry();
+    let control_server = registry_handle
+        .as_ref()
+        .and_then(|registry| control::open_server(registry.dir()));
+    let endpoint = control_server
+        .as_ref()
+        .map(|server| server.endpoint().to_string());
+    let registration = registry_handle
+        .as_ref()
+        .and_then(|registry| register_run(registry, &run_id, endpoint.as_deref(), started));
 
     let mut command = PkCommand::new(program).args(program_args);
     // Default cwd is the runner's own current directory (processkit leaves it
@@ -266,16 +286,31 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
         }
     };
 
-    // The root PID must be read *before* the race moves `running` into `wait()`.
+    // The root PID must be read *before* the race moves `running` into `wait()`. The
+    // mechanism is settled now too; both are reused by the `run_started` event and the
+    // control-plane snapshot below.
     let root_pid = running.pid();
+    let mechanism = events::mechanism_str(group.mechanism());
     emitter.emit(&Event::RunStarted {
         run_id: run_id.clone(),
         root_pid,
-        mechanism: events::mechanism_str(group.mechanism()),
+        mechanism,
         cwd: resolve_cwd(&args),
         command: events::CommandInfo::for_argv(&args.command, args.argv_raw),
     });
     emit_members_snapshot(&mut emitter, &group);
+
+    // What the control server answers an `inspect` with. `members` is a live query of
+    // the owning container, so a snapshot reflects the tree's composition *when
+    // inspected* — the same PID-only view the `members_snapshot` event carries.
+    let members_provider = || {
+        group
+            .members()
+            .map(|pids| pids.into_iter().map(Member::from_pid).collect())
+            .unwrap_or_default()
+    };
+    let snapshot_source =
+        SnapshotSource::new(&run_id, mechanism, root_pid, started, &members_provider);
 
     let timeout = args.timeout;
     let grace = args.grace;
@@ -284,19 +319,23 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     // fires first *decides* the outcome; only then does teardown begin, so the
     // owning group is never dropped before the outcome is known.
     //
-    // `biased` order — cancel, natural exit, deadline — makes the tie-breaks
-    // deliberate: a `Ctrl-C` always wins, and a child that exits in the very poll
-    // its deadline fires is reported as its own exit rather than a timeout. When
-    // the cancel/deadline branch wins, `running` (moved into `wait()`) is dropped;
-    // because this is a shared-group handle that does not kill on drop, the child
-    // stays alive for the grace path below, and its output pumps stop (teardown is
-    // underway).
+    // `biased` order — cancel, natural exit, deadline, then the control server —
+    // makes the tie-breaks deliberate: a `Ctrl-C` always wins, and a child that exits
+    // in the very poll its deadline fires is reported as its own exit rather than a
+    // timeout. When the cancel/deadline branch wins, `running` (moved into `wait()`)
+    // is dropped; because this is a shared-group handle that does not kill on drop,
+    // the child stays alive for the grace path below, and its output pumps stop
+    // (teardown is underway). The control-server branch **never resolves** (its output
+    // is `Infallible`): it serves `inspect` clients concurrently with the output pump,
+    // so it neither delays the child's exit nor blocks teardown — when another branch
+    // wins, this future is dropped, tearing the transport down with it.
     let capturing = capture.is_some();
     let ending = tokio::select! {
         biased;
         () = wait_for_ctrl_c() => Ending::Cancelled,
         outcome = drive_to_outcome(running, capturing) => Ending::Exited(outcome),
         () = deadline(timeout) => Ending::TimedOut,
+        never = control::serve(control_server, &snapshot_source) => match never {},
     };
 
     match ending {
@@ -425,25 +464,36 @@ fn emit_output_captured(emitter: &mut Emitter, capture: &Option<Capture>) {
     }
 }
 
-/// Announce this run in the per-user registry so future control-plane clients
-/// (`inspect`/`cancel`/`kill`, T-008+) can find the live runner.
+/// Open the per-user run registry so control-plane clients (`inspect`, T-008) can
+/// find the live runner.
 ///
-/// **Best-effort by design.** A registry failure is reported on stderr but never
-/// aborts an otherwise-healthy run: the registry is control-plane *discovery*
-/// infrastructure, separate from the containment the run depends on, and its clients
-/// are not shipped yet. Losing an entry only makes this run un-inspectable — it must
-/// never cost the child its faithfully forwarded exit code (`AGENTS.md`, "Exit-code
-/// fidelity"; the same degradation as [`emit_members_snapshot`]). The connection
-/// endpoint is reserved (`None`) until the local transport lands in T-008.
-fn open_registration(run_id: &str) -> Option<registry::Registration> {
-    let registry = match registry::Registry::open() {
-        Ok(registry) => registry,
+/// **Best-effort by design.** A failure is reported on stderr but never aborts an
+/// otherwise-healthy run: the registry is control-plane *discovery* infrastructure,
+/// separate from the containment the run depends on. Losing it only makes this run
+/// un-inspectable — it must never cost the child its faithfully forwarded exit code
+/// (`AGENTS.md`, "Exit-code fidelity"; the same degradation as
+/// [`emit_members_snapshot`]).
+fn open_registry() -> Option<registry::Registry> {
+    match registry::Registry::open() {
+        Ok(registry) => Some(registry),
         Err(err) => {
             eprintln!("processkit-cli: warning: could not open the run registry: {err}");
-            return None;
+            None
         }
-    };
-    match registry.register(run_id, None, SystemTime::now()) {
+    }
+}
+
+/// Publish this run's registry record — its `run_id`, its transport `endpoint` (the
+/// address a client connects to, or `None` when no transport could be stood up), and
+/// the liveness lock the returned [`registry::Registration`] holds for the run.
+/// Best-effort, like [`open_registry`]: a failure warns and yields `None`.
+fn register_run(
+    registry: &registry::Registry,
+    run_id: &str,
+    endpoint: Option<&str>,
+    started: SystemTime,
+) -> Option<registry::Registration> {
+    match registry.register(run_id, endpoint, started) {
         Ok(registration) => Some(registration),
         Err(err) => {
             eprintln!("processkit-cli: warning: could not create the run registry entry: {err}");

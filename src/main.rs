@@ -5,14 +5,17 @@
 //! into a ProcessKit container this process owns, echoes the child's output
 //! live, forwards its exit code faithfully, and writes the versioned JSONL
 //! lifecycle events (see [`events`] and `docs/schema.md`) to the `--jsonl` file.
-//! The control plane (`inspect`/`cancel`/`kill`) lands in a later task; those
-//! subcommands still report a runner-range "not implemented" error rather than
-//! panicking or exiting 0. The compatibility surface — CLI flags (see [`cli`]),
-//! the exit-code contract (see [`exit`] and `docs/exit-codes.md`), and the JSONL
-//! `schema_version` (see [`events`] and `docs/schema.md`) — is fixed.
+//! The control plane's first client, `inspect`, is implemented in [`control`]: it
+//! reaches a live `run` over the per-user registry and local transport and prints a
+//! machine-readable snapshot. `cancel`/`kill` still report a runner-range "not
+//! implemented" error (T-009) rather than panicking or exiting 0. The compatibility
+//! surface — CLI flags (see [`cli`]), the exit-code contract (see [`exit`] and
+//! `docs/exit-codes.md`), and the JSONL `schema_version` (see [`events`] and
+//! `docs/schema.md`) — is fixed.
 
 mod capture;
 mod cli;
+mod control;
 mod events;
 mod exit;
 mod hash;
@@ -63,14 +66,15 @@ fn report_parse_error(err: clap::Error) -> ExitCode {
     }
 }
 
-/// Route a control-plane command to its handler. These paths are unimplemented
-/// in this task; each returns a runner-range "not implemented" error so
-/// downstream tasks can replace the stub without touching the exit-code contract.
-/// `run` is handled directly in [`main`] and never reaches here.
+/// Route a control-plane command to its handler. `inspect` reaches a live runner
+/// through the registry and local transport (see [`control::inspect`]);
+/// `cancel`/`kill` are still stubs (T-009), each returning a runner-range "not
+/// implemented" error so that task can replace them without touching the exit-code
+/// contract. `run` is handled directly in [`main`] and never reaches here.
 fn dispatch(command: Command) -> Result<(), RunnerError> {
     match command {
         Command::Run(_) => Err(RunnerError::not_implemented("run")),
-        Command::Inspect(_) => Err(RunnerError::not_implemented("inspect")),
+        Command::Inspect(args) => control::inspect(&args.run_id),
         Command::Cancel(_) => Err(RunnerError::not_implemented("cancel")),
         Command::Kill(_) => Err(RunnerError::not_implemented("kill")),
     }
