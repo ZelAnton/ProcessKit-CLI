@@ -90,9 +90,14 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       # The opt-in end-to-end containment tier (tests/e2e.rs, `e2e` feature):
       # leaked-grandchild reaping through the built binary, abrupt runner death,
-      # a descendant holding the stdout pipe, and rapid PID-reuse churn. Kept out
-      # of the default `cargo test` job above (heavier, real process trees);
-      # `--nocapture` surfaces each platform skip.
+      # a descendant holding the stdout pipe, rapid PID-reuse churn, `inspect` over
+      # the live control plane, two concurrent runs contained independently,
+      # control-plane `cancel`/`kill` reaping only the target run, a Ctrl-C cancel
+      # (Unix), a `run` nested inside an outer Job Object (Windows), and the MSBuild
+      # node-reuse worker shape (a synthetic worker cross-platform, plus a real
+      # `dotnet build` when a `dotnet` SDK is present). Kept out of the default
+      # `cargo test` job above (heavier, real process trees); `--nocapture` surfaces
+      # each platform skip (e.g. the `dotnet`-absent skip).
       - run: cargo test --features e2e --test e2e -- --nocapture
 
   audit:

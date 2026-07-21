@@ -27,8 +27,9 @@ fn main() -> ExitCode {
         Some("root") => root(&args[1..]),
         Some("spin") => spin(&args[1..]),
         Some("exit") => leaf_exit(&args[1..]),
+        Some("job-parent") => job_parent(&args[1..]),
         other => {
-            eprintln!("e2e-helper: expected a mode (root|spin|exit), got {other:?}");
+            eprintln!("e2e-helper: expected a mode (root|spin|exit|job-parent), got {other:?}");
             ExitCode::from(2)
         }
     }
@@ -112,6 +113,93 @@ fn append_heartbeat(path: &Path) {
 /// rapid launch/exit/relaunch (PID-reuse) scenario.
 fn leaf_exit(args: &[String]) -> ExitCode {
     ExitCode::from(u8_flag(args, "--code", 0))
+}
+
+/// A wrapper that places **itself** into a fresh Windows Job Object and then runs
+/// the tail command (`-- <program> <args…>`) as a child, forwarding its exit code.
+///
+/// This backs the nested-Job-Object e2e scenario: the child it launches — a
+/// `processkit-cli run` — is thus started from an environment that is *already*
+/// inside a Job Object (like a terminal, build server, or IDE), and `run` must still
+/// create and tear down its own **nested** container. The outer job is deliberately
+/// plain (no `KILL_ON_JOB_CLOSE`), so it never reaps anything itself — proving the
+/// *inner* `run` container is what contains and reaps the tree even when nested.
+///
+/// On non-Windows this is a plain passthrough (the scenario that uses it is
+/// Windows-only), so the helper binary still builds on every platform.
+fn job_parent(args: &[String]) -> ExitCode {
+    let command = match tail_after_double_dash(args) {
+        Some(command) if !command.is_empty() => command,
+        _ => {
+            eprintln!("e2e-helper job-parent: expected `-- <program> <args...>`");
+            return ExitCode::from(2);
+        }
+    };
+    #[cfg(windows)]
+    {
+        if let Err(err) = place_self_in_job_object() {
+            eprintln!("e2e-helper job-parent: could not place self in a Job Object: {err}");
+            return ExitCode::from(3);
+        }
+    }
+    run_tail(&command)
+}
+
+/// The command tokens after the first `--` separator in `args`, if present.
+fn tail_after_double_dash(args: &[String]) -> Option<Vec<String>> {
+    let separator = args.iter().position(|arg| arg == "--")?;
+    Some(args[separator + 1..].to_vec())
+}
+
+/// Run the tail command inheriting our stdio (so a `run` launched here echoes to
+/// wherever this wrapper's stdio points) and forward its exit code.
+fn run_tail(command: &[String]) -> ExitCode {
+    let (program, program_args) = command
+        .split_first()
+        .expect("job-parent checked the command is non-empty");
+    match Command::new(program).args(program_args).status() {
+        // Forward the child's low exit byte (0 stays 0); the scenario only checks 0.
+        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Err(err) => {
+            eprintln!("e2e-helper job-parent: could not spawn `{program}`: {err}");
+            ExitCode::from(4)
+        }
+    }
+}
+
+/// Create a plain, unnamed Job Object and assign the current process to it, so any
+/// child spawned afterwards (the `run` under test) is created inside this outer job
+/// and must nest its own container within it.
+#[cfg(windows)]
+fn place_self_in_job_object() -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    // No name and no security attributes: a private job. No limits are set, so it has
+    // no `KILL_ON_JOB_CLOSE` — it contains membership only and never terminates the
+    // tree itself, leaving all reaping to the inner `run` container.
+    // SAFETY: both pointers are null (the documented "default" form); the returned
+    // handle is checked for null and closed on the error path below.
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `job` is a valid job handle just created; `GetCurrentProcess()` is a
+    // pseudo-handle with full access to this process, which is what
+    // AssignProcessToJobObject requires (PROCESS_SET_QUOTA | PROCESS_TERMINATE).
+    let assigned = unsafe { AssignProcessToJobObject(job, GetCurrentProcess()) };
+    if assigned == 0 {
+        let err = std::io::Error::last_os_error();
+        // SAFETY: `job` is the valid handle from CreateJobObjectW, closed exactly once.
+        unsafe { CloseHandle(job) };
+        return Err(err);
+    }
+    // Deliberately keep the job handle open for the rest of this short-lived process:
+    // dropping our reference would be harmless (the job outlives it via its member
+    // processes), but holding it keeps the outer job unambiguously current while the
+    // child `run` nests inside it. The process exits moments later, releasing it.
+    Ok(())
 }
 
 /// The value following `name` in `args`, if present.
