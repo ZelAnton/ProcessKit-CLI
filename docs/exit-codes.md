@@ -38,8 +38,9 @@ failure is not mistaken for a child result.
 | 107  | `CANCELLED`       | The run was cancelled interactively (`Ctrl-C`): the runner tore the process tree down. Distinct from `TIMEOUT` and from any child result. |
 | 108  | `CONTROL_CANCELLED` | The run was cancelled by a control-plane `cancel` command (over the local control channel): the runner ran the same soft-stop → grace → hard-kill teardown as a Ctrl-C. Distinct from `CANCELLED` so "a control client cancelled it" is told from "the operator pressed Ctrl-C". |
 | 109  | `CONTROL_KILLED`  | The run was killed by a control-plane `kill` command: the runner hard-killed the whole tree immediately (no soft stop, no grace). Distinct from every other runner-imposed ending. |
+| 110  | `PROBE_INCOMPATIBLE` | The **preflight probe** (`processkit-cli probe`) found this binary's compatibility surface does not satisfy a `--require-*` expectation. A *pre-launch* verdict, not a run outcome — no child is ever spawned by a probe. See "Preflight probe" below and [env-launch.md](env-launch.md). |
 
-Codes `110`–`119` are **reserved** for future runner-own conditions. `--help`
+Codes `111`–`119` are **reserved** for future runner-own conditions. `--help`
 and `--version` are not failures: they print to stdout and exit `0`.
 
 ## Timeout, cancel, and kill: runner-imposed outcomes
@@ -70,6 +71,25 @@ the authoritative, machine-readable form of these outcomes is the `timeout` /
 `cancelled` / `killed` event (and the terminal `runner_exit`) in the versioned JSONL
 stream — see `docs/schema.md`.
 
+## Preflight probe: a pre-launch verdict, not a run outcome
+
+`PROBE_INCOMPATIBLE` (110) is different in kind from every code above. It is not the
+ending of a run — the `probe` subcommand never spawns a child, opens the registry, or
+creates a container — but the verdict of a *preflight* a consumer runs on a candidate
+binary **before** launching anything through it (see `docs/env-launch.md`). It is
+minted only when the probe was asked to verify an expectation
+(`--require-schema-version`, `--require-exit-code-band`, or `--require-surface`) that
+this binary's surface does not satisfy. A satisfied (or unrequested) surface exits
+`0`. The launcher contract is **fail-closed**: an incompatible binary must be reported
+with this distinct, reserved code rather than silently used, so a consumer never
+degrades into an uncontained launch. As with the run codes, the number is a
+best-effort signal; the authoritative detail is the probe's JSON report (`compatible`
++ `mismatches`).
+
+A malformed probe argument (for example a bad `--require-exit-code-band` value) is a
+`USAGE` (100) error like any other bad flag — distinct from `PROBE_INCOMPATIBLE`, which
+means "the arguments were well-formed, but this binary cannot meet them".
+
 ## Why a band is not enough on its own
 
 Exit codes are a single small integer, and a child can, in principle, exit with
@@ -92,4 +112,6 @@ are additionally recorded out of band.
   eventually be unused. Its retirement is not a breaking change — it only ever
   meant "this build cannot do that yet."
 - New runner-own conditions take the **next free code** in the reserved range
-  rather than overloading an existing one.
+  rather than overloading an existing one. `PROBE_INCOMPATIBLE` (110) is the most
+  recent, taking the next free slot after the control-plane endings; codes
+  `111`–`119` remain reserved.

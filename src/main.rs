@@ -20,6 +20,7 @@ mod control;
 mod events;
 mod exit;
 mod hash;
+mod probe;
 mod registry;
 mod run;
 
@@ -67,17 +68,21 @@ fn report_parse_error(err: clap::Error) -> ExitCode {
     }
 }
 
-/// Route a control-plane command to its handler. `inspect`, `cancel`, and `kill`
-/// each reach a live runner through the registry and local transport (see
+/// Route a non-`run` command to its handler. `inspect`, `cancel`, and `kill` each
+/// reach a live runner through the registry and local transport (see
 /// [`control::inspect`], [`control::cancel`], [`control::kill`]); an unreachable or
-/// stale run is the reserved `CONTROL` failure, not a hang. `run` is handled
-/// directly in [`main`] and never reaches here.
+/// stale run is the reserved `CONTROL` failure, not a hang. `probe` is the
+/// side-effect-free launcher preflight (see [`probe::run`]): it reaches no runner and
+/// spawns nothing, printing this binary's compatibility surface and failing closed
+/// with `PROBE_INCOMPATIBLE` (110) when a `--require-*` check is unmet. `run` is
+/// handled directly in [`main`] and never reaches here.
 fn dispatch(command: Command) -> Result<(), RunnerError> {
     match command {
         Command::Run(_) => Err(RunnerError::not_implemented("run")),
         Command::Inspect(args) => control::inspect(&args.run_id),
         Command::Cancel(args) => control::cancel(&args.run_id),
         Command::Kill(args) => control::kill(&args.run_id),
+        Command::Probe(args) => probe::run(&args),
     }
 }
 

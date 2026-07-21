@@ -24,7 +24,7 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// The four commands that make up the runner's control surface.
+/// The commands that make up the runner's control surface.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Run a program inside a ProcessKit container and report its lifecycle.
@@ -35,6 +35,9 @@ pub enum Command {
     Cancel(TargetArgs),
     /// Hard-kill a live run's container immediately.
     Kill(TargetArgs),
+    /// Report this binary's compatibility surface for a consumer's fail-closed
+    /// launcher preflight (`CC_PROCESSKIT_RUN`) — no run, no child, no side effects.
+    Probe(ProbeArgs),
 }
 
 /// `run [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl> [--create-no-window]
@@ -118,6 +121,46 @@ pub struct TargetArgs {
     pub run_id: String,
 }
 
+/// `probe --json [--require-schema-version <N>] [--require-exit-code-band <s>-<e>]
+/// [--require-surface <token>]...`
+///
+/// The **preflight** surface of the fail-closed launcher contract
+/// (`docs/env-launch.md`). It reports — and, when asked, *verifies* — this binary's
+/// compatibility surface (the JSONL `schema_version`, the reserved exit-code band,
+/// and the CLI surface tokens) so a consumer can confirm a `CC_PROCESSKIT_RUN`
+/// candidate **before** launching any payload. It spawns nothing and touches no
+/// registry or container: it is a pure self-report, so running it has no side
+/// effects. The `--require-*` flags are the machine-checkable half — each one a
+/// consumer expectation; any that this binary cannot meet makes `probe` fail closed
+/// with [`crate::exit::PROBE_INCOMPATIBLE`] (110) instead of a false "ok".
+#[derive(Debug, Args)]
+pub struct ProbeArgs {
+    /// Emit the report as JSON. Required to match the fixed form (JSON is the only
+    /// supported output format, as for `inspect`); clap enforces its presence and
+    /// `probe` always prints JSON.
+    #[allow(dead_code)] // Part of the fixed CLI form; enforced by clap, never read.
+    #[arg(long, required = true)]
+    pub json: bool,
+
+    /// Require the binary's JSONL event `schema_version` to equal `<N>` exactly
+    /// (adapters pin an exact version). A mismatch is a fail-closed incompatibility.
+    #[arg(long, value_name = "N")]
+    pub require_schema_version: Option<u32>,
+
+    /// Require the reserved runner exit-code band to be exactly `<start>-<end>`
+    /// (e.g. `100-119`). A mismatch is a fail-closed incompatibility. A malformed
+    /// value is a usage error (100), like any other bad flag.
+    #[arg(long, value_name = "start-end", value_parser = parse_exit_code_band)]
+    pub require_exit_code_band: Option<(u8, u8)>,
+
+    /// Require a CLI **surface token** to be present (repeatable). A token is either
+    /// a subcommand name (`run`, `probe`) or a subcommand long flag
+    /// (`run:--capture-dir`, `inspect:--json`). An absent token is a fail-closed
+    /// incompatibility, so a consumer can assert the exact flags it will use exist.
+    #[arg(long = "require-surface", value_name = "token")]
+    pub require_surface: Vec<String>,
+}
+
 /// Parse a human duration for `--timeout` / `--grace`.
 ///
 /// Grammar: a base-10, non-negative integer with an optional unit suffix — `ms`,
@@ -165,6 +208,30 @@ fn parse_duration(raw: &str) -> Result<Duration, String> {
     let millis = millis
         .ok_or_else(|| format!("duration `{raw}` is too large to represent in milliseconds"))?;
     Ok(Duration::from_millis(millis))
+}
+
+/// Parse a `--require-exit-code-band` value: two `u8`s as `start-end` (e.g.
+/// `100-119`). Deliberately strict — exactly one `-` separating two base-10
+/// integers, with `start <= end` — so a typo fails loudly at parse time (mapped to
+/// the `USAGE` exit) rather than being reinterpreted into a band the consumer did
+/// not mean. Returns the message clap renders on failure; on success it hands the
+/// probe a ready `(start, end)` pair to compare against the reserved band.
+fn parse_exit_code_band(raw: &str) -> Result<(u8, u8), String> {
+    let (start, end) = raw.split_once('-').ok_or_else(|| {
+        format!("exit-code band `{raw}` must be two numbers as `start-end`, e.g. `100-119`")
+    })?;
+    let start: u8 = start
+        .parse()
+        .map_err(|_| format!("exit-code band `{raw}` has a non-`u8` start `{start}`"))?;
+    let end: u8 = end
+        .parse()
+        .map_err(|_| format!("exit-code band `{raw}` has a non-`u8` end `{end}`"))?;
+    if start > end {
+        return Err(format!(
+            "exit-code band `{raw}` is inverted: start {start} is above end {end}"
+        ));
+    }
+    Ok((start, end))
 }
 
 #[cfg(test)]
@@ -297,6 +364,73 @@ mod tests {
         };
         assert_eq!(args.timeout, Some(Duration::from_secs(5)));
         assert_eq!(args.grace, Some(Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn probe_requires_json_and_accepts_the_require_flags() {
+        // The fixed form mirrors `inspect`: `--json` is mandatory.
+        assert!(
+            Cli::try_parse_from(["processkit-cli", "probe", "--json"]).is_ok(),
+            "a bare `probe --json` is the minimal valid form"
+        );
+        assert!(
+            Cli::try_parse_from(["processkit-cli", "probe"]).is_err(),
+            "--json is part of the fixed probe form"
+        );
+
+        // The requirement flags parse and are captured, `--require-surface` repeats.
+        let cli = Cli::try_parse_from([
+            "processkit-cli",
+            "probe",
+            "--json",
+            "--require-schema-version",
+            "1",
+            "--require-exit-code-band",
+            "100-119",
+            "--require-surface",
+            "probe",
+            "--require-surface",
+            "run:--jsonl",
+        ])
+        .expect("a valid probe invocation");
+        let Command::Probe(args) = cli.command else {
+            panic!("expected the probe subcommand");
+        };
+        assert_eq!(args.require_schema_version, Some(1));
+        assert_eq!(args.require_exit_code_band, Some((100, 119)));
+        assert_eq!(args.require_surface, vec!["probe", "run:--jsonl"]);
+    }
+
+    #[test]
+    fn parse_exit_code_band_accepts_and_rejects() {
+        assert_eq!(parse_exit_code_band("100-119").unwrap(), (100, 119));
+        assert_eq!(parse_exit_code_band("0-255").unwrap(), (0, 255));
+        assert_eq!(parse_exit_code_band("110-110").unwrap(), (110, 110));
+        // Missing separator, non-numeric, out-of-u8-range, and an inverted band all
+        // fail loudly rather than being reinterpreted.
+        for bad in ["100", "100+119", "a-119", "100-b", "100-999", "119-100"] {
+            assert!(
+                parse_exit_code_band(bad).is_err(),
+                "expected `{bad}` to be rejected as an exit-code band"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_rejects_a_malformed_exit_code_band() {
+        // A bad band is a form error, so parsing fails (mapped to USAGE) rather than
+        // reaching the probe handler.
+        assert!(
+            Cli::try_parse_from([
+                "processkit-cli",
+                "probe",
+                "--json",
+                "--require-exit-code-band",
+                "not-a-band",
+            ])
+            .is_err(),
+            "a malformed --require-exit-code-band must fail at parse time"
+        );
     }
 
     #[test]

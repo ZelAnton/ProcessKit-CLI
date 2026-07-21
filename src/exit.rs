@@ -14,12 +14,12 @@
 //! `runner_exit` JSONL event — the numeric code is the best-effort signal for
 //! shells that cannot read the event stream.
 
-/// Inclusive lower bound of the runner-own exit-code band.
-#[allow(dead_code)] // Part of the documented contract; consumed by later tasks and tests.
+/// Inclusive lower bound of the runner-own exit-code band. Read by the preflight
+/// probe (`src/probe.rs`) so a consumer can pin the reserved band before a launch.
 pub const RUNNER_RANGE_START: u8 = 100;
 /// Inclusive upper bound of the runner-own exit-code band. Codes above the ones
-/// assigned below are reserved for future runner-own conditions.
-#[allow(dead_code)] // Part of the documented contract; consumed by later tasks and tests.
+/// assigned below are reserved for future runner-own conditions. Read by the
+/// preflight probe (`src/probe.rs`) so a consumer can pin the reserved band.
 pub const RUNNER_RANGE_END: u8 = 119;
 
 /// Invalid command line: unknown flag, missing required option, malformed value,
@@ -68,6 +68,15 @@ pub const CONTROL_CANCELLED: u8 = 108;
 /// ([`TIMEOUT`], [`CANCELLED`], [`CONTROL_CANCELLED`]) so "it was force-killed by
 /// command" is never confused with a graceful cancel or a child's own exit.
 pub const CONTROL_KILLED: u8 = 109;
+/// The **preflight probe** (`processkit-cli probe`) found this binary's
+/// compatibility surface does not satisfy the requirements a consumer asked it to
+/// verify (a `--require-*` check failed). This is **not** a run outcome — no child
+/// is ever spawned by a probe — but a *pre-launch* verdict: the launcher contract
+/// (`docs/env-launch.md`) is fail-closed, so an incompatible binary must be
+/// reported with a distinct, reserved code rather than silently used. It takes the
+/// next free code after the control-plane endings so no existing assignment shifts
+/// or changes meaning. See [`crate::probe`].
+pub const PROBE_INCOMPATIBLE: u8 = 110;
 
 /// A runner-own failure carrying the exit code it should surface and a
 /// human-readable message. Distinct from a child's exit — a child's code is
@@ -128,6 +137,7 @@ mod tests {
             CANCELLED,
             CONTROL_CANCELLED,
             CONTROL_KILLED,
+            PROBE_INCOMPATIBLE,
         ] {
             assert!(
                 (RUNNER_RANGE_START..=RUNNER_RANGE_END).contains(&code),
@@ -151,6 +161,7 @@ mod tests {
             CANCELLED,
             CONTROL_CANCELLED,
             CONTROL_KILLED,
+            PROBE_INCOMPATIBLE,
         ];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {

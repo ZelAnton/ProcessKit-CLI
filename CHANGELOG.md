@@ -89,6 +89,26 @@ to a dated version section.
   Additive schema v1 change (new `source` values and the `killed` event), reflected in
   `docs/control-plane.md`, `docs/schema.md`, `docs/exit-codes.md`, and the golden
   fixture.
+- Fail-closed launcher contract for the orchestrator (`CC_PROCESSKIT_RUN`): a
+  documented environment variable naming the absolute path to the `processkit-cli`
+  binary a consumer should launch contained commands with — the binary-runner
+  analogue of the existing interpreter-launch contract. A new side-effect-free
+  `probe` subcommand (`processkit-cli probe --json`) is the preflight a consumer
+  runs on a candidate **before** launching any payload: it prints the binary's
+  compatibility surface (package name, version, JSONL `schema_version`, the reserved
+  exit-code band, and the CLI surface tokens derived from the live parser) as one
+  deterministic JSON line, and spawns no child, opens no registry, and creates no
+  container. With `--require-schema-version` / `--require-exit-code-band` /
+  `--require-surface` it *verifies* those dimensions and fails closed with the new
+  reserved code `PROBE_INCOMPATIBLE` (110) — the next free slot in the `100`–`119`
+  band — printing `compatible:false` with concrete `mismatches` rather than a silent
+  "ok". The contract is fail-closed across three distinct, parseable outcomes — path
+  missing (`NotFound` at spawn), present-but-not-executable (a non-`NotFound` spawn
+  error), and present-executable-but-incompatible (exit `110`) — and forbids any
+  silent fallback to an uncontained launch. Documented in the new
+  `docs/env-launch.md` (indexed from `README.md`), with the new code recorded in
+  `docs/exit-codes.md`. Additive only: no existing flag, exit code `100`–`109`, or
+  `schema_version: 1` changes meaning.
 - Abrupt runner-death hardening and proof: every spawned command opts into
   ProcessKit's public parent-death primitive. The versioned `run_started` event
   now reports the actual surviving guarantee as `abrupt_cleanup` (`whole_tree`

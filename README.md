@@ -101,12 +101,21 @@ processkit-cli run     [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl>
 processkit-cli inspect --run-id <id> --json
 processkit-cli cancel  --run-id <id>
 processkit-cli kill    --run-id <id>
+processkit-cli probe   --json [--require-schema-version <N>]
+                       [--require-exit-code-band <start>-<end>]
+                       [--require-surface <token>]...
 ```
 
 The command is intentionally shell-free: `run` executes `<program> <args...>`
 directly, with no shell to expand or re-interpret anything after `--`. Child
 stdout and stderr are echoed through unchanged; runner diagnostics and JSONL
 events never use stdout.
+
+`probe` is a side-effect-free preflight: it prints this binary's compatibility
+surface (version, `schema_version`, exit-code band, and CLI surface tokens) as one
+JSON line and — with `--require-*` — verifies it, so a consumer can confirm a
+runner is usable **before** launching a payload. It spawns no child and touches no
+registry or container. See "Launch contract" below.
 
 Live output is **pipe + echo, not a real inherited terminal**: ProcessKit reads
 the child's stdout/stderr through pipes and this runner re-emits them onto its
@@ -138,7 +147,28 @@ endings — a `--timeout` (`106`), a `Ctrl-C` cancel (`107`), a control-plane `c
 (`108`), and a control-plane `kill` (`109`) — use a distinct, reserved code band so
 they can never be mistaken for a child result, and so each ending is tellable from the
 others by code alone. This is part of the project's compatibility surface — see
-[the exit-code contract](docs/exit-codes.md).
+[the exit-code contract](docs/exit-codes.md). The preflight `probe` adds one code
+to the reserved band — `PROBE_INCOMPATIBLE` (`110`) — for an incompatible launch
+candidate (see "Launch contract" below).
+
+## Launch contract (`CC_PROCESSKIT_RUN`)
+
+The primary consumer (Orchestra) finds the binary through the
+`CC_PROCESSKIT_RUN` environment variable — the absolute path to the
+`processkit-cli` it should launch contained commands with, the binary-runner
+analogue of its existing interpreter-launch contract. The contract is
+**fail-closed**: if the variable points at a missing, non-executable, or
+version-incompatible file, the consumer surfaces the error and refuses to launch —
+it must **never** silently fall back to an uncontained launch, because that would
+reintroduce the very process-leak hazard this project prevents.
+
+The consumer checks a candidate with the `probe` subcommand **before** running any
+payload: `"$CC_PROCESSKIT_RUN" probe --json` reports (and, with `--require-*`,
+verifies) the compatibility surface with no side effects, and fails closed with
+`PROBE_INCOMPATIBLE` (`110`) on an incompatible binary. The three fail-closed
+outcomes (missing / not-executable / incompatible) are each distinct and parseable.
+The full contract — the variable, the probe report shape, the outcome table, and
+the migration/rollback order — is [the launch contract](docs/env-launch.md).
 
 ## Timeouts, cancel, and grace
 
@@ -253,8 +283,10 @@ through the local control plane: `inspect` prints a snapshot, `cancel` ends a ru
 gracefully (its shared soft-stop → grace → hard-kill teardown, exit `108`), and `kill`
 force-kills the whole tree immediately (exit `109`) — each a distinguishable outcome in
 the JSONL stream and by exit code, and each a bounded `CONTROL` (103) failure when the
-run cannot be reached. See [the roadmap](docs/ROADMAP.md) for the intended delivery
-order.
+run cannot be reached. `probe` reports and verifies the binary's compatibility surface
+for a consumer's fail-closed launcher preflight (`CC_PROCESSKIT_RUN`), with no side
+effects, exiting `PROBE_INCOMPATIBLE` (110) on an incompatible candidate (see "Launch
+contract"). See [the roadmap](docs/ROADMAP.md) for the intended delivery order.
 
 ## Development
 
