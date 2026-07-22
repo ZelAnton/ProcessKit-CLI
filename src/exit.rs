@@ -37,9 +37,16 @@ pub const BACKEND: u8 = 102;
 /// run: no such run id, a stale/dead registry entry, or an IPC failure.
 #[allow(dead_code)] // Minted once the control plane is wired (T-004+).
 pub const CONTROL: u8 = 103;
-/// Unexpected runner fault — an invariant was violated. Reported with this code
-/// instead of panicking, so callers still observe a runner-range exit.
-#[allow(dead_code)] // Minted as the runner grows fallible paths (T-002+).
+/// Unexpected runner fault — the runner reached a state its own logic rules out,
+/// or lost a trustworthy view of the run it cannot recover from (a `wait` on the
+/// child failed and its fate is now unknown; the backend returned an outcome this
+/// build cannot faithfully render). Reported with this code instead of panicking,
+/// so callers still observe a runner-range exit. **Strictly a genuine invariant
+/// violation:** an ordinary setup/environment failure — an async runtime that will
+/// not build, an unwritable `--jsonl`/`--capture-dir`, a report that will not
+/// serialize — is *not* an invariant violation and takes [`SETUP`] instead, so a
+/// consumer reading `104` can trust it means "a runner bug", never "a bad path".
+#[allow(dead_code)] // Minted on the runner's genuine invariant-violation paths.
 pub const INTERNAL: u8 = 104;
 /// Retired. Formerly minted for a defined-but-not-yet-built code path while the
 /// runner was under construction; every subcommand is now implemented, so no
@@ -81,6 +88,20 @@ pub const CONTROL_KILLED: u8 = 109;
 /// next free code after the control-plane endings so no existing assignment shifts
 /// or changes meaning. See [`crate::probe`].
 pub const PROBE_INCOMPATIBLE: u8 = 110;
+/// A **setup / support failure**: a prerequisite the runner needs to run — or to
+/// report a result — could not be established or produced for an ordinary reason.
+/// The runner's async runtime could not be built (`run`/`inspect`/`cancel`/`kill`),
+/// a required output the operator asked for could not be created (the `--jsonl`
+/// events file, the `--capture-dir`), or a report/reply the runner must emit could
+/// not be serialized (the `probe` report, an `inspect` snapshot, a control ack).
+/// These are peripheral support steps failing on an environment/resource condition
+/// the *caller* can usually act on — a bad path, missing permissions, exhausted OS
+/// resources — **not** the runner's own run-tracking logic being violated, which
+/// stays [`INTERNAL`]. Splitting them out keeps `INTERNAL` (104) honestly meaning
+/// "a runner bug", so a consumer is never misled into reading a setup error as one.
+/// Takes the next free code after [`PROBE_INCOMPATIBLE`] so no existing assignment
+/// shifts; `112`–`119` remain reserved.
+pub const SETUP: u8 = 111;
 
 /// A runner-own failure carrying the exit code it should surface and a
 /// human-readable message. Distinct from a child's exit — a child's code is
@@ -132,6 +153,7 @@ mod tests {
             CONTROL_CANCELLED,
             CONTROL_KILLED,
             PROBE_INCOMPATIBLE,
+            SETUP,
         ] {
             assert!(
                 (RUNNER_RANGE_START..=RUNNER_RANGE_END).contains(&code),
@@ -156,6 +178,7 @@ mod tests {
             CONTROL_CANCELLED,
             CONTROL_KILLED,
             PROBE_INCOMPATIBLE,
+            SETUP,
         ];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {

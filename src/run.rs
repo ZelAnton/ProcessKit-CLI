@@ -96,7 +96,7 @@ fn run_inner(args: RunArgs) -> Result<i32, RunnerError> {
         .build()
         .map_err(|err| {
             RunnerError::new(
-                exit::INTERNAL,
+                exit::SETUP,
                 format!("could not start the async runtime: {err}"),
             )
         })?;
@@ -166,7 +166,7 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     // best-effort (see `Emitter`), never a reason to abort a healthy run.
     let mut emitter = Emitter::create(&args.jsonl).map_err(|err| {
         RunnerError::new(
-            exit::INTERNAL,
+            exit::SETUP,
             format!(
                 "could not open the JSONL events file `{}`: {err}",
                 args.jsonl.display()
@@ -185,13 +185,13 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             Ok(capture) => Some(capture),
             Err(err) => {
                 let error = RunnerError::new(
-                    exit::INTERNAL,
+                    exit::SETUP,
                     format!(
                         "could not set up output capture in `{}`: {err}",
                         dir.display()
                     ),
                 );
-                return Err(finish(&mut emitter, "internal", None, error));
+                return Err(finish(&mut emitter, "setup", None, error));
             }
         },
         None => None,

@@ -124,7 +124,7 @@ pub fn run(args: &ProbeArgs) -> Result<(), RunnerError> {
 
     let json = serde_json::to_string(&report).map_err(|err| {
         RunnerError::new(
-            exit::INTERNAL,
+            exit::SETUP,
             format!("could not render the probe report: {err}"),
         )
     })?;
