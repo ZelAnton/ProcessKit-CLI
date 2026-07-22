@@ -409,12 +409,15 @@ fn serialize_ack(ack: &ControlAck) -> String {
         .unwrap_or_else(|_| String::from(r#"{"accepted":false,"action":"error","run_id":""}"#))
 }
 
-/// Client entry for `inspect --run-id <id> --json`: find the live runner through the
-/// registry, ask it for a snapshot, and print it. Runs on its own small current-thread
-/// runtime (the transport client is async). A run that cannot be reached — no such id,
-/// a stale entry, a dead-mid-conversation runner — returns a [`exit::CONTROL`] error.
-pub fn inspect(run_id: &str) -> Result<(), RunnerError> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
+/// Build the small current-thread tokio runtime every client entry point (`run`,
+/// `inspect`, `cancel`, `kill`) drives its async body on, mapping a build failure to
+/// the shared [`exit::SETUP`] shape. `enable_all` arms the I/O, time, and signal
+/// drivers each caller's body needs (Cargo unifies every caller's feature set into
+/// the one tokio build), so one small runtime is enough for each — a run is one
+/// child plus its output pumps, a deadline timer, and a Ctrl-C listener; a control
+/// client is one connection under a deadline.
+pub fn current_thread_runtime() -> Result<tokio::runtime::Runtime, RunnerError> {
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|err| {
@@ -422,7 +425,15 @@ pub fn inspect(run_id: &str) -> Result<(), RunnerError> {
                 exit::SETUP,
                 format!("could not start the async runtime: {err}"),
             )
-        })?;
+        })
+}
+
+/// Client entry for `inspect --run-id <id> --json`: find the live runner through the
+/// registry, ask it for a snapshot, and print it. Runs on its own small current-thread
+/// runtime (the transport client is async). A run that cannot be reached — no such id,
+/// a stale entry, a dead-mid-conversation runner — returns a [`exit::CONTROL`] error.
+pub fn inspect(run_id: &str) -> Result<(), RunnerError> {
+    let runtime = current_thread_runtime()?;
     runtime.block_on(inspect_async(run_id))
 }
 
@@ -436,16 +447,8 @@ async fn inspect_async(run_id: &str) -> Result<(), RunnerError> {
 
     // Converse under a deadline: a runner that died mid-write, or accepted but never
     // answers, is bounded here — a distinguishable CONTROL result, not a hang.
-    let snapshot = tokio::time::timeout(CONVERSATION_DEADLINE, converse(stream))
-        .await
-        .map_err(|_| {
-            unreachable_run(
-                "inspect",
-                run_id,
-                "the runner did not answer in time".into(),
-            )
-        })?
-        .map_err(|err| unreachable_run("inspect", run_id, err.to_string()))?;
+    let snapshot: Snapshot =
+        converse_under_deadline(stream, INSPECT_REQUEST, "inspect", run_id).await?;
 
     let json = serde_json::to_string(&snapshot).map_err(|err| {
         RunnerError::new(
@@ -478,15 +481,7 @@ pub fn kill(run_id: &str) -> Result<(), RunnerError> {
 /// Shared driver for the mutating clients ([`cancel`] / [`kill`]): stand up the same
 /// small current-thread runtime `inspect` uses and run the exchange.
 fn run_mutation(run_id: &str, command: ControlCommand) -> Result<(), RunnerError> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|err| {
-            RunnerError::new(
-                exit::SETUP,
-                format!("could not start the async runtime: {err}"),
-            )
-        })?;
+    let runtime = current_thread_runtime()?;
     runtime.block_on(mutate_async(run_id, command))
 }
 
@@ -507,7 +502,8 @@ async fn mutate_async(run_id: &str, command: ControlCommand) -> Result<(), Runne
     // `connect_live`'s round trip. Re-scan and re-resolve right before writing the
     // verb and abort on any outcome other than resolving back to the exact endpoint
     // already connected to. A sub-instruction gap remains between this synchronous
-    // check and the `.await`ed write in `converse_mutation` below — closing that
+    // check and the `.await`ed write in `converse` (via `converse_under_deadline`)
+    // below — closing that
     // fully would need a run_id-keyed lock held across process boundaries, which the
     // registry deliberately does not provide — but it cannot misdirect the verb:
     // `connect_live` already bound this client to `endpoint`'s specific,
@@ -516,10 +512,7 @@ async fn mutate_async(run_id: &str, command: ControlCommand) -> Result<(), Runne
     // `racing_duplicate_after_reconfirm_does_not_misdirect_the_dispatched_verb`).
     reconfirm_target(&registry, action, run_id, &endpoint)?;
 
-    let ack = tokio::time::timeout(CONVERSATION_DEADLINE, converse_mutation(stream, command))
-        .await
-        .map_err(|_| unreachable_run(action, run_id, "the runner did not answer in time".into()))?
-        .map_err(|err| unreachable_run(action, run_id, err.to_string()))?;
+    let ack: ControlAck = converse_under_deadline(stream, command.verb(), action, run_id).await?;
 
     // A well-behaved runner acks the exact action; a rejected or mismatched reply is a
     // CONTROL failure, never a false success (the same parse-back discipline inspect
@@ -671,15 +664,20 @@ async fn connect_live(
         })
 }
 
-/// Ask the connected runner for a snapshot and parse its reply. A closed connection
-/// before a complete line (runner died mid-conversation) or an unparseable line
-/// surfaces as an error the caller maps to [`exit::CONTROL`].
-async fn converse<S>(stream: S) -> io::Result<Snapshot>
+/// Send one request `verb` and parse the runner's one-line JSON reply as `T` —
+/// [`Snapshot`] for `inspect`, [`ControlAck`] for `cancel`/`kill`. The wire exchange
+/// is identical for every verb (write the verb line, flush, read one line back); only
+/// the verb sent and the reply type parsed differ, which is exactly what `T`
+/// parameterizes. A closed connection before a complete line (runner died
+/// mid-conversation) or an unparseable line surfaces as an error the caller maps to
+/// [`exit::CONTROL`].
+async fn converse<S, T>(stream: S, verb: &str) -> io::Result<T>
 where
     S: AsyncRead + AsyncWrite + Unpin,
+    T: serde::de::DeserializeOwned,
 {
     let (read_half, mut write_half) = split(stream);
-    write_half.write_all(INSPECT_REQUEST.as_bytes()).await?;
+    write_half.write_all(verb.as_bytes()).await?;
     write_half.write_all(b"\n").await?;
     write_half.flush().await?;
 
@@ -692,7 +690,7 @@ where
             "the runner closed the connection before answering (it may have just exited)",
         ));
     }
-    serde_json::from_str::<Snapshot>(line.trim()).map_err(|err| {
+    serde_json::from_str::<T>(line.trim()).map_err(|err| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("the runner sent an unreadable response: {err}"),
@@ -700,34 +698,25 @@ where
     })
 }
 
-/// Send a mutating verb (`cancel`/`kill`) and parse the runner's [`ControlAck`]. A
-/// closed connection before a complete line (runner died mid-conversation) or an
-/// unparseable line surfaces as an error the caller maps to [`exit::CONTROL`] — the
-/// same shape as [`converse`], but for the ack rather than a snapshot.
-async fn converse_mutation<S>(stream: S, command: ControlCommand) -> io::Result<ControlAck>
+/// Run [`converse`] under [`CONVERSATION_DEADLINE`] and map both ways a runner can be
+/// lost mid-exchange — it never answers in time, or it answers with something
+/// [`converse`] cannot parse back — onto the same distinguishable [`unreachable_run`]
+/// failure every other runner-loss path in this module uses. Shared by
+/// [`inspect_async`] (`T` = [`Snapshot`]) and [`mutate_async`] (`T` = [`ControlAck`]).
+async fn converse_under_deadline<S, T>(
+    stream: S,
+    verb: &str,
+    action: &str,
+    run_id: &str,
+) -> Result<T, RunnerError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
+    T: serde::de::DeserializeOwned,
 {
-    let (read_half, mut write_half) = split(stream);
-    write_half.write_all(command.verb().as_bytes()).await?;
-    write_half.write_all(b"\n").await?;
-    write_half.flush().await?;
-
-    let mut reader = BufReader::new(read_half);
-    let mut line = String::new();
-    let read = reader.read_line(&mut line).await?;
-    if read == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "the runner closed the connection before answering (it may have just exited)",
-        ));
-    }
-    serde_json::from_str::<ControlAck>(line.trim()).map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("the runner sent an unreadable response: {err}"),
-        )
-    })
+    tokio::time::timeout(CONVERSATION_DEADLINE, converse::<S, T>(stream, verb))
+        .await
+        .map_err(|_| unreachable_run(action, run_id, "the runner did not answer in time".into()))?
+        .map_err(|err| unreachable_run(action, run_id, err.to_string()))
 }
 
 /// A "cannot reach the target run" error carrying the reserved [`exit::CONTROL`] code
@@ -1471,7 +1460,7 @@ mod tests {
     /// its dispatch, but re-review (see `docs/registry.md`, "Run id resolution") kept
     /// finding a further residual gap: `reconfirm_target` is a synchronous scan, while
     /// the verb itself goes out through a later `.await` on the write half
-    /// (`converse_mutation`), so a duplicate could in principle register in between.
+    /// (`converse`), so a duplicate could in principle register in between.
     /// This test proves that residual gap cannot **misdirect** the verb, which is the
     /// actual hazard the finding cares about (a destructive command landing on the
     /// wrong run) — `connect_live` already bound the client to run A's specific,
@@ -1487,7 +1476,7 @@ mod tests {
 
         // Stand in for the real transport connection `connect_live` would already hold
         // by this point: an in-memory duplex, one side owned by the client
-        // (`converse_mutation`), the other by run A's server loop (`serve_one`).
+        // (`converse`), the other by run A's server loop (`serve_one`).
         let (client_stream, server_stream) = tokio::io::duplex(1024);
 
         let first = registry
@@ -1522,7 +1511,7 @@ mod tests {
         // `mutate_async` does after `reconfirm_target` returns.
         let (serve_result, ack) = tokio::join!(
             serve_one(server_stream, &source, &tx),
-            converse_mutation(client_stream, ControlCommand::Cancel),
+            converse::<_, ControlAck>(client_stream, ControlCommand::Cancel.verb()),
         );
         serve_result.expect("run A answers the one connection it actually received");
         let ack = ack.expect("the verb reaches run A over its already-open connection");
