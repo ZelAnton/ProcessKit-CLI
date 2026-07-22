@@ -54,15 +54,28 @@
 //!
 //! [`registry::Registry::register`] does not enforce `run_id` uniqueness, so two
 //! concurrent runs started with the same explicit `--run-id` can both be live and
-//! reachable at once. [`resolve_live_endpoint`] detects that (more than one live
-//! entry with a published endpoint matches the requested `run_id`) and refuses to
-//! pick one: every verb — `inspect`, `cancel`, and `kill` alike — reports the same
-//! reserved [`exit::CONTROL`] (103) "ambiguous run id" failure rather than acting on
-//! whichever entry the directory scan happens to return first. For the mutating
-//! verbs this is load-bearing (a wrong guess cancels or kills the *other* run); the
-//! read-only `inspect` gets the identical hard failure rather than a softer
-//! fallback, because a snapshot of the wrong run is exactly as misleading as acting
-//! on it. See `docs/registry.md`, "Run id resolution — ambiguity is a hard failure".
+//! reachable at once. [`resolve_live_endpoint`] (via [`resolve_in_registry`]) detects
+//! that (more than one live entry with a published endpoint matches the requested
+//! `run_id`) and refuses to pick one: every verb — `inspect`, `cancel`, and `kill`
+//! alike — reports the same reserved [`exit::CONTROL`] (103) "ambiguous run id"
+//! failure rather than acting on whichever entry the directory scan happens to
+//! return first. For the mutating verbs this is load-bearing (a wrong guess cancels
+//! or kills the *other* run); the read-only `inspect` gets the identical hard
+//! failure rather than a softer fallback, because a snapshot of the wrong run is
+//! exactly as misleading as acting on it. See `docs/registry.md`, "Run id resolution
+//! — ambiguity is a hard failure".
+//!
+//! That initial check alone is a TOCTOU race for `cancel`/`kill`: a duplicate can
+//! register under the same `run_id` in the window between the scan and the
+//! destructive verb reaching the wire (the `connect_live` round trip in between),
+//! which would otherwise let the command silently proceed against a target that is
+//! *now* ambiguous. [`mutate_async`] closes that window as tightly as the registry's
+//! decentralized, no-locking-across-processes design allows: it re-runs
+//! [`resolve_in_registry`] ([`reconfirm_target`]) immediately before writing the
+//! verb, and aborts — without ever writing — unless it resolves back to the exact
+//! endpoint already connected to. `inspect` does not repeat this re-check: it is
+//! read-only, so a race that surfaces a snapshot from just before a duplicate
+//! registered is stale information, not a wrong-target action.
 //!
 //! ## Wire protocol
 //!
@@ -467,13 +480,27 @@ fn run_mutation(run_id: &str, command: ControlCommand) -> Result<(), RunnerError
     runtime.block_on(mutate_async(run_id, command))
 }
 
-/// The async body of [`cancel`] / [`kill`]: registry lookup, connect, send the verb,
-/// read and verify the ack, print it. Every runner-loss path is a bounded
-/// [`exit::CONTROL`] failure, mirroring [`inspect_async`].
+/// The async body of [`cancel`] / [`kill`]: registry lookup, connect, re-confirm the
+/// target is still the sole live match, send the verb, read and verify the ack,
+/// print it. Every runner-loss path is a bounded [`exit::CONTROL`] failure,
+/// mirroring [`inspect_async`].
 async fn mutate_async(run_id: &str, command: ControlCommand) -> Result<(), RunnerError> {
     let action = command.verb();
-    let endpoint = resolve_live_endpoint(action, run_id).await?;
+    let registry = open_registry(action, run_id)?;
+    let endpoint = resolve_in_registry(&registry, action, run_id)?;
     let stream = connect_live(&endpoint, action, run_id).await?;
+
+    // Close the resolve-to-dispatch race as tightly as the registry's decentralized,
+    // no-locking-across-processes design allows (`AGENTS.md`, "No PID addressing";
+    // `docs/registry.md`, "Run id resolution"): a duplicate run can register under
+    // the same `run_id` at any point during `resolve_in_registry`'s scan or
+    // `connect_live`'s round trip, which would otherwise let a destructive verb
+    // silently proceed against a target that is *now* ambiguous. Re-scan and
+    // re-resolve right before writing the verb — the only gap left is the
+    // synchronous match below plus the write itself, no further `.await` on the
+    // registry in between — and abort rather than dispatch on any outcome other
+    // than resolving back to the exact endpoint already connected to.
+    reconfirm_target(&registry, action, run_id, &endpoint)?;
 
     let ack = tokio::time::timeout(CONVERSATION_DEADLINE, converse_mutation(stream, command))
         .await
@@ -503,15 +530,38 @@ async fn mutate_async(run_id: &str, command: ControlCommand) -> Result<(), Runne
 
 /// Find the endpoint of the *live* run named `run_id`, or a distinguishable
 /// [`exit::CONTROL`] failure that says *why* it cannot be reached. Shared by every
-/// client (`inspect`/`cancel`/`kill`); `action` names the verb in the message.
+/// client (`inspect`/`cancel`/`kill`); `action` names the verb in the message. Opens
+/// the env/platform-resolved registry and delegates the scan to
+/// [`resolve_in_registry`], which the mutating verbs' pre-dispatch re-check
+/// ([`reconfirm_target`]) also drives, against the same open [`registry::Registry`].
 async fn resolve_live_endpoint(action: &str, run_id: &str) -> Result<String, RunnerError> {
-    let registry = registry::Registry::open().map_err(|err| {
+    let registry = open_registry(action, run_id)?;
+    resolve_in_registry(&registry, action, run_id)
+}
+
+/// Open the env/platform-resolved registry, mapping a failure to the same
+/// distinguishable [`exit::CONTROL`] shape every other unreachable-run result uses.
+fn open_registry(action: &str, run_id: &str) -> Result<registry::Registry, RunnerError> {
+    registry::Registry::open().map_err(|err| {
         unreachable_run(
             action,
             run_id,
             format!("could not open the run registry: {err}"),
         )
-    })?;
+    })
+}
+
+/// Scan `registry` for the *live* run named `run_id` and resolve its endpoint, or a
+/// distinguishable [`exit::CONTROL`] failure that says why it cannot be reached — a
+/// synchronous, no-`.await` scan+match so it can be re-run right before dispatch
+/// (see [`reconfirm_target`]) with a minimal window between the check and the write
+/// that follows, and driven directly against a scratch [`registry::Registry`] in
+/// unit tests without touching the process-wide env-resolved registry.
+fn resolve_in_registry(
+    registry: &registry::Registry,
+    action: &str,
+    run_id: &str,
+) -> Result<String, RunnerError> {
     let entries = registry.entries().map_err(|err| {
         unreachable_run(
             action,
@@ -685,6 +735,35 @@ fn ambiguous_run(action: &str, run_id: &str, count: usize) -> RunnerError {
              registered under it; re-run with a run id that is unique among live runs"
         ),
     )
+}
+
+/// Re-run [`resolve_in_registry`] against the same open `registry` right before a
+/// mutating verb (`cancel`/`kill`) is dispatched, and require it to resolve back to
+/// the exact `expected_endpoint` [`mutate_async`] already connected to. Closes the
+/// window between the initial resolution and the write that follows: a duplicate
+/// that registered under `run_id` during the scan or the connect round trip now
+/// makes the id ambiguous again and surfaces that ambiguity here (or, in the
+/// vanishingly unlikely case the original entry went stale *and* a single different
+/// entry now resolves instead, a dedicated "changed during dispatch" failure) —
+/// either way the verb is never written to the wire. See `docs/registry.md`, "Run id
+/// resolution".
+fn reconfirm_target(
+    registry: &registry::Registry,
+    action: &str,
+    run_id: &str,
+    expected_endpoint: &str,
+) -> Result<(), RunnerError> {
+    let endpoint = resolve_in_registry(registry, action, run_id)?;
+    if endpoint != expected_endpoint {
+        return Err(unreachable_run(
+            action,
+            run_id,
+            "the resolved run changed identity between resolution and dispatch; refusing to \
+             guess which one to act on"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// A unique, PID-free-collision-proof token for a transport endpoint name: the
@@ -1249,6 +1328,85 @@ mod tests {
             message.contains('2'),
             "carries how many entries collided: {message}"
         );
+    }
+
+    /// A unique, empty scratch directory for a test registry — mirrors
+    /// `registry::tests::scratch`, kept local here so these tests drive
+    /// `resolve_in_registry`/`reconfirm_target` against an isolated
+    /// `registry::Registry::open_in` handle and never touch the process-wide
+    /// env-resolved registry `resolve_live_endpoint` uses in production (which would
+    /// be racy across parallel test threads).
+    fn scratch_registry_dir(tag: &str) -> std::path::PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "processkit-cli-control-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// The resolve-to-dispatch TOCTOU window this task closes (see the module doc
+    /// comment, "Ambiguous run id"; `docs/registry.md`, "Run id resolution"): a
+    /// duplicate run can register under the same `run_id` after a mutating verb's
+    /// client performs its initial resolve but before the verb reaches the wire.
+    /// `reconfirm_target` re-scans right before dispatch and must catch exactly
+    /// that. This drives the race deterministically — register, resolve, *then*
+    /// register the racing duplicate, then re-check — rather than depending on real
+    /// thread timing, which would make the test itself flaky.
+    #[test]
+    fn reconfirm_target_catches_a_duplicate_registered_after_the_initial_resolve() {
+        let dir = scratch_registry_dir("reconfirm-race");
+        let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
+
+        let first = registry
+            .register("dup-race", Some("endpoint-a"), SystemTime::now())
+            .expect("register the first run");
+
+        let endpoint = resolve_in_registry(&registry, "kill", "dup-race")
+            .expect("the sole live run resolves before the race window opens");
+        assert_eq!(endpoint, "endpoint-a");
+
+        // The race: a second run registers under the same run_id in the window
+        // between the client's initial resolve and its dispatch.
+        let second = registry
+            .register("dup-race", Some("endpoint-b"), SystemTime::now())
+            .expect("register the second (racing) run");
+
+        let err = reconfirm_target(&registry, "kill", "dup-race", &endpoint)
+            .expect_err("the pre-dispatch re-check must catch the now-ambiguous run id");
+        assert_eq!(err.code(), exit::CONTROL);
+        assert!(
+            err.to_string().contains("ambiguous"),
+            "names the reason: {err}"
+        );
+
+        drop(first);
+        drop(second);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without a racing registration, the pre-dispatch re-check resolves back to the
+    /// same endpoint and passes — a mutating verb with no duplicate in flight is
+    /// never blocked by this defense.
+    #[test]
+    fn reconfirm_target_passes_when_no_duplicate_registers() {
+        let dir = scratch_registry_dir("reconfirm-clean");
+        let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
+
+        let first = registry
+            .register("solo-run", Some("endpoint-solo"), SystemTime::now())
+            .expect("register the run");
+
+        let endpoint = resolve_in_registry(&registry, "cancel", "solo-run")
+            .expect("the sole live run resolves");
+
+        reconfirm_target(&registry, "cancel", "solo-run", &endpoint)
+            .expect("no racing registration occurred, so the re-check passes");
+
+        drop(first);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Endpoint tokens are unique per call, so concurrent runs never collide on a

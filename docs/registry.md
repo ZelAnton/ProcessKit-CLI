@@ -129,6 +129,20 @@ conservative:
   acting on it. A caller that hits this is expected to pick a `--run-id` that is
   unique among currently live runs.
 
+That single check happening once, at the start of the call, is a TOCTOU race for the
+mutating verbs: `register` never enforces uniqueness, so a duplicate can register
+under the same `run_id` in the window between the scan and the verb reaching the
+runner over the transport (the connect round trip in between). `cancel`/`kill`
+narrow that window as tightly as the registry's decentralized, no
+locking-across-processes design allows: immediately before writing the verb, the
+client re-runs the same scan+match and requires it to resolve back to the exact
+endpoint it already connected to — any other outcome (a fresh ambiguity, the entry
+having gone stale, or the resolution landing on a different entry) aborts the
+command without ever writing to the wire, rather than letting it silently proceed
+against a target that is now ambiguous. `inspect` does not repeat this check: being
+read-only, a race that surfaces a snapshot from just before a duplicate registered is
+merely stale information, not a wrong-target action.
+
 ## Lifecycle
 
 - **Create.** `run` writes the record and takes the liveness lock **before** the
