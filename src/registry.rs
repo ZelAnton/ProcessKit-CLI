@@ -211,11 +211,18 @@ impl Registry {
     }
 
     /// Scan every entry, classifying each as [`Health::Live`] or [`Health::Stale`]
-    /// by probing its lock file. Unreadable or malformed files are skipped rather
-    /// than failing the whole scan — a corrupt entry must not blind a client to the
-    /// healthy ones. This is the read side the control-plane client
-    /// (`inspect`, T-008; `cancel`/`kill`, T-009) builds on: find the run whose
-    /// `record.run_id` matches, then act only if it is live.
+    /// by probing its lock file. A malformed *record* (unparsable JSON, or one whose
+    /// `started_at`/`lock_file` field is not the shape a well-behaved runner writes)
+    /// is corrupt-record noise and is skipped outright — there is no lock path worth
+    /// probing. A well-formed record whose lock file *cannot be probed* (any
+    /// non-`NotFound` error opening it, or a lock/unlock error) is different: the
+    /// record itself is trustworthy, only its liveness is unknowable, so the entry is
+    /// still returned — classified [`Health::Stale`] ("could not confirm liveness ⇒
+    /// treat as not live") — rather than dropped. Either way one bad entry never
+    /// aborts the whole scan or blinds a client to the healthy ones. This is the read
+    /// side the control-plane client (`inspect`, T-008; `cancel`/`kill`, T-009) builds
+    /// on: find the run whose `record.run_id` matches, then act only if it is live —
+    /// which a probe-failed entry, being `Stale`, never is.
     pub fn entries(&self) -> io::Result<Vec<Entry>> {
         let read_dir = match fs::read_dir(&self.dir) {
             Ok(read_dir) => read_dir,
@@ -258,13 +265,18 @@ impl Registry {
                 continue;
             }
             let lock_path = self.dir.join(&record.liveness.lock_file);
-            // A per-record probe failure (an unreadable target, or one rejected as a
-            // symlink/reparse point at open time — see [`probe_health`]) marks this one
-            // entry corrupt and is skipped; it must not abort the scan and blind a
-            // client to the healthy entries.
-            let Ok(health) = probe_health(&lock_path) else {
-                continue;
-            };
+            // A per-record probe failure (an unreadable target, one rejected as a
+            // symlink/reparse point at open time, or a lock/unlock error — see
+            // [`probe_health`]) does not discredit the record itself: only its
+            // liveness could not be confirmed. Degrade to `Stale` rather than
+            // dropping the entry or aborting the scan — "could not confirm liveness ⇒
+            // treat as not live" is the least-surprising verdict, it keeps the entry
+            // visible for a future reaper (T-164), and it is exactly what fixes the
+            // misrouting bug this task exists for: `inspect`/`cancel`/`kill` act only
+            // on `Live` entries, so a record whose probe failed can no longer fail
+            // the whole scan and take down an operation on an unrelated, healthy
+            // run_id.
+            let health = probe_health(&lock_path).unwrap_or(Health::Stale);
             entries.push(Entry {
                 record,
                 health,
@@ -1623,8 +1635,10 @@ mod tests {
 
     /// Unix: a lock file that is a *symlink* is refused at open time (`O_NOFOLLOW`),
     /// even though its name passes the simple-name check — so a record pointing a
-    /// valid-looking lock name at a symlink reads as a skipped corrupt entry rather
-    /// than letting the probe follow the link onto an off-target file.
+    /// valid-looking lock name at a symlink still shows up in the scan (the record
+    /// itself is well-formed), but degrades to `Stale`: the probe error must never
+    /// let the link be followed onto an off-target file, and must never abort the
+    /// whole scan either.
     #[cfg(unix)]
     #[test]
     fn symlink_lock_target_is_refused_at_open_time() {
@@ -1645,14 +1659,80 @@ mod tests {
 
         write_record(&dir, "run-symlink-0000", "linked", "run-symlink-0000.lock");
 
-        // The open refuses to follow the symlink, so the probe errors and the entry is
-        // skipped — never returned as a live/stale run.
+        // The open refuses to follow the symlink, so the probe errors — the entry is
+        // still returned (its record is well-formed) but degrades to `Stale` rather
+        // than ever being reported `Live` off a link it never actually locked.
         let entries = registry.entries().expect("scan");
-        assert!(
-            entries.iter().all(|entry| entry.record.run_id != "linked"),
-            "an entry whose lock file is a symlink must be skipped, not followed"
+        let linked = entries
+            .iter()
+            .find(|entry| entry.record.run_id == "linked")
+            .expect("a probe-failed entry is still returned, not dropped");
+        assert_eq!(
+            linked.health,
+            Health::Stale,
+            "an unprobeable lock file (symlink) must degrade to Stale, not abort the scan"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The regression this task exists for: a lock file that points at a
+    /// **directory** rather than a regular file makes the liveness probe's
+    /// write-open fail with a semantic error (`EISDIR` on Unix, an
+    /// access/"is a directory"-shaped error on Windows) for *any* user, including
+    /// root — unlike `chmod 0o000` (see [K-014] in the task's KB section), which a
+    /// privileged or `CAP_DAC_OVERRIDE` CI runner simply ignores, making that
+    /// approach a false-green trap. `entries()` must not abort the whole scan over
+    /// this one unprobeable record: the healthy sibling stays `Live`, and the
+    /// broken one degrades to `Stale` rather than disappearing or taking the scan
+    /// down with it — the exact bug this task fixes (a stale/broken record no
+    /// longer fails `inspect`/`cancel`/`kill` routing to a *different*, healthy
+    /// run_id).
+    #[test]
+    fn entries_degrades_an_unprobeable_lock_directory_to_stale_without_aborting_the_scan() {
+        let dir = scratch("dir-lock");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+
+        // A record whose `lock_file` name is well-formed but resolves to a directory,
+        // not a file: `OpenOptions::read(true).write(true).open(dir)` fails with a
+        // semantic "is a directory" error on every platform and for every user.
+        let broken_lock_dir = dir.join("broken.lock");
+        fs::create_dir(&broken_lock_dir).expect("create the directory the lock name resolves to");
+        write_record(&dir, "broken", "broken", "broken.lock");
+
+        // A well-formed, live sibling entry alongside the unprobeable one.
+        let good = registry
+            .register("good", None, SystemTime::now())
+            .expect("register the good run");
+
+        let entries = registry.entries().expect("scan must not fail");
+        assert_eq!(
+            entries.len(),
+            2,
+            "both the healthy and the unprobeable entry are returned"
+        );
+
+        let good_entry = entries
+            .iter()
+            .find(|entry| entry.record.run_id == "good")
+            .expect("the healthy entry is present");
+        assert_eq!(
+            good_entry.health,
+            Health::Live,
+            "a healthy sibling must stay Live and not be lost to the neighboring probe error"
+        );
+
+        let broken_entry = entries
+            .iter()
+            .find(|entry| entry.record.run_id == "broken")
+            .expect("the unprobeable entry is present, not dropped");
+        assert_eq!(
+            broken_entry.health,
+            Health::Stale,
+            "a record whose lock probe cannot even open must degrade to Stale"
+        );
+
+        good.remove();
         let _ = fs::remove_dir_all(&dir);
     }
 }
