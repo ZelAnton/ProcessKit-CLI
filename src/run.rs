@@ -382,10 +382,19 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             let outcome = match outcome {
                 Ok(outcome) => outcome,
                 Err(err) => {
+                    // The wait itself failed (the child's fate is unknown), but the
+                    // container was still spawned and may still hold live members —
+                    // this is a decided ending like any other, not a setup failure,
+                    // so it must run the very same teardown tail as every other
+                    // branch below rather than returning through the bare `finish`
+                    // a setup-time failure uses. Hard-kill (there is no outcome to
+                    // soft-stop toward), same as the natural-exit and control-kill
+                    // paths.
                     let error = RunnerError::new(
                         exit::INTERNAL,
                         format!("waiting for the child to exit failed: {err}"),
                     );
+                    emit_hard_teardown(&mut emitter, &group, &capture, &registration);
                     return Err(finish(&mut emitter, "internal", None, error));
                 }
             };
@@ -399,17 +408,10 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
                 Ok(child_code) => child_code,
                 Err(error) => return Err(finish(&mut emitter, "internal", None, error)),
             };
-            // Reap any descendant the exited child leaked behind. No soft stop is
-            // attempted on the natural-exit path, so the two cleanup events bracket
-            // only the hard kill.
-            emit_cleanup_started(&mut emitter, &group);
-            emit_cleanup_finished(&mut emitter, &group, None);
-            // Report the bounded capture (paths, byte counts, hashes, truncation)
-            // once the pumps have settled, before the terminal event.
-            emit_output_captured(&mut emitter, &capture);
-            // Remove the registry entry at the same teardown site as the container
-            // reap: a clean exit leaves no entry behind.
-            clear_registration(&registration);
+            // Reap any descendant the exited child leaked behind, report the
+            // capture, and drop the registry entry — the shared hard-teardown tail
+            // (no soft stop is attempted on the natural-exit path).
+            emit_hard_teardown(&mut emitter, &group, &capture, &registration);
             emitter.emit(&Event::RunnerExit {
                 code: child_code,
                 source: "child_exit",
@@ -477,10 +479,7 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             emitter.emit(&Event::Killed {
                 source: "control_kill",
             });
-            emit_cleanup_started(&mut emitter, &group);
-            emit_cleanup_finished(&mut emitter, &group, None);
-            emit_output_captured(&mut emitter, &capture);
-            clear_registration(&registration);
+            emit_hard_teardown(&mut emitter, &group, &capture, &registration);
             let error = control_kill_error();
             Err(finish(&mut emitter, "control_kill", None, error))
         }
@@ -533,6 +532,34 @@ fn emit_output_captured(emitter: &mut Emitter, capture: &Option<Capture>) {
         let (stdout, stderr) = capture.finalize();
         emitter.emit(&Event::OutputCaptured { stdout, stderr });
     }
+}
+
+/// The shared **hard** teardown tail — mark cleanup started, hard-kill the
+/// container immediately (no soft stop), report the capture, and drop the
+/// registry entry, in that order — for every decided ending that has no
+/// soft-stop tier of its own: a clean natural exit, a wait failure (the
+/// child's fate is unknown, so there is no outcome to soft-stop toward
+/// either), and a control-plane `kill`. Routing all three through this one
+/// site makes it structurally impossible for one of them to again drift from
+/// the others, as the wait-failure branch once did (it used to return
+/// through the bare [`finish`] instead, skipping this whole tail).
+///
+/// The three endings with a soft-stop tier (`timeout` / `cancel` /
+/// `control_cancel`, in [`run_async`]'s `Ending` match) are not funneled
+/// through here: they run `soft_terminate_then_grace` between
+/// `cleanup_started` and `cleanup_finished`, so their `cleanup_finished`
+/// carries `Some(label)` instead of this function's fixed `None`. That is
+/// the *only* difference in their tail — every other step matches this one.
+fn emit_hard_teardown(
+    emitter: &mut Emitter,
+    group: &ProcessGroup,
+    capture: &Option<Capture>,
+    registration: &Option<registry::Registration>,
+) {
+    emit_cleanup_started(emitter, group);
+    emit_cleanup_finished(emitter, group, None);
+    emit_output_captured(emitter, capture);
+    clear_registration(registration);
 }
 
 /// Open the per-user run registry so control-plane clients (`inspect`, T-008) can
@@ -1044,5 +1071,75 @@ mod tests {
         assert_eq!(format_duration(Duration::from_millis(500)), "500ms");
         assert_eq!(format_duration(Duration::from_millis(1500)), "1500ms");
         assert_eq!(format_duration(Duration::ZERO), "0ms");
+    }
+
+    /// Forcing a real wait *failure* through the child's actual OS-level wait
+    /// call is practically unreachable from a test (`RunningProcess::wait`'s own
+    /// `Err` path is backend-internal plumbing, not something a spawned test
+    /// child can be made to trigger deterministically). So this proves the
+    /// thing that *is* reachable and is the actual fix: [`emit_hard_teardown`],
+    /// the exact shared tail the wait-failure branch now runs (see the
+    /// `Err(err)` arm of `Ending::Exited` in `run_async`), fires
+    /// `cleanup_started` → the hard kill via `cleanup_finished` (with no
+    /// soft-terminate tier) → `output_captured` → nothing else, in that order,
+    /// for *any* caller — natural exit, control-kill, and the wait-failure path
+    /// alike. A future edit that special-cases one of those callers back out of
+    /// this shared function (as the wait-failure path used to be) has nowhere
+    /// to silently diverge: it would have to stop calling this helper, which is
+    /// visible on review.
+    #[tokio::test]
+    async fn hard_teardown_tail_emits_the_shared_sequence_in_order() {
+        let group = ProcessGroup::new().expect("create a ProcessGroup");
+        let command = if cfg!(windows) {
+            PkCommand::new("cmd").args(["/c", "exit", "0"])
+        } else {
+            PkCommand::new("true")
+        };
+        let running = group
+            .start(&command)
+            .await
+            .expect("start a trivial, fast-exiting child");
+        running.wait().await.expect("the trivial child exits");
+
+        let dir = std::env::temp_dir().join(format!(
+            "processkit-cli-run-unit-hard-teardown-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the epoch")
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).expect("create the scratch dir");
+        let jsonl = dir.join("events.jsonl");
+        let mut emitter = Emitter::create(&jsonl).expect("create the events file");
+        // A real `Capture` (not `None`) so `output_captured` actually fires too —
+        // proving all three events, not just the two cleanup ones.
+        let capture = Some(Capture::create(&dir.join("capture")).expect("create the capture dir"));
+
+        emit_hard_teardown(&mut emitter, &group, &capture, &None);
+
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&jsonl)
+            .expect("read the events file back")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each line is one JSON object"))
+            .collect();
+        let kinds: Vec<&str> = lines
+            .iter()
+            .map(|value| value["event"].as_str().expect("every event has a tag"))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["cleanup_started", "cleanup_finished", "output_captured"],
+            "the shared hard-teardown tail must emit exactly these three events \
+             in this order for every caller"
+        );
+        assert!(
+            lines[1]["soft_terminate"].is_null(),
+            "the hard-teardown tail never soft-stops, so cleanup_finished's \
+             soft_terminate must be null: {:?}",
+            lines[1]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
