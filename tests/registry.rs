@@ -282,6 +282,60 @@ fn inspect_reports_no_such_run_with_the_control_code() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// `inspect` gets the identical hard "ambiguous run id" failure as `cancel`/`kill`
+/// when two concurrent live runs share a `--run-id` — a deliberate, documented
+/// choice (`docs/registry.md`, "Run id resolution"): a snapshot of the wrong run
+/// would be exactly as misleading as acting on it, so there is no softer fallback.
+#[test]
+fn inspect_reports_ambiguous_run_id_for_duplicate_run_ids() {
+    let dir = scratch("inspect-ambiguous");
+    let registry = registry_dir(&dir);
+    let run_id = "dup-inspect";
+
+    let mut first = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", run_id],
+        long_child(),
+    )
+    .spawn()
+    .expect("spawn the first runner");
+    let mut second = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", run_id],
+        long_child(),
+    )
+    .spawn()
+    .expect("spawn the second runner");
+
+    wait_until(|| record_count(&registry) == 2, Duration::from_secs(10));
+
+    let out = inspect(&registry, run_id);
+    assert_eq!(
+        out.status.code(),
+        Some(103),
+        "an ambiguous run id is a CONTROL failure for inspect; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "an ambiguous inspect prints no snapshot: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ambiguous"),
+        "the inspect failure names the reason: {stderr}"
+    );
+
+    let _ = first.kill();
+    let _ = first.wait();
+    let _ = second.kill();
+    let _ = second.wait();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Run a mutating control verb (`cancel`/`kill --run-id <id>`) against the same
 /// scratch registry as the run under test, and wait for it to finish.
 fn control_client(registry: &Path, verb: &str, run_id: &str) -> Output {
@@ -374,6 +428,78 @@ fn kill_ends_a_live_run_with_the_control_kill_code() {
         "a control kill teardown must remove the registry entry"
     );
 
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Two concurrent runs started with the *same* explicit `--run-id` both register and
+/// stay live at once (the registry never enforces `run_id` uniqueness — see
+/// `docs/registry.md`, "Run id resolution"). Against that ambiguity, `cancel`/`kill`
+/// must refuse to guess which run to act on: a deterministic, documented `CONTROL`
+/// (103) "ambiguous run id" failure, never picking whichever entry the directory
+/// scan happens to return first.
+#[test]
+fn cancel_and_kill_report_ambiguous_run_id_for_duplicate_run_ids() {
+    let dir = scratch("control-ambiguous");
+    let registry = registry_dir(&dir);
+    let run_id = "dup-me";
+
+    let mut first = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", run_id],
+        long_child(),
+    )
+    .spawn()
+    .expect("spawn the first runner");
+    let mut second = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", run_id],
+        long_child(),
+    )
+    .spawn()
+    .expect("spawn the second runner");
+
+    // Both runs are live and reachable at once — the ambiguity `cancel`/`kill` must
+    // detect.
+    wait_until(|| record_count(&registry) == 2, Duration::from_secs(10));
+
+    for verb in ["cancel", "kill"] {
+        let out = control_client(&registry, verb, run_id);
+        assert_eq!(
+            out.status.code(),
+            Some(103),
+            "an ambiguous run id is a CONTROL failure for {verb}; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "an ambiguous {verb} prints no ack: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("ambiguous"),
+            "the {verb} failure names the reason: {stderr}"
+        );
+        assert!(
+            stderr.contains(run_id),
+            "the {verb} failure names the run: {stderr}"
+        );
+
+        // Neither run was touched by the rejected command — both stay live.
+        assert_eq!(
+            record_count(&registry),
+            2,
+            "a rejected ambiguous {verb} must not end either run"
+        );
+    }
+
+    // Clean up both still-live runners directly (never through the ambiguous id).
+    let _ = first.kill();
+    let _ = first.wait();
+    let _ = second.kill();
+    let _ = second.wait();
     let _ = fs::remove_dir_all(&dir);
 }
 

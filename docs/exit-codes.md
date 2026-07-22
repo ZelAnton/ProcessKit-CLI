@@ -31,9 +31,9 @@ failure is not mistaken for a child result.
 | 100  | `USAGE`           | Invalid command line: unknown flag, missing required option, malformed value (including a bad `--timeout`/`--grace` duration), or bad subcommand form. |
 | 101  | `SPAWN`           | The target program could not be started (not found, not executable, bad `--cwd`, permission denied). |
 | 102  | `BACKEND`         | ProcessKit backend/containment failure: kernel container, job object, IPC endpoint, or run registry could not be established. |
-| 103  | `CONTROL`         | An `inspect` / `cancel` / `kill` command could not reach its target run: no such run id, a stale/dead registry entry, or an IPC failure. |
+| 103  | `CONTROL`         | An `inspect` / `cancel` / `kill` command could not reach its target run: no such run id, a stale/dead registry entry, an ambiguous run id (more than one live run registered under it), or an IPC failure. |
 | 104  | `INTERNAL`        | Unexpected runner fault (an invariant was violated). Reported with this code instead of panicking. |
-| 105  | `NOT_IMPLEMENTED` | A defined-but-not-yet-built code path. **Transitional** — present only while the runner is being implemented, and retired as each path lands. |
+| 105  | `NOT_IMPLEMENTED` | **Retired.** Formerly minted for a defined-but-not-yet-built code path; every subcommand is now implemented, so no active path mints it. The number stays permanently reserved (see "Stability" below) — it is never reused for a different meaning. |
 | 106  | `TIMEOUT`         | The run exceeded its `--timeout`: the runner enforced the deadline and tore the process tree down. A runner-*imposed outcome*, not a child exit. |
 | 107  | `CANCELLED`       | The run was cancelled interactively (`Ctrl-C`): the runner tore the process tree down. Distinct from `TIMEOUT` and from any child result. |
 | 108  | `CONTROL_CANCELLED` | The run was cancelled by a control-plane `cancel` command (over the local control channel): the runner ran the same soft-stop → grace → hard-kill teardown as a Ctrl-C. Distinct from `CANCELLED` so "a control client cancelled it" is told from "the operator pressed Ctrl-C". |
@@ -107,10 +107,11 @@ are additionally recorded out of band.
 
 - The **band** (`100`–`119`) and the **assigned codes** above are stable; moving
   or repurposing an assigned code is a breaking change.
-- `NOT_IMPLEMENTED` (105) is the one intentionally temporary member: as the
-  runner gains real behavior, the paths that return it are replaced, and it will
-  eventually be unused. Its retirement is not a breaking change — it only ever
-  meant "this build cannot do that yet."
+- `NOT_IMPLEMENTED` (105) was the one intentionally temporary member: it has now
+  retired, since every subcommand it once stood in for is implemented. Its
+  retirement was not a breaking change — it only ever meant "this build cannot
+  do that yet" — but the number is not reassigned to a new meaning; it stays
+  reserved and unused going forward.
 - New runner-own conditions take the **next free code** in the reserved range
   rather than overloading an existing one. `PROBE_INCOMPATIBLE` (110) is the most
   recent, taking the next free slot after the control-plane endings; codes

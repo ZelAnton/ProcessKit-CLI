@@ -29,6 +29,12 @@ It finds one through the per-user run registry: it scans records, matches the ta
 "Staleness"). A record's `endpoint` field carries the address of that run's local
 transport — the channel this document describes.
 
+The registry does not enforce `run_id` uniqueness, so more than one live entry can
+match. That is an **ambiguous run id** — a hard `CONTROL` (103) failure for every
+verb (`inspect` included), never a silent pick of whichever entry the scan returns
+first. See [`docs/registry.md`](registry.md), "Run id resolution — ambiguity is a
+hard failure".
+
 ## Local transport
 
 Each run stands up one local IPC endpoint, restricted to the current user, and

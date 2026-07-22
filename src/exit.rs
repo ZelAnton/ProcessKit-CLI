@@ -41,8 +41,12 @@ pub const CONTROL: u8 = 103;
 /// instead of panicking, so callers still observe a runner-range exit.
 #[allow(dead_code)] // Minted as the runner grows fallible paths (T-002+).
 pub const INTERNAL: u8 = 104;
-/// A defined-but-not-yet-built code path. Transitional: it exists only while the
-/// runner is being implemented and is retired as each path lands.
+/// Retired. Formerly minted for a defined-but-not-yet-built code path while the
+/// runner was under construction; every subcommand is now implemented, so no
+/// active path mints this code anymore. Per the stability contract
+/// (`docs/exit-codes.md`, "Stability"), a retired code is never reused for a
+/// different meaning — this number stays permanently reserved.
+#[allow(dead_code)] // Retired: kept only so the number stays reserved, never reused.
 pub const NOT_IMPLEMENTED: u8 = 105;
 /// The run exceeded its `--timeout`: the runner enforced the deadline and tore
 /// the process tree down. A **runner-imposed outcome**, not a child exit — the
@@ -94,16 +98,6 @@ impl RunnerError {
             code,
             message: message.into(),
         }
-    }
-
-    /// A subcommand path that is defined but not yet implemented in this build.
-    pub fn not_implemented(subcommand: &str) -> Self {
-        Self::new(
-            NOT_IMPLEMENTED,
-            format!(
-                "`{subcommand}` is not implemented yet; see docs/ROADMAP.md for the delivery order"
-            ),
-        )
     }
 
     /// The runner-own exit code this error should surface to the process's caller.
@@ -180,12 +174,5 @@ mod tests {
                 assert_ne!(a, b, "two runner-imposed endings collided on {a}");
             }
         }
-    }
-
-    #[test]
-    fn not_implemented_carries_the_transitional_code() {
-        let err = RunnerError::not_implemented("run");
-        assert_eq!(err.code(), NOT_IMPLEMENTED);
-        assert!(err.to_string().contains("run"));
     }
 }
