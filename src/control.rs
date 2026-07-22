@@ -67,15 +67,22 @@
 //!
 //! That initial check alone is a TOCTOU race for `cancel`/`kill`: a duplicate can
 //! register under the same `run_id` in the window between the scan and the
-//! destructive verb reaching the wire (the `connect_live` round trip in between),
-//! which would otherwise let the command silently proceed against a target that is
-//! *now* ambiguous. [`mutate_async`] closes that window as tightly as the registry's
-//! decentralized, no-locking-across-processes design allows: it re-runs
-//! [`resolve_in_registry`] ([`reconfirm_target`]) immediately before writing the
-//! verb, and aborts — without ever writing — unless it resolves back to the exact
-//! endpoint already connected to. `inspect` does not repeat this re-check: it is
-//! read-only, so a race that surfaces a snapshot from just before a duplicate
-//! registered is stale information, not a wrong-target action.
+//! destructive verb reaching the wire (the `connect_live` round trip in between).
+//! [`mutate_async`] narrows that window as tightly as the registry's decentralized,
+//! no-locking-across-processes design allows: it re-runs [`resolve_in_registry`]
+//! ([`reconfirm_target`]) immediately before writing the verb, and aborts — without
+//! ever writing — unless it resolves back to the exact endpoint already connected
+//! to. A sub-instruction gap remains between that synchronous re-check and the
+//! `.await`ed write itself; closing it fully would need a `run_id`-keyed lock held
+//! across process boundaries, which this design deliberately does not attempt. It
+//! cannot misdirect the verb, though: the client is already connected to the
+//! target's specific, uniquely-tokened transport endpoint by the time the re-check
+//! runs, and no later registry write can retarget bytes already destined for an
+//! open connection — see
+//! `racing_duplicate_after_reconfirm_does_not_misdirect_the_dispatched_verb` in this
+//! module's tests. `inspect` does not repeat this re-check: it is read-only, so a
+//! race that surfaces a snapshot from just before a duplicate registered is stale
+//! information, not a wrong-target action.
 //!
 //! ## Wire protocol
 //!
@@ -494,12 +501,16 @@ async fn mutate_async(run_id: &str, command: ControlCommand) -> Result<(), Runne
     // no-locking-across-processes design allows (`AGENTS.md`, "No PID addressing";
     // `docs/registry.md`, "Run id resolution"): a duplicate run can register under
     // the same `run_id` at any point during `resolve_in_registry`'s scan or
-    // `connect_live`'s round trip, which would otherwise let a destructive verb
-    // silently proceed against a target that is *now* ambiguous. Re-scan and
-    // re-resolve right before writing the verb — the only gap left is the
-    // synchronous match below plus the write itself, no further `.await` on the
-    // registry in between — and abort rather than dispatch on any outcome other
-    // than resolving back to the exact endpoint already connected to.
+    // `connect_live`'s round trip. Re-scan and re-resolve right before writing the
+    // verb and abort on any outcome other than resolving back to the exact endpoint
+    // already connected to. A sub-instruction gap remains between this synchronous
+    // check and the `.await`ed write in `converse_mutation` below — closing that
+    // fully would need a run_id-keyed lock held across process boundaries, which the
+    // registry deliberately does not provide — but it cannot misdirect the verb:
+    // `connect_live` already bound this client to `endpoint`'s specific,
+    // uniquely-tokened connection, so a duplicate registering in that gap cannot
+    // retarget bytes already destined for it (proven by
+    // `racing_duplicate_after_reconfirm_does_not_misdirect_the_dispatched_verb`).
     reconfirm_target(&registry, action, run_id, &endpoint)?;
 
     let ack = tokio::time::timeout(CONVERSATION_DEADLINE, converse_mutation(stream, command))
@@ -740,13 +751,22 @@ fn ambiguous_run(action: &str, run_id: &str, count: usize) -> RunnerError {
 /// Re-run [`resolve_in_registry`] against the same open `registry` right before a
 /// mutating verb (`cancel`/`kill`) is dispatched, and require it to resolve back to
 /// the exact `expected_endpoint` [`mutate_async`] already connected to. Closes the
-/// window between the initial resolution and the write that follows: a duplicate
-/// that registered under `run_id` during the scan or the connect round trip now
-/// makes the id ambiguous again and surfaces that ambiguity here (or, in the
-/// vanishingly unlikely case the original entry went stale *and* a single different
-/// entry now resolves instead, a dedicated "changed during dispatch" failure) —
-/// either way the verb is never written to the wire. See `docs/registry.md`, "Run id
-/// resolution".
+/// window between the initial resolution and this re-check: a duplicate that
+/// registered under `run_id` during the scan or the connect round trip now makes the
+/// id ambiguous again and surfaces that ambiguity here (or, in the vanishingly
+/// unlikely case the original entry went stale *and* a single different entry now
+/// resolves instead, a dedicated "changed during dispatch" failure) — either way the
+/// verb is never written to the wire *for that outcome*.
+///
+/// This check is synchronous and cannot itself be made atomic with the `.await`ed
+/// write that follows in [`mutate_async`], so a duplicate could in principle still
+/// register in the residual gap between this function returning and that write. That
+/// gap cannot **misdirect** the verb, though: by the time this runs, `connect_live`
+/// has already bound the client to `expected_endpoint`'s specific, uniquely-tokened
+/// transport connection, and no later registry write can retarget bytes already
+/// destined for an open connection — see
+/// `racing_duplicate_after_reconfirm_does_not_misdirect_the_dispatched_verb` below
+/// and `docs/registry.md`, "Run id resolution".
 fn reconfirm_target(
     registry: &registry::Registry,
     action: &str,
@@ -1406,6 +1426,87 @@ mod tests {
             .expect("no racing registration occurred, so the re-check passes");
 
         drop(first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `reconfirm_target` closes the window between the client's initial resolve and
+    /// its dispatch, but re-review (see `docs/registry.md`, "Run id resolution") kept
+    /// finding a further residual gap: `reconfirm_target` is a synchronous scan, while
+    /// the verb itself goes out through a later `.await` on the write half
+    /// (`converse_mutation`), so a duplicate could in principle register in between.
+    /// This test proves that residual gap cannot **misdirect** the verb, which is the
+    /// actual hazard the finding cares about (a destructive command landing on the
+    /// wrong run) — `connect_live` already bound the client to run A's specific,
+    /// uniquely-tokened transport connection *before* `reconfirm_target` ran, so a
+    /// later registry write cannot retarget bytes already destined for that open
+    /// connection. It drives the race deterministically — reconfirm, *then* register
+    /// the racing duplicate, *then* dispatch — rather than depending on real thread
+    /// timing.
+    #[tokio::test]
+    async fn racing_duplicate_after_reconfirm_does_not_misdirect_the_dispatched_verb() {
+        let dir = scratch_registry_dir("reconfirm-post-race");
+        let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
+
+        // Stand in for the real transport connection `connect_live` would already hold
+        // by this point: an in-memory duplex, one side owned by the client
+        // (`converse_mutation`), the other by run A's server loop (`serve_one`).
+        let (client_stream, server_stream) = tokio::io::duplex(1024);
+
+        let first = registry
+            .register("dup-post-race", Some("endpoint-a"), SystemTime::now())
+            .expect("register the run the client is connected to");
+
+        let endpoint = resolve_in_registry(&registry, "cancel", "dup-post-race")
+            .expect("the sole live run resolves before the race window opens");
+        assert_eq!(endpoint, "endpoint-a");
+
+        reconfirm_target(&registry, "cancel", "dup-post-race", &endpoint)
+            .expect("no duplicate has registered yet, so the re-check passes");
+
+        // The race, landing *after* the re-check passes — the residual window this
+        // test targets: a second run registers under the same run_id while the verb is
+        // still in flight to the connection already established with run A.
+        let second = registry
+            .register("dup-post-race", Some("endpoint-b"), SystemTime::now())
+            .expect("register the racing duplicate after the re-check passed");
+
+        let members = || vec![Member::from_pid(1)];
+        let source = SnapshotSource::new(
+            "dup-post-race",
+            "job_object",
+            Some(1),
+            SystemTime::UNIX_EPOCH,
+            &members,
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Drive both sides of the already-open connection concurrently, exactly as
+        // `mutate_async` does after `reconfirm_target` returns.
+        let (serve_result, ack) = tokio::join!(
+            serve_one(server_stream, &source, &tx),
+            converse_mutation(client_stream, ControlCommand::Cancel),
+        );
+        serve_result.expect("run A answers the one connection it actually received");
+        let ack = ack.expect("the verb reaches run A over its already-open connection");
+
+        assert!(ack.accepted, "run A acks the cancel it actually received");
+        assert_eq!(ack.action, "cancel");
+        assert_eq!(
+            ack.run_id, "dup-post-race",
+            "the ack comes from the pre-reconfirmed run"
+        );
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(ControlCommand::Cancel),
+            "the routed command came from run A's connection, never the racing \
+             duplicate registered under \"endpoint-b\" after the re-check — a \
+             transport connection cannot be retargeted by a later registry write, so \
+             the verb reaches exactly the run that was reconfirmed regardless of the \
+             now-ambiguous run_id bookkeeping"
+        );
+
+        drop(first);
+        drop(second);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

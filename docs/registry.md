@@ -138,10 +138,28 @@ locking-across-processes design allows: immediately before writing the verb, the
 client re-runs the same scan+match and requires it to resolve back to the exact
 endpoint it already connected to — any other outcome (a fresh ambiguity, the entry
 having gone stale, or the resolution landing on a different entry) aborts the
-command without ever writing to the wire, rather than letting it silently proceed
-against a target that is now ambiguous. `inspect` does not repeat this check: being
+command without ever writing to the wire. `inspect` does not repeat this check: being
 read-only, a race that surfaces a snapshot from just before a duplicate registered is
 merely stale information, not a wrong-target action.
+
+That pre-dispatch re-check is a synchronous scan, while the verb write that follows
+it is a separate, later `.await`; the two cannot be made atomic with each other, so a
+duplicate can in principle still register in the sub-instruction gap between the
+re-check returning and the write reaching the OS. Closing that residual gap
+completely would need a `run_id`-keyed lock held across process boundaries through
+the write — a registry redesign this resolver deliberately does not attempt (see "No
+PID addressing" above). It is not needed for correctness, though: by the time the
+re-check runs, the client has already connected to the target's specific,
+uniquely-tokened transport endpoint (`endpoint_tokens_are_unique` in
+`src/control.rs`), and a later registry write cannot retarget bytes already destined
+for an open connection. So the guarantee the re-check actually buys is narrower than
+"no ambiguity can ever exist at write time" (impossible without that cross-process
+lock) and is instead: **the verb can never be misdirected to a different run than the
+one already resolved and reconfirmed.** A duplicate that registers in the residual
+gap is simply invisible to that call — it becomes visible on the *next* one — never a
+wrong-target action. See
+`racing_duplicate_after_reconfirm_does_not_misdirect_the_dispatched_verb` in
+`src/control.rs` for a deterministic proof of this property.
 
 ## Lifecycle
 
