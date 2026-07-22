@@ -140,12 +140,6 @@ impl Registry {
         Ok(Self { dir })
     }
 
-    /// The registry directory on disk. The control transport places its unix socket
-    /// here so the owner-only (`0700`) directory gates access to it too.
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
     /// Register a starting run: write its [`Record`] and take the exclusive advisory
     /// lock that marks it live. The returned [`Registration`] holds that lock for the
     /// run's lifetime; dropping it (or calling [`Registration::remove`]) tears the
@@ -930,9 +924,9 @@ mod tests {
     #[test]
     fn directory_is_created_owner_only() {
         let dir = scratch("perms");
-        let registry = Registry::open_in(dir.clone()).expect("open registry");
+        let _registry = Registry::open_in(dir.clone()).expect("open registry");
         assert!(
-            platform::is_owner_only(registry.dir()).expect("read permissions"),
+            platform::is_owner_only(&dir).expect("read permissions"),
             "the registry directory must be restricted to its owner"
         );
         let _ = fs::remove_dir_all(&dir);
