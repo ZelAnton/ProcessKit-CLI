@@ -13,6 +13,11 @@ format**, and **staleness signal**. The transport those clients speak over, and 
 `inspect` client itself, are described in [`docs/control-plane.md`](control-plane.md);
 here we define only the registry.
 
+`list` (see "Discovery" below) is the one client that reads the registry directly,
+without connecting to any runner's control transport: it scans every entry and
+prints it, so an operator or orchestrator that has lost (or never had) a `run_id`
+can find one before reaching for `inspect`/`cancel`/`kill`.
+
 ## Location
 
 The registry is a **per-user** directory — not system-wide and not tied to any one
@@ -166,6 +171,33 @@ gap is simply invisible to that call — it becomes visible on the *next* one �
 wrong-target action. See
 `racing_duplicate_after_reconfirm_does_not_misdirect_the_dispatched_verb` in
 `src/control.rs` for a deterministic proof of this property.
+
+## Discovery — `list`
+
+`processkit-cli list [--json]` scans the registry with [`Registry::entries`]
+(`src/registry.rs`) — the same scan every other client shares — and prints every
+entry it finds, live and stale alike: `run_id`, health (`live`/`stale`), `started_at`,
+and `endpoint`. It is deliberately **read-only** and never connects to any runner's
+control transport, so it carries none of the "could not reach the target run"
+failure modes `inspect`/`cancel`/`kill` do — it has no single target to fail to
+reach.
+
+- **No `--json`** prints a human-readable table (or `no runs registered` for an
+  empty registry).
+- **`--json`** prints one JSON object per entry, one per line, sorted by `run_id`
+  then `started_at` for a deterministic order — the same "JSON Lines" shape
+  `inspect --json` uses for a single snapshot.
+- An **empty registry is not an error**: `list` prints an empty result (or the
+  `no runs registered` notice) and exits `0`, exactly like scanning any other
+  registry state.
+- A **stale entry is listed, not hidden** — unlike `inspect`/`cancel`/`kill`, which
+  treat a stale match as an unreachable-run failure, `list`'s whole purpose is
+  discovery, so a stale leftover (evidence of a runner that died abruptly without
+  cleaning up) is exactly the kind of thing an operator wants to see, e.g. before
+  reaping it.
+- A single corrupt or unreadable record is skipped by `Registry::entries` itself
+  (see "Staleness" and the per-record degradation documented there) and never
+  blinds `list` to the other, healthy entries.
 
 ## Lifecycle
 

@@ -138,6 +138,18 @@ to a dated version section.
   the schema, so drift between the schema, the fixture, and the code fails the
   build. `docs/schema.md` remains the normative source of truth on any
   disagreement.
+- `list [--json]`: a new subcommand that scans the per-user registry
+  (`Registry::entries`) and prints every entry it finds, live and stale alike —
+  `run_id`, health, `started_at`, and `endpoint` — the discovery counterpart to
+  `inspect`/`cancel`/`kill` for a caller that has lost (or never had) a `run_id`.
+  Read-only: it never connects to any runner's control transport, so it has none
+  of their unreachable-run failure modes. Without `--json` it prints a
+  human-readable table (`no runs registered` for an empty registry); with
+  `--json` it prints one JSON object per entry, one per line, sorted by `run_id`
+  then `started_at`. An empty registry is not an error (exits `0`), and a single
+  corrupt/unreadable record never blinds the command to the healthy entries
+  (the same degradation `Registry::entries` already applies). Additive only —
+  the new subcommand appears in the `probe` surface tokens automatically.
 
 ### Changed
 - Setup/support failures no longer masquerade as an `INTERNAL` (104) runner fault.

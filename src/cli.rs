@@ -35,6 +35,8 @@ pub enum Command {
     Cancel(TargetArgs),
     /// Hard-kill a live run's container immediately.
     Kill(TargetArgs),
+    /// List every run recorded in the per-user registry, live and stale alike.
+    List(ListArgs),
     /// Report this binary's compatibility surface for a consumer's fail-closed
     /// launcher preflight (`CC_PROCESSKIT_RUN`) — no run, no child, no side effects.
     Probe(ProbeArgs),
@@ -138,6 +140,24 @@ pub struct TargetArgs {
     /// The run to act on.
     #[arg(long, value_name = "id")]
     pub run_id: String,
+}
+
+/// `list [--json]`
+///
+/// Scans the per-user registry ([`crate::registry::Registry::entries`]) and prints
+/// every entry it finds, live or stale — the discovery counterpart to the
+/// by-`run-id` commands above, for an operator or orchestrator that has lost (or
+/// never had) a `run_id`. An empty registry is not an error: it prints an empty
+/// result and exits `0`, and a single unreadable/corrupt record never blinds the
+/// command to the healthy entries (the same per-record degradation
+/// `Registry::entries` already applies).
+#[derive(Debug, Args)]
+pub struct ListArgs {
+    /// Emit one JSON object per entry (one per line) instead of a human-readable
+    /// table. Unlike `inspect`/`probe`, this flag is optional — `list` has a
+    /// human-readable form of its own.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `probe --json [--require-schema-version <N>] [--require-exit-code-band <s>-<e>]
@@ -339,6 +359,24 @@ mod tests {
             Cli::try_parse_from(["processkit-cli", "inspect", "--json"]).is_err(),
             "--run-id is required"
         );
+    }
+
+    #[test]
+    fn list_defaults_to_no_json_and_accepts_the_flag() {
+        let cli = Cli::try_parse_from(["processkit-cli", "list"]).expect("a bare list");
+        let Command::List(args) = cli.command else {
+            panic!("expected the list subcommand");
+        };
+        assert!(
+            !args.json,
+            "--json is optional and defaults to off for list"
+        );
+
+        let cli = Cli::try_parse_from(["processkit-cli", "list", "--json"]).expect("list --json");
+        let Command::List(args) = cli.command else {
+            panic!("expected the list subcommand");
+        };
+        assert!(args.json);
     }
 
     #[test]

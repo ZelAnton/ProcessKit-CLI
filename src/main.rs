@@ -10,7 +10,9 @@
 //! snapshot, and `cancel`/`kill` reach the same live runner over the same transport
 //! to end it — a graceful soft-stop → grace → hard-kill for `cancel`, an immediate
 //! hard kill for `kill` — each a distinguishable outcome in the JSONL stream and by
-//! exit code. The compatibility surface — CLI flags (see [`cli`]), the exit-code
+//! exit code. [`list`] is the discovery counterpart: it scans the same registry and
+//! prints every entry, live or stale, for a caller that has lost (or never had) a
+//! `run_id`. The compatibility surface — CLI flags (see [`cli`]), the exit-code
 //! contract (see [`exit`] and `docs/exit-codes.md`), and the JSONL `schema_version`
 //! (see [`events`] and `docs/schema.md`) — is fixed.
 
@@ -20,6 +22,7 @@ mod control;
 mod events;
 mod exit;
 mod hash;
+mod list;
 mod probe;
 mod registry;
 mod run;
@@ -48,6 +51,7 @@ fn main() -> ExitCode {
         Command::Inspect(args) => report(control::inspect(&args.run_id)),
         Command::Cancel(args) => report(control::cancel(&args.run_id)),
         Command::Kill(args) => report(control::kill(&args.run_id)),
+        Command::List(args) => report(list::run(args.json)),
         Command::Probe(args) => report(probe::run(&args)),
     }
 }

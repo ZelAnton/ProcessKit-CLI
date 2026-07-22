@@ -537,3 +537,117 @@ fn cancel_and_kill_report_no_such_run_with_the_control_code() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Run `list [--json]` against `registry` and wait for it to finish.
+fn list(registry: &Path, json: bool) -> Output {
+    let mut cmd = Command::new(bin());
+    cmd.arg("list");
+    if json {
+        cmd.arg("--json");
+    }
+    cmd.env("PROCESSKIT_CLI_REGISTRY_DIR", registry)
+        .output()
+        .expect("spawn the list client")
+}
+
+/// An empty registry is not an error: `list` exits `0` either way, printing an
+/// empty JSON-lines result for `--json` and a plain notice for the human-readable
+/// form.
+#[test]
+fn list_reports_an_empty_registry() {
+    let dir = scratch("list-empty");
+    let registry = registry_dir(&dir);
+
+    let out = list(&registry, false);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an empty registry is not an error; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("no runs registered"),
+        "the human-readable form notes the registry is empty: {stdout}"
+    );
+
+    let out = list(&registry, true);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an empty registry is not an error for --json either; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "--json prints no lines for an empty registry: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `list --json` finds a live run through the same registry scan `inspect` uses and
+/// prints its `run_id`, health, `started_at`, and `endpoint` as one JSON line — the
+/// discovery counterpart to `inspect`/`cancel`/`kill` for a caller that does not
+/// already know the `run_id`.
+#[test]
+fn list_reports_a_live_run() {
+    let dir = scratch("list-live");
+    let registry = registry_dir(&dir);
+    let mut child = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "list-me"],
+        inspectable_child(),
+    )
+    .spawn()
+    .expect("spawn the runner");
+
+    // The run is listable once its record (and thus its endpoint) is published.
+    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+
+    let out = list(&registry, true);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "listing a registry with a live run succeeds; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(lines.len(), 1, "exactly one entry is registered: {stdout}");
+    let entry: serde_json::Value =
+        serde_json::from_str(lines[0]).expect("list --json prints one valid JSON line per entry");
+    assert_eq!(
+        entry["run_id"], "list-me",
+        "the entry names the run: {entry}"
+    );
+    assert_eq!(
+        entry["health"], "live",
+        "the live entry reports health live: {entry}"
+    );
+    assert!(
+        entry["started_at"].is_string(),
+        "the entry carries a start time: {entry}"
+    );
+    assert!(
+        entry["endpoint"].is_string(),
+        "a live run has published its control-transport endpoint: {entry}"
+    );
+
+    // The human-readable form also names the run and its health.
+    let out = list(&registry, false);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("list-me") && stdout.contains("live"),
+        "the human-readable form names the run and its health: {stdout}"
+    );
+
+    // Let the run finish cleanly (removing its own entry).
+    let _ = child.wait();
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -105,6 +105,7 @@ processkit-cli run     [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl>
 processkit-cli inspect --run-id <id> --json
 processkit-cli cancel  --run-id <id>
 processkit-cli kill    --run-id <id>
+processkit-cli list    [--json]
 processkit-cli probe   --json [--require-schema-version <N>]
                        [--require-exit-code-band <start>-<end>]
                        [--require-surface <token>]...
@@ -142,6 +143,18 @@ stale rather than an invitation to address processes by PID, and a cancel/kill a
 it is a bounded `CONTROL` (103) failure — never a hang. Cleanup after an abrupt runner
 death follows the platform-specific `abrupt_cleanup` guarantee above; only Windows
 currently guarantees the whole tree.
+
+`list` is the discovery counterpart to `inspect`/`cancel`/`kill`: it scans the same
+per-user registry and prints every entry it finds — `run_id`, health (`live`/
+`stale`), `started_at`, and `endpoint` — for an operator or orchestrator that has
+lost (or never had) a `run_id`. It is read-only and never connects to any runner's
+control transport, so it has none of their unreachable-run failure modes. Without
+`--json` it prints a human-readable table (`no runs registered` for an empty
+registry); with `--json` it prints one JSON object per entry, one per line. An
+empty registry is not an error — `list` exits `0` either way — and a stale entry is
+listed rather than hidden, since surfacing a leftover from an abruptly-died runner
+is exactly the point. See [`docs/registry.md`](docs/registry.md), "Discovery —
+`list`".
 
 ## Exit codes
 
@@ -312,7 +325,10 @@ through the local control plane: `inspect` prints a snapshot, `cancel` ends a ru
 gracefully (its shared soft-stop → grace → hard-kill teardown, exit `108`), and `kill`
 force-kills the whole tree immediately (exit `109`) — each a distinguishable outcome in
 the JSONL stream and by exit code, and each a bounded `CONTROL` (103) failure when the
-run cannot be reached. `probe` reports and verifies the binary's compatibility surface
+run cannot be reached. `list` scans the same registry read-only and prints every
+entry, live or stale, as a table or (with `--json`) as JSON Lines — the discovery
+counterpart for a caller that has lost or never had a `run_id`. `probe` reports and
+verifies the binary's compatibility surface
 for a consumer's fail-closed launcher preflight (`CC_PROCESSKIT_RUN`), with no side
 effects, exiting `PROBE_INCOMPATIBLE` (110) on an incompatible candidate (see "Launch
 contract"). See [the roadmap](docs/ROADMAP.md) for the intended delivery order.
