@@ -101,6 +101,13 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+# Validates the JSONL event golden fixture (and events emitted by the
+# through-the-binary tests) against the published JSON Schema
+# (`fixtures/schema/v1/schema.json`), keeping the schema, the code, and
+# `docs/schema.md` in lockstep (`tests/events.rs`). Default features pull in a
+# remote-`$ref` HTTP/file resolver (and `reqwest`) that this schema — fully
+# self-contained via internal `$defs` — never needs, so they are disabled.
+jsonschema = { version = "0.48.2", default-features = false }
 
 # Unix-only: the cancel integration test needs to deliver a real SIGINT (the
 # `Ctrl-C` the runner listens for) to the spawned runner process, which the std

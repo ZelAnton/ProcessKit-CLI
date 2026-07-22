@@ -11,6 +11,21 @@ shapes. Treat every field below as public API.
   [`fixtures/schema/v1/events.jsonl`](../fixtures/schema/v1/events.jsonl); the
   golden test (`events::tests::golden_stream_matches_the_fixture`) keeps this
   document, the code, and the fixture in lockstep.
+- A machine-readable JSON Schema (draft 2020-12) is published at
+  [`fixtures/schema/v1/schema.json`](../fixtures/schema/v1/schema.json) — one
+  variant per event type plus the shared envelope, transcribed from this
+  document. **This prose document remains the normative source of truth**; the
+  JSON Schema is a mechanical mirror of it, kept honest by
+  `tests::golden_fixture_validates_against_the_schema` (`tests/events.rs`),
+  which validates the golden fixture (and, in several other tests in that
+  file, live streams emitted by the binary) against it — so a discrepancy
+  between the schema and the fixture/code fails CI rather than drifting
+  silently. On any disagreement between the schema and this document, trust
+  this document and treat the schema as needing a fix. The schema's version is
+  synchronized with `schema_version`: it lives under `fixtures/schema/v1/`
+  alongside the fixture, and a breaking change that bumps `schema_version`
+  (see "Versioning") moves both to a new `fixtures/schema/vN/` directory
+  together, never one without the other.
 
 ## Transport
 

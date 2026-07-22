@@ -128,6 +128,16 @@ to a dated version section.
   install. `README.md` gains an Installation section with a platform matrix that
   states the actual kernel container mechanism reported per platform (Job Object
   on Windows, cgroup v2 on Linux, POSIX process group on macOS/other Unix).
+- Machine-readable JSON Schema (draft 2020-12) for the JSONL event contract v1,
+  published at `fixtures/schema/v1/schema.json` alongside the golden
+  `events.jsonl` fixture: one schema variant per event type plus the shared
+  envelope, transcribed from the normative `docs/schema.md`. Adapters
+  (`processkit-py`) can validate against it instead of reimplementing the
+  shapes by hand. A new test (`tests/events.rs`) validates the golden fixture,
+  and several live streams emitted by the through-the-binary tests, against
+  the schema, so drift between the schema, the fixture, and the code fails the
+  build. `docs/schema.md` remains the normative source of truth on any
+  disagreement.
 
 ### Changed
 - The control plane's three clients — `inspect`, `cancel`, and `kill` — all reach a

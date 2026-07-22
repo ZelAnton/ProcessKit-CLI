@@ -268,6 +268,8 @@ richer per-member fields declared but absent until ProcessKit-rs ships them.
 - Normative field reference: [`docs/schema.md`](docs/schema.md).
 - Golden sample stream for adapters:
   [`fixtures/schema/v1/events.jsonl`](fixtures/schema/v1/events.jsonl).
+- Machine-readable JSON Schema (draft 2020-12) for the same contract:
+  [`fixtures/schema/v1/schema.json`](fixtures/schema/v1/schema.json).
 
 ## Status
 
