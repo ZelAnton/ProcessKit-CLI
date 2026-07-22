@@ -19,7 +19,7 @@ sketched from the code as of this writing rather than from memory.
 | --- | --- |
 | [`src/cli.rs`](../src/cli.rs) | The CLI-flags half of the compatibility surface: the clap-derived `Cli`/`Command` types for `run`, `inspect`, `cancel`, `kill`, and `probe`. Parsing and shape validation only — each subcommand's behavior lives in its own module. |
 | [`src/main.rs`](../src/main.rs) | Entry point. Parses `Cli`, dispatches to the subcommand module, and maps the result onto a process exit code: `run` owns its own exit path (it hard-exits with the child's code and never returns here); every other subcommand's `Result<(), RunnerError>` is mapped through `RunnerError::code()`, and a clap parse failure is mapped onto the runner's own `USAGE` code rather than clap's default. |
-| [`src/run.rs`](../src/run.rs) | The `run` subcommand itself: spawns the child into a `processkit::ProcessGroup` this module owns, pipes and echoes its output live, races the child's exit against `--timeout`/`Ctrl-C`/a control-plane command, and drives the one shared teardown path (soft stop → grace → hard kill) for every runner-imposed ending. Exit-code fidelity — the child's exact code on a normal completion, a reserved-band code for every runner-imposed ending — is enforced here. |
+| [`src/run.rs`](../src/run.rs) | The `run` subcommand itself: spawns the child into a `processkit::ProcessGroup` this module owns, pipes and echoes its output live, races the child's exit against `--timeout`/`Ctrl-C`/a control-plane command, and drives the shared teardown tiers — the graceful soft stop → grace → hard kill for `timeout`/`Ctrl-C`/`cancel`, and the immediate hard kill (no soft stop, no grace) for a control-plane `kill`. Exit-code fidelity — the child's exact code on a normal completion, a reserved-band code for every runner-imposed ending — is enforced here. |
 | [`src/events.rs`](../src/events.rs) | The versioned JSONL lifecycle-event schema and its emitter — this repository's normative, golden-tested public event contract (see [`docs/schema.md`](schema.md)). Also owns argv redaction: the default SHA-256 `argv_sha256` fingerprint and the `HINT_RULES` worker-shape classifier. |
 | [`src/capture.rs`](../src/capture.rs) | `--capture-dir` bounded per-stream stdout/stderr capture to files, riding the same tee `run` already echoes through (no second output-reading path). Records, per stream, a full byte counter, a SHA-256 of the bytes written, and independent explicit `truncated`/`write_error` flags, surfaced in the `output_captured` event. |
 | [`src/hash.rs`](../src/hash.rs) | The one hand-rolled incremental/one-shot SHA-256 (FIPS 180-4) both `events` (argv fingerprint) and `capture` (streamed transcript hashing) build on, so the project has a single digest primitive and rendering style. |
@@ -37,8 +37,16 @@ implemented in `run::execute`/`run::run_async` (`src/run.rs`):
    `ProcessGroup` this process owns — not a shared or global one — so the
    group's kernel-backed kill-on-drop (Windows Job Object, Linux
    cgroup/POSIX-group, macOS process group) reaps the whole tree on every exit
-   path. A `run_started` event (run id, root PID, containment mechanism,
-   working directory) opens the JSONL stream.
+   path *this process lives to observe* (normal completion, timeout, `Ctrl-C`,
+   control-plane `cancel`/`kill`). That guarantee does not extend to this
+   process's own **abrupt** death (crash/`SIGKILL`/`TerminateProcess`), which
+   skips `Drop` entirely: reaping a leaked grandchild after the runner itself
+   dies abruptly is a platform-derived tri-state — `whole_tree` on Windows (Job
+   Object survives the owner's abrupt death), `direct_child_only` on Linux
+   (`kill_on_parent_death`/`PR_SET_PDEATHSIG`, direct child only), `none` on
+   macOS/BSD — surfaced per run as `run_started`'s `abrupt_cleanup` field (see
+   K-005). A `run_started` event (run id, root PID, containment mechanism,
+   abrupt-cleanup tri-state, working directory) opens the JSONL stream.
 2. **Pump events.** `processkit`'s line pump concurrently reads the child's
    stdout/stderr and drives two things off the same read: the live echo to
    this process's own stdout/stderr (`src/run.rs`), and — when
@@ -50,14 +58,18 @@ implemented in `run::execute`/`run::run_async` (`src/run.rs`):
    ceiling-truncation flag and write-error flag — never inferred from the
    file's size. This stage is a no-op, with no capture files and no
    `output_captured` event, unless `--capture-dir` was passed.
-4. **Teardown.** Every runner-imposed ending — `--timeout` elapsing,
-   interactive `Ctrl-C`, or a control-plane `cancel`/`kill` reaching the live
-   runner over `src/control.rs` — drives the *same* path: a soft stop
-   (`SIGTERM` to the tree on Unix; no soft-signal tier on Windows yet, so the
-   grace window still elapses honestly with no signal sent), a `--grace`
-   wait, then the owning `ProcessGroup`'s kernel-backed hard kill-on-drop. A
-   normal completion instead reaps via the same drop once the child's own
-   exit is observed (`root_exited`, then `cleanup_started`/`cleanup_finished`).
+4. **Teardown.** Runner-imposed endings split into two tiers, not one shared
+   path. `--timeout` elapsing, interactive `Ctrl-C`, and a control-plane
+   `cancel` reaching the live runner over `src/control.rs` all drive the
+   *same* graceful path: a soft stop (`SIGTERM` to the tree on Unix; no
+   soft-signal tier on Windows yet, so the grace window still elapses honestly
+   with no signal sent), a `--grace` wait, then the owning `ProcessGroup`'s
+   kernel-backed hard kill-on-drop. A control-plane **`kill`** is not part of
+   that tier: it skips the soft stop and the grace window entirely and
+   hard-kills the whole tree immediately via the same kill-on-drop mechanism —
+   documented as immediate on purpose, not a shorter grace. A normal
+   completion instead reaps via the same drop once the child's own exit is
+   observed (`root_exited`, then `cleanup_started`/`cleanup_finished`).
 5. **`runner_exit`.** The terminal JSONL event closes the stream, always
    carrying the outcome — the child's own exit code on a normal completion,
    or the reserved code for whichever runner-imposed ending fired
@@ -89,8 +101,10 @@ by PID; they resolve it through the run registry (`src/registry.rs`):
    unix domain socket or a Windows named pipe, both owner-restricted — and
    speaks the shared line-oriented wire protocol: one request-verb line out,
    one JSON reply line in. `inspect` is read-only and prints a `Snapshot`;
-   `cancel`/`kill` are mutating, reuse `run`'s own teardown path exactly as
-   described above, and reply with a `ControlAck` before the run ends.
+   `cancel`/`kill` are mutating and reuse `run`'s own teardown tiers exactly as
+   described above — `cancel` the graceful soft-stop → grace → hard-kill tier,
+   `kill` the immediate hard-kill tier — replying with a `ControlAck` before
+   the run ends.
 
 See [`docs/registry.md`](registry.md) for the registry's location, record
 format, and staleness signal, and [`docs/control-plane.md`](control-plane.md)
