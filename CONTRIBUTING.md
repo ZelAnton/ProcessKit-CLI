@@ -2,6 +2,11 @@
 
 Thanks for your interest in improving **processkit-cli**.
 
+Before making a non-trivial change, skim [the architecture
+overview](docs/architecture.md) for how the modules fit together — the module
+map, the data flow of one `run`, the control-plane contour, and the boundary
+with the `processkit` crate.
+
 ## Prerequisites
 
 - A stable Rust toolchain. The repo pins it via

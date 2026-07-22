@@ -15,6 +15,9 @@ The project owns the versioned JSONL event contract used by runner clients and
 future adapters, including `processkit-py`. ProcessKit-rs remains the sole
 owner of containment, teardown, PID-reuse discipline, and lifecycle semantics.
 
+For a map of the modules below, the data flow of one run, and the
+control-plane contour, see [the architecture overview](docs/architecture.md).
+
 ## Installation
 
 `processkit-cli` ships as a single self-contained binary — running it needs
