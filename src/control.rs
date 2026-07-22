@@ -108,7 +108,6 @@
 
 use std::convert::Infallible;
 use std::io;
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -285,13 +284,17 @@ impl<'a> SnapshotSource<'a> {
     }
 }
 
-/// Stand up the local control transport for a run, bound in `dir` (the owner-only
-/// registry directory). **Best-effort:** a failure warns on stderr and returns
+/// Stand up the local control transport for a run. Not tied to the registry
+/// directory: the unix implementation binds its socket in its own short-lived
+/// directory under `/tmp` (the registry dir's path routinely exceeds
+/// `sockaddr_un::sun_path` on macOS/BSD, see K-009), and the Windows
+/// implementation lives in the kernel's named-pipe namespace, not the
+/// filesystem. **Best-effort:** a failure warns on stderr and returns
 /// `None` — the control plane is discovery infrastructure, and losing it only makes
 /// this run un-inspectable, never costs the child its exit-code fidelity (the same
 /// degradation as the registry itself, `AGENTS.md`, "Exit-code fidelity").
-pub fn open_server(dir: &Path) -> Option<ControlServer> {
-    match ControlServer::bind(dir) {
+pub fn open_server() -> Option<ControlServer> {
+    match ControlServer::bind() {
         Ok(server) => Some(server),
         Err(err) => {
             eprintln!("processkit-cli: warning: could not open the control transport: {err}");
@@ -810,7 +813,7 @@ mod imp {
 
     use std::fs::DirBuilder;
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     use tokio::net::{UnixListener, UnixStream};
 
@@ -832,10 +835,11 @@ mod imp {
     }
 
     impl ControlServer {
-        /// Bind a fresh socket in a short owner-only directory. The registry path is
-        /// deliberately not used: test/project paths routinely exceed macOS's
-        /// `sockaddr_un::sun_path` limit before a socket filename is appended.
-        pub fn bind(_registry_dir: &Path) -> io::Result<Self> {
+        /// Bind a fresh socket in a short owner-only directory of its own —
+        /// deliberately not the registry directory: test/project paths routinely
+        /// exceed macOS's `sockaddr_un::sun_path` limit before a socket filename is
+        /// appended.
+        pub fn bind() -> io::Result<Self> {
             let dir = create_private_socket_dir()?;
             let path = dir.join("c.sock");
             let endpoint = match path.to_str() {
@@ -947,7 +951,6 @@ mod imp {
     //! Windows transport: a named pipe with an owner-only protected DACL.
 
     use core::ffi::c_void;
-    use std::path::Path;
 
     use tokio::net::windows::named_pipe::{
         ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
@@ -978,9 +981,9 @@ mod imp {
 
     impl ControlServer {
         /// Create the pipe name and its first instance, restricted to the current
-        /// user. `dir` is unused on Windows — the pipe lives in the kernel namespace,
-        /// not the filesystem — but taken for a uniform signature with the unix side.
-        pub fn bind(_dir: &Path) -> io::Result<Self> {
+        /// user. No directory is taken — the pipe lives in the kernel namespace, not
+        /// the filesystem.
+        pub fn bind() -> io::Result<Self> {
             let endpoint = format!(r"\\.\pipe\processkit-cli-{}", unique_token());
             let security = OwnerOnlySecurityDescriptor::new()?;
             let first = create_instance(&endpoint, &security, true)?;
@@ -1554,16 +1557,16 @@ mod tests {
         assert_ne!(a, b, "each transport endpoint gets a distinct name");
     }
 
-    /// A deeply nested registry must not leak into the Unix socket address: macOS
-    /// allows only a short `sun_path`, which is much smaller than normal CI paths.
+    /// The Unix socket address stays short and owner-only regardless of any
+    /// external path: macOS allows only a short `sun_path`, so `bind` uses its own
+    /// short-lived directory rather than a caller-supplied one.
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_socket_path_stays_short_and_owner_only() {
         use std::os::unix::fs::PermissionsExt;
 
-        let long_registry = std::env::temp_dir().join("r".repeat(180));
-        let server = imp::ControlServer::bind(&long_registry)
-            .expect("a long registry path does not prevent binding the control socket");
+        let server = imp::ControlServer::bind()
+            .expect("binding the control socket does not depend on external paths");
         let endpoint = std::path::Path::new(server.endpoint());
         assert!(
             endpoint.as_os_str().as_encoded_bytes().len() < 100,

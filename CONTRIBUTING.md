@@ -78,6 +78,36 @@ and the harness never kills by (recyclable) PID. CI runs this tier as a separate
 
 [`tests/e2e.rs`]: tests/e2e.rs
 
+## Code coverage
+
+CI measures line/region coverage with [`cargo-llvm-cov`] in a dedicated
+`coverage` job (ubuntu-latest and windows-latest, so both the `cfg(unix)` and
+`cfg(windows)` halves of the code are covered), publishing an HTML report as a
+build artifact plus a text summary in the job's step summary. It is
+informational only: no coverage-percentage threshold gates the build, and the
+job never fails the pipeline, so treat a dip as a signal to look, not a
+required fix.
+
+Install it once (the `llvm-tools-preview` rustup component is required):
+
+```sh
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov --locked
+```
+
+Run it locally over the same scope CI measures — the default `cargo test`
+tier (unit tests plus the through-the-binary integration tests), excluding the
+feature-gated `e2e` tier:
+
+```sh
+cargo llvm-cov --open
+```
+
+`--open` builds an HTML report and opens it in your browser; drop the flag for
+a plain terminal summary instead.
+
+[`cargo-llvm-cov`]: https://github.com/taiki-e/cargo-llvm-cov
+
 ## Conventions
 
 - **Formatting** is governed by `rustfmt` (run `cargo fmt`); non-Rust files

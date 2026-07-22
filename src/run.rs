@@ -235,9 +235,15 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     let started = SystemTime::now();
     let run_id = events::resolve_run_id(args.run_id.as_deref());
     let registry_handle = open_registry();
+    // `open_server` no longer takes the registry directory (it never gated the
+    // transport's bind location on either platform, see `control::open_server`'s
+    // docstring) — but the transport is still gated on the registry being present:
+    // without a registry there is nowhere to publish the endpoint, so a client could
+    // never discover this run's control transport even if it were bound. Skipping the
+    // bind in that case is a deliberate choice, not leftover coupling to `dir`.
     let control_server = registry_handle
         .as_ref()
-        .and_then(|registry| control::open_server(registry.dir()));
+        .and_then(|_| control::open_server());
     let endpoint = control_server
         .as_ref()
         .map(|server| server.endpoint().to_string());

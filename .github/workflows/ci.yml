@@ -74,6 +74,60 @@ jobs:
       - run: cargo build --all-targets
       - run: cargo test
 
+  coverage:
+    name: coverage (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Data source, not a gate: no --fail-under-* threshold is set below, and
+    # continue-on-error absorbs any step failure (install hiccup, instrumented
+    # build/test failure) so this job never turns red and never blocks a merge —
+    # it is not a required check, and the `test`/`clippy`/`fmt`/other jobs above
+    # are unaffected either way.
+    #
+    # Scope mirrors the `test` job above: the default `cargo test` set (the
+    # `src/*.rs` unit tests baked into the `processkit-cli` binary — this crate
+    # is bin-only, there is no `--lib` target — plus the through-the-binary
+    # integration tests under `tests/`; see docs/architecture.md, "Test
+    # tiers"). ubuntu-latest + windows-latest covers both the `cfg(unix)` and
+    # `cfg(windows)` platform halves. The feature-gated `e2e` tier is out of
+    # scope here too, same reasoning as `test`: it spawns real, multi-level
+    # process trees and is heavier — a separate concern from this job's data.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@stable # rolling toolchain selector — intentionally unpinned
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2
+        with:
+          tool: cargo-llvm-cov
+      # Instrument and run the tests once; the two `report` steps below reuse
+      # this same profile data instead of re-running the suite (the documented
+      # `--no-report` + `report` split, see the cargo-llvm-cov README's "Merge
+      # coverages generated under different test conditions").
+      - name: Run instrumented tests
+        run: cargo llvm-cov --no-report
+      - name: Coverage summary
+        shell: bash
+        run: |
+          {
+            echo "### Coverage summary (${{ matrix.os }})"
+            echo '```text'
+            cargo llvm-cov report
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Coverage HTML report
+        run: cargo llvm-cov report --html --output-dir coverage-report
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-report-${{ matrix.os }}
+          path: coverage-report
+
   e2e:
     name: e2e (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
