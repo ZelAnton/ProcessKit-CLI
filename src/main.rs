@@ -55,15 +55,16 @@ fn main() -> ExitCode {
 
 /// Map clap's parse outcome onto the runner exit-code contract. `--help` and
 /// `--version` are successful requests: clap has already formatted their text
-/// for stdout, so we print it and exit 0. Every genuine parse failure exits with
-/// the runner-own [`exit::USAGE`] code instead of clap's default `2`, keeping the
-/// runner's failures inside its documented band.
+/// for stdout, so we print it and exit 0. Every genuine parse failure — including
+/// a bare invocation with no subcommand at all (clap's
+/// `DisplayHelpOnMissingArgumentOrSubcommand`) — exits with the runner-own
+/// [`exit::USAGE`] code instead of clap's default `2`, keeping the runner's
+/// failures inside its documented band and failing loudly rather than reporting
+/// success for an invalid command line.
 fn report_parse_error(err: clap::Error) -> ExitCode {
     let _ = err.print();
     match err.kind() {
-        ErrorKind::DisplayHelp
-        | ErrorKind::DisplayVersion
-        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => ExitCode::SUCCESS,
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => ExitCode::SUCCESS,
         _ => ExitCode::from(exit::USAGE),
     }
 }
