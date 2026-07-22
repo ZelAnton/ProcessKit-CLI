@@ -10,8 +10,11 @@
 //!   owner — unix mode `0700`, and on Windows a *protected* DACL that grants only
 //!   the current user (see [`platform`]). A record names a run's local transport
 //!   endpoint, so a world-readable registry would leak a control channel to any
-//!   local process. The restriction is re-asserted on every open so a pre-existing
-//!   directory is locked down too.
+//!   local process. [`Registry::open`] (the mutating path a run about to write a
+//!   record uses) re-asserts the restriction on every call so a pre-existing
+//!   directory is locked down too; [`Registry::open_read_only`] (`list`'s path)
+//!   deliberately does neither — a read-only scan must not create the directory or
+//!   touch its permissions.
 //! - **No PID addressing.** A record is never indexed or identified by a bare PID
 //!   (`AGENTS.md`: "Nothing is addressed by PID, which is what makes PID reuse
 //!   irrelevant"). Entries are found by scanning records and matching their
@@ -112,10 +115,11 @@ pub enum Health {
 pub struct Entry {
     pub record: Record,
     pub health: Health,
-    /// The record file's path — how a client acts on or reaps the entry. Read by the
-    /// reaping clients (`cancel`/`kill`, T-009); `inspect` matches on `run_id` and
-    /// health alone, so it does not touch it yet.
-    #[allow(dead_code)]
+    /// The record file's path — how a client acts on or reaps the entry (the
+    /// reaping clients, `cancel`/`kill`, T-009), and, for `list`, a unique-per-entry
+    /// tertiary sort key (two records can otherwise share both `run_id` and
+    /// `started_at`); `inspect` matches on `run_id` and health alone, so it does not
+    /// touch it.
     pub path: PathBuf,
 }
 
@@ -128,6 +132,13 @@ impl Registry {
     /// Open the per-user registry, creating its directory (and parents) restricted
     /// to the owner. The location is [`REGISTRY_DIR_ENV`] if set, else the platform
     /// default.
+    ///
+    /// This is the *mutating* open used by [`Registry::register`]'s caller (`run`):
+    /// it must create the directory (and re-assert its owner-only permissions on a
+    /// pre-existing one) because a run is about to write a record into it. A caller
+    /// that only wants to *read* the registry — `list` — must use
+    /// [`Registry::open_read_only`] instead, so a read-only scan cannot itself
+    /// create registry state or touch its permissions.
     pub fn open() -> io::Result<Self> {
         Self::open_in(resolve_dir()?)
     }
@@ -138,6 +149,24 @@ impl Registry {
     pub fn open_in(dir: PathBuf) -> io::Result<Self> {
         platform::create_owner_only_dir(&dir)?;
         Ok(Self { dir })
+    }
+
+    /// Open the per-user registry **without** creating its directory or touching its
+    /// permissions — the read-only counterpart of [`Registry::open`], for a caller
+    /// (`list`) that must never mutate registry state just to look at it. The
+    /// location is resolved exactly as [`Registry::open`] resolves it
+    /// ([`REGISTRY_DIR_ENV`] if set, else the platform default); a directory that
+    /// does not exist yet is not an error here either — [`Registry::entries`]
+    /// already treats a missing directory as an empty registry.
+    pub fn open_read_only() -> io::Result<Self> {
+        Ok(Self::open_read_only_in(resolve_dir()?))
+    }
+
+    /// Open a registry rooted at an explicit directory, read-only (the tests use
+    /// this directly; [`Registry::open_read_only`] resolves the directory and
+    /// delegates here). Never touches the filesystem — it cannot fail.
+    pub fn open_read_only_in(dir: PathBuf) -> Self {
+        Self { dir }
     }
 
     /// Register a starting run: write its [`Record`] and take the exclusive advisory
@@ -207,6 +236,16 @@ impl Registry {
             let Ok(record) = serde_json::from_str::<Record>(&text) else {
                 continue;
             };
+            // `started_at` is untrusted deserialized data too: a record written by a
+            // well-behaved runner always carries an [`events::format_rfc3339_utc`]
+            // value, but a corrupted or hand-edited record could carry anything
+            // `serde_json` will accept into a `String` field. A malformed value is
+            // corrupt-record noise, not a real start time — skip it like any other
+            // corrupt entry rather than listing (and sorting) garbage as if it were
+            // valid.
+            if !is_valid_rfc3339_millis_utc(&record.started_at) {
+                continue;
+            }
             // The `lock_file` field is untrusted deserialized data. Validate it as a
             // simple, single-component, relative `.lock` name *before* joining it onto
             // the registry directory — a value carrying `..`, a path separator, an
@@ -375,6 +414,48 @@ fn probe_health(lock_path: &Path) -> io::Result<Health> {
     } else {
         Ok(Health::Live)
     }
+}
+
+/// Validate that `value` has the exact shape [`events::format_rfc3339_utc`]
+/// produces: `YYYY-MM-DDTHH:MM:SS.sssZ`, 24 ASCII bytes, with the four calendar/
+/// clock fields in their documented ranges (month 1-12, day 1-31, hour 0-23, minute
+/// 0-59, second 0-59). This is a **shape/range** check, not a full calendar
+/// validator (it does not reject, say, day 31 of a 30-day month) — that is enough to
+/// catch the corrupt-record case this guards against (garbage, truncated, or
+/// wrong-format text swapped into `started_at`), which is the same standard
+/// [`is_simple_lock_file_name`] holds `lock_file` to. A live runner only ever writes
+/// values this function accepts.
+fn is_valid_rfc3339_millis_utc(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 24 {
+        return false;
+    }
+    const DIGIT_POSITIONS: [usize; 17] =
+        [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 22];
+    if !DIGIT_POSITIONS.iter().all(|&i| bytes[i].is_ascii_digit()) {
+        return false;
+    }
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'.'
+        || bytes[23] != b'Z'
+    {
+        return false;
+    }
+    let two = |i: usize| u32::from(bytes[i] - b'0') * 10 + u32::from(bytes[i + 1] - b'0');
+    let month = two(5);
+    let day = two(8);
+    let hour = two(11);
+    let minute = two(14);
+    let second = two(17);
+    (1..=12).contains(&month)
+        && (1..=31).contains(&day)
+        && hour <= 23
+        && minute <= 59
+        && second <= 59
 }
 
 /// Validate a registry record's `lock_file` field as a **simple, single-component,
@@ -1078,6 +1159,61 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// `open_read_only` is `list`'s entry point and must never create registry
+    /// state: scanning an empty registry (one whose directory does not exist yet)
+    /// must leave the directory absent, not conjure it into existence just to
+    /// discover there is nothing in it.
+    #[test]
+    fn open_read_only_does_not_create_the_directory() {
+        let dir = scratch("read-only-absent");
+        assert!(!dir.exists(), "the scratch fixture starts absent");
+
+        let registry = Registry::open_read_only_in(dir.clone());
+        assert!(
+            !dir.exists(),
+            "a read-only open must not create the registry directory"
+        );
+        assert!(
+            registry.entries().expect("scan").is_empty(),
+            "a missing directory reads back as an empty registry"
+        );
+        assert!(
+            !dir.exists(),
+            "scanning a missing directory must not create it either"
+        );
+    }
+
+    /// `open_read_only` must not re-assert (or otherwise touch) the permissions of
+    /// an *existing* registry directory — only the mutating [`Registry::open`] /
+    /// [`Registry::open_in`] path is allowed to do that. Unix-only: it is the
+    /// platform whose owner-only enforcement (`chmod`) is cheap to defeat and
+    /// re-check from a plain `std::fs` test without extra Windows ACL plumbing.
+    #[cfg(unix)]
+    #[test]
+    fn open_read_only_does_not_touch_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch("read-only-existing-perms");
+        let _mutating = Registry::open_in(dir.clone()).expect("create the registry once");
+        assert!(platform::is_owner_only(&dir).expect("read permissions"));
+
+        // Loosen the directory's permissions out-of-band, simulating an operator (or
+        // a prior process) having widened them for some unrelated reason.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("loosen permissions");
+
+        let read_only = Registry::open_read_only_in(dir.clone());
+        assert!(
+            read_only.entries().expect("scan").is_empty(),
+            "an empty existing directory still reads back empty"
+        );
+        assert!(
+            !platform::is_owner_only(&dir).expect("read permissions"),
+            "a read-only open must leave a pre-existing directory's permissions alone"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// A registered run writes a well-formed record: the run id, the endpoint it was
     /// given (here `None`), the start timestamp, and the advisory-lock liveness
     /// signal — and carries no PID.
@@ -1224,6 +1360,24 @@ mod tests {
         fs::write(dir.join(format!("{stem}.json")), json).expect("write the record");
     }
 
+    /// Like [`write_record`], but with an explicit `started_at` string instead of
+    /// the current time — for exercising [`is_valid_rfc3339_millis_utc`]'s
+    /// corrupt-record guard with values a real runner would never write.
+    fn write_record_with_started_at(dir: &Path, stem: &str, run_id: &str, started_at: &str) {
+        let record = Record {
+            registry_version: REGISTRY_VERSION,
+            run_id: run_id.to_string(),
+            endpoint: None,
+            started_at: started_at.to_string(),
+            liveness: Liveness {
+                kind: LIVENESS_ADVISORY_LOCK.to_string(),
+                lock_file: format!("{stem}.lock"),
+            },
+        };
+        let json = serde_json::to_string(&record).expect("serialize the record");
+        fs::write(dir.join(format!("{stem}.json")), json).expect("write the record");
+    }
+
     /// A platform-absolute path (never a simple in-directory name).
     fn absolute_escape() -> &'static str {
         if cfg!(windows) {
@@ -1342,6 +1496,75 @@ mod tests {
         );
         assert_eq!(entries[0].record.run_id, "good");
         assert_eq!(entries[0].health, Health::Live);
+
+        good.remove();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `is_valid_rfc3339_millis_utc` accepts every value the formatter it mirrors can
+    /// actually produce (the positive case a corrupt-record guard must not
+    /// accidentally reject) and rejects the shapes a hand-edited or truncated record
+    /// could plausibly carry instead.
+    #[test]
+    fn started_at_validator_accepts_the_formatter_output_and_rejects_malformed_values() {
+        for secs in [0u64, 1, 59, 3599, 86_399, 1_700_000_000] {
+            for millis in [0u64, 5, 500, 999] {
+                let formatted = events::format_rfc3339_utc(
+                    UNIX_EPOCH + Duration::from_secs(secs) + Duration::from_millis(millis),
+                );
+                assert!(
+                    is_valid_rfc3339_millis_utc(&formatted),
+                    "the formatter's own output must validate: {formatted:?}"
+                );
+            }
+        }
+
+        for bad in [
+            "",
+            "not-a-timestamp",
+            "2026-07-22T00:00:00Z",       // missing millisecond field
+            "2026-07-22 00:00:00.000Z",   // space instead of `T`
+            "2026-07-22T00:00:00.000",    // missing trailing `Z`
+            "2026-13-01T00:00:00.000Z",   // month out of range
+            "2026-07-32T00:00:00.000Z",   // day out of range
+            "2026-07-22T24:00:00.000Z",   // hour out of range
+            "2026-07-22T00:60:00.000Z",   // minute out of range
+            "2026-07-22T00:00:60.000Z",   // second out of range
+            "2026-07-22T00:00:00.000Z\0", // trailing NUL
+            "20260722T000000.000Z",       // no separators at all
+        ] {
+            assert!(
+                !is_valid_rfc3339_millis_utc(bad),
+                "a malformed started_at value must be rejected: {bad:?}"
+            );
+        }
+    }
+
+    /// A record whose `started_at` is malformed (not the runner's own
+    /// [`events::format_rfc3339_utc`] shape) is corrupt-record noise: the scan skips
+    /// it — never listing or sorting a fabricated timestamp as if it were real —
+    /// while a well-formed sibling entry is still scanned and returned. Mirrors
+    /// `entries_skip_unsafe_lock_files_without_aborting_the_scan`'s degradation
+    /// proof for the `started_at` field.
+    #[test]
+    fn entries_skip_malformed_started_at_without_aborting_the_scan() {
+        let dir = scratch("bad-started-at");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+
+        write_record_with_started_at(&dir, "garbage", "garbage", "not-a-timestamp");
+        write_record_with_started_at(&dir, "truncated", "truncated", "2026-07-22T00:00:00Z");
+
+        let good = registry
+            .register("good", None, SystemTime::now())
+            .expect("register the good run");
+
+        let entries = registry.entries().expect("scan");
+        assert_eq!(
+            entries.len(),
+            1,
+            "every malformed-started_at entry is skipped and only the well-formed one survives"
+        );
+        assert_eq!(entries[0].record.run_id, "good");
 
         good.remove();
         let _ = fs::remove_dir_all(&dir);

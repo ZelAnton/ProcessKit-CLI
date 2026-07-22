@@ -651,3 +651,30 @@ fn list_reports_a_live_run() {
     let _ = child.wait();
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// `list` is documented as read-only and must never mutate registry state just to
+/// scan it: listing an empty (never-yet-created) registry must leave the registry
+/// directory absent, not create it as a side effect of the scan.
+#[test]
+fn list_does_not_create_the_registry_directory() {
+    let dir = scratch("list-no-create");
+    let registry = registry_dir(&dir);
+    assert!(
+        !registry.exists(),
+        "the scratch registry directory starts absent"
+    );
+
+    let out = list(&registry, false);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "listing a never-created registry is not an error; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !registry.exists(),
+        "a read-only `list` must not create the registry directory as a side effect"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}

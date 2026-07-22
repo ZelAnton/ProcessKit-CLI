@@ -18,6 +18,8 @@
 //! degradation already lives in [`registry::Registry::entries`], so this module
 //! does not need to (and does not) duplicate it.
 
+use std::path::PathBuf;
+
 use serde::Serialize;
 
 use crate::exit::{self, RunnerError};
@@ -28,7 +30,7 @@ use crate::registry::{self, Health};
 /// human-readable row or serialized as JSON without leaking registry-internal
 /// fields (the lock file name, the registry format version) that a caller of
 /// `list` has no use for.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct ListEntry {
     /// The run's identifier — the value a caller passes as `--run-id` to
     /// `inspect`/`cancel`/`kill`.
@@ -47,12 +49,21 @@ struct ListEntry {
     endpoint: Option<String>,
 }
 
-/// Run `list [--json]`: open the per-user registry, scan every entry, and print
-/// them either as a human-readable table (default) or as one JSON object per line
-/// (`--json`) — deterministically ordered by `run_id` then `started_at` so the
-/// output is stable across runs of the same registry state.
+/// Run `list [--json]`: open the per-user registry read-only, scan every entry, and
+/// print them either as a human-readable table (default) or as one JSON object per
+/// line (`--json`) — deterministically ordered by `run_id` then `started_at`, with
+/// each entry's registry record path as a tertiary tie-breaker (two records can
+/// legitimately share both a `run_id` and a millisecond-precision `started_at`; the
+/// record path is unique per on-disk entry, so it makes the order fully
+/// deterministic without leaking into the printed/serialized shape) so the output
+/// is stable across runs of the same registry state.
+///
+/// Uses [`registry::Registry::open_read_only`], not [`registry::Registry::open`]:
+/// `list` must never create the registry directory or touch its permissions just to
+/// scan it (see the module docs above) — that mutating path exists only for `run`,
+/// which is actually about to write a record.
 pub fn run(json: bool) -> Result<(), RunnerError> {
-    let registry = registry::Registry::open().map_err(|err| {
+    let registry = registry::Registry::open_read_only().map_err(|err| {
         RunnerError::new(
             exit::SETUP,
             format!("could not open the run registry: {err}"),
@@ -65,20 +76,21 @@ pub fn run(json: bool) -> Result<(), RunnerError> {
         )
     })?;
 
-    let mut rows: Vec<ListEntry> = entries
+    let mut rows: Vec<(PathBuf, ListEntry)> = entries
         .into_iter()
-        .map(|entry| ListEntry {
-            run_id: entry.record.run_id,
-            health: health_str(entry.health),
-            started_at: entry.record.started_at,
-            endpoint: entry.record.endpoint,
+        .map(|entry| {
+            let path = entry.path;
+            let list_entry = ListEntry {
+                run_id: entry.record.run_id,
+                health: health_str(entry.health),
+                started_at: entry.record.started_at,
+                endpoint: entry.record.endpoint,
+            };
+            (path, list_entry)
         })
         .collect();
-    rows.sort_by(|a, b| {
-        a.run_id
-            .cmp(&b.run_id)
-            .then_with(|| a.started_at.cmp(&b.started_at))
-    });
+    sort_rows(&mut rows);
+    let rows: Vec<ListEntry> = rows.into_iter().map(|(_, entry)| entry).collect();
 
     if json {
         print_json(&rows)
@@ -86,6 +98,19 @@ pub fn run(json: bool) -> Result<(), RunnerError> {
         print_table(&rows);
         Ok(())
     }
+}
+
+/// Order `rows` by `run_id`, then `started_at`, then the entry's registry record
+/// path — the tertiary key exists purely to make the order fully deterministic when
+/// two entries legitimately share both a `run_id` and a millisecond-precision
+/// `started_at` (see [`run`]'s docs); it is never printed or serialized.
+fn sort_rows(rows: &mut [(PathBuf, ListEntry)]) {
+    rows.sort_by(|(a_path, a), (b_path, b)| {
+        a.run_id
+            .cmp(&b.run_id)
+            .then_with(|| a.started_at.cmp(&b.started_at))
+            .then_with(|| a_path.cmp(b_path))
+    });
 }
 
 /// `health` rendered in the vocabulary `list` prints and serializes — never the
@@ -155,6 +180,51 @@ mod tests {
         assert_eq!(value["health"], "live");
         assert_eq!(value["started_at"], "2026-07-22T00:00:00.000Z");
         assert_eq!(value["endpoint"], "/tmp/pkc-x/c.sock");
+    }
+
+    /// Two entries sharing both `run_id` and `started_at` (a millisecond collision
+    /// is possible in principle) must still sort deterministically — on their
+    /// registry record path, the tertiary key — rather than falling back to
+    /// whatever order the registry scan happened to hand them in.
+    #[test]
+    fn sort_rows_breaks_run_id_and_started_at_ties_on_the_record_path() {
+        let entry = |suffix: &str| ListEntry {
+            run_id: "same-run-id".to_string(),
+            health: "live",
+            started_at: "2026-07-22T00:00:00.000Z".to_string(),
+            endpoint: Some(format!("/tmp/pkc-{suffix}.sock")),
+        };
+        let path = |name: &str| PathBuf::from(name);
+
+        // Deliberately fed in the "wrong" (path-descending) order; a correct sort
+        // must still land them path-ascending.
+        let mut rows = vec![
+            (path("c-run.json"), entry("c")),
+            (path("a-run.json"), entry("a")),
+            (path("b-run.json"), entry("b")),
+        ];
+        sort_rows(&mut rows);
+
+        let ordered_paths: Vec<&PathBuf> = rows.iter().map(|(path, _)| path).collect();
+        assert_eq!(
+            ordered_paths,
+            vec![
+                &path("a-run.json"),
+                &path("b-run.json"),
+                &path("c-run.json"),
+            ],
+            "identical run_id/started_at must tie-break on the record path"
+        );
+
+        // Sorting the exact same input again yields the exact same order — the sort
+        // is deterministic, not merely "some" total order.
+        let mut rows_again = vec![
+            (path("c-run.json"), entry("c")),
+            (path("a-run.json"), entry("a")),
+            (path("b-run.json"), entry("b")),
+        ];
+        sort_rows(&mut rows_again);
+        assert_eq!(rows, rows_again, "sorting is repeatable across runs");
     }
 
     /// A `None` endpoint serializes as JSON `null`, not an absent field — a

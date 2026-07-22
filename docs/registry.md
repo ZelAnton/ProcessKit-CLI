@@ -36,9 +36,12 @@ run. It is resolved in this order:
 ### Permissions
 
 The registry directory is created **restricted to its owner**, and the restriction
-is re-asserted on every open (so a pre-existing directory is locked down too). A
-record names a run's private control-channel endpoint, so a world-readable registry
-would hand that channel to any local process.
+is re-asserted on every *mutating* open (`run`'s path, so a pre-existing directory
+is locked down too before a record is written into it). A record names a run's
+private control-channel endpoint, so a world-readable registry would hand that
+channel to any local process. `list`'s **read-only** open (see "Discovery" below)
+deliberately does neither: it does not create the directory and does not touch its
+permissions, since a read-only scan must not mutate registry state.
 
 - **Unix:** mode `0700`. Applied at creation and re-asserted with `chmod` (which,
   unlike the creating `mkdir`, is not filtered by the umask).
@@ -174,19 +177,23 @@ wrong-target action. See
 
 ## Discovery — `list`
 
-`processkit-cli list [--json]` scans the registry with [`Registry::entries`]
-(`src/registry.rs`) — the same scan every other client shares — and prints every
-entry it finds, live and stale alike: `run_id`, health (`live`/`stale`), `started_at`,
-and `endpoint`. It is deliberately **read-only** and never connects to any runner's
-control transport, so it carries none of the "could not reach the target run"
-failure modes `inspect`/`cancel`/`kill` do — it has no single target to fail to
-reach.
+`processkit-cli list [--json]` opens the registry through
+[`Registry::open_read_only`] (`src/registry.rs`) — **not** the mutating
+[`Registry::open`] `run` uses, so listing never creates the registry directory and
+never touches its permissions — and scans it with [`Registry::entries`], the same
+scan every other client shares, printing every entry it finds, live and stale alike:
+`run_id`, health (`live`/`stale`), `started_at`, and `endpoint`. It is deliberately
+**read-only** and never connects to any runner's control transport, so it carries
+none of the "could not reach the target run" failure modes `inspect`/`cancel`/`kill`
+do — it has no single target to fail to reach.
 
 - **No `--json`** prints a human-readable table (or `no runs registered` for an
   empty registry).
-- **`--json`** prints one JSON object per entry, one per line, sorted by `run_id`
-  then `started_at` for a deterministic order — the same "JSON Lines" shape
-  `inspect --json` uses for a single snapshot.
+- **`--json`** prints one JSON object per entry, one per line, sorted by `run_id`,
+  then `started_at`, then the entry's registry record path (a tertiary tie-break,
+  never itself printed) for a fully deterministic order even when two entries share
+  both a `run_id` and a millisecond-precision `started_at` — the same "JSON Lines"
+  shape `inspect --json` uses for a single snapshot.
 - An **empty registry is not an error**: `list` prints an empty result (or the
   `no runs registered` notice) and exits `0`, exactly like scanning any other
   registry state.
@@ -197,7 +204,9 @@ reach.
   reaping it.
 - A single corrupt or unreadable record is skipped by `Registry::entries` itself
   (see "Staleness" and the per-record degradation documented there) and never
-  blinds `list` to the other, healthy entries.
+  blinds `list` to the other, healthy entries — including a record whose
+  `started_at` is not the well-formed `YYYY-MM-DDTHH:MM:SS.sssZ` shape a runner
+  actually writes.
 
 ## Lifecycle
 
