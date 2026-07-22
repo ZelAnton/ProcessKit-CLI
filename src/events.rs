@@ -157,9 +157,9 @@ pub enum Event {
     /// is never lost or aliased (`AGENTS.md`, "Exit-code fidelity"). `source`
     /// names why the runner exited (`child_exit` | `timeout` | `cancelled` |
     /// `control_cancel` | `control_kill` | `spawn_error` | `container_error` |
-    /// `internal`); `child_code` carries the child's own code when it exited on its
-    /// own, and is `null` for a runner-imposed ending or a child that never produced
-    /// one.
+    /// `internal` | `setup`); `child_code` carries the child's own code when it
+    /// exited on its own, and is `null` for a runner-imposed ending or a child
+    /// that never produced one.
     RunnerExit {
         code: i32,
         source: &'static str,
