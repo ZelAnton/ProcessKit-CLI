@@ -150,6 +150,19 @@ to a dated version section.
   corrupt/unreadable record never blinds the command to the healthy entries
   (the same degradation `Registry::entries` already applies). Additive only —
   the new subcommand appears in the `probe` surface tokens automatically.
+- `prune [--json]`: a new subcommand that reaps detectably-dead registry entries —
+  after a runner dies abruptly its `.json`/`.lock` pair lingers forever, since
+  cleanup only runs on an orderly exit. It probes each entry on its own and removes
+  only those confirmed stale by a successful liveness probe: a live entry is never
+  touched, and an entry whose probe merely fails (its lock file could not be opened
+  at all) is left in place rather than assumed dead — deliberately distinct from the
+  degradation `Registry::entries` applies for display. Removal reaches files only
+  through the scanned record path, never a PID, and holds the stale entry's lock
+  while deleting its record and lock file. Without `--json` it reports how many
+  entries were reaped, kept live, and left unprobed; with `--json` it prints that
+  summary as one JSON object. An empty or already-clean registry is a no-op (exits
+  `0`). Additive only — the new subcommand appears in the `probe` surface tokens
+  automatically.
 
 ### Changed
 - Setup/support failures no longer masquerade as an `INTERNAL` (104) runner fault.
