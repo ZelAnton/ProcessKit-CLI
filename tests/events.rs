@@ -413,6 +413,65 @@ fn spawn_failure_records_spawn_failed_and_a_null_child_code() {
     );
 }
 
+/// An uncreatable `--capture-dir` is a fail-closed **setup** failure (T-158): the
+/// child never runs, the runner exits with the reserved `SETUP` code (111) rather
+/// than `INTERNAL` (104, kept for genuine runner-logic faults), and its terminal
+/// `runner_exit` agrees — `source: "setup"`, the same code, and a null `child_code`.
+/// The emitted stream validates against the published schema, which lists `setup`
+/// among the `runner_exit` sources.
+#[test]
+fn an_uncreatable_capture_dir_is_a_setup_failure_with_a_null_child_code() {
+    let dir = scratch("setup-capture-fail");
+    // A regular file cannot be a parent directory, so creating a capture dir beneath
+    // it fails the same way on every platform (ENOTDIR / "directory name is invalid").
+    let blocker = dir.join("blocker");
+    std::fs::write(&blocker, b"not a directory\n").expect("write the blocker file");
+    let capture_flag = blocker.join("cap").to_string_lossy().into_owned();
+
+    let out = run_with_flags(
+        &dir,
+        &[],
+        &["--capture-dir", &capture_flag],
+        shell_inline("echo should-not-run"),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(111),
+        "an uncreatable --capture-dir uses the reserved SETUP code, not INTERNAL: stderr {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "the child never ran, so nothing reaches its stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let events = read_events(&dir);
+    assert_events_match_schema(&events);
+    let types = event_types(&events);
+    assert!(
+        !types.iter().any(|t| t == "run_started"),
+        "no run_started when the setup failed before the child spawned: {types:?}"
+    );
+
+    let runner_exit = events.last().expect("a terminal event");
+    assert_eq!(runner_exit["event"], "runner_exit");
+    assert_eq!(
+        runner_exit["source"], "setup",
+        "the terminal event names the setup source: {runner_exit}"
+    );
+    assert_eq!(
+        runner_exit["code"], 111,
+        "the terminal event carries the reserved SETUP code: {runner_exit}"
+    );
+    assert!(
+        runner_exit["child_code"].is_null(),
+        "no child code is fabricated for a child that never ran: {runner_exit}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A `--timeout` that elapses emits a `timeout` event and the cleanup pair, then a
 /// terminal `runner_exit` in the reserved band with a null child code. Kept
 /// cross-platform via a runtime `cfg!` so both OSes compile and lint this test.

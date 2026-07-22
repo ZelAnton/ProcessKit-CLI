@@ -303,7 +303,8 @@
             "control_kill",
             "spawn_error",
             "container_error",
-            "internal"
+            "internal",
+            "setup"
           ],
           "description": "Why the runner exited."
         },

@@ -270,4 +270,73 @@ mod tests {
         hasher.update(b"c");
         assert_eq!(hasher.finalize_hex(), sha256_hex(b"abc"));
     }
+
+    // Property-based tier (T-167). Placed in this same `#[cfg(test)]` module
+    // rather than a new `tests/properties.rs`: this crate is bin-only (no
+    // `[lib]` target — see K-006), so an integration test under `tests/` cannot
+    // link against `sha256_hex`/`Sha256`/`to_hex` at all — only in-module tests
+    // run via `cargo test --bin processkit-cli` can reach them.
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Byte strings with extra density right around the 57–63-byte final-block
+        /// spill boundary (K-008 — the known-fragile zone in `finalize`), plus a
+        /// broader spread of lengths so the property isn't purely local to that
+        /// window.
+        fn near_boundary_bytes() -> impl Strategy<Value = Vec<u8>> {
+            prop_oneof![
+                // Weighted toward the 50..70 band straddling the 57-63 spill zone.
+                3 => prop::collection::vec(any::<u8>(), 50..70),
+                2 => prop::collection::vec(any::<u8>(), 0..300),
+            ]
+        }
+
+        /// A byte string plus a sequence of chunk lengths to feed it through
+        /// `update` in. Lengths may overshoot what remains (the test caller clamps
+        /// each chunk to the data actually left), so any combination is valid input
+        /// — no `prop_filter` needed.
+        fn bytes_with_splits() -> impl Strategy<Value = (Vec<u8>, Vec<usize>)> {
+            (
+                prop::collection::vec(any::<u8>(), 0..300),
+                prop::collection::vec(0usize..80, 0..8),
+            )
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// The hand-rolled digest agrees with an independent reference
+            /// implementation (the `sha2` crate) on every generated input, with
+            /// extra density around the historically fragile 57–63-byte boundary.
+            #[test]
+            fn matches_reference_implementation(data in near_boundary_bytes()) {
+                use sha2::Digest as _;
+                let mut reference = sha2::Sha256::new();
+                reference.update(&data);
+                let expected = to_hex(&reference.finalize());
+                prop_assert_eq!(sha256_hex(&data), expected);
+            }
+
+            /// Splitting the same input across an arbitrary sequence of `update`
+            /// calls always yields the same digest as one call over the whole
+            /// message — the invariant the streaming capture path
+            /// ([`crate::capture`]) depends on.
+            #[test]
+            fn incremental_split_matches_one_shot((data, splits) in bytes_with_splits()) {
+                let one_shot = sha256_hex(&data);
+
+                let mut hasher = Sha256::new();
+                let mut start = 0usize;
+                for len in splits {
+                    let end = (start + len).min(data.len());
+                    hasher.update(&data[start..end]);
+                    start = end;
+                }
+                hasher.update(&data[start..]);
+
+                prop_assert_eq!(hasher.finalize_hex(), one_shot);
+            }
+        }
+    }
 }

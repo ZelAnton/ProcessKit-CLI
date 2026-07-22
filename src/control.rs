@@ -416,7 +416,7 @@ pub fn inspect(run_id: &str) -> Result<(), RunnerError> {
         .build()
         .map_err(|err| {
             RunnerError::new(
-                exit::INTERNAL,
+                exit::SETUP,
                 format!("could not start the async runtime: {err}"),
             )
         })?;
@@ -446,7 +446,7 @@ async fn inspect_async(run_id: &str) -> Result<(), RunnerError> {
 
     let json = serde_json::to_string(&snapshot).map_err(|err| {
         RunnerError::new(
-            exit::INTERNAL,
+            exit::SETUP,
             format!("could not render the inspect snapshot: {err}"),
         )
     })?;
@@ -480,7 +480,7 @@ fn run_mutation(run_id: &str, command: ControlCommand) -> Result<(), RunnerError
         .build()
         .map_err(|err| {
             RunnerError::new(
-                exit::INTERNAL,
+                exit::SETUP,
                 format!("could not start the async runtime: {err}"),
             )
         })?;
@@ -531,7 +531,7 @@ async fn mutate_async(run_id: &str, command: ControlCommand) -> Result<(), Runne
 
     let json = serde_json::to_string(&ack).map_err(|err| {
         RunnerError::new(
-            exit::INTERNAL,
+            exit::SETUP,
             format!("could not render the control ack: {err}"),
         )
     })?;
