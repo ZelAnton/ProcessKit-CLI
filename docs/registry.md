@@ -104,6 +104,31 @@ performing a pure liveness *query* releases the lock immediately after acquiring
 a client that intends to *reclaim* a stale entry would instead keep the lock held to
 claim it atomically.
 
+## Run id resolution — ambiguity is a hard failure
+
+The registry does **not** enforce uniqueness of `run_id` at `register` time: two
+concurrent runs started with the same explicit `--run-id` are both written as
+independent entries (independent opaque file stems — see "No PID addressing" above)
+and both read as live for as long as they run. Resolution is therefore the client's
+job, in `resolve_live_endpoint` (`src/control.rs`), and it is deliberately
+conservative:
+
+- The client scans every entry, filters to those matching the requested `run_id`,
+  and narrows to the ones that are both live (see "Staleness" above) and publish an
+  `endpoint`.
+- **Exactly one** such entry → resolved, normally.
+- **Zero** → a distinguishable `CONTROL` (103) failure naming *why* (no such run
+  registered at all, the sole match is stale, or the sole live match predates the
+  transport) — see [`docs/control-plane.md`](control-plane.md).
+- **More than one** → also a `CONTROL` (103) failure, "ambiguous run id", instead of
+  silently acting on whichever entry the directory scan happens to return first.
+  This applies to **every** client the same way — the destructive `cancel`/`kill`
+  verbs *and* the read-only `inspect` — rather than a softer fallback for `inspect`:
+  guessing wrong on a mutating verb ends the *other* run instead of the intended
+  one, and a snapshot of the wrong run under `inspect` is exactly as misleading as
+  acting on it. A caller that hits this is expected to pick a `--run-id` that is
+  unique among currently live runs.
+
 ## Lifecycle
 
 - **Create.** `run` writes the record and takes the liveness lock **before** the

@@ -50,6 +50,20 @@
 //!   deadline, so a runner that accepted but never answers cannot wedge the client
 //!   either.
 //!
+//! ## Ambiguous run id — a hard failure, never a guess
+//!
+//! [`registry::Registry::register`] does not enforce `run_id` uniqueness, so two
+//! concurrent runs started with the same explicit `--run-id` can both be live and
+//! reachable at once. [`resolve_live_endpoint`] detects that (more than one live
+//! entry with a published endpoint matches the requested `run_id`) and refuses to
+//! pick one: every verb — `inspect`, `cancel`, and `kill` alike — reports the same
+//! reserved [`exit::CONTROL`] (103) "ambiguous run id" failure rather than acting on
+//! whichever entry the directory scan happens to return first. For the mutating
+//! verbs this is load-bearing (a wrong guess cancels or kills the *other* run); the
+//! read-only `inspect` gets the identical hard failure rather than a softer
+//! fallback, because a snapshot of the wrong run is exactly as misleading as acting
+//! on it. See `docs/registry.md`, "Run id resolution — ambiguity is a hard failure".
+//!
 //! ## Wire protocol
 //!
 //! Line-oriented and deliberately tiny. A client writes one request verb line
@@ -518,13 +532,28 @@ async fn resolve_live_endpoint(action: &str, run_id: &str) -> Result<String, Run
         ));
     }
 
-    // Reach only a live entry that actually advertises an endpoint. If none does, say
-    // *why* — the run is gone (stale) or predates the transport (live, no endpoint) —
-    // rather than a generic failure.
-    let Some(entry) = matches
+    // Reach only a live entry that actually advertises an endpoint — but first check
+    // *how many* such entries there are. `register` (`src/registry.rs`) never
+    // enforces `run_id` uniqueness, so two concurrent runs started with the same
+    // explicit `--run-id` can both be live and reachable at once. Every verb
+    // (`inspect`/`cancel`/`kill`) shares this resolver and treats that as a hard,
+    // documented failure rather than silently acting on whichever entry the
+    // directory scan happens to return first: for the mutating verbs, guessing
+    // wrong means cancelling or killing the *other* run instead of the intended
+    // one; `inspect` gets the same treatment rather than a softer fallback because
+    // a snapshot of the wrong run is just as misleading as acting on it (see
+    // `docs/registry.md`, "Run id resolution — ambiguity is a hard failure").
+    let live_with_endpoint: Vec<&registry::Entry> = matches
         .iter()
-        .find(|entry| entry.health == Health::Live && entry.record.endpoint.is_some())
-    else {
+        .filter(|entry| entry.health == Health::Live && entry.record.endpoint.is_some())
+        .collect();
+    if live_with_endpoint.len() > 1 {
+        return Err(ambiguous_run(action, run_id, live_with_endpoint.len()));
+    }
+
+    // If none does, say *why* — the run is gone (stale) or predates the transport
+    // (live, no endpoint) — rather than a generic failure.
+    let Some(entry) = live_with_endpoint.into_iter().next() else {
         if matches.iter().any(|entry| entry.health == Health::Live) {
             return Err(unreachable_run(
                 action,
@@ -639,6 +668,22 @@ fn unreachable_run(action: &str, run_id: &str, detail: String) -> RunnerError {
     RunnerError::new(
         exit::CONTROL,
         format!("cannot {action} run `{run_id}`: {detail}"),
+    )
+}
+
+/// An "ambiguous run id" error: `count` distinct live, reachable registry entries
+/// share `run_id`, so [`resolve_live_endpoint`] refuses to guess which one `action`
+/// means — reserving the same [`exit::CONTROL`] code as every other unreachable-run
+/// result (still "could not reach *the* target run": there is no single one to
+/// reach). See `docs/registry.md`, "Run id resolution — ambiguity is a hard
+/// failure".
+fn ambiguous_run(action: &str, run_id: &str, count: usize) -> RunnerError {
+    RunnerError::new(
+        exit::CONTROL,
+        format!(
+            "cannot {action} run `{run_id}`: ambiguous run id — {count} live runs are \
+             registered under it; re-run with a run id that is unique among live runs"
+        ),
     )
 }
 
@@ -1187,6 +1232,23 @@ mod tests {
         assert!(message.contains("cancel"), "names the action: {message}");
         assert!(message.contains("run-9"), "names the run: {message}");
         assert!(message.contains("stale"), "carries the reason: {message}");
+    }
+
+    /// An "ambiguous run id" error also takes the reserved CONTROL code, and names
+    /// the action, the run, and how many live entries collided — distinguishable
+    /// from every other unreachable-run reason.
+    #[test]
+    fn ambiguous_run_uses_the_control_code() {
+        let err = ambiguous_run("kill", "dup-id", 2);
+        assert_eq!(err.code(), exit::CONTROL);
+        let message = err.to_string();
+        assert!(message.contains("kill"), "names the action: {message}");
+        assert!(message.contains("dup-id"), "names the run: {message}");
+        assert!(message.contains("ambiguous"), "names the reason: {message}");
+        assert!(
+            message.contains('2'),
+            "carries how many entries collided: {message}"
+        );
     }
 
     /// Endpoint tokens are unique per call, so concurrent runs never collide on a
