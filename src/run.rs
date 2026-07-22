@@ -257,6 +257,22 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     if let Some(cwd) = &args.cwd {
         command = command.current_dir(cwd);
     }
+    // `--env-clear`/`--env-remove`/`--env` map onto processkit's own environment
+    // builder, applied in that exact call order: clear first (a clean slate
+    // instead of the runner's own inherited environment), then removals of
+    // specific inherited vars, then explicit sets. `env`/`env_remove` accumulate
+    // into one ordered list where a later entry wins on a duplicated key, so this
+    // order makes an explicit `--env` always win over an `--env-remove` of the
+    // same key — the order documented in README.md, "Environment".
+    if args.env_clear {
+        command = command.env_clear();
+    }
+    for key in &args.env_remove {
+        command = command.env_remove(key);
+    }
+    for (key, value) in &args.env {
+        command = command.env(key, value);
+    }
     // `--create-no-window` maps straight onto `Command::create_no_window()`
     // (`CREATE_NO_WINDOW` on Windows, a no-op elsewhere). Default: OFF. A bare
     // `run` should behave like launching the child directly, so we do not force

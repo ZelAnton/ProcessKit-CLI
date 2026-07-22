@@ -20,12 +20,14 @@
 
 mod common;
 
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::{
     ChildGuard, Scenario, bin, command_with_flags, events_path, file_len, helper_bin, pid_is_alive,
-    read_events, read_pid, run_with_flags, wait_child_bounded, wait_for_file_nonempty, wait_until,
+    read_events, read_pid, run_with_flags, shell_inline, wait_child_bounded,
+    wait_for_file_nonempty, wait_until,
 };
 
 /// The `-- <program> <args…>` tail that runs the e2e helper in `mode` with `args`,
@@ -1185,5 +1187,143 @@ fn dotnet_build_leaves_no_reuse_worker() {
         "dotnet_build_leaves_no_reuse_worker: contained a real `dotnet build` (exit {:?}) and \
          tore its tree down in {elapsed:?}",
         out.status.code()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `--env` / `--env-remove` / `--env-clear` (T-165): the child echoes one or more
+// named environment variables through a tiny platform shell one-liner, proving
+// each flag's effect through the built binary — the value this tier adds over a
+// unit test of the CLI parser (`src/cli.rs`) or of `run.rs`'s builder calls.
+// ---------------------------------------------------------------------------
+
+/// The platform one-liner that echoes each named env var on its own line. `cmd
+/// /c echo %VAR%` prints the *literal* text `%VAR%` when the variable is unset (a
+/// well-known cmd quirk); `sh -c 'echo "$VAR"'` prints an empty line instead.
+/// Either way, the assertions below key off whether a specific, distinctive value
+/// string appears in stdout — never off how an *unset* variable renders — so
+/// that platform difference never matters.
+fn echo_env_script(names: &[&str]) -> String {
+    if cfg!(windows) {
+        names
+            .iter()
+            .map(|name| format!("echo %{name}%"))
+            .collect::<Vec<_>>()
+            .join("&")
+    } else {
+        names
+            .iter()
+            .map(|name| format!("echo \"${name}\""))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+/// `--env KEY=VALUE` sets a variable for the child that was never present in the
+/// runner's own environment.
+#[test]
+fn env_sets_a_new_variable_for_the_child() {
+    let scenario = Scenario::new("e2e-env-set");
+    let out = run_with_flags(
+        &scenario.dir,
+        &[],
+        &["--env", "PK_CLI_ENV_SET=set-by-env-flag"],
+        shell_inline(&echo_env_script(&["PK_CLI_ENV_SET"])),
+    );
+    assert!(
+        out.status.success(),
+        "the child must exit cleanly; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("set-by-env-flag"),
+        "--env must set the variable for the child: {stdout:?}"
+    );
+}
+
+/// `--env-remove KEY` removes one variable the child would otherwise inherit from
+/// the runner's own environment. Proved against a baseline run (no
+/// `--env-remove`) that shows the variable really is inherited by default —
+/// otherwise a "the value is absent" assertion alone would not distinguish
+/// "removed" from "was never there".
+#[test]
+fn env_remove_removes_an_inherited_variable() {
+    let runner_envs: &[(&str, &Path)] = &[(
+        "PK_CLI_ENV_REMOVE_TARGET",
+        Path::new("inherited-and-removed"),
+    )];
+    let script = || shell_inline(&echo_env_script(&["PK_CLI_ENV_REMOVE_TARGET"]));
+
+    let baseline_scenario = Scenario::new("e2e-env-remove-baseline");
+    let baseline = run_with_flags(&baseline_scenario.dir, runner_envs, &[], script());
+    assert!(
+        baseline.status.success(),
+        "baseline child must exit cleanly; stderr: {}",
+        String::from_utf8_lossy(&baseline.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&baseline.stdout).contains("inherited-and-removed"),
+        "baseline: the runner's own environment must reach the child by default \
+         (without --env-remove) for this to be a meaningful proof"
+    );
+
+    let removed_scenario = Scenario::new("e2e-env-remove-removed");
+    let removed = run_with_flags(
+        &removed_scenario.dir,
+        runner_envs,
+        &["--env-remove", "PK_CLI_ENV_REMOVE_TARGET"],
+        script(),
+    );
+    assert!(
+        removed.status.success(),
+        "removed-case child must exit cleanly; stderr: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&removed.stdout).contains("inherited-and-removed"),
+        "--env-remove must strip the inherited variable from the child's environment"
+    );
+}
+
+/// `--env-clear` wipes the child's entire inherited environment; an `--env` given
+/// on the same run still sets its own explicit variable on top of that cleared
+/// slate — the documented "clear, then remove, then set" applied order
+/// (README.md, "Environment").
+#[test]
+fn env_clear_wipes_inherited_env_except_explicit_env() {
+    let scenario = Scenario::new("e2e-env-clear");
+    let runner_envs: &[(&str, &Path)] = &[(
+        "PK_CLI_ENV_CLEAR_TARGET",
+        Path::new("inherited-and-cleared"),
+    )];
+    let script = shell_inline(&echo_env_script(&[
+        "PK_CLI_ENV_CLEAR_TARGET",
+        "PK_CLI_ENV_CLEAR_KEEP",
+    ]));
+
+    let out = run_with_flags(
+        &scenario.dir,
+        runner_envs,
+        &[
+            "--env-clear",
+            "--env",
+            "PK_CLI_ENV_CLEAR_KEEP=kept-by-env-flag",
+        ],
+        script,
+    );
+    assert!(
+        out.status.success(),
+        "the child must exit cleanly; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("inherited-and-cleared"),
+        "--env-clear must wipe the inherited variable: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("kept-by-env-flag"),
+        "an explicit --env still sets its variable on top of the cleared slate: {stdout:?}"
     );
 }
