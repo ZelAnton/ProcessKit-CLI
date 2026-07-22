@@ -235,13 +235,17 @@ is never lost or aliased even when the process returns a runner-band code
 | Field        | Type              | Notes                                                                       |
 |--------------|-------------------|-----------------------------------------------------------------------------|
 | `code`       | integer           | The exit code the runner process returns (child's code, or a runner-band code). |
-| `source`     | string            | Why the runner exited: `child_exit`, `timeout`, `cancelled`, `control_cancel`, `control_kill`, `spawn_error`, `container_error`, or `internal`. |
+| `source`     | string            | Why the runner exited: `child_exit`, `timeout`, `cancelled`, `control_cancel`, `control_kill`, `spawn_error`, `container_error`, `internal`, or `setup`. |
 | `child_code` | integer, nullable | The child's own exit code when it exited on its own; `null` for a runner-imposed ending or a child that never produced one. |
 
 When `source` is `child_exit`, `code` equals `child_code`. For a runner-imposed
 ending (`timeout` / `cancelled` / `control_cancel` / `control_kill`) or a pre-run
-failure (`spawn_error` / `container_error`), `child_code` is `null` and `code` is the
-runner-band value.
+failure (`spawn_error` / `container_error` / `setup`), `child_code` is `null` and
+`code` is the runner-band value. `setup` names a fail-closed setup failure — a
+required output (`--jsonl` / `--capture-dir`) that could not be created — and
+carries the reserved `SETUP` code (111), distinct from `internal` (a genuine runner
+fault) so a consumer never reads a bad path as a runner bug (see
+`docs/exit-codes.md`).
 
 ### `output_captured`
 

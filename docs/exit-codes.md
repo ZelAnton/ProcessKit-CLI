@@ -32,15 +32,16 @@ failure is not mistaken for a child result.
 | 101  | `SPAWN`           | The target program could not be started (not found, not executable, bad `--cwd`, permission denied). |
 | 102  | `BACKEND`         | ProcessKit backend/containment failure: kernel container, job object, IPC endpoint, or run registry could not be established. |
 | 103  | `CONTROL`         | An `inspect` / `cancel` / `kill` command could not reach its target run: no such run id, a stale/dead registry entry, an ambiguous run id (more than one live run registered under it), or an IPC failure. |
-| 104  | `INTERNAL`        | Unexpected runner fault (an invariant was violated). Reported with this code instead of panicking. |
+| 104  | `INTERNAL`        | Unexpected runner fault: the runner reached a state its own logic rules out, or lost a trustworthy view of the run (a `wait` on the child failed and its fate is unknown; the backend returned an outcome this build cannot render). Reported with this code instead of panicking. **A genuine runner bug** — an ordinary setup failure is `SETUP` (111), not this. |
 | 105  | `NOT_IMPLEMENTED` | **Retired.** Formerly minted for a defined-but-not-yet-built code path; every subcommand is now implemented, so no active path mints it. The number stays permanently reserved (see "Stability" below) — it is never reused for a different meaning. |
 | 106  | `TIMEOUT`         | The run exceeded its `--timeout`: the runner enforced the deadline and tore the process tree down. A runner-*imposed outcome*, not a child exit. |
 | 107  | `CANCELLED`       | The run was cancelled interactively (`Ctrl-C`): the runner tore the process tree down. Distinct from `TIMEOUT` and from any child result. |
 | 108  | `CONTROL_CANCELLED` | The run was cancelled by a control-plane `cancel` command (over the local control channel): the runner ran the same soft-stop → grace → hard-kill teardown as a Ctrl-C. Distinct from `CANCELLED` so "a control client cancelled it" is told from "the operator pressed Ctrl-C". |
 | 109  | `CONTROL_KILLED`  | The run was killed by a control-plane `kill` command: the runner hard-killed the whole tree immediately (no soft stop, no grace). Distinct from every other runner-imposed ending. |
 | 110  | `PROBE_INCOMPATIBLE` | The **preflight probe** (`processkit-cli probe`) found this binary's compatibility surface does not satisfy a `--require-*` expectation. A *pre-launch* verdict, not a run outcome — no child is ever spawned by a probe. See "Preflight probe" below and [env-launch.md](env-launch.md). |
+| 111  | `SETUP`           | A fail-closed **setup / support failure**: a prerequisite the runner needs to run — or to report a result — could not be established or produced for an ordinary reason (its async runtime would not build, a required `--jsonl`/`--capture-dir` output could not be created, or a `probe`/`inspect`/control reply would not serialize). An environment/resource condition the caller can usually act on (a bad path, missing permissions, exhausted resources), **not** a runner bug — that stays `INTERNAL` (104). See "Setup failures vs internal faults" below. |
 
-Codes `111`–`119` are **reserved** for future runner-own conditions. `--help`
+Codes `112`–`119` are **reserved** for future runner-own conditions. `--help`
 and `--version` are not failures: they print to stdout and exit `0`.
 
 ## Timeout, cancel, and kill: runner-imposed outcomes
@@ -90,6 +91,32 @@ A malformed probe argument (for example a bad `--require-exit-code-band` value) 
 `USAGE` (100) error like any other bad flag — distinct from `PROBE_INCOMPATIBLE`, which
 means "the arguments were well-formed, but this binary cannot meet them".
 
+## Setup failures vs internal faults
+
+`SETUP` (111) and `INTERNAL` (104) are deliberately kept apart so the code alone tells a
+caller which one happened:
+
+- `SETUP` (111) is a **fail-closed setup / support failure**: the runner could not
+  establish a prerequisite it needs, or produce a result it must emit, for an *ordinary*
+  reason the caller can usually act on. It covers a `run` whose async runtime will not
+  build; a required `--jsonl` events file or `--capture-dir` the operator asked for but
+  that cannot be created (an unwritable path, a missing parent, denied permissions); and a
+  `probe` / `inspect` / control (`cancel`/`kill`) reply that cannot be serialized. In every
+  case the runner's own run-tracking logic is intact — a peripheral support step just
+  failed — so reporting it as an `INTERNAL` "runner bug" would mislead the consumer. A
+  `SETUP` failure before the child is spawned takes the `SETUP` code and (where a `--jsonl`
+  stream is already open) a terminal `runner_exit` with `source: "setup"` and a null
+  `child_code`; no child code is ever lost, because no child ran.
+- `INTERNAL` (104) stays **strictly for a genuine invariant violation**: the runner
+  reached a state its own logic rules out (the backend reported a `TimedOut` outcome when no
+  deadline was armed on the child, or an outcome variant this build does not recognize), or
+  lost a trustworthy view of the run it cannot recover from (a `wait` on the child failed
+  and its fate is now unknown). These *are* runner bugs, and a consumer reading `104` can
+  treat them as such.
+
+The distinction is which side failed: an environment/resource condition the caller can fix
+(`SETUP`) versus the runner's own logic being wrong (`INTERNAL`).
+
 ## Why a band is not enough on its own
 
 Exit codes are a single small integer, and a child can, in principle, exit with
@@ -113,6 +140,6 @@ are additionally recorded out of band.
   do that yet" — but the number is not reassigned to a new meaning; it stays
   reserved and unused going forward.
 - New runner-own conditions take the **next free code** in the reserved range
-  rather than overloading an existing one. `PROBE_INCOMPATIBLE` (110) is the most
-  recent, taking the next free slot after the control-plane endings; codes
-  `111`–`119` remain reserved.
+  rather than overloading an existing one. `SETUP` (111) is the most recent, taking
+  the next free slot after `PROBE_INCOMPATIBLE` (110); codes `112`–`119` remain
+  reserved.

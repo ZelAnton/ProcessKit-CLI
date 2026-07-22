@@ -140,6 +140,14 @@ to a dated version section.
   disagreement.
 
 ### Changed
+- Setup/support failures no longer masquerade as an `INTERNAL` (104) runner fault.
+  A new reserved code `SETUP` (111) covers a fail-closed setup failure — an async
+  runtime that will not build, an unwritable `--jsonl`/`--capture-dir`, or a
+  `probe`/`inspect`/control reply that will not serialize — so `INTERNAL` (104) now
+  means strictly a genuine invariant violation (a runner bug) and a consumer never
+  reads a bad path as one. The `--capture-dir` setup failure's terminal
+  `runner_exit` event gains a matching `source: "setup"` (added to the JSONL
+  schema); codes `112`–`119` remain reserved.
 - The control plane's three clients — `inspect`, `cancel`, and `kill` — all reach a
   live runner over the local transport now; no subcommand returns the runner-range
   "not implemented" code any longer.
