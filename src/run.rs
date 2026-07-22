@@ -86,20 +86,12 @@ pub fn execute(args: RunArgs) -> ExitCode {
 /// may hard-exit with the child's code.
 fn run_inner(args: RunArgs) -> Result<i32, RunnerError> {
     // A small current-thread runtime is enough: the run is one child plus its
-    // output pumps, a deadline timer, and a Ctrl-C listener. `enable_all` arms the
-    // I/O, time, and signal drivers those need — the child-pipe I/O driver is
-    // compiled in through `processkit`'s own tokio `process`/`net` features, and
-    // the `time`/`signal` features this crate now requests arm the rest (Cargo
-    // unifies them into the single tokio build).
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|err| {
-            RunnerError::new(
-                exit::SETUP,
-                format!("could not start the async runtime: {err}"),
-            )
-        })?;
+    // output pumps, a deadline timer, and a Ctrl-C listener. The shared helper's
+    // `enable_all` arms the I/O, time, and signal drivers those need — the
+    // child-pipe I/O driver is compiled in through `processkit`'s own tokio
+    // `process`/`net` features, and the `time`/`signal` features this crate now
+    // requests arm the rest (Cargo unifies them into the single tokio build).
+    let runtime = control::current_thread_runtime()?;
     runtime.block_on(run_async(args))
 }
 

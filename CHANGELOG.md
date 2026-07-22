@@ -153,6 +153,12 @@ to a dated version section.
   "not implemented" code any longer.
 - `run` now consumes every flag it parses: `--jsonl` (the JSONL event stream) and
   `--capture-dir` (bounded output capture) are both wired up.
+- Internal: the control plane's client-side scaffolding is de-duplicated. The
+  `inspect`/`cancel`/`kill` wire exchange (`converse`/`converse_mutation`) is now
+  one function generic over the reply type; `inspect_async`/`mutate_async` share a
+  single deadline-timeout-to-`unreachable_run` helper; and the three
+  current-thread tokio runtime constructions in `run`/`inspect`/`cancel`/`kill`
+  now go through one shared builder. No externally visible behavior changes.
 
 ### Fixed
 - Unix control sockets now use a short owner-only temporary directory instead of
