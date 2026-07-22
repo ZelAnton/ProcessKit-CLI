@@ -35,7 +35,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use processkit::{Mechanism, Outcome};
+use processkit::{Command as PkCommand, Mechanism, Outcome, ParentDeathCleanup};
 
 /// The schema version stamped on every event. Part of the compatibility surface:
 /// any breaking change to an event's shape is a **major** bump of this number
@@ -478,22 +478,20 @@ pub fn mechanism_str(mechanism: Mechanism) -> &'static str {
 /// This is deliberately OS-derived rather than inferred from [`Mechanism`]: Linux
 /// cgroups persist after their creator dies, so the enabled PDEATHSIG still covers
 /// only the direct child; a Windows Job handle close reaps the whole tree.
+///
+/// Sourced from `processkit`'s own honest capability report
+/// (`Command::kill_on_parent_death_scope`, shipped in processkit 2.3.2) rather than
+/// reimplementing the per-platform `cfg!` derivation here, so this crate and
+/// `processkit` cannot drift on the claim. `ParentDeathCleanup` is
+/// `#[non_exhaustive]`; an unrecognized future variant maps to `"none"` — the
+/// conservative choice, since this string is a reaping *guarantee*, not a mere
+/// capability label, and must never overclaim.
 pub fn abrupt_cleanup_str() -> &'static str {
-    #[cfg(windows)]
-    {
-        "whole_tree"
-    }
-    #[cfg(target_os = "linux")]
-    {
-        "direct_child_only"
-    }
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        "none"
-    }
-    #[cfg(not(any(windows, unix)))]
-    {
-        "none"
+    match PkCommand::kill_on_parent_death_scope() {
+        ParentDeathCleanup::WholeTree => "whole_tree",
+        ParentDeathCleanup::DirectChildOnly => "direct_child_only",
+        ParentDeathCleanup::Unsupported => "none",
+        _ => "none",
     }
 }
 

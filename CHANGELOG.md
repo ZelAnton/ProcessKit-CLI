@@ -184,6 +184,11 @@ to a dated version section.
   single deadline-timeout-to-`unreachable_run` helper; and the three
   current-thread tokio runtime constructions in `run`/`inspect`/`cancel`/`kill`
   now go through one shared builder. No externally visible behavior changes.
+- Updated the `processkit` dependency to 2.3.2 (from 2.3.0). `events::abrupt_cleanup_str()`
+  now sources the abrupt-owner-death reap scope from `processkit`'s own honest
+  capability report (`Command::kill_on_parent_death_scope`, new in 2.3.2) instead of
+  reimplementing the per-platform derivation locally; the emitted
+  `whole_tree`/`direct_child_only`/`none` wire values are unchanged.
 
 ### Fixed
 - Unix control sockets now use a short owner-only temporary directory instead of
