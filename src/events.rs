@@ -167,8 +167,9 @@ pub enum Event {
     },
     /// Bounded stdout/stderr capture (`--capture-dir`) finished: for each stream,
     /// the file it was written to, the full byte counter, the SHA-256 of the
-    /// captured bytes, and an explicit truncation flag (see [`CaptureInfo`] and
-    /// `docs/schema.md`, "output_captured"). Emitted **only** when `--capture-dir`
+    /// captured bytes, an explicit truncation flag, and an explicit write-error flag
+    /// (see [`CaptureInfo`] and `docs/schema.md`, "output_captured"). Emitted **only**
+    /// when `--capture-dir`
     /// is set — a run without capture is byte-for-byte unchanged — once per run,
     /// after the teardown pair and before `runner_exit`.
     OutputCaptured {
@@ -208,29 +209,42 @@ impl Member {
 /// One stream's bounded-capture result, as carried by [`Event::OutputCaptured`].
 ///
 /// `bytes` is the **full** byte counter — every decoded byte the stream produced,
-/// so it exceeds the file's size once the stream was truncated. `sha256` is the
-/// lowercase-hex digest of the bytes actually written to `path` (so a consumer can
-/// verify the file it holds), computed with the same [`crate::hash`] primitive as
-/// the argv fingerprint. `truncated` is an **explicit** flag — set when the stream
-/// outran the per-stream capture ceiling — never inferred from the file's size, so
-/// "captured in full" is distinguishable from "clipped at the limit" on the flag
-/// alone (`docs/schema.md`, "output_captured").
+/// so it exceeds the file's size once the stream was truncated or a write failed.
+/// `sha256` is the lowercase-hex digest of the bytes actually written to `path` (so
+/// a consumer can verify the file it holds), computed with the same [`crate::hash`]
+/// primitive as the argv fingerprint. `truncated` and `write_error` are two
+/// **explicit** flags, never inferred from the file's size, that between them tell a
+/// consumer whether the file is the whole stream: `truncated` is set when the stream
+/// outran the per-stream capture ceiling and the tail was deliberately dropped;
+/// `write_error` is set when a file write failed mid-stream (a disk problem), after
+/// which capture stopped touching the broken file. The two are independent — a stream
+/// can be both — so "captured in full" is `!truncated && !write_error`, and each
+/// incomplete cause is distinguishable from the other on the flags alone
+/// (`docs/schema.md`, "output_captured").
 #[derive(Debug, Serialize)]
 pub struct CaptureInfo {
     path: String,
     bytes: u64,
     sha256: String,
     truncated: bool,
+    write_error: bool,
 }
 
 impl CaptureInfo {
     /// Assemble one stream's capture metadata for the event.
-    pub fn new(path: String, bytes: u64, sha256: String, truncated: bool) -> Self {
+    pub fn new(
+        path: String,
+        bytes: u64,
+        sha256: String,
+        truncated: bool,
+        write_error: bool,
+    ) -> Self {
         Self {
             path,
             bytes,
             sha256,
             truncated,
+            write_error,
         }
     }
 
@@ -250,6 +264,13 @@ impl CaptureInfo {
     #[cfg(test)]
     pub fn truncated(&self) -> bool {
         self.truncated
+    }
+
+    /// Whether a file write failed mid-stream, leaving the on-disk transcript short
+    /// of the byte counter.
+    #[cfg(test)]
+    pub fn write_error(&self) -> bool {
+        self.write_error
     }
 }
 
@@ -594,19 +615,22 @@ mod tests {
                 soft_terminate: None,
             },
             // One `output_captured`: stdout captured in full (the `abc` vector),
-            // stderr empty (the empty-string digest). Pins the shape adapters read
-            // when `--capture-dir` is set; a run without capture emits none.
+            // stderr empty (the empty-string digest). Both complete — neither
+            // ceiling-truncated nor write-errored. Pins the shape adapters read when
+            // `--capture-dir` is set; a run without capture emits none.
             Event::OutputCaptured {
                 stdout: CaptureInfo::new(
                     "/work/project/capture/stdout.log".to_string(),
                     3,
                     "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_string(),
                     false,
+                    false,
                 ),
                 stderr: CaptureInfo::new(
                     "/work/project/capture/stderr.log".to_string(),
                     0,
                     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+                    false,
                     false,
                 ),
             },
@@ -935,8 +959,10 @@ mod tests {
     }
 
     /// `output_captured` carries per-stream capture metadata: a file path, the full
-    /// byte counter, the content digest, and an explicit truncation flag that is a
-    /// real boolean (a truncated stdout beside a complete stderr).
+    /// byte counter, the content digest, and the two explicit incompleteness flags
+    /// (`truncated`, `write_error`) as real booleans. The two streams show the flags
+    /// are independent: stdout was ceiling-truncated with no disk error, stderr hit a
+    /// mid-stream write error without ever reaching the ceiling.
     #[test]
     fn output_captured_reports_per_stream_metadata() {
         let event = Event::OutputCaptured {
@@ -945,12 +971,14 @@ mod tests {
                 9000,
                 "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_string(),
                 true,
+                false,
             ),
             stderr: CaptureInfo::new(
                 "/tmp/cap/stderr.log".to_string(),
-                0,
+                50,
                 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
                 false,
+                true,
             ),
         };
         let value: serde_json::Value =
@@ -963,9 +991,19 @@ mod tests {
             value["stdout"]["truncated"], true,
             "an over-ceiling stream is explicitly truncated"
         );
-        // The sibling stream is independent: complete, empty, its own digest.
-        assert_eq!(value["stderr"]["bytes"], 0);
+        assert_eq!(
+            value["stdout"]["write_error"], false,
+            "a clean ceiling clip is not a write error"
+        );
+        // The sibling stream is independent: a mid-stream write error, so its byte
+        // counter (50) outruns what reached disk, and it is flagged distinctly from a
+        // ceiling truncation.
+        assert_eq!(value["stderr"]["bytes"], 50);
         assert_eq!(value["stderr"]["truncated"], false);
+        assert_eq!(
+            value["stderr"]["write_error"], true,
+            "a mid-stream disk write failure is its own explicit flag"
+        );
     }
 
     /// The hand-rolled UTC formatter against well-known epoch instants.
