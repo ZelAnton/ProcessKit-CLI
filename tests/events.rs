@@ -6,13 +6,77 @@
 //! wire shapes are pinned separately by the in-crate golden test
 //! (`src/events.rs`), since a live stream's timestamps/PIDs/run-id are not
 //! deterministic.
+//!
+//! This module also validates the golden fixture — and, where a test already has
+//! a live stream in hand, the events actually emitted by the binary — against the
+//! published, machine-readable JSON Schema (`fixtures/schema/v1/schema.json`).
+//! That keeps the schema honest against the same material the in-crate golden
+//! test pins byte-for-byte and the through-the-binary tests exercise live
+//! (`docs/schema.md`, "This is the normative description").
 
 mod common;
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use common::{events_path, run, run_with_flags, scratch, shell_inline};
+use jsonschema::Validator;
 use serde_json::Value;
+
+/// The compiled schema validator for `fixtures/schema/v1/schema.json`, built once
+/// and shared by every test in this module.
+fn schema_validator() -> &'static Validator {
+    static VALIDATOR: OnceLock<Validator> = OnceLock::new();
+    VALIDATOR.get_or_init(|| {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/schema/v1/schema.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read schema {}: {err}", path.display()));
+        let schema: Value = serde_json::from_str(&text).expect("schema.json is valid JSON");
+        jsonschema::validator_for(&schema)
+            .expect("schema.json is a valid JSON Schema (draft 2020-12)")
+    })
+}
+
+/// Assert every event in `events` validates against the published JSON Schema,
+/// collecting every violation before panicking so a shape drift reports every
+/// offending line in one failure rather than only the first.
+fn assert_events_match_schema(events: &[Value]) {
+    let validator = schema_validator();
+    let failures: Vec<String> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, event)| {
+            let errs: Vec<String> = validator
+                .iter_errors(event)
+                .map(|e| e.to_string())
+                .collect();
+            (!errs.is_empty())
+                .then(|| format!("line {}: {event}\n    {}", i + 1, errs.join("\n    ")))
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "event(s) did not validate against fixtures/schema/v1/schema.json:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// The golden fixture (`fixtures/schema/v1/events.jsonl`) — one representative of
+/// every v1 event type, in both `run_started` redaction branches — validates
+/// line-for-line against the published schema.
+#[test]
+fn golden_fixture_validates_against_the_schema() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/schema/v1/events.jsonl");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("read golden fixture {}: {err}", path.display()));
+    let events: Vec<Value> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("each fixture line is valid JSON"))
+        .collect();
+    assert!(!events.is_empty(), "the golden fixture must not be empty");
+    assert_events_match_schema(&events);
+}
 
 /// Read the emitted event stream for `dir` and parse each non-empty line as JSON,
 /// panicking if any line is not a well-formed object — a malformed stream is a
@@ -76,6 +140,7 @@ fn events_go_to_the_jsonl_file_and_never_stdout() {
             "every event carries a string type tag: {event}"
         );
     }
+    assert_events_match_schema(&events);
 
     let types = event_types(&events);
     for expected in ["run_started", "root_exited", "runner_exit"] {
@@ -265,6 +330,7 @@ fn capture_dir_adds_output_captured_and_its_absence_is_unchanged() {
     assert_eq!(out.status.code(), Some(0));
 
     let events = read_events(&dir);
+    assert_events_match_schema(&events);
     let types = event_types(&events);
     assert!(
         types.iter().any(|t| t == "output_captured"),
@@ -325,6 +391,7 @@ fn spawn_failure_records_spawn_failed_and_a_null_child_code() {
     assert!(out.stdout.is_empty(), "nothing on the child's stdout");
 
     let events = read_events(&dir);
+    assert_events_match_schema(&events);
     let types = event_types(&events);
     assert!(
         !types.iter().any(|t| t == "run_started"),
@@ -370,6 +437,7 @@ fn timeout_emits_timeout_cleanup_and_runner_exit() {
     );
 
     let events = read_events(&dir);
+    assert_events_match_schema(&events);
     let types = event_types(&events);
     for expected in [
         "run_started",

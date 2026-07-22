@@ -104,6 +104,69 @@ performing a pure liveness *query* releases the lock immediately after acquiring
 a client that intends to *reclaim* a stale entry would instead keep the lock held to
 claim it atomically.
 
+## Run id resolution — ambiguity is a hard failure
+
+The registry does **not** enforce uniqueness of `run_id` at `register` time: two
+concurrent runs started with the same explicit `--run-id` are both written as
+independent entries (independent opaque file stems — see "No PID addressing" above)
+and both read as live for as long as they run. Resolution is therefore the client's
+job, in `resolve_live_endpoint` (`src/control.rs`), and it is deliberately
+conservative:
+
+- The client scans every entry and filters to those matching the requested
+  `run_id`, then counts how many of *those* are live (see "Staleness" above) —
+  deliberately **before** ever looking at whether they publish an `endpoint`. A
+  live entry that has not (yet, or ever) published an endpoint — a disconnected
+  or failed transport — still counts as a live duplicate; if endpoint presence
+  narrowed the count first, such an entry would be silently skipped and a
+  duplicate could evade detection.
+- **Zero** live matches → a distinguishable `CONTROL` (103) failure naming *why*
+  (no such run registered at all, or the sole match is stale) — see
+  [`docs/control-plane.md`](control-plane.md).
+- **More than one** live match → also a `CONTROL` (103) failure, "ambiguous run
+  id", instead of silently acting on whichever entry the directory scan happens
+  to return first. This applies to **every** client the same way — the
+  destructive `cancel`/`kill` verbs *and* the read-only `inspect` — rather than a
+  softer fallback for `inspect`: guessing wrong on a mutating verb ends the
+  *other* run instead of the intended one, and a snapshot of the wrong run under
+  `inspect` is exactly as misleading as acting on it. A caller that hits this is
+  expected to pick a `--run-id` that is unique among currently live runs.
+- **Exactly one** live match → only now does its endpoint matter: resolved
+  normally if it published one, or a distinguishable `CONTROL` (103) failure
+  ("the run is live but exposes no control endpoint") if it did not.
+
+That single check happening once, at the start of the call, is a TOCTOU race for the
+mutating verbs: `register` never enforces uniqueness, so a duplicate can register
+under the same `run_id` in the window between the scan and the verb reaching the
+runner over the transport (the connect round trip in between). `cancel`/`kill`
+narrow that window as tightly as the registry's decentralized, no
+locking-across-processes design allows: immediately before writing the verb, the
+client re-runs the same scan+match and requires it to resolve back to the exact
+endpoint it already connected to — any other outcome (a fresh ambiguity, the entry
+having gone stale, or the resolution landing on a different entry) aborts the
+command without ever writing to the wire. `inspect` does not repeat this check: being
+read-only, a race that surfaces a snapshot from just before a duplicate registered is
+merely stale information, not a wrong-target action.
+
+That pre-dispatch re-check is a synchronous scan, while the verb write that follows
+it is a separate, later `.await`; the two cannot be made atomic with each other, so a
+duplicate can in principle still register in the sub-instruction gap between the
+re-check returning and the write reaching the OS. Closing that residual gap
+completely would need a `run_id`-keyed lock held across process boundaries through
+the write — a registry redesign this resolver deliberately does not attempt (see "No
+PID addressing" above). It is not needed for correctness, though: by the time the
+re-check runs, the client has already connected to the target's specific,
+uniquely-tokened transport endpoint (`endpoint_tokens_are_unique` in
+`src/control.rs`), and a later registry write cannot retarget bytes already destined
+for an open connection. So the guarantee the re-check actually buys is narrower than
+"no ambiguity can ever exist at write time" (impossible without that cross-process
+lock) and is instead: **the verb can never be misdirected to a different run than the
+one already resolved and reconfirmed.** A duplicate that registers in the residual
+gap is simply invisible to that call — it becomes visible on the *next* one — never a
+wrong-target action. See
+`racing_duplicate_after_reconfirm_does_not_misdirect_the_dispatched_verb` in
+`src/control.rs` for a deterministic proof of this property.
+
 ## Lifecycle
 
 - **Create.** `run` writes the record and takes the liveness lock **before** the

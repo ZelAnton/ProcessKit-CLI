@@ -1,0 +1,332 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/ZelAnton/ProcessKit-CLI/main/fixtures/schema/v1/schema.json",
+  "title": "processkit-cli JSONL lifecycle-event stream (v1)",
+  "description": "One line of processkit-cli's `--jsonl` lifecycle-event stream. This is the machine-readable mirror of the normative prose in docs/schema.md; docs/schema.md is the source of truth on any discrepancy. Each event object shares a common envelope (`schema_version`, `time`, `event`) plus fields specific to its `event` type tag. Validated against `fixtures/schema/v1/events.jsonl` (the golden fixture) by `tests/events.rs`.",
+  "oneOf": [
+    { "$ref": "#/$defs/runStarted" },
+    { "$ref": "#/$defs/membersSnapshot" },
+    { "$ref": "#/$defs/rootExited" },
+    { "$ref": "#/$defs/cleanupStarted" },
+    { "$ref": "#/$defs/cleanupFinished" },
+    { "$ref": "#/$defs/limitHit" },
+    { "$ref": "#/$defs/timeout" },
+    { "$ref": "#/$defs/cancelled" },
+    { "$ref": "#/$defs/killed" },
+    { "$ref": "#/$defs/spawnFailed" },
+    { "$ref": "#/$defs/containerFailed" },
+    { "$ref": "#/$defs/runnerExit" },
+    { "$ref": "#/$defs/outputCaptured" }
+  ],
+  "$defs": {
+    "schemaVersion": {
+      "description": "Always 1 for this version (docs/schema.md, 'Versioning').",
+      "const": 1
+    },
+    "time": {
+      "type": "string",
+      "description": "Emission time, RFC 3339 UTC, millisecond precision (`…Z`).",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+    },
+    "nonNegativeInt": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "u8": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 255
+    },
+    "u32": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "u32OrNull": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "u64OrNull": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "u64": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "member": {
+      "type": "object",
+      "description": "One entry of a members_snapshot. Only `pid` is populated today; the enriched fields are always present but explicitly null until ProcessKit ships members_info() (docs/schema.md, 'Enriched member fields').",
+      "properties": {
+        "pid": { "$ref": "#/$defs/u32", "description": "The process id." },
+        "ppid": { "$ref": "#/$defs/u32OrNull", "description": "Parent pid; null until the enriched member fields ship." },
+        "name": { "type": ["string", "null"], "description": "Executable name; null until the enriched member fields ship." },
+        "start_time": { "type": ["string", "null"], "description": "Process start time; null until the enriched member fields ship." }
+      },
+      "required": ["pid", "ppid", "name", "start_time"],
+      "additionalProperties": false
+    },
+    "commandInfo": {
+      "type": "object",
+      "description": "The command a run executed, in its redaction-aware v1 shape (docs/schema.md, 'Command redaction').",
+      "properties": {
+        "redacted": { "type": "boolean", "description": "true by default; false only under --argv-raw." },
+        "argv": {
+          "type": ["array", "null"],
+          "items": { "type": "string" },
+          "description": "The raw argv, present only when redacted is false; null otherwise."
+        },
+        "argv_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Lowercase-hex SHA-256 fingerprint of argv; filled on every run regardless of redaction (docs/schema.md, 'Fingerprint')."
+        },
+        "hint": {
+          "type": ["string", "null"],
+          "description": "Worker-shape hint for a recognized argv (e.g. msbuild_node_reuse), else null (docs/schema.md, 'Hint classifier')."
+        }
+      },
+      "required": ["redacted", "argv", "argv_sha256", "hint"],
+      "additionalProperties": false
+    },
+    "captureInfo": {
+      "type": "object",
+      "description": "One stream's bounded-capture result (docs/schema.md, 'output_captured').",
+      "properties": {
+        "path": { "type": "string", "description": "The file the stream was written to." },
+        "bytes": { "$ref": "#/$defs/u64", "description": "Full byte counter; exceeds the file size when truncated or a write failed." },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Lowercase-hex SHA-256 of the bytes actually written to path."
+        },
+        "truncated": { "type": "boolean", "description": "true when the stream outran the per-stream capture ceiling." },
+        "write_error": { "type": "boolean", "description": "true when a file write failed part-way through the stream." }
+      },
+      "required": ["path", "bytes", "sha256", "truncated", "write_error"],
+      "additionalProperties": false
+    },
+    "runStarted": {
+      "type": "object",
+      "description": "The run has begun: the child is spawned into the container.",
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "time": { "$ref": "#/$defs/time" },
+        "event": { "const": "run_started" },
+        "run_id": { "type": "string", "description": "The --run-id value, or a generated run-<pid>-<unix_nanos>." },
+        "root_pid": { "$ref": "#/$defs/u32OrNull", "description": "The root child's PID; null if the backend exposed none." },
+        "mechanism": {
+          "type": "string",
+          "enum": ["job_object", "cgroup_v2", "process_group"],
+          "description": "Containment mechanism."
+        },
+        "abrupt_cleanup": {
+          "type": "string",
+          "enum": ["whole_tree", "direct_child_only", "none"],
+          "description": "Cleanup surviving abrupt runner death."
+        },
+        "cwd": { "type": ["string", "null"], "description": "The child's working directory; null if it could not be resolved." },
+        "command": { "$ref": "#/$defs/commandInfo" }
+      },
+      "required": ["schema_version", "time", "event", "run_id", "root_pid", "mechanism", "abrupt_cleanup", "cwd", "command"],
+      "additionalProperties": false
+    },
+    "membersSnapshot": {
+      "type": "object",
+      "description": "A point-in-time snapshot of the container's members.",
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "time": { "$ref": "#/$defs/time" },
+        "event": { "const": "members_snapshot" },
+        "members": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/member" }
+        }
+      },
+      "required": ["schema_version", "time", "event", "members"],
+      "additionalProperties": false
+    },
+    "rootExited": {
+      "type": "object",
+      "description": "The root child exited on its own.",
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "time": { "$ref": "#/$defs/time" },
+        "event": { "const": "root_exited" },
+        "outcome": {
+          "type": "string",
+          "enum": ["exited", "signalled", "timed_out", "unknown"]
+        },
+        "code": { "type": ["integer", "null"], "description": "The exit code for exited; null otherwise." },
+        "signal": { "type": ["integer", "null"], "description": "The signal number for a Unix signalled death; null otherwise." }
+      },
+      "required": ["schema_version", "time", "event", "outcome", "code", "signal"],
+      "additionalProperties": false
+    },
+    "cleanupStarted": {
+      "type": "object",
+      "description": "Container teardown is beginning.",
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "time": { "$ref": "#/$defs/time" },
+        "event": { "const": "cleanup_started" },
+        "members_before": { "$ref": "#/$defs/nonNegativeInt", "description": "The tree size (member count) about to be reaped." }
+      },
+      "required": ["schema_version", "time", "event", "members_before"],
+      "additionalProperties": false
+    },
+    "cleanupFinished": {
+      "type": "object",
+      "description": "Container teardown finished (after the hard kill).",
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "time": { "$ref": "#/$defs/time" },
+        "event": { "const": "cleanup_finished" },
+        "remaining": { "$ref": "#/$defs/nonNegativeInt", "description": "Count of remaining_pids." },
+        "remaining_pids": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/u32" },
+          "description": "Post-kill member snapshot; normally empty."
+        },
+        "soft_terminate": {
+          "type": ["string", "null"],
+          "enum": ["signalled", "unsupported", "failed", null],
+          "description": "The soft-stop tier for a runner-imposed ending; null on the natural-exit path."
+        }
+      },
+      "required": ["schema_version", "time", "event", "remaining", "remaining_pids", "soft_terminate"],
+      "additionalProperties": false
+    },
+    "limitHit": {
+      "type": "object",
+      "description": "A configured ProcessKit resource limit was exceeded or could not be applied. Reserved for v1 shape-pinning; not emitted at runtime in this version.",
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "time": { "$ref": "#/$defs/time" },
+        "event": { "const": "limit_hit" },
+        "limit": { "type": "string", "description": "Which limit, e.g. processes, memory, cpu." },
+        "detail": { "type": ["string", "null"], "description": "Human-readable detail; null if none." }
+      },
+      "required": ["schema_version", "time", "event", "limit", "detail"],
+      "additionalProperties": false
+    },
+    "timeout": {
+      "type": "object",
+      "description": "The --timeout deadline elapsed while the child was still running.",
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "time": { "$ref": "#/$defs/time" },
+        "event": { "const": "timeout" },
+        "timeout_ms": { "$ref": "#/$defs/nonNegativeInt", "description": "The deadline that elapsed, milliseconds." },
+        "grace_ms": { "$ref": "#/$defs/u64OrNull", "description": "The --grace window, ms; null if unset." }
+      },
+      "required": ["schema_version", "time", "event", "timeout_ms", "grace_ms"],
+      "additionalProperties": false
+    },
+    "cancelled": {
+      "type": "object",
+      "description": "The run was cancelled and torn down through the shared soft-stop -> grace -> hard-kill path.",
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "time": { "$ref": "#/$defs/time" },
+        "event": { "const": "cancelled" },
+        "source": {
+          "type": "string",
+          "enum": ["ctrl_c", "control_cancel"],
+          "description": "ctrl_c for a local interactive Ctrl-C; control_cancel for a control-plane cancel."
+        },
+        "grace_ms": { "$ref": "#/$defs/u64OrNull", "description": "The --grace window, ms; null if unset." }
+      },
+      "required": ["schema_version", "time", "event", "source", "grace_ms"],
+      "additionalProperties": false
+    },
+    "killed": {
+      "type": "object",
+      "description": "The run was killed by a control-plane kill command: an immediate hard kill of the whole tree, with no soft stop and no grace.",
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "time": { "$ref": "#/$defs/time" },
+        "event": { "const": "killed" },
+        "source": { "const": "control_kill" }
+      },
+      "required": ["schema_version", "time", "event", "source"],
+      "additionalProperties": false
+    },
+    "spawnFailed": {
+      "type": "object",
+      "description": "The program could not be started (not found, not executable, bad --cwd): the child never ran.",
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "time": { "$ref": "#/$defs/time" },
+        "event": { "const": "spawn_failed" },
+        "code": { "$ref": "#/$defs/u8", "description": "The runner-band exit code (SPAWN, 101)." },
+        "message": { "type": "string", "description": "Human-readable failure reason." }
+      },
+      "required": ["schema_version", "time", "event", "code", "message"],
+      "additionalProperties": false
+    },
+    "containerFailed": {
+      "type": "object",
+      "description": "Creating the container, or joining the child to it, failed.",
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "time": { "$ref": "#/$defs/time" },
+        "event": { "const": "container_failed" },
+        "phase": {
+          "type": "string",
+          "enum": ["create", "attach"],
+          "description": "create (the container could not be created) or attach (the launch into it failed)."
+        },
+        "code": { "$ref": "#/$defs/u8", "description": "The runner-band exit code (BACKEND, 102)." },
+        "message": { "type": "string", "description": "Human-readable failure reason." }
+      },
+      "required": ["schema_version", "time", "event", "phase", "code", "message"],
+      "additionalProperties": false
+    },
+    "runnerExit": {
+      "type": "object",
+      "description": "The terminal event of every run: the exact code the runner process returns.",
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "time": { "$ref": "#/$defs/time" },
+        "event": { "const": "runner_exit" },
+        "code": { "type": "integer", "description": "The exit code the runner process returns (child's code, or a runner-band code)." },
+        "source": {
+          "type": "string",
+          "enum": [
+            "child_exit",
+            "timeout",
+            "cancelled",
+            "control_cancel",
+            "control_kill",
+            "spawn_error",
+            "container_error",
+            "internal"
+          ],
+          "description": "Why the runner exited."
+        },
+        "child_code": {
+          "type": ["integer", "null"],
+          "description": "The child's own exit code when it exited on its own; null for a runner-imposed ending or a child that never produced one."
+        }
+      },
+      "required": ["schema_version", "time", "event", "code", "source", "child_code"],
+      "additionalProperties": false
+    },
+    "outputCaptured": {
+      "type": "object",
+      "description": "Bounded stdout/stderr capture finished. Emitted only when run was given --capture-dir.",
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "time": { "$ref": "#/$defs/time" },
+        "event": { "const": "output_captured" },
+        "stdout": { "$ref": "#/$defs/captureInfo" },
+        "stderr": { "$ref": "#/$defs/captureInfo" }
+      },
+      "required": ["schema_version", "time", "event", "stdout", "stderr"],
+      "additionalProperties": false
+    }
+  }
+}

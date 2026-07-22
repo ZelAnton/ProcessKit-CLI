@@ -1,5 +1,9 @@
 # JSONL schema v1 — golden fixtures
 
+This directory holds two companion artifacts for schema version 1 of
+processkit-cli's JSONL lifecycle-event contract: the golden sample stream
+(`events.jsonl`) and its machine-readable JSON Schema (`schema.json`).
+
 `events.jsonl` is the **golden sample stream** for schema version 1 of
 processkit-cli's JSONL lifecycle-event contract: at least one representative
 instance of every event type, serialized exactly as the runner writes each line to
@@ -30,3 +34,13 @@ an event's wire shape fails the build.
   stable fixture; a real stream carries the actual run's values.
 - A breaking change to any shape below is a **major** bump of `schema_version`
   (see `docs/schema.md`, "Versioning"), which lands under a new `fixtures/schema/vN/`.
+
+`schema.json` is a JSON Schema (draft 2020-12) mechanically transcribed from
+`docs/schema.md`, published for adapters that would rather validate against a
+schema than reimplement the shapes by hand. **`docs/schema.md` remains the
+normative source of truth**; `schema.json` is kept honest against it (and
+against `events.jsonl`, and several live streams emitted by the through-the-
+binary tests) by `tests::golden_fixture_validates_against_the_schema` and its
+sibling assertions in `tests/events.rs`. Unlike `events.jsonl`, `schema.json`
+is hand-maintained — update it alongside any change to `docs/schema.md` or to
+an event's shape in `src/events.rs`, and let the test catch drift.
