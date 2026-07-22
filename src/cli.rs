@@ -91,6 +91,25 @@ pub struct RunArgs {
     #[arg(long)]
     pub argv_raw: bool,
 
+    /// Clear the child's entire inherited environment before any
+    /// `--env-remove`/`--env` is applied (repeatable flag has no effect beyond
+    /// the first). Maps onto `processkit::Command::env_clear()`. See
+    /// `README.md`, "Environment", for the full applied order.
+    #[arg(long)]
+    pub env_clear: bool,
+
+    /// Remove an inherited environment variable by name (repeatable). Applied
+    /// after `--env-clear` and before `--env`, so an explicit `--env` for the
+    /// same key still wins. Maps onto `processkit::Command::env_remove()`.
+    #[arg(long = "env-remove", value_name = "KEY")]
+    pub env_remove: Vec<String>,
+
+    /// Set an environment variable for the child as `KEY=VALUE` (repeatable).
+    /// Applied last — after `--env-clear` and `--env-remove` — so it always wins
+    /// on a duplicated key. Maps onto `processkit::Command::env()`.
+    #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env_kv)]
+    pub env: Vec<(String, String)>,
+
     /// The program to run followed by its arguments. Everything after `--` is
     /// taken verbatim — there is no shell mode, so nothing here is expanded or
     /// re-interpreted. Kept as `OsString`s to preserve bytes exactly.
@@ -232,6 +251,22 @@ fn parse_exit_code_band(raw: &str) -> Result<(u8, u8), String> {
         ));
     }
     Ok((start, end))
+}
+
+/// Parse a `--env` value: `KEY=VALUE`, split on the **first** `=` (so a value
+/// containing `=` is preserved verbatim rather than truncated). A missing `=` or
+/// an empty `KEY` is rejected at parse time — mapped to the `USAGE` exit — rather
+/// than silently accepted as a malformed environment variable name.
+fn parse_env_kv(raw: &str) -> Result<(String, String), String> {
+    let (key, value) = raw.split_once('=').ok_or_else(|| {
+        format!(
+            "`--env` value `{raw}` must be `KEY=VALUE` (a literal `=` separating name and value)"
+        )
+    })?;
+    if key.is_empty() {
+        return Err(format!("`--env` value `{raw}` has an empty KEY before `=`"));
+    }
+    Ok((key.to_string(), value.to_string()))
 }
 
 #[cfg(test)]
@@ -431,6 +466,83 @@ mod tests {
             .is_err(),
             "a malformed --require-exit-code-band must fail at parse time"
         );
+    }
+
+    #[test]
+    fn run_parses_env_flags_in_the_order_given() {
+        let cli = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--env-clear",
+            "--env-remove",
+            "FOO",
+            "--env",
+            "BAR=1",
+            "--env",
+            "BAZ=with=equals",
+            "--",
+            "true",
+        ])
+        .expect("a valid run invocation");
+        let Command::Run(args) = cli.command else {
+            panic!("expected the run subcommand");
+        };
+        assert!(args.env_clear);
+        assert_eq!(args.env_remove, vec!["FOO".to_string()]);
+        assert_eq!(
+            args.env,
+            vec![
+                ("BAR".to_string(), "1".to_string()),
+                ("BAZ".to_string(), "with=equals".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn run_env_flags_default_to_absent() {
+        let cli = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--",
+            "true",
+        ])
+        .expect("a valid run invocation");
+        let Command::Run(args) = cli.command else {
+            panic!("expected the run subcommand");
+        };
+        assert!(!args.env_clear);
+        assert!(args.env_remove.is_empty());
+        assert!(args.env.is_empty());
+    }
+
+    #[test]
+    fn parse_env_kv_splits_on_the_first_equals() {
+        assert_eq!(
+            parse_env_kv("FOO=bar").unwrap(),
+            ("FOO".to_string(), "bar".to_string())
+        );
+        assert_eq!(
+            parse_env_kv("FOO=").unwrap(),
+            ("FOO".to_string(), String::new())
+        );
+        assert_eq!(
+            parse_env_kv("FOO=a=b=c").unwrap(),
+            ("FOO".to_string(), "a=b=c".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_env_kv_rejects_a_missing_separator_or_empty_key() {
+        for bad in ["FOO", "", "=novalue"] {
+            assert!(
+                parse_env_kv(bad).is_err(),
+                "expected `{bad}` to be rejected as a KEY=VALUE pair"
+            );
+        }
     }
 
     #[test]

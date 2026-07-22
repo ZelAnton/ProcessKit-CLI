@@ -39,17 +39,29 @@ fn main() -> ExitCode {
     };
 
     // `run` owns the process's exit path: on a completed container it hard-exits
-    // with the child's exact (full-width) code, so it never returns here. The
-    // remaining subcommands share the runner-error reporting below.
+    // with the child's exact (full-width) code, so it never returns here. Every
+    // other subcommand reaches a live runner (`inspect`/`cancel`/`kill`) or is
+    // self-contained (`probe`) and reports through the shared runner-error path
+    // below.
     match cli.command {
         Command::Run(args) => run::execute(args),
-        other => match dispatch(other) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(err) => {
-                eprintln!("processkit-cli: {err}");
-                ExitCode::from(err.code())
-            }
-        },
+        Command::Inspect(args) => report(control::inspect(&args.run_id)),
+        Command::Cancel(args) => report(control::cancel(&args.run_id)),
+        Command::Kill(args) => report(control::kill(&args.run_id)),
+        Command::Probe(args) => report(probe::run(&args)),
+    }
+}
+
+/// Map a non-`run` command's result onto the process's exit code: success is
+/// `0`, a runner-own failure prints its message to stderr and exits with its
+/// reserved-band code (see `src/exit.rs` and `docs/exit-codes.md`).
+fn report(result: Result<(), RunnerError>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("processkit-cli: {err}");
+            ExitCode::from(err.code())
+        }
     }
 }
 
@@ -66,24 +78,6 @@ fn report_parse_error(err: clap::Error) -> ExitCode {
     match err.kind() {
         ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => ExitCode::SUCCESS,
         _ => ExitCode::from(exit::USAGE),
-    }
-}
-
-/// Route a non-`run` command to its handler. `inspect`, `cancel`, and `kill` each
-/// reach a live runner through the registry and local transport (see
-/// [`control::inspect`], [`control::cancel`], [`control::kill`]); an unreachable or
-/// stale run is the reserved `CONTROL` failure, not a hang. `probe` is the
-/// side-effect-free launcher preflight (see [`probe::run`]): it reaches no runner and
-/// spawns nothing, printing this binary's compatibility surface and failing closed
-/// with `PROBE_INCOMPATIBLE` (110) when a `--require-*` check is unmet. `run` is
-/// handled directly in [`main`] and never reaches here.
-fn dispatch(command: Command) -> Result<(), RunnerError> {
-    match command {
-        Command::Run(_) => Err(RunnerError::not_implemented("run")),
-        Command::Inspect(args) => control::inspect(&args.run_id),
-        Command::Cancel(args) => control::cancel(&args.run_id),
-        Command::Kill(args) => control::kill(&args.run_id),
-        Command::Probe(args) => probe::run(&args),
     }
 }
 

@@ -97,6 +97,7 @@ owned container's ordinary teardown path on every supported platform.
 processkit-cli run     [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl>
                        [--create-no-window] [--timeout <duration>]
                        [--grace <duration>] [--capture-dir <dir>] [--argv-raw]
+                       [--env-clear] [--env-remove <KEY>]... [--env <KEY=VALUE>]...
                        -- <program> <args...>
 processkit-cli inspect --run-id <id> --json
 processkit-cli cancel  --run-id <id>
@@ -217,6 +218,29 @@ child that legitimately wants its own console. The runner itself never allocates
 a console, so it spawns no extra console host on its own account. Headless
 Windows deployments (such as Orchestra) that want to suppress a stray `conhost`
 window for the child pass `--create-no-window` explicitly.
+
+## Environment
+
+By default the child inherits the runner's own environment unchanged, exactly as
+launching it directly would. Three flags give control over that, mapping straight
+onto `processkit::Command`'s own environment builder (`env`/`env_remove`/
+`env_clear`) — the runner never reimplements this logic itself:
+
+- `--env-clear` clears the child's entire inherited environment, so it starts
+  from an empty slate rather than the runner's own environment.
+- `--env-remove <KEY>` (repeatable) removes one inherited variable by name.
+- `--env <KEY=VALUE>` (repeatable) sets one variable for the child, splitting on
+  the *first* `=` (so a value that itself contains `=` is preserved verbatim).
+
+**Applied order: clear, then remove, then set** — regardless of the order the
+flags are given on the command line. Concretely: `--env-clear` first empties the
+slate (or is skipped if absent), `--env-remove` then strips any of the remaining
+inherited variables it names, and `--env` is applied last, so an explicit `--env`
+always wins over an `--env-remove` of the same key. This is the intuitive "what I
+set is what I get" outcome: combining `--env-clear` with an `--env` for the same
+key still leaves that key set (`--env` fills the slate back in after the clear),
+and combining `--env-remove KEY` with `--env KEY=VALUE` always sets `KEY=VALUE`
+regardless of which flag was written first on the command line.
 
 ## Bounded output capture
 
