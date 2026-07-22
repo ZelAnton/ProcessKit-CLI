@@ -944,11 +944,10 @@ mod imp {
     use tokio::net::windows::named_pipe::{
         ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
     };
-    use windows_sys::Win32::Foundation::{ERROR_PIPE_BUSY, HLOCAL, LocalFree};
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-    };
+    use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+
+    use crate::win_security::SecurityDescriptor;
 
     use super::{
         ControlCommandSink, Infallible, SnapshotSource, handle_connection, io, unique_token,
@@ -964,7 +963,7 @@ mod imp {
     /// published.
     pub struct ControlServer {
         endpoint: String,
-        security: OwnerOnlySecurityDescriptor,
+        security: SecurityDescriptor,
         first: Option<NamedPipeServer>,
     }
 
@@ -974,7 +973,7 @@ mod imp {
         /// the filesystem.
         pub fn bind() -> io::Result<Self> {
             let endpoint = format!(r"\\.\pipe\processkit-cli-{}", unique_token());
-            let security = OwnerOnlySecurityDescriptor::new()?;
+            let security = owner_only_descriptor()?;
             let first = create_instance(&endpoint, &security, true)?;
             Ok(Self {
                 endpoint,
@@ -1039,7 +1038,7 @@ mod imp {
     /// name; remote clients are rejected (local-only channel).
     fn create_instance(
         endpoint: &str,
-        security: &OwnerOnlySecurityDescriptor,
+        security: &SecurityDescriptor,
         first: bool,
     ) -> io::Result<NamedPipeServer> {
         let mut attributes = SECURITY_ATTRIBUTES {
@@ -1061,61 +1060,19 @@ mod imp {
         }
     }
 
-    /// An owner-only security descriptor (`D:P(A;;FA;;;<current-user-SID>)`): a
-    /// **P**rotected DACL with a single allow-**F**ull-**A**ccess ACE for the current
-    /// user and nothing else. Built from the same SID the registry restricts to, so
-    /// the pipe and the registry are locked to one identity. Frees the LocalAlloc'd
-    /// descriptor on drop.
-    struct OwnerOnlySecurityDescriptor {
-        descriptor: *mut c_void,
-    }
-
-    // SAFETY: `descriptor` is a heap security descriptor (LocalAlloc) with no thread
-    // affinity — moving ownership across threads is sound, and it is freed exactly
-    // once, in `Drop`. `Send` lets the control server ride the async runtime.
-    unsafe impl Send for OwnerOnlySecurityDescriptor {}
-
-    impl OwnerOnlySecurityDescriptor {
-        fn new() -> io::Result<Self> {
-            let sid = crate::registry::current_user_sid_string()?;
-            let sddl = to_wide(&format!("D:P(A;;FA;;;{sid})"));
-            let mut descriptor: *mut c_void = core::ptr::null_mut();
-            // SAFETY: `sddl` is a valid NUL-terminated UTF-16 SDDL string; on success
-            // `descriptor` receives a LocalAlloc'd security descriptor freed in Drop.
-            let ok = unsafe {
-                ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                    sddl.as_ptr(),
-                    SDDL_REVISION_1,
-                    &mut descriptor,
-                    core::ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(Self { descriptor })
-        }
-
-        fn as_ptr(&self) -> *mut c_void {
-            self.descriptor
-        }
-    }
-
-    impl Drop for OwnerOnlySecurityDescriptor {
-        fn drop(&mut self) {
-            // SAFETY: `descriptor` came from ConvertStringSecurityDescriptorToSecurity
-            // DescriptorW (LocalAlloc'd), freed exactly once here.
-            unsafe { LocalFree(self.descriptor as HLOCAL) };
-        }
-    }
-
-    /// Encode a string as a NUL-terminated UTF-16 buffer for the wide Win32 APIs.
-    fn to_wide(value: &str) -> Vec<u16> {
-        use std::os::windows::ffi::OsStrExt;
-        std::ffi::OsStr::new(value)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
+    /// Build the pipe's owner-only security descriptor: a **P**rotected DACL with a
+    /// single allow-**F**ull-**A**ccess ACE for the current user and nothing else
+    /// (`D:P(A;;FA;;;<current-user-SID>)`). **No inheritance flags** — deliberately
+    /// unlike the registry *directory*'s inheritable `D:P(A;OICI;FA;;;<sid>)`, because
+    /// a named pipe has no child objects for an ACE to be inherited by. Built from the
+    /// same SID the registry restricts to (see [`crate::registry::current_user_sid_string`]),
+    /// so the pipe and the registry are locked to one identity. The returned
+    /// [`SecurityDescriptor`] owns the `LocalAlloc`'d descriptor and frees it on drop —
+    /// the shared unsafe conversion/free lives in [`crate::win_security`], this site
+    /// only owns the SDDL policy.
+    fn owner_only_descriptor() -> io::Result<SecurityDescriptor> {
+        let sid = crate::registry::current_user_sid_string()?;
+        SecurityDescriptor::from_sddl(&format!("D:P(A;;FA;;;{sid})"))
     }
 
     /// Connect to a runner's named-pipe endpoint. A pipe whose every instance is busy

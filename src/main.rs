@@ -26,6 +26,8 @@ mod list;
 mod probe;
 mod registry;
 mod run;
+#[cfg(windows)]
+mod win_security;
 
 use std::process::ExitCode;
 

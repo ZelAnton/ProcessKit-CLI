@@ -709,16 +709,16 @@ mod platform {
 
     use std::fs::{self, File};
     use std::io;
-    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
     use std::path::{Path, PathBuf};
+
+    use crate::win_security::SecurityDescriptor;
 
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_LOCK_VIOLATION, HANDLE, HLOCAL, LocalFree,
     };
     use windows_sys::Win32::Security::Authorization::{
-        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+        ConvertSidToStringSidW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
     };
     use windows_sys::Win32::Security::{
         DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetTokenInformation,
@@ -771,27 +771,13 @@ mod platform {
     /// so a pre-existing directory is locked down too.
     fn restrict_to_current_user(dir: &Path) -> io::Result<()> {
         let sid = current_user_sid_string()?;
-        let sddl = to_wide(&format!("D:P(A;OICI;FA;;;{sid})"));
-
-        let mut descriptor: *mut core::ffi::c_void = std::ptr::null_mut();
-        // SAFETY: `sddl` is a valid NUL-terminated UTF-16 string; on success
-        // `descriptor` receives a LocalAlloc'd security descriptor freed below.
-        let ok = unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl.as_ptr(),
-                SDDL_REVISION_1,
-                &mut descriptor,
-                std::ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        let result = apply_dacl(dir, descriptor);
-        // SAFETY: `descriptor` came from the converter above (LocalAlloc'd).
-        unsafe { LocalFree(descriptor as HLOCAL) };
-        result
+        // The inheritable (`OICI`) DACL for a *directory*, converted through the
+        // shared RAII wrapper: it owns the LocalAlloc'd descriptor and frees it on
+        // drop, so there is no manual `LocalFree` here anymore. The descriptor stays
+        // alive across the `apply_dacl` call below and is freed when it drops at the
+        // end of this function.
+        let descriptor = SecurityDescriptor::from_sddl(&format!("D:P(A;OICI;FA;;;{sid})"))?;
+        apply_dacl(dir, descriptor.as_ptr())
     }
 
     /// Apply the DACL from `descriptor` to `dir` as a protected DACL.
@@ -799,7 +785,8 @@ mod platform {
         let mut present = 0;
         let mut dacl = std::ptr::null_mut();
         let mut defaulted = 0;
-        // SAFETY: `descriptor` is a valid security descriptor from the converter.
+        // SAFETY: `descriptor` is a valid security descriptor borrowed from the
+        // caller's live [`SecurityDescriptor`] (still owned there for this call).
         let ok = unsafe {
             GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
         };
@@ -807,7 +794,7 @@ mod platform {
             return Err(io::Error::last_os_error());
         }
 
-        let path = to_wide(&dir.to_string_lossy());
+        let path = crate::win_security::to_wide(&dir.to_string_lossy());
         // SAFETY: `path` is NUL-terminated; `dacl` points into the live `descriptor`.
         // Owner/group/SACL are left untouched (null). SetNamedSecurityInfoW returns a
         // WIN32_ERROR (0 == success), not last-error.
@@ -947,14 +934,6 @@ mod platform {
         ))
     }
 
-    /// Encode a string as a NUL-terminated UTF-16 buffer for the wide Win32 APIs.
-    fn to_wide(value: &str) -> Vec<u16> {
-        std::ffi::OsStr::new(value)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
-    }
-
     /// Read a NUL-terminated UTF-16 string into an owned `String`.
     ///
     /// # Safety
@@ -999,7 +978,7 @@ mod platform {
 
         let user_sid = current_user_sid_bytes()?;
 
-        let path = to_wide(&dir.to_string_lossy());
+        let path = crate::win_security::to_wide(&dir.to_string_lossy());
         let mut descriptor: *mut core::ffi::c_void = std::ptr::null_mut();
         let mut dacl: *mut ACL = std::ptr::null_mut();
         // SAFETY: `path` is NUL-terminated; on success `dacl` points into the
