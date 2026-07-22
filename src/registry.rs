@@ -213,8 +213,25 @@ impl Registry {
             let Ok(record) = serde_json::from_str::<Record>(&text) else {
                 continue;
             };
+            // The `lock_file` field is untrusted deserialized data. Validate it as a
+            // simple, single-component, relative `.lock` name *before* joining it onto
+            // the registry directory — a value carrying `..`, a path separator, an
+            // absolute path, a NUL/control character, or a Windows reserved device
+            // name (even in the name-plus-extension aliasing form) would otherwise let
+            // a corrupt or adversarial record steer the liveness probe at a file
+            // outside the owner-only registry directory. A failing value is a corrupt
+            // record and is skipped, exactly like an unreadable or unparsable file.
+            if !is_simple_lock_file_name(&record.liveness.lock_file) {
+                continue;
+            }
             let lock_path = self.dir.join(&record.liveness.lock_file);
-            let health = probe_health(&lock_path)?;
+            // A per-record probe failure (an unreadable target, or one rejected as a
+            // symlink/reparse point at open time — see [`probe_health`]) marks this one
+            // entry corrupt and is skipped; it must not abort the scan and blind a
+            // client to the healthy entries.
+            let Ok(health) = probe_health(&lock_path) else {
+                continue;
+            };
             entries.push(Entry {
                 record,
                 health,
@@ -345,8 +362,14 @@ impl Drop for Registration {
 /// definition. When the probe acquires the lock it drops it immediately (the entry
 /// is stale, not being claimed) — a client that means to *reclaim* a stale entry
 /// would instead keep the lock held.
+///
+/// The lock file is opened *without following a symlink* at its final component
+/// ([`platform::open_lock_file`]: `O_NOFOLLOW` on unix, reparse-point rejection on
+/// Windows), closing the open-time TOCTOU window that a symlink swapped in after the
+/// name check would otherwise open — the probe can only ever touch a regular file
+/// inside the registry directory, never a link redirecting elsewhere.
 fn probe_health(lock_path: &Path) -> io::Result<Health> {
-    let lock = match OpenOptions::new().read(true).write(true).open(lock_path) {
+    let lock = match platform::open_lock_file(lock_path) {
         Ok(lock) => lock,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Health::Stale),
         Err(err) => return Err(err),
@@ -358,6 +381,88 @@ fn probe_health(lock_path: &Path) -> io::Result<Health> {
     } else {
         Ok(Health::Live)
     }
+}
+
+/// Validate a registry record's `lock_file` field as a **simple, single-component,
+/// relative** file name that is safe to resolve against the registry directory. This
+/// is a pure check on the string and its path components — it never touches the
+/// filesystem — so it runs *before* the value is ever joined onto `self.dir` or
+/// opened, and a value that fails it is treated as a corrupt record (the scan skips
+/// that entry). A live runner only ever writes the `run-<hex>-<hex>.lock` names
+/// [`next_stem`] mints, all of which pass; the guard exists purely for corrupt or
+/// adversarial deserialized input.
+///
+/// Rejected: an empty name; any embedded NUL or control character (a NUL can
+/// truncate the name at the OS boundary); any path separator (`/` or `\`) or Windows
+/// drive / alternate-data-stream delimiter (`:`); anything that is not exactly one
+/// *normal* path component (so `.`, `..`, an absolute path, and a `C:`-style prefix
+/// are all out); a name without the expected `.lock` extension; and a Windows
+/// reserved device name, including its name-plus-extension aliasing form
+/// (see [`is_windows_reserved_device_name`]).
+fn is_simple_lock_file_name(name: &str) -> bool {
+    // Reject empties and any embedded NUL / control character up front.
+    if name.is_empty() || name.chars().any(char::is_control) {
+        return false;
+    }
+    // Reject every path separator and the Windows drive / stream delimiter outright,
+    // so the value can never denote a subdirectory, a drive-relative path, or an
+    // alternate data stream — regardless of the OS the record is scanned on.
+    if name.contains('/') || name.contains('\\') || name.contains(':') {
+        return false;
+    }
+    // The value must resolve to exactly one *normal* component equal to itself. This
+    // rejects `.`, `..`, absolute paths, and any platform prefix.
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(only)), None) if only.to_str() == Some(name) => {}
+        _ => return false,
+    }
+    // Require the documented `.lock` extension.
+    if Path::new(name).extension().and_then(|ext| ext.to_str()) != Some("lock") {
+        return false;
+    }
+    // Finally reject Windows reserved device names (including `NUL.tar.gz.lock`).
+    !is_windows_reserved_device_name(name)
+}
+
+/// Whether `name` aliases a Windows reserved legacy device name. Win32 treats a file
+/// whose base name — the part before the *first* `.` — matches one of these as the
+/// device itself, not a file, **regardless of any trailing extension** (so
+/// `NUL.tar.gz.lock` still aliases `NUL`). The match is case-insensitive and also
+/// covers the Latin-1 superscript digit forms of `COM`/`LPT` (`COM¹`/`COM²`/`COM³`/
+/// `LPT¹`/`LPT²`/`LPT³`, code points U+00B9/U+00B2/U+00B3), which current Windows
+/// still reserves — only digits 1-3 have such a code point, so there is no
+/// superscript form for `COM4`-`COM9`/`LPT4`-`LPT9`. Rejected on every platform (not
+/// just Windows) so a record written on one OS cannot alias a device when scanned on
+/// another.
+fn is_windows_reserved_device_name(name: &str) -> bool {
+    // Windows reserves on the base name up to the first dot, ignoring the extension.
+    let base = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    if matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    // `COMx` / `LPTx` where `x` is an ASCII digit 1-9 or a Latin-1 superscript 1-3.
+    for prefix in ["COM", "LPT"] {
+        if let Some(ordinal) = base.strip_prefix(prefix)
+            && matches!(
+                ordinal,
+                "1" | "2"
+                    | "3"
+                    | "4"
+                    | "5"
+                    | "6"
+                    | "7"
+                    | "8"
+                    | "9"
+                    | "\u{b9}"
+                    | "\u{b2}"
+                    | "\u{b3}"
+            )
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Resolve the registry directory: the env override if set and non-empty, else the
@@ -408,7 +513,7 @@ mod platform {
     use std::fs::{self, DirBuilder, File, Permissions};
     use std::io;
     use std::os::fd::AsRawFd;
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
     use std::path::{Path, PathBuf};
 
     /// Owner-only directory: mode `0700`, re-asserted with `chmod` (which, unlike the
@@ -417,6 +522,20 @@ mod platform {
     pub fn create_owner_only_dir(dir: &Path) -> io::Result<()> {
         DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
         fs::set_permissions(dir, Permissions::from_mode(0o700))
+    }
+
+    /// Open an existing lock file for a liveness probe **without following a symlink**
+    /// at its final component. `O_NOFOLLOW` makes the open fail (`ELOOP`) rather than
+    /// traverse a symlink swapped in at the lock's name, closing the open-time TOCTOU
+    /// window; the registry directory itself is owner-only and created by us, so only
+    /// the final component needs guarding. A missing file surfaces as `NotFound` (the
+    /// caller reads that as a stale entry).
+    pub fn open_lock_file(path: &Path) -> io::Result<File> {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
     }
 
     /// Try to take a non-blocking exclusive advisory lock. Returns `true` if
@@ -493,7 +612,8 @@ mod platform {
         PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, LOCKFILE_EXCLUSIVE_LOCK,
+        LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
     };
     use windows_sys::Win32::System::IO::OVERLAPPED;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -503,6 +623,32 @@ mod platform {
     pub fn create_owner_only_dir(dir: &Path) -> io::Result<()> {
         fs::create_dir_all(dir)?;
         restrict_to_current_user(dir)
+    }
+
+    /// Open an existing lock file for a liveness probe **without following a reparse
+    /// point** (symlink or junction) at its final component. `FILE_FLAG_OPEN_REPARSE_POINT`
+    /// yields a handle to the link itself rather than its target — a regular file
+    /// ignores the flag and opens as usual — and the handle's attributes are then
+    /// checked so a reparse point is rejected outright, closing the open-time TOCTOU
+    /// window a symlink swapped in at the lock's name would open. The registry
+    /// directory itself is owner-only and created by us, so only the final component
+    /// needs guarding. A missing file surfaces as `NotFound` (the caller reads that as
+    /// a stale entry).
+    pub fn open_lock_file(path: &Path) -> io::Result<File> {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "registry lock file is a reparse point (symlink/junction), not a regular file",
+            ));
+        }
+        Ok(file)
     }
 
     /// Replace `dir`'s DACL with `D:P(A;OICI;FA;;;<current-user-SID>)`: **P**rotected
@@ -1063,6 +1209,182 @@ mod tests {
         );
 
         second.remove();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Write a hand-crafted registry record (`<stem>.json`) with a chosen `lock_file`
+    /// value, simulating a corrupt or adversarial deserialized entry a real runner
+    /// would never write (`register` only ever mints a safe `run-<hex>-<hex>.lock`).
+    fn write_record(dir: &Path, stem: &str, run_id: &str, lock_file: &str) {
+        let record = Record {
+            registry_version: REGISTRY_VERSION,
+            run_id: run_id.to_string(),
+            endpoint: None,
+            started_at: events::format_rfc3339_utc(SystemTime::now()),
+            liveness: Liveness {
+                kind: LIVENESS_ADVISORY_LOCK.to_string(),
+                lock_file: lock_file.to_string(),
+            },
+        };
+        let json = serde_json::to_string(&record).expect("serialize the record");
+        fs::write(dir.join(format!("{stem}.json")), json).expect("write the record");
+    }
+
+    /// A platform-absolute path (never a simple in-directory name).
+    fn absolute_escape() -> &'static str {
+        if cfg!(windows) {
+            "C:\\Windows\\Temp\\escape.lock"
+        } else {
+            "/tmp/escape.lock"
+        }
+    }
+
+    /// The names a live runner actually mints, plus benign edge cases that merely
+    /// *resemble* a reserved device, are all accepted — the guard must not discard a
+    /// legitimate entry (the positive case).
+    #[test]
+    fn simple_lock_file_names_are_accepted() {
+        for name in [
+            "run-00000000000000000000000000000000-0000000000000000.lock",
+            "run-0123456789abcdef.lock",
+            "a.lock",
+            // Resembles a device name but is not one: extra letters / an out-of-range
+            // ordinal / no ordinal at all.
+            "console.lock",
+            "nula.lock",
+            "com10.lock",
+            "com0.lock",
+            "lpt.lock",
+        ] {
+            assert!(
+                is_simple_lock_file_name(name),
+                "a plain single-component .lock name must be accepted: {name:?}"
+            );
+        }
+    }
+
+    /// Every way a `lock_file` value can fail the simple-name contract — path
+    /// traversal, absolute paths, embedded separators, a missing/wrong extension,
+    /// NUL/control characters, the `:` drive/stream delimiter, and Windows reserved
+    /// device names (bare and in their name-plus-extension aliasing form, including
+    /// the superscript `COM`/`LPT` variants) — is rejected.
+    #[test]
+    fn unsafe_lock_file_names_are_rejected() {
+        for name in [
+            // Empty / traversal / absolute.
+            "",
+            "..",
+            ".",
+            "../escape.lock",
+            "..\\escape.lock",
+            "/tmp/escape.lock",
+            "/etc/passwd.lock",
+            "C:\\Windows\\escape.lock",
+            "C:escape.lock",
+            // Embedded path separators / drive-or-stream delimiter.
+            "sub/dir.lock",
+            "sub\\dir.lock",
+            "stream:evil.lock",
+            // Missing or wrong extension.
+            "run-0000",
+            "run-0000.txt",
+            "run-0000.lock.bak",
+            ".lock",
+            // NUL / control characters.
+            "run-0000\0.lock",
+            "run-0000\t.lock",
+            "run-0000\n.lock",
+            // Windows reserved device names, bare and with an added extension chain.
+            "CON.lock",
+            "con.lock",
+            "PRN.lock",
+            "AUX.lock",
+            "NUL.lock",
+            "NUL.tar.gz.lock",
+            "COM1.lock",
+            "com9.lock",
+            "LPT1.lock",
+            "lpt9.lock",
+            // Latin-1 superscript device-name aliases (still reserved).
+            "COM\u{b9}.lock",
+            "COM\u{b2}.lock",
+            "COM\u{b3}.lock",
+            "LPT\u{b9}.lock",
+            "LPT\u{b2}.lock",
+            "LPT\u{b3}.lock",
+        ] {
+            assert!(
+                !is_simple_lock_file_name(name),
+                "an unsafe lock_file value must be rejected: {name:?}"
+            );
+        }
+    }
+
+    /// A record whose `lock_file` is not a simple in-directory name — a `..`
+    /// traversal, an absolute path, or a Windows reserved device name — is a corrupt
+    /// entry: the scan skips it (never joining the value onto the registry directory
+    /// to probe a file outside it) while a well-formed sibling entry is still scanned
+    /// and returned. Proves the guard both defends the directory boundary and does not
+    /// abort the whole scan over one bad record.
+    #[test]
+    fn entries_skip_unsafe_lock_files_without_aborting_the_scan() {
+        let dir = scratch("unsafe-lock");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+
+        write_record(&dir, "escaper-rel", "escaper-rel", "../escape.lock");
+        write_record(&dir, "escaper-abs", "escaper-abs", absolute_escape());
+        write_record(&dir, "device", "device", "NUL.tar.gz.lock");
+
+        // A well-formed live entry alongside the corrupt ones.
+        let good = registry
+            .register("good", None, SystemTime::now())
+            .expect("register the good run");
+
+        let entries = registry.entries().expect("scan");
+        assert_eq!(
+            entries.len(),
+            1,
+            "every unsafe entry is skipped and only the well-formed one survives"
+        );
+        assert_eq!(entries[0].record.run_id, "good");
+        assert_eq!(entries[0].health, Health::Live);
+
+        good.remove();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Unix: a lock file that is a *symlink* is refused at open time (`O_NOFOLLOW`),
+    /// even though its name passes the simple-name check — so a record pointing a
+    /// valid-looking lock name at a symlink reads as a skipped corrupt entry rather
+    /// than letting the probe follow the link onto an off-target file.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_lock_target_is_refused_at_open_time() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch("symlink-lock");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+
+        // A decoy the symlink would redirect the probe onto, and a symlink named like
+        // a valid lock file pointing at it.
+        let decoy = dir.join("decoy-target");
+        fs::write(&decoy, b"decoy").expect("write the decoy target");
+        let link = dir.join("run-symlink-0000.lock");
+        symlink(&decoy, &link).expect("create the symlink lock file");
+
+        // The name itself is a valid simple `.lock` name.
+        assert!(is_simple_lock_file_name("run-symlink-0000.lock"));
+
+        write_record(&dir, "run-symlink-0000", "linked", "run-symlink-0000.lock");
+
+        // The open refuses to follow the symlink, so the probe errors and the entry is
+        // skipped — never returned as a live/stale run.
+        let entries = registry.entries().expect("scan");
+        assert!(
+            entries.iter().all(|entry| entry.record.run_id != "linked"),
+            "an entry whose lock file is a symlink must be skipped, not followed"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 }
