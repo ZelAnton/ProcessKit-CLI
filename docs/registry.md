@@ -113,21 +113,27 @@ and both read as live for as long as they run. Resolution is therefore the clien
 job, in `resolve_live_endpoint` (`src/control.rs`), and it is deliberately
 conservative:
 
-- The client scans every entry, filters to those matching the requested `run_id`,
-  and narrows to the ones that are both live (see "Staleness" above) and publish an
-  `endpoint`.
-- **Exactly one** such entry → resolved, normally.
-- **Zero** → a distinguishable `CONTROL` (103) failure naming *why* (no such run
-  registered at all, the sole match is stale, or the sole live match predates the
-  transport) — see [`docs/control-plane.md`](control-plane.md).
-- **More than one** → also a `CONTROL` (103) failure, "ambiguous run id", instead of
-  silently acting on whichever entry the directory scan happens to return first.
-  This applies to **every** client the same way — the destructive `cancel`/`kill`
-  verbs *and* the read-only `inspect` — rather than a softer fallback for `inspect`:
-  guessing wrong on a mutating verb ends the *other* run instead of the intended
-  one, and a snapshot of the wrong run under `inspect` is exactly as misleading as
-  acting on it. A caller that hits this is expected to pick a `--run-id` that is
-  unique among currently live runs.
+- The client scans every entry and filters to those matching the requested
+  `run_id`, then counts how many of *those* are live (see "Staleness" above) —
+  deliberately **before** ever looking at whether they publish an `endpoint`. A
+  live entry that has not (yet, or ever) published an endpoint — a disconnected
+  or failed transport — still counts as a live duplicate; if endpoint presence
+  narrowed the count first, such an entry would be silently skipped and a
+  duplicate could evade detection.
+- **Zero** live matches → a distinguishable `CONTROL` (103) failure naming *why*
+  (no such run registered at all, or the sole match is stale) — see
+  [`docs/control-plane.md`](control-plane.md).
+- **More than one** live match → also a `CONTROL` (103) failure, "ambiguous run
+  id", instead of silently acting on whichever entry the directory scan happens
+  to return first. This applies to **every** client the same way — the
+  destructive `cancel`/`kill` verbs *and* the read-only `inspect` — rather than a
+  softer fallback for `inspect`: guessing wrong on a mutating verb ends the
+  *other* run instead of the intended one, and a snapshot of the wrong run under
+  `inspect` is exactly as misleading as acting on it. A caller that hits this is
+  expected to pick a `--run-id` that is unique among currently live runs.
+- **Exactly one** live match → only now does its endpoint matter: resolved
+  normally if it published one, or a distinguishable `CONTROL` (103) failure
+  ("the run is live but exposes no control endpoint") if it did not.
 
 That single check happening once, at the start of the call, is a TOCTOU race for the
 mutating verbs: `register` never enforces uniqueness, so a duplicate can register

@@ -53,17 +53,17 @@
 //! ## Ambiguous run id — a hard failure, never a guess
 //!
 //! [`registry::Registry::register`] does not enforce `run_id` uniqueness, so two
-//! concurrent runs started with the same explicit `--run-id` can both be live and
-//! reachable at once. [`resolve_live_endpoint`] (via [`resolve_in_registry`]) detects
-//! that (more than one live entry with a published endpoint matches the requested
-//! `run_id`) and refuses to pick one: every verb — `inspect`, `cancel`, and `kill`
-//! alike — reports the same reserved [`exit::CONTROL`] (103) "ambiguous run id"
-//! failure rather than acting on whichever entry the directory scan happens to
-//! return first. For the mutating verbs this is load-bearing (a wrong guess cancels
-//! or kills the *other* run); the read-only `inspect` gets the identical hard
-//! failure rather than a softer fallback, because a snapshot of the wrong run is
-//! exactly as misleading as acting on it. See `docs/registry.md`, "Run id resolution
-//! — ambiguity is a hard failure".
+//! concurrent runs started with the same explicit `--run-id` can both be live at
+//! once. [`resolve_live_endpoint`] (via [`resolve_in_registry`]) detects that (more
+//! than one *live* entry matches the requested `run_id`, counted regardless of
+//! whether each one has published an endpoint yet) and refuses to pick one: every
+//! verb — `inspect`, `cancel`, and `kill` alike — reports the same reserved
+//! [`exit::CONTROL`] (103) "ambiguous run id" failure rather than acting on whichever
+//! entry the directory scan happens to return first. For the mutating verbs this is
+//! load-bearing (a wrong guess cancels or kills the *other* run); the read-only
+//! `inspect` gets the identical hard failure rather than a softer fallback, because a
+//! snapshot of the wrong run is exactly as misleading as acting on it. See
+//! `docs/registry.md`, "Run id resolution — ambiguity is a hard failure".
 //!
 //! That initial check alone is a TOCTOU race for `cancel`/`kill`: a duplicate can
 //! register under the same `run_id` in the window between the scan and the
@@ -593,35 +593,33 @@ fn resolve_in_registry(
         ));
     }
 
-    // Reach only a live entry that actually advertises an endpoint — but first check
-    // *how many* such entries there are. `register` (`src/registry.rs`) never
-    // enforces `run_id` uniqueness, so two concurrent runs started with the same
-    // explicit `--run-id` can both be live and reachable at once. Every verb
-    // (`inspect`/`cancel`/`kill`) shares this resolver and treats that as a hard,
-    // documented failure rather than silently acting on whichever entry the
-    // directory scan happens to return first: for the mutating verbs, guessing
-    // wrong means cancelling or killing the *other* run instead of the intended
-    // one; `inspect` gets the same treatment rather than a softer fallback because
-    // a snapshot of the wrong run is just as misleading as acting on it (see
-    // `docs/registry.md`, "Run id resolution — ambiguity is a hard failure").
-    let live_with_endpoint: Vec<&registry::Entry> = matches
+    // Count *live* entries first — regardless of whether they advertise an
+    // endpoint — before ever looking at endpoints. `register` (`src/registry.rs`)
+    // never enforces `run_id` uniqueness, so two concurrent runs started with the
+    // same explicit `--run-id` can both be live at once, and one of them may not
+    // (yet, or ever) have published an endpoint (disconnected/failed transport).
+    // Counting only endpoint-having entries would let such a duplicate evade
+    // detection and have the sole endpoint-having entry acted on as if it were
+    // unambiguous. Every verb (`inspect`/`cancel`/`kill`) shares this resolver and
+    // treats *any* live duplicate as a hard, documented failure rather than
+    // silently acting on whichever entry the directory scan happens to return
+    // first: for the mutating verbs, guessing wrong means cancelling or killing
+    // the *other* run instead of the intended one; `inspect` gets the same
+    // treatment rather than a softer fallback because a snapshot of the wrong run
+    // is just as misleading as acting on it (see `docs/registry.md`, "Run id
+    // resolution — ambiguity is a hard failure").
+    let live: Vec<&registry::Entry> = matches
         .iter()
-        .filter(|entry| entry.health == Health::Live && entry.record.endpoint.is_some())
+        .filter(|entry| entry.health == Health::Live)
         .collect();
-    if live_with_endpoint.len() > 1 {
-        return Err(ambiguous_run(action, run_id, live_with_endpoint.len()));
+    if live.len() > 1 {
+        return Err(ambiguous_run(action, run_id, live.len()));
     }
 
-    // If none does, say *why* — the run is gone (stale) or predates the transport
-    // (live, no endpoint) — rather than a generic failure.
-    let Some(entry) = live_with_endpoint.into_iter().next() else {
-        if matches.iter().any(|entry| entry.health == Health::Live) {
-            return Err(unreachable_run(
-                action,
-                run_id,
-                "the run is live but exposes no control endpoint".to_string(),
-            ));
-        }
+    // Exactly one live entry (or none) — now it's safe to look at its endpoint.
+    // Say *why* it's unreachable — the run is gone (stale) or predates the
+    // transport (live, no endpoint) — rather than a generic failure.
+    let Some(entry) = live.into_iter().next() else {
         return Err(unreachable_run(
             action,
             run_id,
@@ -629,6 +627,13 @@ fn resolve_in_registry(
                 .to_string(),
         ));
     };
+    if entry.record.endpoint.is_none() {
+        return Err(unreachable_run(
+            action,
+            run_id,
+            "the run is live but exposes no control endpoint".to_string(),
+        ));
+    }
     Ok(entry
         .record
         .endpoint
@@ -1404,6 +1409,36 @@ mod tests {
 
         drop(first);
         drop(second);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (R-02) Ambiguity detection must count *every* live entry, not just the ones
+    /// that happen to advertise an endpoint. A live run that has not (yet, or
+    /// ever) published an endpoint — a disconnected or failed transport — must
+    /// still make the `run_id` ambiguous; it must not be silently skipped in favor
+    /// of treating the sole endpoint-having entry as unambiguous.
+    #[test]
+    fn resolve_in_registry_detects_ambiguity_even_when_one_duplicate_has_no_endpoint() {
+        let dir = scratch_registry_dir("dup-endpointless");
+        let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
+
+        let with_endpoint = registry
+            .register("dup-endpointless", Some("endpoint-a"), SystemTime::now())
+            .expect("register the run that has an endpoint");
+        let without_endpoint = registry
+            .register("dup-endpointless", None, SystemTime::now())
+            .expect("register the live run that never published an endpoint");
+
+        let err = resolve_in_registry(&registry, "kill", "dup-endpointless")
+            .expect_err("two live entries under the same run_id must be ambiguous");
+        assert_eq!(err.code(), exit::CONTROL);
+        assert!(
+            err.to_string().contains("ambiguous"),
+            "names the reason: {err}"
+        );
+
+        drop(with_endpoint);
+        drop(without_endpoint);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
