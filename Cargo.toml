@@ -108,6 +108,16 @@ windows-sys = { version = "0.61", features = [
 # remote-`$ref` HTTP/file resolver (and `reqwest`) that this schema — fully
 # self-contained via internal `$defs` — never needs, so they are disabled.
 jsonschema = { version = "0.48.2", default-features = false }
+# Property-based test tier for the hand-rolled primitives (SHA-256 in
+# `src/hash.rs`, the `--timeout`/`--grace` duration grammar in `src/cli.rs`,
+# and the `HINT_RULES` classifier in `src/events.rs`) — a regression net over
+# arbitrary/generated inputs, not just the fixed example vectors already in
+# each module's `#[cfg(test)]` block.
+proptest = "1"
+# Independent reference SHA-256 implementation, used only to cross-check the
+# hand-rolled incremental hasher in `src/hash.rs`'s property tests against a
+# well-tested, unrelated implementation (rather than against itself).
+sha2 = "0.11"
 
 # Unix-only: the cancel integration test needs to deliver a real SIGINT (the
 # `Ctrl-C` the runner listens for) to the spawned runner process, which the std

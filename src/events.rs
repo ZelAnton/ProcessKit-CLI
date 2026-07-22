@@ -855,6 +855,100 @@ mod tests {
         );
     }
 
+    // Property-based tier (T-167). Placed in this same `#[cfg(test)]` module
+    // rather than a new `tests/properties.rs`: this crate is bin-only (no
+    // `[lib]` target — see K-006), so an integration test under `tests/` cannot
+    // reach the private `classify_hint`/`HINT_RULES` at all — only an in-module
+    // test run via `cargo test --bin processkit-cli` can.
+    //
+    // The generator is deliberately *not* fully random bytes: `classify_hint` is
+    // a documented, rule-driven substring matcher (`HINT_RULES`), so a
+    // meaningful property test constructs argv from the documented marker set
+    // (with randomized casing and optional omission) interleaved with filler
+    // tokens drawn from a pool that cannot spell out any marker substring —
+    // exercising the classifier's actual contract instead of noise it was never
+    // meant to classify.
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// The one documented rule's markers, canonical casing.
+        const MARKERS: [&str; 3] = ["MSBuild.dll", "/nodemode:1", "/nodeReuse:true"];
+
+        /// Filler tokens that share no substring with any marker above (verified
+        /// by the `debug_assert!` below), so their presence never accidentally
+        /// satisfies a marker match.
+        const FILLERS: [&str; 8] = [
+            "cmd", "/c", "echo", "true", "hello", "value123", "--flag", "worker",
+        ];
+
+        /// Re-case `s` per `variant`: 0 = as written, 1 = upper, 2 = lower.
+        fn recase(s: &str, variant: u8) -> String {
+            match variant % 3 {
+                0 => s.to_string(),
+                1 => s.to_uppercase(),
+                _ => s.to_lowercase(),
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// Classifying the same argv twice is deterministic (repeated calls
+            /// agree), and the outcome matches the documented rule: the hint fires
+            /// exactly when all three markers are present (in any casing), and
+            /// never fires on the filler-only pool, which cannot spell out a
+            /// marker substring.
+            #[test]
+            fn classification_is_stable_and_matches_the_documented_rule(
+                include in [any::<bool>(), any::<bool>(), any::<bool>()],
+                casing in [0u8..3, 0u8..3, 0u8..3],
+                fillers in prop::collection::vec(
+                    prop::sample::select(FILLERS.as_slice()),
+                    0..4,
+                ),
+                shuffle_seed in any::<u64>(),
+            ) {
+                for marker in MARKERS {
+                    for filler in FILLERS {
+                        debug_assert!(
+                            !filler.to_ascii_lowercase().contains(&marker.to_ascii_lowercase()),
+                            "filler {filler:?} must not contain marker {marker:?}"
+                        );
+                    }
+                }
+
+                let mut argv: Vec<String> = MARKERS
+                    .iter()
+                    .zip(include)
+                    .zip(casing)
+                    .filter(|((_, keep), _)| *keep)
+                    .map(|((marker, _), variant)| recase(marker, variant))
+                    .collect();
+                argv.extend(fillers.iter().map(|f| f.to_string()));
+
+                // A cheap deterministic shuffle (no extra proptest strategy needed):
+                // rotate the vector by the seed. Order must not affect the result —
+                // classify_hint checks substring presence, not position.
+                if !argv.is_empty() {
+                    let rotate_by = (shuffle_seed as usize) % argv.len();
+                    argv.rotate_left(rotate_by);
+                }
+
+                let first = classify_hint(&argv);
+                let second = classify_hint(&argv);
+                prop_assert_eq!(first, second, "classification must be stable across repeated calls");
+
+                let all_present = include.iter().all(|&keep| keep);
+                if all_present {
+                    prop_assert_eq!(first, Some("msbuild_node_reuse"));
+                } else {
+                    prop_assert_eq!(first, None);
+                }
+            }
+        }
+    }
+
     #[test]
     fn mechanism_maps_to_the_documented_strings() {
         assert_eq!(mechanism_str(Mechanism::JobObject), "job_object");

@@ -379,6 +379,67 @@ mod tests {
         assert!(parse_duration(&format!("{}h", u64::MAX)).is_err());
     }
 
+    // Property-based tier (T-167). Placed in this same `#[cfg(test)]` module
+    // rather than a new `tests/properties.rs`: this crate is bin-only (no
+    // `[lib]` target — see K-006), so an integration test under `tests/` cannot
+    // reach the private `parse_duration` at all — only an in-module test run via
+    // `cargo test --bin processkit-cli` can.
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            /// Unit equivalence across the documented grammar: `s` is 1000x `ms`,
+            /// `m` is 60x `s`, `h` is 60x `m`, and a bare number defaults to `s` —
+            /// for any value small enough that none of the multiplications
+            /// overflow `u64` milliseconds.
+            #[test]
+            fn unit_equivalence_holds(value in 0u64..1_000_000) {
+                let bare = parse_duration(&value.to_string()).unwrap();
+                let secs = parse_duration(&format!("{value}s")).unwrap();
+                let millis = parse_duration(&format!("{}ms", value * 1_000)).unwrap();
+                let mins = parse_duration(&format!("{value}m")).unwrap();
+                let mins_as_secs = parse_duration(&format!("{}s", value * 60)).unwrap();
+                let hours = parse_duration(&format!("{value}h")).unwrap();
+                let hours_as_mins = parse_duration(&format!("{}m", value * 60)).unwrap();
+
+                prop_assert_eq!(bare, secs, "a bare number must default to seconds");
+                prop_assert_eq!(secs, millis, "`Ns` must equal `(N*1000)ms`");
+                prop_assert_eq!(mins, mins_as_secs, "`Nm` must equal `(N*60)s`");
+                prop_assert_eq!(hours, hours_as_mins, "`Nh` must equal `(N*60)m`");
+            }
+
+            /// Any string that does not start with an ASCII digit is rejected: the
+            /// grammar requires a leading digit run, so `raw.find` locating the
+            /// first non-digit at index 0 always leaves `number` empty.
+            #[test]
+            fn non_digit_leading_input_is_rejected(raw in "[^0-9]{0,32}") {
+                prop_assert!(parse_duration(&raw).is_err());
+            }
+
+            /// A digit run followed by any suffix outside the four documented
+            /// units is rejected rather than silently reinterpreted.
+            #[test]
+            fn digits_with_unknown_unit_are_rejected(
+                value in 0u64..1_000_000,
+                unit in "[a-zA-Z]{1,8}",
+            ) {
+                prop_assume!(!matches!(unit.as_str(), "ms" | "s" | "m" | "h"));
+                let raw = format!("{value}{unit}");
+                prop_assert!(parse_duration(&raw).is_err());
+            }
+
+            /// No input — arbitrary, not just grammar-shaped — ever makes the
+            /// parser panic; it always returns `Ok` or `Err`.
+            #[test]
+            fn never_panics_on_arbitrary_input(raw in ".{0,64}") {
+                let _ = parse_duration(&raw);
+            }
+        }
+    }
+
     #[test]
     fn run_parses_timeout_and_grace_into_durations() {
         let cli = Cli::try_parse_from([
