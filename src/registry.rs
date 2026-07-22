@@ -418,13 +418,14 @@ fn probe_health(lock_path: &Path) -> io::Result<Health> {
 
 /// Validate that `value` has the exact shape [`events::format_rfc3339_utc`]
 /// produces: `YYYY-MM-DDTHH:MM:SS.sssZ`, 24 ASCII bytes, with the four calendar/
-/// clock fields in their documented ranges (month 1-12, day 1-31, hour 0-23, minute
-/// 0-59, second 0-59). This is a **shape/range** check, not a full calendar
-/// validator (it does not reject, say, day 31 of a 30-day month) — that is enough to
-/// catch the corrupt-record case this guards against (garbage, truncated, or
-/// wrong-format text swapped into `started_at`), which is the same standard
-/// [`is_simple_lock_file_name`] holds `lock_file` to. A live runner only ever writes
-/// values this function accepts.
+/// clock fields in their documented ranges (month 1-12, day valid for that month
+/// *and* year — including leap-year February 29 — hour 0-23, minute 0-59, second
+/// 0-59). This **is** a full calendar validator: day 31 of a 30-day month, day 30 of
+/// February, and February 29 of a non-leap year are all rejected, alongside the pure
+/// shape/digit checks — that is enough to catch the corrupt-record case this guards
+/// against (garbage, truncated, or wrong-format text swapped into `started_at`),
+/// which is the same standard [`is_simple_lock_file_name`] holds `lock_file` to. A
+/// live runner only ever writes values this function accepts.
 fn is_valid_rfc3339_millis_utc(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() != 24 {
@@ -445,17 +446,42 @@ fn is_valid_rfc3339_millis_utc(value: &str) -> bool {
     {
         return false;
     }
+    let four = |i: usize| {
+        u32::from(bytes[i] - b'0') * 1000
+            + u32::from(bytes[i + 1] - b'0') * 100
+            + u32::from(bytes[i + 2] - b'0') * 10
+            + u32::from(bytes[i + 3] - b'0')
+    };
     let two = |i: usize| u32::from(bytes[i] - b'0') * 10 + u32::from(bytes[i + 1] - b'0');
+    let year = four(0);
     let month = two(5);
     let day = two(8);
     let hour = two(11);
     let minute = two(14);
     let second = two(17);
     (1..=12).contains(&month)
-        && (1..=31).contains(&day)
+        && day >= 1
+        && day <= days_in_month(year, month)
         && hour <= 23
         && minute <= 59
         && second <= 59
+}
+
+/// Number of days in `month` (1-12) of `year`, per the proleptic Gregorian calendar —
+/// including leap-year handling for February (divisible by 4, except centuries not
+/// divisible by 400). Only called from [`is_valid_rfc3339_millis_utc`] after `month`
+/// has already been range-checked to `1..=12`; any other value falls through to the
+/// `_ => 31` arm, which is unreachable in that caller but keeps this total rather
+/// than panicking if ever reused elsewhere.
+fn days_in_month(year: u32, month: u32) -> u32 {
+    let is_leap_year =
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    match month {
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year => 29,
+        2 => 28,
+        _ => 31,
+    }
 }
 
 /// Validate a registry record's `lock_file` field as a **simple, single-component,
@@ -1532,10 +1558,35 @@ mod tests {
             "2026-07-22T00:00:60.000Z",   // second out of range
             "2026-07-22T00:00:00.000Z\0", // trailing NUL
             "20260722T000000.000Z",       // no separators at all
+            "2026-02-31T00:00:00.000Z",   // February never has 31 days
+            "2026-02-30T00:00:00.000Z",   // February never has 30 days
+            "2026-02-29T00:00:00.000Z",   // 2026 is not a leap year
+            "2100-02-29T00:00:00.000Z",   // century not divisible by 400: not a leap year
+            "2026-04-31T00:00:00.000Z",   // April is a 30-day month
+            "2026-06-31T00:00:00.000Z",   // June is a 30-day month
+            "2026-09-31T00:00:00.000Z",   // September is a 30-day month
+            "2026-11-31T00:00:00.000Z",   // November is a 30-day month
         ] {
             assert!(
                 !is_valid_rfc3339_millis_utc(bad),
                 "a malformed started_at value must be rejected: {bad:?}"
+            );
+        }
+
+        // Calendar-valid edge cases that must still be accepted: leap-year February 29
+        // (both the ordinary `% 4 == 0` rule and the `% 400 == 0` century exception),
+        // and the last day of every 30/31-day month.
+        for good in [
+            "2024-02-29T00:00:00.000Z", // ordinary leap year (divisible by 4, not by 100)
+            "2000-02-29T00:00:00.000Z", // century leap year (divisible by 400)
+            "2026-02-28T00:00:00.000Z", // last day of February in a non-leap year
+            "2026-04-30T00:00:00.000Z", // last day of a 30-day month
+            "2026-01-31T00:00:00.000Z", // last day of a 31-day month
+            "2026-12-31T00:00:00.000Z", // last day of the year
+        ] {
+            assert!(
+                is_valid_rfc3339_millis_utc(good),
+                "a calendar-valid started_at value must be accepted: {good:?}"
             );
         }
     }
