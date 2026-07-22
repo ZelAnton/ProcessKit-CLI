@@ -243,22 +243,28 @@ does not emit it (the stream is otherwise byte-for-byte identical).
 
 A **capture** object (one per stream):
 
-| Field       | Type    | Notes                                                                                     |
-|-------------|---------|-------------------------------------------------------------------------------------------|
-| `path`      | string  | The file the stream was written to (`<dir>/stdout.log` or `<dir>/stderr.log`).             |
-| `bytes`     | integer | **Full** byte counter — every decoded byte the stream produced; exceeds the file size when the stream was truncated. |
-| `sha256`    | string  | Lowercase-hex SHA-256 of the bytes actually written to `path` — verify the file against it. Same digest primitive as `argv_sha256`. |
-| `truncated` | boolean | **Explicit** flag: `true` when the stream outran the per-stream capture ceiling and the tail was not written. Never inferred from the file's size. |
+| Field         | Type    | Notes                                                                                     |
+|---------------|---------|-------------------------------------------------------------------------------------------|
+| `path`        | string  | The file the stream was written to (`<dir>/stdout.log` or `<dir>/stderr.log`).             |
+| `bytes`       | integer | **Full** byte counter — every decoded byte the stream produced; exceeds the file size when the stream was truncated or a write failed. |
+| `sha256`      | string  | Lowercase-hex SHA-256 of the bytes actually written to `path` — verify the file against it. Same digest primitive as `argv_sha256`. |
+| `truncated`   | boolean | **Explicit** flag: `true` when the stream outran the per-stream capture ceiling and the tail was deliberately not written. Never inferred from the file's size. |
+| `write_error` | boolean | **Explicit** flag: `true` when a file write failed part-way through the stream, after which capture stopped writing to the (broken) file. Signals a disk-level problem, distinct from a ceiling clip. Never inferred from the file's size. |
 
-The point of the explicit `truncated` flag is that a consumer distinguishes
-"captured in full" from "clipped at the limit" from the flag alone — not by
-comparing the file's size against a ceiling it would have to know. When
-`truncated` is `false`, `bytes` equals the file's size and `sha256` covers the
-whole stream; when `true`, `bytes` is the full amount produced while the file
-holds (and `sha256` covers) the first ceiling's worth. The two streams are
-independent: one may be truncated while the other is complete. On a runner-imposed
-ending (`timeout` / `cancelled`) the event reports whatever was captured before the
-teardown.
+The two explicit flags exist so a consumer distinguishes "captured in full" from
+"clipped at the limit" from "cut short by a disk write error" from the flags alone —
+not by comparing the file's size against a ceiling it would have to know. The stream
+was captured in full exactly when **both** `truncated` and `write_error` are `false`;
+then `bytes` equals the file's size and `sha256` covers the whole stream. When
+`truncated` is `true`, `bytes` is the full amount produced while the file holds (and
+`sha256` covers) the first ceiling's worth. When `write_error` is `true`, a write
+failed mid-stream: `bytes` remains the full byte counter, but the file holds — and
+`sha256` covers — only the prefix that reached disk before the failure, so `bytes`
+exceeds the file's size. The two flags are independent and may both be set (a stream
+that outran the ceiling and then also hit a write error). The two streams are likewise
+independent: one may be truncated or write-errored while the other is complete. On a
+runner-imposed ending (`timeout` / `cancelled`) the event reports whatever was captured
+before the teardown.
 
 ## Ordering
 
@@ -351,7 +357,11 @@ A future version lands under a new `fixtures/schema/vN/` directory. Additive,
 backward-compatible clarifications that do not change any existing shape do not bump
 the version. Adding a **new event type** (as `output_captured` was added) is
 likewise additive: it introduces no change to any existing event's shape, and a
-consumer that pins the events it knows simply ignores one it does not. Filling a
+consumer that pins the events it knows simply ignores one it does not. Adding a **new
+field** to an existing event — always present, and leaving every other field's name,
+type, and meaning intact — is additive in the same way: a consumer that reads the
+fields it knows is unaffected and simply ignores the new one. The `output_captured`
+per-stream `write_error` flag was added this way within v1. Filling a
 field that was reserved-as-`null` is **not** a breaking change: the field already
 exists and its type is unchanged. The `argv_sha256` and
 `hint` fields were filled this way — they now carry values on every run instead of

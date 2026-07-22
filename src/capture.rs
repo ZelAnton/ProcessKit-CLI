@@ -14,13 +14,19 @@
 //! in-flight assembly buffer without limit — the runner writes no draining/limiting
 //! of its own.
 //!
-//! For each stream three facts are recorded and surfaced in the JSONL
+//! For each stream four facts are recorded and surfaced in the JSONL
 //! `output_captured` event (see [`crate::events`] and `docs/schema.md`): the full
 //! byte counter (every decoded byte the stream produced), the SHA-256 of the bytes
-//! actually written to the file, and an **explicit** truncation flag — set when the
-//! stream outran the per-stream file ceiling, never inferred from the file's size.
-//! A consumer therefore tells "captured in full" from "clipped at the limit" from
-//! the flag alone, and can verify the file it holds against the recorded digest.
+//! actually written to the file, an **explicit** truncation flag — set when the
+//! stream outran the per-stream file ceiling, never inferred from the file's size —
+//! and an **explicit** write-error flag — set when a file write failed mid-stream so
+//! capture stopped touching a broken file before the stream ended. The two flags are
+//! independent conditions (a stream can be both ceiling-truncated and write-errored),
+//! and each is reported directly rather than inferred: a consumer tells "captured in
+//! full" (`truncated` and `write_error` both false) from "clipped at the limit" from
+//! "cut short by a disk write error" on the flags alone, and can verify the file it
+//! holds against the recorded digest (which always covers exactly the bytes that
+//! reached disk).
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -67,7 +73,9 @@ struct StreamCapture {
     /// Set once `seen` exceeds the ceiling: an explicit signal, not a size compare.
     truncated: bool,
     /// Latched on the first file write error so we stop touching a broken file
-    /// (best-effort: capture never aborts the run).
+    /// (best-effort: capture never aborts the run). Surfaced in the finalized
+    /// [`CaptureInfo`] as its own explicit flag, so a consumer learns the on-disk
+    /// transcript is short of the byte counter without comparing sizes.
     write_error: bool,
 }
 
@@ -118,6 +126,7 @@ impl StreamCapture {
             self.seen,
             self.hasher.clone().finalize_hex(),
             self.truncated,
+            self.write_error,
         )
     }
 }
@@ -366,6 +375,38 @@ mod tests {
         let info = cap.info();
         assert_eq!(info.bytes(), 0);
         assert!(!info.truncated());
+        assert!(!info.write_error());
         assert_eq!(info.sha256(), crate::hash::sha256_hex(b""));
+    }
+
+    #[test]
+    fn a_write_error_is_surfaced_and_is_not_a_ceiling_truncation() {
+        let path = temp_path("write-error");
+        let mut cap = StreamCapture::new(path.clone()).expect("create capture file");
+        // Force a deterministic write failure on every platform: swap the writable
+        // handle for a read-only one on the same file, so the next `write_all`
+        // returns `Err` (EBADF / ERROR_ACCESS_DENIED) without depending on an
+        // OS-specific error kind or a mid-stream disk-full condition.
+        cap.file = std::fs::File::open(&path).expect("reopen the capture file read-only");
+        cap.absorb(b"hello");
+        let info = cap.info();
+        assert!(
+            info.write_error(),
+            "a mid-stream file write failure is surfaced as an explicit flag"
+        );
+        assert!(
+            !info.truncated(),
+            "a write error is a distinct condition from a ceiling truncation"
+        );
+        assert_eq!(
+            info.bytes(),
+            5,
+            "the full byte counter still sums every produced byte, past the write error"
+        );
+        // Nothing reached disk before the latch, so the digest is the empty-input
+        // hash and the file is empty — the recorded digest covers exactly what was
+        // written, and `bytes` (5) exceeds the file's size (0) as the flag warns.
+        assert_eq!(info.sha256(), crate::hash::sha256_hex(b""));
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
     }
 }
