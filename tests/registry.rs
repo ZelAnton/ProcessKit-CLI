@@ -678,3 +678,125 @@ fn list_does_not_create_the_registry_directory() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Run `prune [--json]` against `registry` and wait for it to finish.
+fn prune(registry: &Path, json: bool) -> Output {
+    let mut cmd = Command::new(bin());
+    cmd.arg("prune");
+    if json {
+        cmd.arg("--json");
+    }
+    cmd.env("PROCESSKIT_CLI_REGISTRY_DIR", registry)
+        .output()
+        .expect("spawn the prune client")
+}
+
+/// Hand-write a confirmed-stale entry into `registry`: a well-formed record plus an
+/// **unlocked** sibling lock file — exactly the `.json`/`.lock` pair an abruptly-killed
+/// runner leaves behind, with no process holding the lock. `register` only ever mints
+/// safe opaque stems, so a test fabricates this leftover directly, the same way the
+/// in-`src` unit tests do.
+fn write_stale_entry(registry: &Path, stem: &str) {
+    fs::create_dir_all(registry).expect("create the registry directory");
+    let lock_name = format!("{stem}.lock");
+    // A minimal valid record: registry_version 1, a well-formed millisecond RFC-3339
+    // `started_at`, and a simple in-directory `lock_file` name — the exact shape a
+    // live runner writes, so the scan treats it as a real (not corrupt) record.
+    let record = format!(
+        "{{\"registry_version\":1,\"run_id\":\"{stem}\",\"endpoint\":null,\
+         \"started_at\":\"2026-07-22T00:00:00.000Z\",\
+         \"liveness\":{{\"kind\":\"advisory_lock\",\"lock_file\":\"{lock_name}\"}}}}"
+    );
+    fs::write(registry.join(format!("{stem}.json")), record).expect("write the stale record");
+    // An unlocked lock file: present on disk, but held by no one, so the prune probe
+    // takes its exclusive lock and confirms the entry stale.
+    fs::write(registry.join(&lock_name), b"").expect("write the unlocked lock file");
+}
+
+/// The end-to-end reaping contract: `prune` deletes a confirmed-stale entry from disk
+/// while leaving a live run's entry completely untouched — the through-the-binary
+/// counterpart to the fine-grained `Registry::prune` unit tests in `src/registry.rs`.
+#[test]
+fn prune_reaps_a_stale_entry_and_keeps_a_live_one() {
+    let dir = scratch("prune-mixed");
+    let registry = registry_dir(&dir);
+
+    // A hand-written, confirmed-stale entry (record + unlocked lock file).
+    write_stale_entry(&registry, "run-stale-0000");
+    assert!(
+        registry.join("run-stale-0000.json").exists()
+            && registry.join("run-stale-0000.lock").exists(),
+        "the stale fixture starts on disk"
+    );
+
+    // A real, live run alongside it — its runner holds the liveness lock for the whole
+    // run, so prune must never touch it.
+    let mut child = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "live-run"],
+        long_child(),
+    )
+    .spawn()
+    .expect("spawn the runner");
+
+    // Both records are present once the live runner has published its own.
+    wait_until(|| record_count(&registry) == 2, Duration::from_secs(10));
+
+    let out = prune(&registry, true);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "prune succeeds; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("prune --json prints one JSON object");
+    assert_eq!(
+        report["pruned"], 1,
+        "exactly the stale entry is reaped: {report}"
+    );
+    assert_eq!(
+        report["live"], 1,
+        "the live entry is counted as kept, not reaped: {report}"
+    );
+
+    // The stale entry is gone from disk, both files...
+    assert!(
+        !registry.join("run-stale-0000.json").exists(),
+        "the stale record file is reaped"
+    );
+    assert!(
+        !registry.join("run-stale-0000.lock").exists(),
+        "the stale lock file is reaped"
+    );
+    // ...and only the live run's record survives.
+    assert_eq!(
+        record_count(&registry),
+        1,
+        "only the live entry's record remains"
+    );
+    let survivor = read_only_record(&registry);
+    assert!(
+        survivor.contains("live-run"),
+        "the surviving record is the live run's: {survivor}"
+    );
+
+    // A second prune over the now-live-only registry reaps nothing.
+    let out = prune(&registry, true);
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("prune --json prints one JSON object");
+    assert_eq!(
+        report["pruned"], 0,
+        "a repeat prune leaves the live entry alone: {report}"
+    );
+    assert_eq!(
+        record_count(&registry),
+        1,
+        "the live entry still stands after a repeat prune"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_dir_all(&dir);
+}

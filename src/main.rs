@@ -12,7 +12,9 @@
 //! hard kill for `kill` — each a distinguishable outcome in the JSONL stream and by
 //! exit code. [`list`] is the discovery counterpart: it scans the same registry and
 //! prints every entry, live or stale, for a caller that has lost (or never had) a
-//! `run_id`. The compatibility surface — CLI flags (see [`cli`]), the exit-code
+//! `run_id`; [`prune`] is the cleanup counterpart, reaping the confirmed-stale
+//! leftovers of runners that died abruptly while never touching a live entry.
+//! The compatibility surface — CLI flags (see [`cli`]), the exit-code
 //! contract (see [`exit`] and `docs/exit-codes.md`), and the JSONL `schema_version`
 //! (see [`events`] and `docs/schema.md`) — is fixed.
 
@@ -24,6 +26,7 @@ mod exit;
 mod hash;
 mod list;
 mod probe;
+mod prune;
 mod registry;
 mod run;
 #[cfg(windows)]
@@ -54,6 +57,7 @@ fn main() -> ExitCode {
         Command::Cancel(args) => report(control::cancel(&args.run_id)),
         Command::Kill(args) => report(control::kill(&args.run_id)),
         Command::List(args) => report(list::run(args.json)),
+        Command::Prune(args) => report(prune::run(args.json)),
         Command::Probe(args) => report(probe::run(&args)),
     }
 }

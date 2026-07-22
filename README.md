@@ -106,6 +106,7 @@ processkit-cli inspect --run-id <id> --json
 processkit-cli cancel  --run-id <id>
 processkit-cli kill    --run-id <id>
 processkit-cli list    [--json]
+processkit-cli prune   [--json]
 processkit-cli probe   --json [--require-schema-version <N>]
                        [--require-exit-code-band <start>-<end>]
                        [--require-surface <token>]...
@@ -155,6 +156,22 @@ empty registry is not an error — `list` exits `0` either way — and a stale e
 listed rather than hidden, since surfacing a leftover from an abruptly-died runner
 is exactly the point. See [`docs/registry.md`](docs/registry.md), "Discovery —
 `list`".
+
+`list` shows those stale leftovers; `prune` removes them. It reaps every registry
+entry it can **confirm** is stale — the `.json`/`.lock` pair a runner that died
+abruptly never cleaned up — and leaves every other entry alone. The safety rule is
+strict and one-directional: prune deletes **only** an entry whose liveness probe
+*succeeded and reported stale*. A **live** entry is never touched; an entry whose
+probe merely **failed** (its lock file could not be opened, so its liveness is
+unknown, not confirmed dead) is **left in place**, on every repeated run; and no
+entry is ever addressed by PID — a stale record is reaped through the path the scan
+already found, so PID reuse can never misdirect a deletion. A confirmed-stale entry
+is removed while its lock is still held, so a second concurrent prune cannot race on
+the same files. Without `--json` it prints a one-line summary (`no stale entries to
+prune` when there was nothing to do); with `--json` it prints a single JSON object
+`{"pruned":N,"live":N,"unprobed":N}`. An empty or never-created registry is not an
+error — `prune` reports a zero tally and exits `0`, and pruning a missing registry
+does not create it. See [`docs/registry.md`](docs/registry.md), "Reaping — `prune`".
 
 ## Exit codes
 

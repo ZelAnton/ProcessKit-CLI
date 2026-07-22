@@ -37,6 +37,9 @@ pub enum Command {
     Kill(TargetArgs),
     /// List every run recorded in the per-user registry, live and stale alike.
     List(ListArgs),
+    /// Reap the registry's confirmed-stale entries — the leftover records of runners
+    /// that died abruptly — while never touching a live run's entry.
+    Prune(PruneArgs),
     /// Report this binary's compatibility surface for a consumer's fail-closed
     /// launcher preflight (`CC_PROCESSKIT_RUN`) — no run, no child, no side effects.
     Probe(ProbeArgs),
@@ -156,6 +159,25 @@ pub struct ListArgs {
     /// Emit one JSON object per entry (one per line) instead of a human-readable
     /// table. Unlike `inspect`/`probe`, this flag is optional — `list` has a
     /// human-readable form of its own.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `prune [--json]`
+///
+/// Scans the per-user registry ([`crate::registry::Registry::prune`]) and reaps every
+/// entry it can **confirm** is stale — a leftover `.json`/`.lock` pair from a runner
+/// that died abruptly without running its clean-exit removal — while leaving every
+/// live entry, and every entry whose liveness it could not probe, untouched. Unlike
+/// `list`, prune *mutates* the registry (it deletes files), but like `list` it opens
+/// the registry read-only: a missing registry has nothing to prune, so prune never
+/// creates the directory or touches its permissions just to look. An empty (or
+/// missing) registry is not an error — prune reports a zero tally and exits `0`.
+#[derive(Debug, Args)]
+pub struct PruneArgs {
+    /// Emit the prune tally as a single JSON object instead of a human-readable
+    /// summary line. Optional, mirroring `list` — prune has a human-readable form of
+    /// its own.
     #[arg(long)]
     pub json: bool,
 }
@@ -375,6 +397,24 @@ mod tests {
         let cli = Cli::try_parse_from(["processkit-cli", "list", "--json"]).expect("list --json");
         let Command::List(args) = cli.command else {
             panic!("expected the list subcommand");
+        };
+        assert!(args.json);
+    }
+
+    #[test]
+    fn prune_defaults_to_no_json_and_accepts_the_flag() {
+        let cli = Cli::try_parse_from(["processkit-cli", "prune"]).expect("a bare prune");
+        let Command::Prune(args) = cli.command else {
+            panic!("expected the prune subcommand");
+        };
+        assert!(
+            !args.json,
+            "--json is optional and defaults to off for prune"
+        );
+
+        let cli = Cli::try_parse_from(["processkit-cli", "prune", "--json"]).expect("prune --json");
+        let Command::Prune(args) = cli.command else {
+            panic!("expected the prune subcommand");
         };
         assert!(args.json);
     }

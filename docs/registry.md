@@ -13,10 +13,11 @@ format**, and **staleness signal**. The transport those clients speak over, and 
 `inspect` client itself, are described in [`docs/control-plane.md`](control-plane.md);
 here we define only the registry.
 
-`list` (see "Discovery" below) is the one client that reads the registry directly,
-without connecting to any runner's control transport: it scans every entry and
-prints it, so an operator or orchestrator that has lost (or never had) a `run_id`
-can find one before reaching for `inspect`/`cancel`/`kill`.
+`list` (see "Discovery" below) and `prune` (see "Reaping" below) are the two clients
+that read the registry directly, without connecting to any runner's control
+transport: `list` scans every entry and prints it, so an operator or orchestrator
+that has lost (or never had) a `run_id` can find one before reaching for
+`inspect`/`cancel`/`kill`, and `prune` reaps the entries `list` would show as stale.
 
 ## Location
 
@@ -207,6 +208,61 @@ do — it has no single target to fail to reach.
   blinds `list` to the other, healthy entries — including a record whose
   `started_at` is not the well-formed `YYYY-MM-DDTHH:MM:SS.sssZ` shape a runner
   actually writes.
+
+## Reaping — `prune`
+
+`processkit-cli prune [--json]` is the cleanup counterpart to `list`. Where `list`
+shows a stale leftover, `prune` deletes it: it opens the registry through
+[`Registry::open_read_only`] (`src/registry.rs`) — like `list`, so it never creates
+the directory or touches its permissions; a missing or empty registry simply has
+nothing to prune — scans it with the same shared scan `list` uses, and for each
+scanned record deletes **both** its files (`<stem>.json` then `<stem>.lock`, the same
+order [`Registration::remove`] uses) only when it can *confirm* the record is stale.
+
+### The reaping safety invariant
+
+Pruning deletes files, so it is deliberately conservative: an entry is reaped **only**
+when its own liveness probe *succeeds and reports stale*. The three probe outcomes are
+kept strictly apart — and this is the load-bearing distinction:
+
+- **Confirmed stale ⇒ reaped.** The lock file is absent (stale by definition), or its
+  exclusive lock was free and the probe took it (no live runner holds it). Only this
+  case deletes anything.
+- **Live ⇒ never touched.** A live runner holds the lock, so its entry is left exactly
+  as it is. Prune never deletes a running run's record.
+- **Probe failed ⇒ left in place.** The probe could not even be performed — the lock
+  file would not open (a directory in its place, a permission error, a rejected
+  symlink/reparse point) or the lock call itself errored. Liveness is *unknown*, not
+  confirmed stale, so the entry is **kept**, on every repeated prune. This is the case
+  the `list`/`inspect` read path deliberately collapses into `stale` (its
+  "could not confirm liveness ⇒ treat as not live" degradation): prune must **not**
+  reuse that collapsed verdict — a probe-failed record is not a confirmed-dead one —
+  so it probes on its own path that keeps the failure distinct, and errs toward
+  keeping a record it is unsure about.
+
+Two further guarantees hold, mirroring the rest of the registry:
+
+- **Never by PID.** A reaped entry is addressed only through the record path the
+  directory scan produced (the same PID-free tokened stem — see "No PID addressing"
+  above), never by a process id, so PID reuse can never misdirect a deletion.
+- **Reclaim under the lock.** A confirmed-stale entry is deleted **while the probe
+  still holds its exclusive lock** — the "keep the lock to reclaim" behavior noted
+  under "Staleness" above — so a second concurrent prune sees the entry as live and
+  skips it instead of racing on the same files.
+
+Corrupt records the scan already skips (unreadable, unparsable JSON, a malformed
+`started_at`, or a `lock_file` that is not a simple in-directory name) are **not**
+prune candidates: they are never probed and never deleted, exactly as `list` leaves
+them alone. Every deletion is best-effort and per-entry — an OS error reaping one
+entry never aborts the reaping of the others (the leftover just reads as stale again
+next time) — and pruning an already-clean, empty, or missing registry is a no-op that
+exits `0`.
+
+- **No `--json`** prints a one-line summary (`no stale entries to prune` when there
+  was nothing to reap).
+- **`--json`** prints a single JSON object with the tally: `pruned` (entries reaped),
+  `live` (live entries left untouched), and `unprobed` (entries whose probe failed and
+  were left in place).
 
 ## Lifecycle
 

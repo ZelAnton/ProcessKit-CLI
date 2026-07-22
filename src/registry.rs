@@ -123,6 +123,35 @@ pub struct Entry {
     pub path: PathBuf,
 }
 
+/// A registry record that passed every corruption guard in the scan — readable,
+/// parsable JSON, a well-formed `started_at`, and a simple in-directory `lock_file`
+/// name — paired with the two on-disk paths it resolves to. The shared product of
+/// [`Registry::scan`], consumed by [`Registry::entries`] (which probes each into an
+/// [`Entry`]) and [`Registry::prune`] (which reaps only the confirmed-stale ones).
+struct ScannedRecord {
+    record: Record,
+    /// The record file (`<stem>.json`) — what [`Entry::path`] carries and what prune
+    /// deletes first.
+    json_path: PathBuf,
+    /// The validated, joined lock file path (`<stem>.lock`) the liveness probe opens.
+    lock_path: PathBuf,
+}
+
+/// The tally a [`Registry::prune`] pass produces: how many entries it reaped, how
+/// many live ones it deliberately left alone, and how many it could not probe (and
+/// so also left alone). The counts sum only over records the scan considered — a
+/// corrupt/unreadable record is never a prune candidate and is not counted here.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PruneOutcome {
+    /// Confirmed-stale entries whose `.json`/`.lock` files were reaped.
+    pub pruned: usize,
+    /// Live entries left untouched (a live runner holds the lock).
+    pub live: usize,
+    /// Entries whose liveness could not be probed (the lock file would not open, or
+    /// the lock call errored) and were therefore left in place rather than risked.
+    pub unprobed: usize,
+}
+
 /// A handle onto the per-user run registry directory.
 pub struct Registry {
     dir: PathBuf,
@@ -224,6 +253,111 @@ impl Registry {
     /// on: find the run whose `record.run_id` matches, then act only if it is live —
     /// which a probe-failed entry, being `Stale`, never is.
     pub fn entries(&self) -> io::Result<Vec<Entry>> {
+        let mut entries = Vec::new();
+        for ScannedRecord {
+            record,
+            json_path,
+            lock_path,
+        } in self.scan()?
+        {
+            // A per-record probe failure (an unreadable target, one rejected as a
+            // symlink/reparse point at open time, or a lock/unlock error — see
+            // [`probe_health`]) does not discredit the record itself: only its
+            // liveness could not be confirmed. Degrade to `Stale` rather than
+            // dropping the entry or aborting the scan — "could not confirm liveness ⇒
+            // treat as not live" is the least-surprising verdict, it keeps the entry
+            // visible for the `prune` reaper (T-164), and it is exactly what fixes the
+            // misrouting bug this task exists for: `inspect`/`cancel`/`kill` act only
+            // on `Live` entries, so a record whose probe failed can no longer fail
+            // the whole scan and take down an operation on an unrelated, healthy
+            // run_id. **Prune must not reuse this collapsed value** — it cannot tell a
+            // genuinely stale entry from a probe-failed one — and so probes on its own
+            // path (see [`Registry::prune`] / [`probe_for_prune`]).
+            let health = probe_health(&lock_path).unwrap_or(Health::Stale);
+            entries.push(Entry {
+                record,
+                health,
+                path: json_path,
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Reap every **confirmed-stale** entry, deleting both its files, and leave every
+    /// other entry untouched. The safe-by-construction cleanup for the leftover
+    /// `.json`/`.lock` pair an abruptly-killed runner leaves behind (its clean-exit
+    /// [`Registration::remove`] never ran), which the registry would otherwise
+    /// accumulate forever.
+    ///
+    /// The single load-bearing safety property is that pruning deletes **only** an
+    /// entry whose liveness probe **succeeded and returned stale** — and nothing else:
+    ///
+    /// - **`Ok(stale)` ⇒ reap.** The lock file was absent, or the exclusive lock was
+    ///   free and taken: no live runner holds it, so the record is genuinely dead.
+    /// - **`Ok(live)` ⇒ never touch.** A live runner holds the lock — reaping it would
+    ///   delete a running run's registry entry.
+    /// - **`Err(_)` ⇒ leave in place.** The probe could not even be performed (the lock
+    ///   file would not open — EISDIR, permission-denied, a rejected reparse point — or
+    ///   the lock call itself errored). Liveness is *unknown*, not confirmed stale, so
+    ///   the entry is kept, on every repeated prune, rather than risk deleting a record
+    ///   that may belong to a live run. This is exactly the distinction
+    ///   [`Registry::entries`] deliberately throws away (its `.unwrap_or(Health::Stale)`
+    ///   folds `Err` into `Stale` — see [K-024]); prune therefore probes on its **own**
+    ///   path ([`probe_for_prune`]), which keeps the three cases apart, and never reads
+    ///   the collapsed [`Entry::health`].
+    ///
+    /// Corrupt records the scan already skips (unreadable, unparsable JSON, a malformed
+    /// `started_at`, or a `lock_file` that is not a simple in-directory name) are
+    /// **not** candidates — they are never probed and never deleted, exactly as
+    /// [`Registry::entries`] leaves them alone. No entry is ever addressed by PID: a
+    /// candidate is reached only through the record path the directory scan already
+    /// produced.
+    ///
+    /// A confirmed-stale entry is reaped **while its lock is still held** (see
+    /// [`probe_for_prune`]): the reclaim keeps the exclusive lock across the two
+    /// deletions, so a second concurrent prune sees the entry as live and skips it
+    /// rather than racing on the same files — the "hold the lock to reclaim" pattern
+    /// `docs/registry.md` documents. Deletion mirrors [`Registration::remove`]: the
+    /// record (`.json`) first, then the lock (`.lock`), each best-effort — an OS delete
+    /// error on one entry never aborts the reaping of the others (a leftover just reads
+    /// as stale again next time). Running prune over an already-clean registry is a
+    /// no-op, not an error.
+    pub fn prune(&self) -> io::Result<PruneOutcome> {
+        let mut outcome = PruneOutcome::default();
+        for ScannedRecord {
+            json_path,
+            lock_path,
+            ..
+        } in self.scan()?
+        {
+            match probe_for_prune(&lock_path) {
+                // Confirmed stale: reap both files while still holding the acquired
+                // lock (when there was one). The record is deleted first, then the
+                // lock file, mirroring `Registration::remove`; the held lock is
+                // released only when `_held_lock` drops after both deletes.
+                Ok(PruneProbe::Reapable(_held_lock)) => {
+                    let _ = fs::remove_file(&json_path);
+                    let _ = fs::remove_file(&lock_path);
+                    outcome.pruned += 1;
+                }
+                // A live runner holds the lock — never touch a running run's entry.
+                Ok(PruneProbe::Live) => outcome.live += 1,
+                // The probe could not be performed: liveness is unknown, not
+                // confirmed stale, so the entry is left exactly as it is.
+                Err(_) => outcome.unprobed += 1,
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Scan the registry directory into the records that pass every corruption guard,
+    /// each paired with the two on-disk paths it resolves to — the shared read step
+    /// under both [`Registry::entries`] (which probes each into an [`Entry`]) and
+    /// [`Registry::prune`] (which reaps only the confirmed-stale ones). Sharing this
+    /// step guarantees the two paths agree exactly on which records are corrupt-and-
+    /// skipped versus real-and-probed, so prune can never act on a record `entries`
+    /// would have dropped. A missing directory is simply an empty registry.
+    fn scan(&self) -> io::Result<Vec<ScannedRecord>> {
         let read_dir = match fs::read_dir(&self.dir) {
             Ok(read_dir) => read_dir,
             // A missing directory is simply an empty registry.
@@ -231,7 +365,7 @@ impl Registry {
             Err(err) => return Err(err),
         };
 
-        let mut entries = Vec::new();
+        let mut scanned = Vec::new();
         for dir_entry in read_dir {
             let path = dir_entry?.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
@@ -265,25 +399,13 @@ impl Registry {
                 continue;
             }
             let lock_path = self.dir.join(&record.liveness.lock_file);
-            // A per-record probe failure (an unreadable target, one rejected as a
-            // symlink/reparse point at open time, or a lock/unlock error — see
-            // [`probe_health`]) does not discredit the record itself: only its
-            // liveness could not be confirmed. Degrade to `Stale` rather than
-            // dropping the entry or aborting the scan — "could not confirm liveness ⇒
-            // treat as not live" is the least-surprising verdict, it keeps the entry
-            // visible for a future reaper (T-164), and it is exactly what fixes the
-            // misrouting bug this task exists for: `inspect`/`cancel`/`kill` act only
-            // on `Live` entries, so a record whose probe failed can no longer fail
-            // the whole scan and take down an operation on an unrelated, healthy
-            // run_id.
-            let health = probe_health(&lock_path).unwrap_or(Health::Stale);
-            entries.push(Entry {
+            scanned.push(ScannedRecord {
                 record,
-                health,
-                path,
+                json_path: path,
+                lock_path,
             });
         }
-        Ok(entries)
+        Ok(scanned)
     }
 
     /// Reserve a unique entry by atomically creating its lock file (`create_new`) and
@@ -425,6 +547,56 @@ fn probe_health(lock_path: &Path) -> io::Result<Health> {
         Ok(Health::Stale)
     } else {
         Ok(Health::Live)
+    }
+}
+
+/// The verdict [`probe_for_prune`] returns — the reaping counterpart to the
+/// [`Health`] that [`probe_health`] yields, but deliberately keeping the case
+/// [`Registry::entries`] discards.
+enum PruneProbe {
+    /// The entry is **confirmed stale** and safe to reap. Carries the held exclusive
+    /// lock when there was a lock file to acquire, so the caller deletes the entry's
+    /// files while the lock is still held (nothing can slip in and claim the entry
+    /// between the check and the delete); `None` when the lock file was already gone —
+    /// the record is an orphan with nothing left to hold.
+    Reapable(Option<File>),
+    /// A live runner holds the lock: the entry must never be reaped.
+    Live,
+}
+
+/// Probe an entry's lock file **for pruning**, keeping apart the three cases
+/// [`Registry::entries`] deliberately folds together (its `.unwrap_or(Health::Stale)`
+/// collapses a probe *error* into `Stale`, so a probe-failed record is indistinguishable
+/// there from a genuinely dead one — see [K-024]). Here they stay distinct, because
+/// prune deletes files and must never act on a record it did not actually confirm dead:
+///
+/// - lock file **absent** (`NotFound`) ⇒ [`PruneProbe::Reapable`]`(None)` — stale by
+///   definition, an orphaned record with no lock left to hold;
+/// - lock **acquired** (no live holder) ⇒ [`PruneProbe::Reapable`]`(Some(lock))` —
+///   confirmed stale, and the acquired lock is **kept held** and handed back so the
+///   reap runs under it (pruning *reclaims* the entry, unlike [`probe_health`], which
+///   drops the lock at once for a pure liveness query — the "keep the lock to reclaim"
+///   pattern `docs/registry.md` documents);
+/// - lock **denied** (a live runner holds it) ⇒ [`PruneProbe::Live`];
+/// - any real probe **failure** — the lock file cannot be opened (EISDIR/permission-
+///   denied/reparse-point rejection) or the lock call itself errors — is returned as
+///   `Err`, so the caller leaves the entry in place rather than deleting an
+///   unconfirmed record.
+fn probe_for_prune(lock_path: &Path) -> io::Result<PruneProbe> {
+    let lock = match platform::open_lock_file(lock_path) {
+        Ok(lock) => lock,
+        // A missing lock file is stale by definition — and there is no lock to hold.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(PruneProbe::Reapable(None));
+        }
+        Err(err) => return Err(err),
+    };
+    if platform::try_lock_exclusive(&lock)? {
+        // Acquired: no live holder. Keep the handle so the reap deletes the files
+        // under the still-held lock.
+        Ok(PruneProbe::Reapable(Some(lock)))
+    } else {
+        Ok(PruneProbe::Live)
     }
 }
 
@@ -1713,5 +1885,226 @@ mod tests {
 
         good.remove();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Prune reaps a confirmed-stale **orphan**: a record whose lock file is already
+    /// gone (`probe_for_prune` opens it and gets `NotFound` — stale by definition, a
+    /// successful probe, not an error). The dangling `.json` is deleted; there is no
+    /// lock file left to delete.
+    #[test]
+    fn prune_reaps_a_confirmed_stale_orphan_record() {
+        let dir = scratch("prune-orphan");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+
+        // A record pointing at a well-formed lock name that does not exist on disk.
+        write_record(&dir, "orphan", "orphan", "orphan.lock");
+        let record_path = dir.join("orphan.json");
+        assert!(record_path.exists(), "the orphan record starts on disk");
+
+        let outcome = registry.prune().expect("prune must not fail");
+        assert_eq!(
+            outcome,
+            PruneOutcome {
+                pruned: 1,
+                live: 0,
+                unprobed: 0,
+            },
+            "an orphaned stale record is reaped"
+        );
+        assert!(!record_path.exists(), "the orphaned record file is deleted");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Prune reaps a confirmed-stale entry whose runner died abruptly (the released
+    /// lock is taken by the probe, so both files are deleted) — and a second prune over
+    /// the now-clean registry is a no-op, not an error.
+    #[test]
+    fn prune_reaps_a_stale_entry_with_a_released_lock_and_is_idempotent() {
+        let dir = scratch("prune-released");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+
+        let registration = registry
+            .register("victim", None, SystemTime::now())
+            .expect("register run");
+        let record_path = registration.record_path().to_owned();
+        let lock_path = registration.lock_path().to_owned();
+
+        // Abrupt death: release the lock, leave both files behind.
+        registration.simulate_abrupt_death();
+        assert!(
+            record_path.exists() && lock_path.exists(),
+            "the abrupt-death fixture leaves both files on disk"
+        );
+
+        let outcome = registry.prune().expect("prune must not fail");
+        assert_eq!(
+            outcome,
+            PruneOutcome {
+                pruned: 1,
+                live: 0,
+                unprobed: 0,
+            },
+            "the confirmed-stale entry is reaped"
+        );
+        assert!(
+            !record_path.exists() && !lock_path.exists(),
+            "both files of a reaped entry are deleted"
+        );
+
+        // Nothing left to prune: a repeat pass reaps nothing and does not error.
+        assert_eq!(
+            registry.prune().expect("a second prune must not fail"),
+            PruneOutcome::default(),
+            "pruning an already-clean registry is a no-op"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A live entry is **never** reaped, even sitting right beside a confirmed-stale
+    /// one: the live runner still holds its lock, so the probe reports it live and
+    /// prune leaves its files alone while reaping the dead sibling. Modelled on
+    /// [`entries_degrades_an_unprobeable_lock_directory_to_stale_without_aborting_the_scan`].
+    #[test]
+    fn prune_never_reaps_a_live_entry() {
+        let dir = scratch("prune-live");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+        let now = SystemTime::now();
+
+        let live = registry
+            .register("alive", None, now)
+            .expect("register the live run");
+        let doomed = registry
+            .register("dead", None, now)
+            .expect("register the doomed run");
+        let live_record = live.record_path().to_owned();
+        let live_lock = live.lock_path().to_owned();
+        let dead_record = doomed.record_path().to_owned();
+        let dead_lock = doomed.lock_path().to_owned();
+
+        // Only the second runner dies abruptly; the first keeps holding its lock.
+        doomed.simulate_abrupt_death();
+
+        let outcome = registry.prune().expect("prune must not fail");
+        assert_eq!(
+            outcome,
+            PruneOutcome {
+                pruned: 1,
+                live: 1,
+                unprobed: 0,
+            },
+            "exactly the stale entry is reaped and the live one is counted, not touched"
+        );
+        assert!(
+            live_record.exists() && live_lock.exists(),
+            "a live entry's files must survive prune untouched"
+        );
+        assert!(
+            !dead_record.exists() && !dead_lock.exists(),
+            "the stale sibling's files are reaped"
+        );
+
+        // The survivor still scans as the live run.
+        let entries = registry.entries().expect("scan");
+        assert_eq!(entries.len(), 1, "only the live entry remains");
+        assert_eq!(entries[0].record.run_id, "alive");
+        assert_eq!(entries[0].health, Health::Live);
+
+        live.remove();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A record whose lock probe **fails** (here the lock name resolves to a
+    /// *directory*, so the write-open fails with a semantic EISDIR/access error for
+    /// any user — the confirmed cross-platform trick from [K-014], never `chmod
+    /// 0o000`) is **not** reaped: liveness is unknown, not confirmed stale, so prune
+    /// leaves it in place on every pass. One unprobeable entry never aborts the reap
+    /// of a healthy stale sibling either.
+    #[test]
+    fn prune_leaves_an_unprobeable_entry_in_place() {
+        let dir = scratch("prune-unprobeable");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+
+        // A well-formed record whose `lock_file` name resolves to a directory: the
+        // probe's write-open fails with a semantic error, so `probe_for_prune` returns
+        // `Err` — the entry must be kept, not deleted.
+        let broken_lock_dir = dir.join("broken.lock");
+        fs::create_dir(&broken_lock_dir).expect("create the directory the lock name resolves to");
+        write_record(&dir, "broken", "broken", "broken.lock");
+
+        // A confirmed-stale orphan alongside it, which must still be reaped despite the
+        // unprobeable neighbor.
+        write_record(&dir, "orphan", "orphan", "orphan.lock");
+
+        let outcome = registry
+            .prune()
+            .expect("prune must not fail on an unprobeable entry");
+        assert_eq!(
+            outcome,
+            PruneOutcome {
+                pruned: 1,
+                live: 0,
+                unprobed: 1,
+            },
+            "the unprobeable entry is kept and the stale sibling is still reaped"
+        );
+        assert!(
+            dir.join("broken.json").exists(),
+            "an unprobeable record is never reaped"
+        );
+        assert!(
+            broken_lock_dir.exists(),
+            "the unprobeable entry's lock target is left alone"
+        );
+        assert!(
+            !dir.join("orphan.json").exists(),
+            "a healthy stale sibling is still reaped past the unprobeable one"
+        );
+
+        // Repeated prune keeps leaving the unprobeable entry — at any number of runs.
+        assert_eq!(
+            registry.prune().expect("a second prune must not fail"),
+            PruneOutcome {
+                pruned: 0,
+                live: 0,
+                unprobed: 1,
+            },
+            "the unprobeable entry is still kept on a repeat pass"
+        );
+        assert!(
+            dir.join("broken.json").exists(),
+            "the unprobeable record survives every prune"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Pruning an empty registry — and a never-created one — is a no-op that returns
+    /// all-zero counts and never errors, and pruning a missing directory does not
+    /// create it (prune, like `list`, opens read-only).
+    #[test]
+    fn prune_over_a_clean_or_missing_registry_is_a_no_op() {
+        let dir = scratch("prune-clean");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+        assert_eq!(
+            registry.prune().expect("prune an empty registry"),
+            PruneOutcome::default(),
+            "an empty registry has nothing to prune"
+        );
+        let _ = fs::remove_dir_all(&dir);
+
+        let missing = scratch("prune-missing");
+        assert!(!missing.exists(), "the scratch fixture starts absent");
+        let read_only = Registry::open_read_only_in(missing.clone());
+        assert_eq!(
+            read_only.prune().expect("prune a missing registry"),
+            PruneOutcome::default(),
+            "a missing registry reads back as empty and prunes nothing"
+        );
+        assert!(
+            !missing.exists(),
+            "pruning a missing registry must not create its directory"
+        );
     }
 }
