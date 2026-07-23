@@ -1037,7 +1037,7 @@ fn inherited_stdio_preserves_real_windows_console_handles() {
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::null())
         .spawn()
         .expect("spawn the dedicated Windows console host");
     let mut host = ChildGuard::new(host);
@@ -1093,19 +1093,43 @@ fn inherited_stdio_preserves_a_usable_posix_terminal() {
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn the dedicated Unix pty host");
+    let host_pid = host.id();
     let mut host = ChildGuard::new(host);
-    let status = wait_child_bounded(host.child_mut(), Duration::from_secs(30)).unwrap_or_else(|| {
-        let report_state = std::fs::read_to_string(&report)
-            .map_or_else(|err| format!("unavailable: {err}"), |text| format!("{text:?}"));
-        let event_state = std::fs::read_to_string(&jsonl)
-            .map_or_else(|err| format!("unavailable: {err}"), |text| format!("{text:?}"));
-        panic!(
-            "the pty-hosted runner did not exit; child report={report_state}; JSONL={event_state}"
-        )
-    });
+    let status =
+        wait_child_bounded(host.child_mut(), Duration::from_secs(30)).unwrap_or_else(|| {
+            let report_state = std::fs::read_to_string(&report).map_or_else(
+                |err| format!("unavailable: {err}"),
+                |text| format!("{text:?}"),
+            );
+            let event_state = std::fs::read_to_string(&jsonl).map_or_else(
+                |err| format!("unavailable: {err}"),
+                |text| format!("{text:?}"),
+            );
+            let process_state = Command::new("ps")
+                .args(["-axo", "pid=,ppid=,pgid=,tpgid=,stat=,command="])
+                .output()
+                .map_or_else(
+                    |err| format!("ps failed: {err}"),
+                    |output| {
+                        String::from_utf8_lossy(&output.stdout)
+                            .lines()
+                            .filter(|line| {
+                                line.contains(&host_pid.to_string())
+                                    || line.contains("processkit-cli")
+                                    || line.contains("e2e_helper")
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    },
+                );
+            panic!(
+                "the pty-hosted runner did not exit; child report={report_state}; \
+             JSONL={event_state}; processes={process_state:?}"
+            )
+        });
     assert_eq!(
         status.code(),
         Some(0),
