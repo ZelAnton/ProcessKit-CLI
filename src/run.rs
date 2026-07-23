@@ -569,6 +569,65 @@ struct TerminalForegroundGuard {
 struct TerminalForegroundState {
     fd: libc::c_int,
     original_pgrp: libc::pid_t,
+    sigttou: ScopedSignalIgnore,
+}
+
+/// Keep one job-control signal ignored until the foreground terminal belongs to
+/// this runner again. A thread-local mask only protects the `tcsetpgrp` call;
+/// the runner remains a background process for the entire child lifetime and
+/// must not be stopped if any runner diagnostic reaches a `TOSTOP` terminal.
+#[cfg(unix)]
+struct ScopedSignalIgnore {
+    signal: libc::c_int,
+    previous: Option<libc::sigaction>,
+}
+
+#[cfg(unix)]
+impl ScopedSignalIgnore {
+    fn acquire(signal: libc::c_int) -> std::io::Result<Self> {
+        // SAFETY: sigaction is a plain C value whose mask is initialized below.
+        let mut ignored: libc::sigaction = unsafe { std::mem::zeroed() };
+        ignored.sa_sigaction = libc::SIG_IGN;
+        // SAFETY: `sa_mask` is a valid writable signal set.
+        if unsafe { libc::sigemptyset(&mut ignored.sa_mask) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        // SAFETY: sigaction initializes `previous` on success; both pointers stay
+        // valid for the duration of the call.
+        let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+        if unsafe { libc::sigaction(signal, &ignored, &mut previous) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            signal,
+            previous: Some(previous),
+        })
+    }
+
+    fn restore(mut self) -> std::io::Result<()> {
+        self.restore_inner()
+    }
+
+    fn restore_inner(&mut self) -> std::io::Result<()> {
+        let Some(previous) = self.previous.take() else {
+            return Ok(());
+        };
+        // SAFETY: `previous` was returned by sigaction for this same signal.
+        if unsafe { libc::sigaction(self.signal, &previous, std::ptr::null_mut()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ScopedSignalIgnore {
+    fn drop(&mut self) {
+        if let Err(err) = self.restore_inner() {
+            eprintln!("processkit-cli: warning: could not restore the SIGTTOU disposition: {err}");
+        }
+    }
 }
 
 impl TerminalForegroundGuard {
@@ -612,6 +671,13 @@ impl TerminalForegroundGuard {
                 )
             })?;
             let child_pgrp = child_pid as libc::pid_t;
+            // Interactive shells ignore SIGTTOU while they manipulate foreground
+            // groups. Keep it ignored for the full child lifetime, not only around
+            // tcsetpgrp: on macOS the runner otherwise remains stoppable while it
+            // is the terminal's background group, which can strand the PTY host.
+            // The child has already spawned, so it does not inherit this temporary
+            // disposition.
+            let sigttou = ScopedSignalIgnore::acquire(libc::SIGTTOU)?;
             if let Err(err) = set_terminal_foreground(fd, child_pgrp) {
                 // A very short command can exit between ProcessKit returning its
                 // PID and this handoff. Preserve its real result instead of
@@ -622,7 +688,11 @@ impl TerminalForegroundGuard {
                 return Ok(Self { state: None });
             }
             Ok(Self {
-                state: Some(TerminalForegroundState { fd, original_pgrp }),
+                state: Some(TerminalForegroundState {
+                    fd,
+                    original_pgrp,
+                    sigttou,
+                }),
             })
         }
     }
@@ -642,12 +712,19 @@ impl TerminalForegroundGuard {
 #[cfg(unix)]
 impl Drop for TerminalForegroundGuard {
     fn drop(&mut self) {
-        if let Some(state) = self.state.take()
-            && let Err(err) = set_terminal_foreground(state.fd, state.original_pgrp)
-        {
-            eprintln!(
-                "processkit-cli: warning: could not restore terminal foreground control: {err}"
-            );
+        if let Some(state) = self.state.take() {
+            if let Err(err) = set_terminal_foreground(state.fd, state.original_pgrp) {
+                eprintln!(
+                    "processkit-cli: warning: could not restore terminal foreground control: {err}"
+                );
+            }
+            // Restore the terminal first: until this call the runner is still a
+            // background process and must remain immune to SIGTTOU.
+            if let Err(err) = state.sigttou.restore() {
+                eprintln!(
+                    "processkit-cli: warning: could not restore the SIGTTOU disposition: {err}"
+                );
+            }
         }
     }
 }
@@ -669,41 +746,18 @@ fn process_group_exists(pgrp: libc::pid_t) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// `tcsetpgrp` can send SIGTTOU when the caller is currently a background group
-/// (which is necessarily true while restoring control from the child). Block it
-/// for this thread around the syscall, exactly as an interactive shell does.
+/// Set the terminal foreground group while [`ScopedSignalIgnore`] owns an
+/// ignored SIGTTOU disposition. Restoring control necessarily happens while the
+/// runner is a background group, so callers must keep that guard alive.
 #[cfg(unix)]
 fn set_terminal_foreground(fd: libc::c_int, pgrp: libc::pid_t) -> std::io::Result<()> {
-    // SAFETY: sigset_t is a plain C value initialized by sigemptyset below.
-    let mut block: libc::sigset_t = unsafe { std::mem::zeroed() };
-    // SAFETY: both functions receive a valid, writable sigset_t.
-    if unsafe { libc::sigemptyset(&mut block) } != 0
-        || unsafe { libc::sigaddset(&mut block, libc::SIGTTOU) } != 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `old` is initialized by pthread_sigmask on success.
-    let mut old: libc::sigset_t = unsafe { std::mem::zeroed() };
-    // SAFETY: all sigset pointers are valid for the duration of the calls.
-    let mask_rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old) };
-    if mask_rc != 0 {
-        return Err(std::io::Error::from_raw_os_error(mask_rc));
-    }
-
     // SAFETY: `fd` names the controlling terminal checked by the caller and
     // `pgrp` is either the contained child's group or the saved original group.
-    let set_result = if unsafe { libc::tcsetpgrp(fd, pgrp) } == 0 {
+    if unsafe { libc::tcsetpgrp(fd, pgrp) } == 0 {
         Ok(())
     } else {
         Err(std::io::Error::last_os_error())
-    };
-    // SAFETY: restore the exact mask pthread_sigmask returned above.
-    let restore_rc =
-        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
-    if restore_rc != 0 {
-        return Err(std::io::Error::from_raw_os_error(restore_rc));
     }
-    set_result
 }
 
 /// Emit the terminal [`Event::RunnerExit`] for a runner-own failure and return the

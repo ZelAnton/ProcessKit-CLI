@@ -23,7 +23,10 @@ to a dated version section.
 -
 
 ### Fixed
--
+- macOS inherited-stdio runs no longer risk stopping the runner with `SIGTTOU`
+  while the interactive child owns the foreground terminal. The runner now uses
+  a scoped ignored disposition, restores terminal ownership first, and then
+  restores the caller's original signal disposition.
 
 ## [0.2.1] - 2026-07-23
 
