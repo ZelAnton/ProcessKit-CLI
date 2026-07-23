@@ -2,7 +2,7 @@
 
 The runner's exit codes are part of processkit-cli's **public compatibility
 surface**, alongside the CLI flags and the JSONL `schema_version` (see
-`AGENTS.md`). Consumers — Orchestra and adapters such as processkit-py — depend
+`AGENTS.md`). Consumers and adapters such as processkit-py depend
 on these codes, so changing them incompatibly is a **major** version bump.
 
 The in-code source of truth for these values is `src/exit.rs`; this document is
@@ -77,7 +77,7 @@ stream — see `docs/schema.md`.
 `PROBE_INCOMPATIBLE` (110) is different in kind from every code above. It is not the
 ending of a run — the `probe` subcommand never spawns a child, opens the registry, or
 creates a container — but the verdict of a *preflight* a consumer runs on a candidate
-binary **before** launching anything through it (see `docs/env-launch.md`). It is
+binary **before** launching anything through it. It is
 minted only when the probe was asked to verify an expectation
 (`--require-schema-version`, `--require-exit-code-band`, or `--require-surface`) that
 this binary's surface does not satisfy. A satisfied (or unrequested) surface exits

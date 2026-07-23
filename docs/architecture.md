@@ -25,7 +25,7 @@ sketched from the code as of this writing rather than from memory.
 | [`src/hash.rs`](../src/hash.rs) | The one hand-rolled incremental/one-shot SHA-256 (FIPS 180-4) both `events` (argv fingerprint) and `capture` (streamed transcript hashing) build on, so the project has a single digest primitive and rendering style. |
 | [`src/registry.rs`](../src/registry.rs) | The per-user run registry: one record per in-flight run in an owner-only-restricted directory, found by scanning and matching `run_id` (never a PID), with staleness detected via an OS advisory lock the live runner holds (see [`docs/registry.md`](registry.md)). The first brick of the control plane. |
 | [`src/control.rs`](../src/control.rs) | The live-run control plane: the per-run local IPC transport (unix domain socket / Windows named pipe, owner-restricted) stood up inside `run`, its line-oriented `inspect`/`cancel`/`kill` wire protocol, and the three clients that speak it (see [`docs/control-plane.md`](control-plane.md)). |
-| [`src/probe.rs`](../src/probe.rs) | The side-effect-free `probe` subcommand: the in-binary half of the fail-closed `CC_PROCESSKIT_RUN` launcher contract, reporting (and, with `--require-*`, verifying) this binary's version/`schema_version`/exit-code band/CLI surface as one JSON line (see [`docs/env-launch.md`](env-launch.md)). |
+| [`src/probe.rs`](../src/probe.rs) | The side-effect-free `probe` subcommand: reports (and, with `--require-*`, verifies) this binary's version/`schema_version`/exit-code band/CLI surface as one JSON line. |
 | [`src/exit.rs`](../src/exit.rs) | The reserved runner-own exit-code band (`100`–`119`) constants — the exit-code half of the compatibility surface (see [`docs/exit-codes.md`](exit-codes.md)). |
 
 ## Data flow of one `run`
@@ -181,8 +181,6 @@ overview only sketches how they connect:
   protocol, and the `inspect`/`cancel`/`kill` clients.
 - [`docs/exit-codes.md`](exit-codes.md) — the reserved runner-own exit-code
   band and the child-fidelity rule.
-- [`docs/env-launch.md`](env-launch.md) — the `CC_PROCESSKIT_RUN` fail-closed
-  launcher contract and the `probe` subcommand.
 - [`docs/schema.md`](schema.md) — the versioned JSONL lifecycle-event schema.
 - [`docs/ROADMAP.md`](ROADMAP.md) — the intended delivery order for the
   project as a whole (this document describes what exists today, not the

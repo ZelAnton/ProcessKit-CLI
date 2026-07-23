@@ -186,7 +186,7 @@ pub struct PruneArgs {
 /// [--require-surface <token>]...`
 ///
 /// The **preflight** surface of the fail-closed launcher contract
-/// (`docs/env-launch.md`). It reports — and, when asked, *verifies* — this binary's
+/// It reports — and, when asked, *verifies* — this binary's
 /// compatibility surface (the JSONL `schema_version`, the reserved exit-code band,
 /// and the CLI surface tokens) so a consumer can confirm a `CC_PROCESSKIT_RUN`
 /// candidate **before** launching any payload. It spawns nothing and touches no

@@ -15,7 +15,7 @@ here we define only the registry.
 
 `list` (see "Discovery" below) and `prune` (see "Reaping" below) are the two clients
 that read the registry directly, without connecting to any runner's control
-transport: `list` scans every entry and prints it, so an operator or orchestrator
+transport: `list` scans every entry and prints it, so an operator
 that has lost (or never had) a `run_id` can find one before reaching for
 `inspect`/`cancel`/`kill`, and `prune` reaps the entries `list` would show as stale.
 

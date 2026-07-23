@@ -5,11 +5,9 @@ public API of [`processkit`](https://crates.io/crates/processkit). It runs one
 program inside ProcessKit's kernel-backed containment boundary and reports the
 run lifecycle without requiring Python or a development virtual environment.
 
-Its primary consumer is Orchestra: an agent orchestrator that must ensure a
-completed or failed command cannot leave descendants behind, including workers
-such as `MSBuild.dll /nodemode:1 /nodeReuse:true` on Windows. The CLI never
-kills processes by name; cleanup is restricted to the current run's ProcessKit
-container.
+The CLI ensures a completed or failed command cannot leave descendants behind.
+It never kills processes by name; cleanup is restricted to the current run's
+ProcessKit container.
 
 The project owns the versioned JSONL event contract used by runner clients and
 future adapters, including `processkit-py`. ProcessKit-rs remains the sole
@@ -121,7 +119,7 @@ events never use stdout.
 surface (version, `schema_version`, exit-code band, and CLI surface tokens) as one
 JSON line and — with `--require-*` — verifies it, so a consumer can confirm a
 runner is usable **before** launching a payload. It spawns no child and touches no
-registry or container. See "Launch contract" below.
+registry or container.
 
 Live output is **pipe + echo, not a real inherited terminal**: ProcessKit reads
 the child's stdout/stderr through pipes and this runner re-emits them onto its
@@ -183,26 +181,7 @@ they can never be mistaken for a child result, and so each ending is tellable fr
 others by code alone. This is part of the project's compatibility surface — see
 [the exit-code contract](docs/exit-codes.md). The preflight `probe` adds one code
 to the reserved band — `PROBE_INCOMPATIBLE` (`110`) — for an incompatible launch
-candidate (see "Launch contract" below).
-
-## Launch contract (`CC_PROCESSKIT_RUN`)
-
-The primary consumer (Orchestra) finds the binary through the
-`CC_PROCESSKIT_RUN` environment variable — the absolute path to the
-`processkit-cli` it should launch contained commands with, the binary-runner
-analogue of its existing interpreter-launch contract. The contract is
-**fail-closed**: if the variable points at a missing, non-executable, or
-version-incompatible file, the consumer surfaces the error and refuses to launch —
-it must **never** silently fall back to an uncontained launch, because that would
-reintroduce the very process-leak hazard this project prevents.
-
-The consumer checks a candidate with the `probe` subcommand **before** running any
-payload: `"$CC_PROCESSKIT_RUN" probe --json` reports (and, with `--require-*`,
-verifies) the compatibility surface with no side effects, and fails closed with
-`PROBE_INCOMPATIBLE` (`110`) on an incompatible binary. The three fail-closed
-outcomes (missing / not-executable / incompatible) are each distinct and parseable.
-The full contract — the variable, the probe report shape, the outcome table, and
-the migration/rollback order — is [the launch contract](docs/env-launch.md).
+candidate.
 
 ## Timeouts, cancel, and grace
 
@@ -249,8 +228,8 @@ launching the child directly as possible, so the runner does not force the flag 
 doing so unconditionally would diverge from a direct launch and could hide a
 child that legitimately wants its own console. The runner itself never allocates
 a console, so it spawns no extra console host on its own account. Headless
-Windows deployments (such as Orchestra) that want to suppress a stray `conhost`
-window for the child pass `--create-no-window` explicitly.
+Windows deployments that want to suppress a stray `conhost` window for the child
+pass `--create-no-window` explicitly.
 
 ## Environment
 
@@ -345,10 +324,10 @@ the JSONL stream and by exit code, and each a bounded `CONTROL` (103) failure wh
 run cannot be reached. `list` scans the same registry read-only and prints every
 entry, live or stale, as a table or (with `--json`) as JSON Lines — the discovery
 counterpart for a caller that has lost or never had a `run_id`. `probe` reports and
-verifies the binary's compatibility surface
-for a consumer's fail-closed launcher preflight (`CC_PROCESSKIT_RUN`), with no side
-effects, exiting `PROBE_INCOMPATIBLE` (110) on an incompatible candidate (see "Launch
-contract"). See [the roadmap](docs/ROADMAP.md) for the intended delivery order.
+verifies the binary's compatibility surface for a consumer's fail-closed launcher
+preflight, with no side effects, exiting `PROBE_INCOMPATIBLE` (110) on an
+incompatible candidate. See [the roadmap](docs/ROADMAP.md) for the intended
+delivery order.
 
 ## Development
 

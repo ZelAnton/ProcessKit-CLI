@@ -276,7 +276,7 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     // `run` should behave like launching the child directly, so we do not force
     // the flag — that would diverge from a direct launch and could hide a child
     // that legitimately wants its own console. Headless Windows deployments
-    // (Orchestra) that must avoid a stray `conhost` window pass the flag
+    // that must avoid a stray `conhost` window pass the flag
     // explicitly; the runner itself never allocates a console, so it spawns no
     // extra host on its own account. (See README, "Windows console".)
     if args.create_no_window {

@@ -106,7 +106,7 @@ to a dated version section.
   Additive schema v1 change (new `source` values and the `killed` event), reflected in
   `docs/control-plane.md`, `docs/schema.md`, `docs/exit-codes.md`, and the golden
   fixture.
-- Fail-closed launcher contract for the orchestrator (`CC_PROCESSKIT_RUN`): a
+- Fail-closed launcher contract (`CC_PROCESSKIT_RUN`): a
   documented environment variable naming the absolute path to the `processkit-cli`
   binary a consumer should launch contained commands with — the binary-runner
   analogue of the existing interpreter-launch contract. A new side-effect-free
@@ -122,8 +122,7 @@ to a dated version section.
   "ok". The contract is fail-closed across three distinct, parseable outcomes — path
   missing (`NotFound` at spawn), present-but-not-executable (a non-`NotFound` spawn
   error), and present-executable-but-incompatible (exit `110`) — and forbids any
-  silent fallback to an uncontained launch. Documented in the new
-  `docs/env-launch.md` (indexed from `README.md`), with the new code recorded in
+  silent fallback to an uncontained launch. The new code is recorded in
   `docs/exit-codes.md`. Additive only: no existing flag, exit code `100`–`109`, or
   `schema_version: 1` changes meaning.
 - Abrupt runner-death hardening and proof: every spawned command opts into

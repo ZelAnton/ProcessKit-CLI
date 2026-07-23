@@ -1,10 +1,8 @@
 //! The **preflight probe** (`processkit-cli probe`): the in-binary half of the
-//! fail-closed launcher contract a consumer drives through the `CC_PROCESSKIT_RUN`
-//! environment variable (`docs/env-launch.md`).
+//! fail-closed launcher preflight a consumer drives through the CLI.
 //!
-//! An orchestrator that discovers a `processkit-cli` binary through
-//! `CC_PROCESSKIT_RUN` must confirm the file is *suitable* — that it exists, is
-//! executable, and is **version-compatible on the confirmed surface** (the CLI
+//! A consumer that discovers a `processkit-cli` binary must confirm the file is
+//! *suitable* — that it exists, is executable, and is **version-compatible on the confirmed surface** (the CLI
 //! flags, the reserved exit-code band, and the JSONL `schema_version`) — **before**
 //! it launches any payload through it. Silently falling back to an uncontained
 //! launch when the candidate is unusable would reintroduce exactly the
@@ -26,9 +24,8 @@
 //!
 //! ## The three consumer-side outcomes it grounds
 //!
-//! The consumer resolves a path from `CC_PROCESSKIT_RUN` and runs
-//! `<path> probe --json [--require-...]`. The full fail-closed table lives in
-//! `docs/env-launch.md`; the outcomes this binary is responsible for are:
+//! The consumer runs `<path> probe --json [--require-...]`; the outcomes this
+//! binary is responsible for are:
 //!
 //! - **path missing / not executable** — the *spawn* fails before this process ever
 //!   starts; the consumer distinguishes them by the OS error (a missing path is

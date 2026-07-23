@@ -5,7 +5,7 @@
 //! `schema_version`* and requires the runner's own failures to use a distinct,
 //! documented range so a child's exit code is never lost or aliased. This module
 //! is the in-code mirror of that contract; `docs/exit-codes.md` is the normative
-//! document consumers (Orchestra, adapters) pin against.
+//! document consumers and adapters pin against.
 //!
 //! A successful run forwards the *child's* exit code verbatim (implemented in a
 //! later task). The codes below are minted only when the runner itself fails
@@ -83,7 +83,7 @@ pub const CONTROL_KILLED: u8 = 109;
 /// compatibility surface does not satisfy the requirements a consumer asked it to
 /// verify (a `--require-*` check failed). This is **not** a run outcome — no child
 /// is ever spawned by a probe — but a *pre-launch* verdict: the launcher contract
-/// (`docs/env-launch.md`) is fail-closed, so an incompatible binary must be
+/// is fail-closed, so an incompatible binary must be
 /// reported with a distinct, reserved code rather than silently used. It takes the
 /// next free code after the control-plane endings so no existing assignment shifts
 /// or changes meaning. See [`crate::probe`].

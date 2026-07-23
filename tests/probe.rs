@@ -1,5 +1,5 @@
 //! Through-the-binary tests for the `probe` preflight subcommand — the in-binary
-//! half of the fail-closed launcher contract (`docs/env-launch.md`). They drive the
+//! half of the fail-closed launcher contract. They drive the
 //! *built binary* (as every test here does, `AGENTS.md`, "Testing tiers"), because
 //! the value is the binary's contract, not the library.
 //!
