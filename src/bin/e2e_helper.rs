@@ -15,6 +15,8 @@
 //! self-heals instead of leaking a process forever.
 
 use std::fs;
+#[cfg(unix)]
+use std::io::Read;
 use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::path::PathBuf;
@@ -258,6 +260,35 @@ fn pty_parent(args: &[String]) -> ExitCode {
                 return ExitCode::from(4);
             }
         };
+        let mut master_reader = match master.try_clone() {
+            Ok(reader) => reader,
+            Err(err) => {
+                let _ = runner.kill();
+                let _ = runner.wait();
+                eprintln!("e2e-helper pty-parent: could not clone the pty master: {err}");
+                return ExitCode::from(5);
+            }
+        };
+        // A terminal emulator continuously drains its master side. This is
+        // load-bearing on macOS: `_exit` may wait for a closing terminal's output
+        // to drain, and the line discipline echoes our test input even though the
+        // child itself writes its report out-of-band. Leaving the master unread
+        // can therefore strand an otherwise fully completed runner in exit.
+        let _master_drain = std::thread::spawn(move || {
+            let mut buffer = [0_u8; 4096];
+            loop {
+                match master_reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    // PTY masters commonly report EIO when the last slave closes.
+                    Err(err) if err.raw_os_error() == Some(libc::EIO) => break,
+                    Err(err) => {
+                        eprintln!("e2e-helper pty-parent: pty drain failed: {err}");
+                        break;
+                    }
+                }
+            }
+        });
         if let Err(err) = master
             .write_all(b"pty line\n")
             .and_then(|()| master.flush())
