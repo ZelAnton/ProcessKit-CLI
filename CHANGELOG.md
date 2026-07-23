@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [0.1.0] - 2026-07-23
+
+### Added
 - Initial project skeleton.
 - Command-line surface: the `run`, `inspect`, `cancel`, and `kill` subcommands
   are parsed and validated, including `run`'s verbatim `-- <program> <args...>`
@@ -195,4 +206,5 @@ to a dated version section.
   inheriting the registry's full path, so deeply nested macOS CI/workspace paths
   cannot exceed `sockaddr_un::sun_path` and silently disable `inspect`.
 
-[Unreleased]: https://github.com/ZelAnton/processkit-cli/commits/HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/ZelAnton/ProcessKit-CLI/releases/tag/v0.1.0
