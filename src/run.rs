@@ -1,5 +1,5 @@
 //! The `run` subcommand: launch one shell-free program inside a ProcessKit
-//! container, echo its output live, forward its exit code faithfully, and bound
+//! container, route its output live, forward its exit code faithfully, and bound
 //! the run with a hard `--timeout` and an interactive `Ctrl-C` cancel.
 //!
 //! This is the first executable path of the runner (see `docs/ROADMAP.md`,
@@ -14,12 +14,12 @@
 //!   whole tree (including any leaked grandchild) when the group drops, on every
 //!   exit path. The teardown is the group's, never a hand-rolled wait/cleanup
 //!   loop on top of it. The group is dropped only *after* the outcome is decided.
-//! - **Live output is pipe + echo, not fd inheritance.** processkit's line pump
-//!   reads the child's stdout/stderr and tees each line to *our* stdout/stderr.
-//!   The child therefore sees no TTY (documented in `README.md`: colors and
-//!   progress bars may degrade). Streams stay strictly separated — child stdout
-//!   to our stdout, child stderr to our stderr — and no runner diagnostic is ever
-//!   written to the child's stdout.
+//! - **Output is pipe + echo by default, direct inheritance by opt-in.** The
+//!   default path uses processkit's line pump and therefore exposes no TTY to the
+//!   child. `--inherit-stdio` instead maps all three streams onto ProcessKit's
+//!   public inheritance modes, preserving the caller's terminal handles without
+//!   a runner-side pump. Streams stay strictly separated either way, and no runner
+//!   diagnostic is ever written to the child's stdout.
 //! - **Exit-code fidelity, with distinguishable runner-imposed endings.** On a
 //!   completed run the process exits with the child's *exact* code (full width,
 //!   never clamped). When the runner instead *ends* the run — the `--timeout`
@@ -48,8 +48,8 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 use processkit::{
-    Command as PkCommand, Error as PkError, Outcome, OutputBufferPolicy, ProcessGroup,
-    RunningProcess, Signal, Stdin,
+    Command as PkCommand, Error as PkError, Mechanism, Outcome, OutputBufferPolicy, ProcessGroup,
+    RunningProcess, Signal, Stdin, StdioMode,
 };
 
 use crate::capture::{CAPTURE_INFLIGHT_MAX_BYTES, Capture};
@@ -297,35 +297,39 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     if args.create_no_window {
         command = command.create_no_window();
     }
-    // Stdin defaults to ProcessKit's closed/null mode. Both opt-ins delegate to
-    // ProcessKit: inheritance shares this runner's real stdin, while a file is
-    // streamed through its managed pipe and closed at EOF. Clap rejects the
-    // contradictory pair before this point, matching the core's own guard.
-    if args.inherit_stdin {
+    // Stdin defaults to ProcessKit's closed/null mode. The inheritance opt-ins
+    // share this runner's real stdin, while a file is streamed through the core's
+    // managed pipe and closed at EOF. Clap rejects every contradictory pair before
+    // this point, matching the core's own guard.
+    if args.inherit_stdio || args.inherit_stdin {
         command = command.inherit_stdin();
     } else if let Some(path) = args.stdin_file.as_deref() {
         command = command.stdin(Stdin::from_file(path));
     }
-    // Pipe + echo: the pump reads the child's piped stdout/stderr and tees each
-    // decoded line to our own stdout/stderr. This is the live-output mechanism —
-    // not true fd inheritance — so the child gets no TTY, and the two streams are
-    // never crossed or mixed with runner diagnostics.
+    // `--inherit-stdio` gives the child the runner's actual output handles. No
+    // pump, decoding, or tee sits between a terminal and the child, so terminal
+    // status and full-screen behavior are preserved. Capture conflicts at parse
+    // time because it fundamentally requires replacing these handles with pipes.
     //
-    // With `--capture-dir` the *same* tee also mirrors each stream into a bounded
-    // capture file, and the child is drained under a byte-capped
-    // `OutputBufferPolicy` so the pump's in-flight line assembly is bounded by the
-    // kernel — the runner adds no output-draining or volume-limiting of its own
-    // (see `src/capture.rs`). The live echo is unchanged either way.
-    command = match &capture {
-        Some(capture) => command
-            .output_buffer(
-                OutputBufferPolicy::bounded(0).with_max_bytes(CAPTURE_INFLIGHT_MAX_BYTES),
-            )
-            .stdout_tee(capture.stdout_tee(tokio::io::stdout()))
-            .stderr_tee(capture.stderr_tee(tokio::io::stderr())),
-        None => command
-            .stdout_tee(tokio::io::stdout())
-            .stderr_tee(tokio::io::stderr()),
+    // Otherwise pipe + echo remains the compatibility default: ProcessKit's pump
+    // reads each stream and tees it to the corresponding runner stream. With
+    // `--capture-dir` that same tee also mirrors into bounded files.
+    command = if args.inherit_stdio {
+        command
+            .stdout(StdioMode::Inherit)
+            .stderr(StdioMode::Inherit)
+    } else {
+        match &capture {
+            Some(capture) => command
+                .output_buffer(
+                    OutputBufferPolicy::bounded(0).with_max_bytes(CAPTURE_INFLIGHT_MAX_BYTES),
+                )
+                .stdout_tee(capture.stdout_tee(tokio::io::stdout()))
+                .stderr_tee(capture.stderr_tee(tokio::io::stderr())),
+            None => command
+                .stdout_tee(tokio::io::stdout())
+                .stderr_tee(tokio::io::stderr()),
+        }
     };
 
     // `ProcessGroup::start` joins the child to the group *we* own and hands back a
@@ -348,7 +352,35 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     // mechanism is settled now too; both are reused by the `run_started` event and the
     // control-plane snapshot below.
     let root_pid = running.pid();
-    let mechanism = events::mechanism_str(group.mechanism());
+    let group_mechanism = group.mechanism();
+    let terminal_foreground =
+        match TerminalForegroundGuard::acquire(args.inherit_stdio, group_mechanism, root_pid) {
+            Ok(guard) => guard,
+            Err(err) => {
+                let error = RunnerError::new(
+                    exit::BACKEND,
+                    format!("could not give the interactive child terminal control: {err}"),
+                );
+                emit_hard_teardown(&mut emitter, &group, &capture, &registration);
+                return Err(finish(&mut emitter, "container_error", None, error));
+            }
+        };
+    // The POSIX process-group backend must place the child in its own group for
+    // containment. If it tried reading the inherited terminal in the tiny window
+    // before the foreground handoff, the kernel may have stopped it with SIGTTIN;
+    // resume through ProcessKit after the handoff so interactive input is usable.
+    if terminal_foreground.is_active()
+        && let Err(err) = group.resume()
+    {
+        let error = RunnerError::new(
+            exit::BACKEND,
+            format!("could not resume the interactive child process group: {err}"),
+        );
+        emit_hard_teardown(&mut emitter, &group, &capture, &registration);
+        return Err(finish(&mut emitter, "container_error", None, error));
+    }
+
+    let mechanism = events::mechanism_str(group_mechanism);
     emitter.emit(&Event::RunStarted {
         run_id: run_id.clone(),
         root_pid,
@@ -522,6 +554,156 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             Err(finish(&mut emitter, "control_kill", None, error))
         }
     }
+}
+
+/// Restores the caller's foreground terminal group after an interactive child
+/// exits. Only the POSIX process-group containment fallback needs a handoff:
+/// Windows console handles have no `tcsetpgrp`, and Linux cgroups leave the child
+/// in the runner's foreground process group.
+struct TerminalForegroundGuard {
+    #[cfg(unix)]
+    state: Option<TerminalForegroundState>,
+}
+
+#[cfg(unix)]
+struct TerminalForegroundState {
+    fd: libc::c_int,
+    original_pgrp: libc::pid_t,
+}
+
+impl TerminalForegroundGuard {
+    fn acquire(
+        enabled: bool,
+        mechanism: Mechanism,
+        child_pid: Option<u32>,
+    ) -> std::io::Result<Self> {
+        #[cfg(not(unix))]
+        {
+            let _ = (enabled, mechanism, child_pid);
+            Ok(Self {})
+        }
+        #[cfg(unix)]
+        {
+            if !enabled || mechanism != Mechanism::ProcessGroup {
+                return Ok(Self { state: None });
+            }
+            let fd = libc::STDIN_FILENO;
+            // No terminal means there is no foreground job-control state to move;
+            // direct inheritance of a file or pipe remains correct as-is.
+            if unsafe { libc::isatty(fd) } != 1 {
+                return Ok(Self { state: None });
+            }
+            // SAFETY: `fd` is the process stdin descriptor and was just confirmed
+            // to refer to a terminal.
+            let original_pgrp = unsafe { libc::tcgetpgrp(fd) };
+            if original_pgrp < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // A background invocation must remain a background job, just like a
+            // direct child started by an interactive shell. Only transfer control
+            // when this runner's group currently owns the terminal.
+            // SAFETY: getpgrp takes no pointers and cannot fail.
+            if original_pgrp != unsafe { libc::getpgrp() } {
+                return Ok(Self { state: None });
+            }
+            let child_pid = child_pid.ok_or_else(|| {
+                std::io::Error::other(
+                    "ProcessKit did not expose the child PID required for terminal control",
+                )
+            })?;
+            let child_pgrp = child_pid as libc::pid_t;
+            if let Err(err) = set_terminal_foreground(fd, child_pgrp) {
+                // A very short command can exit between ProcessKit returning its
+                // PID and this handoff. Preserve its real result instead of
+                // replacing it with a terminal-setup failure.
+                if process_group_exists(child_pgrp) {
+                    return Err(err);
+                }
+                return Ok(Self { state: None });
+            }
+            Ok(Self {
+                state: Some(TerminalForegroundState { fd, original_pgrp }),
+            })
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        #[cfg(not(unix))]
+        {
+            false
+        }
+        #[cfg(unix)]
+        {
+            self.state.is_some()
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalForegroundGuard {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take()
+            && let Err(err) = set_terminal_foreground(state.fd, state.original_pgrp)
+        {
+            eprintln!(
+                "processkit-cli: warning: could not restore terminal foreground control: {err}"
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl Drop for TerminalForegroundGuard {
+    fn drop(&mut self) {}
+}
+
+/// Probe a positive process-group id without signalling it. `EPERM` still means
+/// the group exists; every other error means it disappeared or was invalid.
+#[cfg(unix)]
+fn process_group_exists(pgrp: libc::pid_t) -> bool {
+    // SAFETY: signal 0 performs permission/existence checks only. `pgrp` comes
+    // from an OS-assigned child PID and is positive.
+    if unsafe { libc::kill(-pgrp, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// `tcsetpgrp` can send SIGTTOU when the caller is currently a background group
+/// (which is necessarily true while restoring control from the child). Block it
+/// for this thread around the syscall, exactly as an interactive shell does.
+#[cfg(unix)]
+fn set_terminal_foreground(fd: libc::c_int, pgrp: libc::pid_t) -> std::io::Result<()> {
+    // SAFETY: sigset_t is a plain C value initialized by sigemptyset below.
+    let mut block: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: both functions receive a valid, writable sigset_t.
+    if unsafe { libc::sigemptyset(&mut block) } != 0
+        || unsafe { libc::sigaddset(&mut block, libc::SIGTTOU) } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `old` is initialized by pthread_sigmask on success.
+    let mut old: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: all sigset pointers are valid for the duration of the calls.
+    let mask_rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old) };
+    if mask_rc != 0 {
+        return Err(std::io::Error::from_raw_os_error(mask_rc));
+    }
+
+    // SAFETY: `fd` names the controlling terminal checked by the caller and
+    // `pgrp` is either the contained child's group or the saved original group.
+    let set_result = if unsafe { libc::tcsetpgrp(fd, pgrp) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    };
+    // SAFETY: restore the exact mask pthread_sigmask returned above.
+    let restore_rc =
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
+    if restore_rc != 0 {
+        return Err(std::io::Error::from_raw_os_error(restore_rc));
+    }
+    set_result
 }
 
 /// Emit the terminal [`Event::RunnerExit`] for a runner-own failure and return the

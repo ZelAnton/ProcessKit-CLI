@@ -19,7 +19,7 @@ sketched from the code as of this writing rather than from memory.
 | --- | --- |
 | [`src/cli.rs`](../src/cli.rs) | The CLI-flags half of the compatibility surface: the clap-derived `Cli`/`Command` types for `run`, `inspect`, `cancel`, `kill`, and `probe`. Parsing and shape validation only — each subcommand's behavior lives in its own module. |
 | [`src/main.rs`](../src/main.rs) | Entry point. Parses `Cli`, dispatches to the subcommand module, and maps the result onto a process exit code: `run` owns its own exit path (it hard-exits with the child's code and never returns here); every other subcommand's `Result<(), RunnerError>` is mapped through `RunnerError::code()`, and a clap parse failure is mapped onto the runner's own `USAGE` code rather than clap's default. |
-| [`src/run.rs`](../src/run.rs) | The `run` subcommand itself: spawns the child into a `processkit::ProcessGroup` this module owns, pipes and echoes its output live, races the child's exit against `--timeout`/`Ctrl-C`/a control-plane command, and drives the shared teardown tiers — the graceful soft stop → grace → hard kill for `timeout`/`Ctrl-C`/`cancel`, and the immediate hard kill (no soft stop, no grace) for a control-plane `kill`. Exit-code fidelity — the child's exact code on a normal completion, a reserved-band code for every runner-imposed ending — is enforced here. |
+| [`src/run.rs`](../src/run.rs) | The `run` subcommand itself: spawns the child into a `processkit::ProcessGroup` this module owns, selects either default pipe-and-echo I/O or direct inherited stdio, temporarily hands a POSIX terminal to a separate child process group when required, races the child's exit against `--timeout`/`Ctrl-C`/a control-plane command, and drives the shared teardown tiers — the graceful soft stop → grace → hard kill for `timeout`/`Ctrl-C`/`cancel`, and the immediate hard kill (no soft stop, no grace) for a control-plane `kill`. Exit-code fidelity — the child's exact code on a normal completion, a reserved-band code for every runner-imposed ending — is enforced here. |
 | [`src/events.rs`](../src/events.rs) | The versioned JSONL lifecycle-event schema and its emitter — this repository's normative, golden-tested public event contract (see [`docs/schema.md`](schema.md)). Also owns argv redaction: the default SHA-256 `argv_sha256` fingerprint and the `HINT_RULES` worker-shape classifier. |
 | [`src/capture.rs`](../src/capture.rs) | `--capture-dir` bounded per-stream stdout/stderr capture to files, riding the same tee `run` already echoes through (no second output-reading path). Records, per stream, a full byte counter, a SHA-256 of the bytes written, and independent explicit `truncated`/`write_error` flags, surfaced in the `output_captured` event. |
 | [`src/hash.rs`](../src/hash.rs) | The one hand-rolled incremental/one-shot SHA-256 (FIPS 180-4) both `events` (argv fingerprint) and `capture` (streamed transcript hashing) build on, so the project has a single digest primitive and rendering style. |
@@ -47,17 +47,23 @@ implemented in `run::execute`/`run::run_async` (`src/run.rs`):
    macOS/BSD — surfaced per run as `run_started`'s `abrupt_cleanup` field (see
    K-005). A `run_started` event (run id, root PID, containment mechanism,
    abrupt-cleanup tri-state, working directory) opens the JSONL stream.
-2. **Pump events.** `processkit`'s line pump concurrently reads the child's
-   stdout/stderr and drives two things off the same read: the live echo to
-   this process's own stdout/stderr (`src/run.rs`), and — when
-   `--capture-dir` is set — the per-stream tee in `src/capture.rs`. A
-   `members_snapshot` event records the container's PID-only member list.
+2. **Select the I/O path.** By default, `processkit`'s line pump concurrently
+   reads the child's stdout/stderr and drives two things off the same read: the
+   live echo to this process's own stdout/stderr (`src/run.rs`), and — when
+   `--capture-dir` is set — the per-stream tee in `src/capture.rs`.
+   `--inherit-stdio` instead gives the child the runner's three handles directly;
+   it conflicts with capture, so there is no pump or tee. When ProcessKit selects
+   POSIX process-group containment and stdin is a terminal, `run` temporarily
+   assigns the terminal's foreground group to the child and restores the original
+   group during cleanup. A `members_snapshot` event records the container's
+   PID-only member list in either path.
 3. **Capture and hash.** `src/capture.rs`'s `CaptureTee` mirrors every echoed
    byte into a bounded capture file per stream, hashing what actually reached
    disk with `src/hash.rs`'s incremental SHA-256 and recording an explicit
    ceiling-truncation flag and write-error flag — never inferred from the
    file's size. This stage is a no-op, with no capture files and no
-   `output_captured` event, unless `--capture-dir` was passed.
+   `output_captured` event, unless `--capture-dir` was passed; clap rejects
+   `--capture-dir` together with `--inherit-stdio` before the child starts.
 4. **Teardown.** Runner-imposed endings split into two tiers, not one shared
    path. `--timeout` elapsing, interactive `Ctrl-C`, and a control-plane
    `cancel` reaching the live runner over `src/control.rs` all drive the
@@ -124,7 +130,8 @@ Concretely:
 
 - **What `processkit` owns:** the kernel-backed container
   (`ProcessGroup`) and its kill-on-drop teardown, the async child-output line
-  pump (with a byte-capped `OutputBufferPolicy`), and the environment
+  pump (with a byte-capped `OutputBufferPolicy`), direct `StdioMode::Inherit`,
+  and the environment
   builder (`Command::env`/`env_remove`/`env_clear`) `run`'s `--env*` flags map
   onto directly.
 - **What this runner owns:** the CLI surface (`src/cli.rs`), the versioned
@@ -132,7 +139,9 @@ Concretely:
   runner-own exit-code band (`src/exit.rs`), bounded diagnostic capture with
   hashing (`src/capture.rs`, `src/hash.rs`), the per-user run registry
   (`src/registry.rs`), and the live-run control plane
-  (`src/control.rs`)/preflight probe (`src/probe.rs`) built on top of it —
+  (`src/control.rs`)/preflight probe (`src/probe.rs`) built on top of it, plus
+  the temporary POSIX foreground-terminal handoff required by ProcessKit's
+  separate process-group mechanism —
   none of which `processkit` itself provides.
 
 `README.md`'s introduction states the same division for a project outsider:
@@ -164,7 +173,8 @@ Three tiers, increasing in weight and decreasing in how often they run:
   spawns real multi-level process trees, observes liveness from *outside* the
   runner (an OS process-table probe, not the container's own member list),
   and stresses concurrent runs, nested Windows Job Objects, PID-reuse storms,
-  and abrupt runner death. It is gated behind the `e2e` Cargo feature (with
+  abrupt runner death, and inherited stdio through a real Windows console or
+  POSIX pseudo-terminal. It is gated behind the `e2e` Cargo feature (with
   its `src/bin/e2e_helper.rs` worker binary) so it stays off in the default
   `cargo test` and runs explicitly via
   `cargo test --features e2e --test e2e -- --nocapture`; CI runs it as a

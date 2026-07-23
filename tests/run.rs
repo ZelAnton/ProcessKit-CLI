@@ -105,6 +105,56 @@ fn inherited_stdin_reaches_the_child_and_preserves_the_terminal_event() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `--inherit-stdio` hands all three outer handles directly to the child. Piping
+/// the runner from this parent makes the contract deterministic on Windows and
+/// Unix: the child reads from the same input pipe and writes to the same two
+/// output pipes, while lifecycle data remains isolated in JSONL.
+#[test]
+fn inherited_stdio_reaches_the_child_directly_and_preserves_the_terminal_event() {
+    let dir = scratch("inherit-stdio");
+    let mut runner =
+        common::command_with_flags(&dir, &[], &["--inherit-stdio"], stdio_reader_program(&dir))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the runner with three piped outer handles");
+    let mut stdin = runner
+        .stdin
+        .take()
+        .expect("the runner receives the test input pipe");
+    stdin
+        .write_all(b"direct line\n")
+        .expect("write one line through inherited stdin");
+    drop(stdin);
+
+    let out = runner
+        .wait_with_output()
+        .expect("the runner exits after the child reads inherited stdio");
+    assert_eq!(out.status.code(), Some(0), "child exit is forwarded");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("stdio-out:direct line"),
+        "the child writes directly to inherited stdout: {stdout:?}"
+    );
+    assert!(
+        stderr.contains("stdio-err:direct line"),
+        "the child writes directly to inherited stderr: {stderr:?}"
+    );
+
+    assert_child_exit_event(&dir);
+    let events = read_run_events(&dir);
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["event"] == "output_captured"),
+        "interactive output must never be copied into lifecycle JSONL"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `--stdin-file` keeps input bytes out of the command tail and streams them via
 /// ProcessKit, closing the child's stdin once the file reaches EOF.
 #[test]
@@ -357,15 +407,19 @@ fn read_run_events(dir: &Path) -> Vec<Value> {
         .collect()
 }
 
-/// A natural stdin-consuming run remains a normal child exit: cleanup completes
+/// A natural input-consuming run remains a normal child exit: cleanup completes
 /// and the terminal event retains the child's code rather than minting a runner code.
 fn assert_child_exit_event(dir: &Path) {
     let events = read_run_events(dir);
-    assert!(
-        events
-            .iter()
-            .any(|event| event["event"] == "cleanup_finished"),
-        "stdin does not bypass containment cleanup: {events:?}"
+    let cleanup = events
+        .iter()
+        .find(|event| event["event"] == "cleanup_finished")
+        .unwrap_or_else(|| panic!("interactive input does not bypass cleanup: {events:?}"));
+    assert_eq!(cleanup["remaining"], 0, "cleanup must leave no members");
+    assert_eq!(
+        cleanup["remaining_pids"],
+        serde_json::json!([]),
+        "cleanup must leave no member PIDs"
     );
     let terminal = events.last().expect("a terminal event");
     assert_eq!(terminal["event"], "runner_exit");
@@ -390,6 +444,26 @@ fn stdin_reader_program(dir: &Path) -> Vec<String> {
             "/bin/sh".into(),
             "-c".into(),
             "IFS= read -r line; printf 'stdin:%s\\n' \"$line\"".into(),
+        ]
+    }
+}
+
+/// Read one line, then write it to both output streams. A script file avoids
+/// cmd.exe's single-command variable-expansion rules on Windows.
+fn stdio_reader_program(dir: &Path) -> Vec<String> {
+    if cfg!(windows) {
+        let script = dir.join("read-stdio.bat");
+        std::fs::write(
+            &script,
+            "@echo off\r\nset /p line=\r\necho stdio-out:%line%\r\necho stdio-err:%line% 1>&2\r\n",
+        )
+        .expect("write Windows stdio reader");
+        vec!["cmd".into(), "/c".into(), path_arg(&script)]
+    } else {
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "IFS= read -r line; printf 'stdio-out:%s\\n' \"$line\"; printf 'stdio-err:%s\\n' \"$line\" >&2".into(),
         ]
     }
 }

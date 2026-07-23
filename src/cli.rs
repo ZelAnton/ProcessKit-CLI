@@ -40,13 +40,13 @@ pub enum Command {
     /// that died abruptly — while never touching a live run's entry.
     Prune(PruneArgs),
     /// Report this binary's compatibility surface for a consumer's fail-closed
-    /// launcher preflight (`CC_PROCESSKIT_RUN`) — no run, no child, no side effects.
+    /// compatibility preflight — no run, no child, no side effects.
     Probe(ProbeArgs),
 }
 
 /// `run [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl> [--create-no-window]
 /// [--timeout <duration>] [--grace <duration>] [--capture-dir <dir>] [--argv-raw]
-/// [--inherit-stdin | --stdin-file <file>]
+/// [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
 /// -- <program> <args...>`
 //
 // `run` consumes every field: `cwd`, `create_no_window`, `timeout`, `grace`,
@@ -91,6 +91,20 @@ pub struct RunArgs {
     /// truncation flag are reported in the `output_captured` JSONL event.
     #[arg(long, value_name = "dir")]
     pub capture_dir: Option<PathBuf>,
+
+    /// Give the child the runner's stdin, stdout, and stderr handles directly.
+    /// This preserves terminal status and cannot be combined with mediated I/O
+    /// or Windows' no-console mode.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "capture_dir",
+            "create_no_window",
+            "inherit_stdin",
+            "stdin_file"
+        ]
+    )]
+    pub inherit_stdio: bool,
 
     /// Give the child the runner's own stdin (terminal, file, or pipe). This does
     /// not create a PTY and cannot be combined with `--stdin-file`.
@@ -550,7 +564,24 @@ mod tests {
     }
 
     #[test]
-    fn run_parses_each_stdin_mode_and_rejects_their_combination() {
+    fn run_parses_each_stdio_mode_and_rejects_incompatible_combinations() {
+        let inherited_stdio = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--inherit-stdio",
+            "--",
+            "true",
+        ])
+        .expect("--inherit-stdio is a valid opt-in");
+        let Command::Run(args) = inherited_stdio.command else {
+            panic!("expected the run subcommand");
+        };
+        assert!(args.inherit_stdio);
+        assert!(!args.inherit_stdin);
+        assert!(args.stdin_file.is_none());
+
         let inherited = Cli::try_parse_from([
             "processkit-cli",
             "run",
@@ -564,6 +595,7 @@ mod tests {
         let Command::Run(args) = inherited.command else {
             panic!("expected the run subcommand");
         };
+        assert!(!args.inherit_stdio);
         assert!(args.inherit_stdin);
         assert!(args.stdin_file.is_none());
 
@@ -581,6 +613,7 @@ mod tests {
         let Command::Run(args) = file.command else {
             panic!("expected the run subcommand");
         };
+        assert!(!args.inherit_stdio);
         assert!(!args.inherit_stdin);
         assert_eq!(args.stdin_file, Some(PathBuf::from("input.txt")));
 
@@ -598,6 +631,40 @@ mod tests {
             ])
             .is_err(),
             "the two stdin modes are contradictory and must fail at parse time"
+        );
+
+        for incompatible in ["--inherit-stdin", "--stdin-file", "--capture-dir"] {
+            let mut argv = vec![
+                "processkit-cli",
+                "run",
+                "--jsonl",
+                "events.jsonl",
+                "--inherit-stdio",
+                incompatible,
+            ];
+            if matches!(incompatible, "--stdin-file" | "--capture-dir") {
+                argv.push("path");
+            }
+            argv.extend(["--", "true"]);
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "--inherit-stdio must reject {incompatible}"
+            );
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "processkit-cli",
+                "run",
+                "--jsonl",
+                "events.jsonl",
+                "--inherit-stdio",
+                "--create-no-window",
+                "--",
+                "true",
+            ])
+            .is_err(),
+            "--inherit-stdio requires a usable Windows console when one exists"
         );
     }
 

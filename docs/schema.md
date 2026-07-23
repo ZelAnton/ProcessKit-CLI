@@ -254,6 +254,8 @@ Bounded stdout/stderr capture finished. Emitted **only** when `run` was given
 `<dir>/stdout.log` and `<dir>/stderr.log` alongside the unchanged live echo, and
 this event records, per stream, what was captured. A run without `--capture-dir`
 does not emit it (the stream is otherwise byte-for-byte identical).
+`--inherit-stdio` conflicts with `--capture-dir`, because direct child output
+does not pass through the runner's tee, and therefore never emits this event.
 
 | Field    | Type   | Notes                                     |
 |----------|--------|-------------------------------------------|

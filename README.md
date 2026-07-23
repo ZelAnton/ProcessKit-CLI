@@ -97,7 +97,7 @@ owned container's ordinary teardown path on every supported platform.
 processkit-cli run     [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl>
                        [--create-no-window] [--timeout <duration>]
                        [--grace <duration>] [--capture-dir <dir>] [--argv-raw]
-                       [--inherit-stdin | --stdin-file <file>]
+                       [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
                        [--env-clear] [--env-remove <KEY>]... [--env <KEY=VALUE>]...
                        -- <program> <args...>
 processkit-cli inspect --run-id <id> --json
@@ -121,18 +121,27 @@ JSON line and — with `--require-*` — verifies it, so a consumer can confirm 
 runner is usable **before** launching a payload. It spawns no child and touches no
 registry or container.
 
-Live output is **pipe + echo, not a real inherited terminal**: ProcessKit reads
-the child's stdout/stderr through pipes and this runner re-emits them onto its
-own stdout/stderr. A deliberate, honest consequence is that the child sees **no
-TTY**, so terminal-dependent behavior can degrade — colors, progress bars, and
-other cursor tricks may render as plain, line-oriented text. A true PTY is not
-implemented here (PTY support is deferred in the core crate).
+By default, live output is **pipe + echo, not a real inherited terminal**:
+ProcessKit reads the child's stdout/stderr through pipes and this runner re-emits
+them onto its own stdout/stderr. The child therefore sees **no TTY**, so colors,
+progress bars, and other cursor tricks may degrade. `--inherit-stdio` is the
+explicit alternative for interactive commands: it gives the child the runner's
+three standard handles directly, preserving an existing terminal without a pump.
+It does not allocate or emulate a PTY; if the caller supplied pipes or files, the
+child sees those pipes or files.
 
-## Standard input
+## Standard I/O
 
 By default the child receives closed/null stdin, so a noninteractive command cannot
-wait forever for bytes the runner does not own. Two explicit, mutually exclusive
-opt-ins change that default:
+wait forever for bytes the runner does not own. Three mutually exclusive opt-ins
+change the standard-I/O path:
+
+- `--inherit-stdio` gives the child the runner's stdin, stdout, and stderr handles
+  directly. There is no output pump, echo, tee, or transcript capture in this mode;
+  the child writes to the inherited destinations itself. JSONL events still go only
+  to `--jsonl`, and runner diagnostics still avoid stdout. This mode conflicts with
+  `--capture-dir`, `--create-no-window`, `--inherit-stdin`, and `--stdin-file`.
+  `probe --json` advertises the capability as `run:--inherit-stdio`.
 
 - `--inherit-stdin` gives the child the runner's own stdin handle. It can read from
   the caller's terminal, file, or pipe directly; the runner neither mediates nor
@@ -142,13 +151,20 @@ opt-ins change that default:
   never appear in the child argv or lifecycle JSONL. The file is checked before a
   child is spawned; an unreadable path is a `SETUP` (111) failure.
 
-Neither mode creates a PTY: stdout/stderr remain pipe-and-echo, and the child still
-must not assume terminal capabilities. `Ctrl-C` remains a runner-owned cancellation:
-the runner observes it and tears down the ProcessKit container. The CLI does not
-forward Ctrl-C as input bytes or synthesize a separate child signal, but native
-console-signal delivery to processes sharing a console is platform- and host-
-dependent. Callers must therefore not rely on exactly one recipient; the runner's
-own outcome remains the documented `cancelled` event and exit code `107`.
+The two input-only modes leave stdout/stderr on the default pipe-and-echo path and
+do not create a PTY. Their `Ctrl-C` behavior remains runner-owned cancellation with
+the documented `cancelled` event and exit code `107`.
+
+`--inherit-stdio` preserves native terminal signal delivery instead of pretending
+to mediate it. On Windows and containment mechanisms that keep child and runner in
+the same foreground group, the host may deliver `Ctrl-C` to both; when the runner's
+listener observes it, the result is the normal `cancelled`/`107` outcome. On Unix
+when ProcessKit uses a separate process group, the runner temporarily makes that
+group foreground so terminal input works, and the terminal delivers `Ctrl-C` to the
+child group; a child that exits from the signal is therefore reported as a child
+exit. In every case the runner restores the original foreground group and tears
+down its ProcessKit container before returning. Callers that require a deterministic
+runner-owned cancellation outcome should use the control-plane `cancel` command.
 
 `inspect`, `cancel`, and `kill` all communicate with a live `run` process over the
 same local IPC control plane, addressing it by `run_id` through the per-user registry
@@ -207,7 +223,8 @@ candidate.
 
 ## Timeouts, cancel, and grace
 
-`run` bounds a run two ways, and both end in the **same** teardown path:
+In the default and input-only I/O modes, `run` bounds a run two ways, and both end
+in the **same** teardown path:
 
 - `--timeout <duration>` is a hard deadline for the whole run. When it elapses the
   runner ends the run and exits with the reserved `TIMEOUT` code (`106`) — never
@@ -216,6 +233,9 @@ candidate.
   reserved `CANCELLED` code (`107`), distinct from a timeout and from any child
   code, so "I interrupted it" is never confused with "it ran too long" or with a
   child that merely returned non-zero.
+
+With `--inherit-stdio`, native terminal delivery takes precedence; see
+[Standard I/O](#standard-io) for the platform-dependent reporting contract.
 
 `--grace <duration>` sets the pause between the *soft* stop and the *hard* kill on
 both paths: the runner first asks the process tree to stop, waits up to the grace
@@ -251,7 +271,9 @@ doing so unconditionally would diverge from a direct launch and could hide a
 child that legitimately wants its own console. The runner itself never allocates
 a console, so it spawns no extra console host on its own account. Headless
 Windows deployments that want to suppress a stray `conhost` window for the child
-pass `--create-no-window` explicitly.
+pass `--create-no-window` explicitly. It cannot be combined with
+`--inherit-stdio`: suppressing the child's console and promising to preserve the
+caller's terminal are contradictory requests.
 
 ## Environment
 
@@ -282,6 +304,8 @@ regardless of which flag was written first on the command line.
 `<dir>/stdout.log` and `<dir>/stderr.log` — **alongside** the live echo, which is
 unchanged: the same output still streams to the runner's own stdout/stderr. The
 child's stdout and stderr are captured to separate files, never interleaved.
+It cannot be combined with `--inherit-stdio`, because direct child writes never
+pass through the runner's bounded tee.
 
 The capture is **bounded**. ProcessKit's line pump drains the child's pipes under a
 byte-capped [`OutputBufferPolicy`](https://docs.rs/processkit) — so the runner
@@ -332,7 +356,8 @@ richer per-member fields declared but absent until ProcessKit-rs ships them.
 ## Status
 
 `run` is implemented: it spawns the child into a ProcessKit container the runner
-owns, echoes the child's output live, forwards the child's exit code exactly,
+owns, echoes the child's output live by default or directly inherits all three
+standard handles with `--inherit-stdio`, forwards the child's exit code exactly,
 enforces `--timeout`, `--grace`, and `Ctrl-C` cancellation with a guaranteed
 teardown of the whole tree (see "Timeouts, cancel, and grace"), and writes the
 versioned JSONL event stream to `--jsonl` (see "JSONL event schema"). `--run-id`

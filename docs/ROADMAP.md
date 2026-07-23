@@ -24,6 +24,24 @@
    aarch64, Linux x86_64 glibc and musl plus aarch64 glibc, and Apple Silicon
    macOS. Source installation remains available through `cargo install`.
 
+## Delivered in v0.2.1
+
+1. **Explicit stdin sources.** `--inherit-stdin` shares the runner's input
+   handle with the child, while `--stdin-file <file>` streams a checked file
+   through ProcessKit and closes stdin at EOF. Closed/null stdin remains the
+   safe default.
+
+## Current development
+
+1. **Interactive inherited stdio.** `--inherit-stdio` passes stdin, stdout, and
+   stderr directly to the child, preserving an existing console or terminal
+   while retaining ProcessKit containment, lifecycle JSONL, the control plane,
+   cleanup, and exit-code fidelity. The default remains pipe + echo; transcript
+   capture and no-console mode intentionally conflict with direct inheritance.
+2. **Cross-platform terminal proof.** Through-the-binary tests cover piped I/O,
+   a real Windows console, and a POSIX pseudo-terminal, including input,
+   terminal detection, JSONL completion, and descendant cleanup.
+
 ## Remaining ProcessKit-rs dependencies
 
 The CLI will consume, rather than duplicate, the core's forthcoming

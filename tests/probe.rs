@@ -106,6 +106,7 @@ fn probe_reports_a_consistent_compatible_surface() {
         "probe",
         "run:--jsonl",
         "run:--capture-dir",
+        "run:--inherit-stdio",
         "run:--inherit-stdin",
         "run:--stdin-file",
         "inspect:--json",
@@ -224,6 +225,8 @@ fn incompatible_band_and_surface_fail_closed_and_real_ones_pass() {
             "--require-surface",
             "run:--capture-dir",
             "--require-surface",
+            "run:--inherit-stdio",
+            "--require-surface",
             "run:--inherit-stdin",
             "--require-surface",
             "run:--stdin-file",
@@ -236,8 +239,8 @@ fn incompatible_band_and_surface_fail_closed_and_real_ones_pass() {
 }
 
 /// Fail-closed outcome 1 — **path missing.** A consumer that resolves a
-/// `CC_PROCESSKIT_RUN` pointing at a nonexistent file cannot even spawn the probe:
-/// the OS reports `NotFound`, the distinguishable signal for "the file is gone". The
+/// nonexistent candidate cannot even spawn the probe: the OS reports `NotFound`,
+/// the distinguishable signal for "the file is gone". The
 /// consumer must fail closed here, never fall back to an uncontained launch.
 #[test]
 fn a_missing_path_fails_the_spawn_with_not_found() {

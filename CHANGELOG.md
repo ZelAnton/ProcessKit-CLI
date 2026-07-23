@@ -12,7 +12,12 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+- `run --inherit-stdio` for interactive commands that need the runner's stdin,
+  stdout, and stderr handles directly. It preserves an existing terminal while
+  retaining containment, JSONL lifecycle events, cleanup, control-plane access,
+  and exit-code fidelity; the default closed-stdin plus pipe-and-echo behavior is
+  unchanged. The mode is advertised through `probe` and conflicts with capture,
+  no-console mode, and the two input-only modes.
 
 ### Changed
 -
@@ -120,11 +125,8 @@ to a dated version section.
   Additive schema v1 change (new `source` values and the `killed` event), reflected in
   `docs/control-plane.md`, `docs/schema.md`, `docs/exit-codes.md`, and the golden
   fixture.
-- Fail-closed launcher contract (`CC_PROCESSKIT_RUN`): a
-  documented environment variable naming the absolute path to the `processkit-cli`
-  binary a consumer should launch contained commands with — the binary-runner
-  analogue of the existing interpreter-launch contract. A new side-effect-free
-  `probe` subcommand (`processkit-cli probe --json`) is the preflight a consumer
+- Side-effect-free compatibility probe: `processkit-cli probe --json` is the
+  preflight a consumer
   runs on a candidate **before** launching any payload: it prints the binary's
   compatibility surface (package name, version, JSONL `schema_version`, the reserved
   exit-code band, and the CLI surface tokens derived from the live parser) as one

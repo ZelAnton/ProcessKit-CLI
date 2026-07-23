@@ -147,8 +147,10 @@ jobs:
       # a descendant holding the stdout pipe, rapid PID-reuse churn, `inspect` over
       # the live control plane, two concurrent runs contained independently,
       # control-plane `cancel`/`kill` reaping only the target run, a Ctrl-C cancel
-      # (Unix), a `run` nested inside an outer Job Object (Windows), and the MSBuild
-      # node-reuse worker shape (a synthetic worker cross-platform, plus a real
+      # (Unix), a `run` nested inside an outer Job Object (Windows), real-console
+      # (Windows) and pseudo-terminal (Unix) `--inherit-stdio` smoke tests, and
+      # the MSBuild node-reuse worker shape
+      # (a synthetic worker cross-platform, plus a real
       # `dotnet build` when a `dotnet` SDK is present). Kept out of the default
       # `cargo test` job above (heavier, real process trees); `--nocapture` surfaces
       # each platform skip (e.g. the `dotnet`-absent skip).

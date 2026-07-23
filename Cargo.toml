@@ -87,6 +87,9 @@ libc = "0.2"
 # `Win32_System_JobObjects` is enabled solely for the e2e tier's test-support worker
 # (`src/bin/e2e_helper.rs`, `job-parent` mode): it self-places into an outer Job
 # Object so the nested-Job-Object scenario can prove `run` still contains its tree.
+# `Win32_System_Console` supports that helper's real-console smoke for
+# `--inherit-stdio`: the helper allocates fresh console handles, then proves the
+# contained child still identifies all three inherited streams as a terminal.
 # The bin shares this crate's `[dependencies]` (a `[[bin]]` cannot see dev-deps), so
 # the feature lives here; the library itself never references it.
 [target.'cfg(windows)'.dependencies]
@@ -95,6 +98,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
     "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_Threading",

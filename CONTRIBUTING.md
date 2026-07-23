@@ -60,7 +60,10 @@ runner's own bookkeeping. It covers:
 - a descendant that **holds the stdout handle** after the root exits not hanging
   the runner (proven with an upper time bound);
 - a rapid launch → exit → relaunch storm not misattributing or killing an
-  unrelated bystander as **PIDs recycle**.
+  unrelated bystander as **PIDs recycle**;
+- `--inherit-stdio` preserving direct input/output and terminal detection in a
+  real Windows console and a POSIX pseudo-terminal, while lifecycle JSONL still
+  closes cleanly.
 
 The tier is gated behind the `e2e` Cargo feature (with its `e2e_helper` worker),
 so it is **off** in the default `cargo test` — those scenarios spawn real process

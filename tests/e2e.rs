@@ -1011,6 +1011,119 @@ fn run_nested_in_a_job_object_still_contains_its_tree() {
     );
 }
 
+/// A real Windows console survives both process boundaries: the dedicated host
+/// allocates fresh `CONIN$`/`CONOUT$` handles, the runner inherits them, and
+/// `--inherit-stdio` passes them through ProcessKit to a terminal-aware child.
+/// The result is written out-of-band so the assertion itself never redirects the
+/// handles being tested.
+#[cfg(windows)]
+#[test]
+fn inherited_stdio_preserves_real_windows_console_handles() {
+    let scenario = Scenario::new("e2e-inherit-stdio-console");
+    let jsonl = events_path(&scenario.dir);
+    let report = scenario.path("stdio-report.txt");
+    let jsonl_arg = jsonl.to_string_lossy().into_owned();
+    let report_arg = report.to_string_lossy().into_owned();
+
+    let host = Command::new(helper_bin())
+        .args([
+            "console-parent",
+            "--runner",
+            bin(),
+            "--jsonl",
+            &jsonl_arg,
+            "--report",
+            &report_arg,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the dedicated Windows console host");
+    let mut host = ChildGuard::new(host);
+    let status = wait_child_bounded(host.child_mut(), Duration::from_secs(30))
+        .expect("the console-hosted runner exited");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the console-hosted inherited-stdio run must complete cleanly"
+    );
+
+    let observed = std::fs::read_to_string(&report).expect("read terminal-status report");
+    assert_eq!(
+        observed, "stdin=true\nstdout=true\nstderr=true\ninput=\n",
+        "the contained child must see all three inherited handles as console terminals"
+    );
+
+    let events = read_events(&jsonl);
+    let cleanup = events
+        .iter()
+        .find(|event| event_tag(event) == "cleanup_finished")
+        .expect("the interactive run records completed containment cleanup");
+    assert_eq!(cleanup["remaining"], 0);
+    assert_eq!(cleanup["remaining_pids"], serde_json::json!([]));
+    let runner_exit = events.last().expect("a terminal lifecycle event");
+    assert_eq!(event_tag(runner_exit), "runner_exit");
+    assert_eq!(runner_exit["source"], "child_exit");
+    assert_eq!(runner_exit["child_code"], 0);
+}
+
+/// A Unix pseudo-terminal proves more than descriptor inheritance: the contained
+/// child sees all streams as terminals and successfully reads. On targets where
+/// ProcessKit uses a separate process group, the runner temporarily hands that
+/// group foreground control and restores its own group after cleanup.
+#[cfg(unix)]
+#[test]
+fn inherited_stdio_preserves_a_usable_posix_terminal() {
+    let scenario = Scenario::new("e2e-inherit-stdio-pty");
+    let jsonl = events_path(&scenario.dir);
+    let report = scenario.path("stdio-report.txt");
+    let jsonl_arg = jsonl.to_string_lossy().into_owned();
+    let report_arg = report.to_string_lossy().into_owned();
+
+    let host = Command::new(helper_bin())
+        .args([
+            "pty-parent",
+            "--runner",
+            bin(),
+            "--jsonl",
+            &jsonl_arg,
+            "--report",
+            &report_arg,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the dedicated Unix pty host");
+    let mut host = ChildGuard::new(host);
+    let status = wait_child_bounded(host.child_mut(), Duration::from_secs(30))
+        .expect("the pty-hosted runner exited");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the pty-hosted inherited-stdio run must complete cleanly"
+    );
+
+    let observed = std::fs::read_to_string(&report).expect("read terminal-status report");
+    assert_eq!(
+        observed, "stdin=true\nstdout=true\nstderr=true\ninput=pty line\n",
+        "the child must see a usable terminal and read the supplied pty input"
+    );
+
+    let events = read_events(&jsonl);
+    let cleanup = events
+        .iter()
+        .find(|event| event_tag(event) == "cleanup_finished")
+        .expect("the interactive run records completed containment cleanup");
+    assert_eq!(cleanup["remaining"], 0);
+    assert_eq!(cleanup["remaining_pids"], serde_json::json!([]));
+    let runner_exit = events.last().expect("a terminal lifecycle event");
+    assert_eq!(event_tag(runner_exit), "runner_exit");
+    assert_eq!(runner_exit["source"], "child_exit");
+    assert_eq!(runner_exit["child_code"], 0);
+}
+
 /// The project's raison d'être, cross-platform and deterministic: a leaked,
 /// long-lived worker of the **MSBuild node-reuse shape** does not survive `run`. The
 /// runner's program argv carries the reusable-node markers (`MSBuild.dll`,
