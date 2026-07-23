@@ -20,6 +20,12 @@ to a dated version section.
 ### Fixed
 -
 
+## [0.2.0] - 2026-07-23
+
+### Changed
+
+- ci: drop x86_64-apple-darwin from the release/CI target matrix
+
 ## [0.1.0] - 2026-07-23
 
 ### Added
@@ -206,5 +212,6 @@ to a dated version section.
   inheriting the registry's full path, so deeply nested macOS CI/workspace paths
   cannot exceed `sockaddr_un::sun_path` and silently disable `inspect`.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ZelAnton/ProcessKit-CLI/releases/tag/v0.1.0
