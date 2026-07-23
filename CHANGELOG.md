@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [0.2.1] - 2026-07-23
+
+### Added
 - `run --inherit-stdin` and `run --stdin-file <file>` opt-ins. The former shares
   the runner's stdin with the child; the latter streams a readable file through
   ProcessKit and closes stdin at EOF. The modes are mutually exclusive, leave the
@@ -214,6 +225,7 @@ to a dated version section.
   inheriting the registry's full path, so deeply nested macOS CI/workspace paths
   cannot exceed `sockaddr_un::sun_path` and silently disable `inspect`.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ZelAnton/ProcessKit-CLI/releases/tag/v0.1.0
