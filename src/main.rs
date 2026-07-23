@@ -52,7 +52,7 @@ fn main() -> ExitCode {
     // self-contained (`probe`) and reports through the shared runner-error path
     // below.
     match cli.command {
-        Command::Run(args) => run::execute(args),
+        Command::Run(args) => run::execute(*args),
         Command::Inspect(args) => report(control::inspect(&args.run_id)),
         Command::Cancel(args) => report(control::cancel(&args.run_id)),
         Command::Kill(args) => report(control::kill(&args.run_id)),

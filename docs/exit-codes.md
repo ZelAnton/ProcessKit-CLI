@@ -39,7 +39,7 @@ failure is not mistaken for a child result.
 | 108  | `CONTROL_CANCELLED` | The run was cancelled by a control-plane `cancel` command (over the local control channel): the runner ran the same soft-stop → grace → hard-kill teardown as a Ctrl-C. Distinct from `CANCELLED` so "a control client cancelled it" is told from "the operator pressed Ctrl-C". |
 | 109  | `CONTROL_KILLED`  | The run was killed by a control-plane `kill` command: the runner hard-killed the whole tree immediately (no soft stop, no grace). Distinct from every other runner-imposed ending. |
 | 110  | `PROBE_INCOMPATIBLE` | The **preflight probe** (`processkit-cli probe`) found this binary's compatibility surface does not satisfy a `--require-*` expectation. A *pre-launch* verdict, not a run outcome — no child is ever spawned by a probe. See "Preflight probe" below. |
-| 111  | `SETUP`           | A fail-closed **setup / support failure**: a prerequisite the runner needs to run — or to report a result — could not be established or produced for an ordinary reason (its async runtime would not build, a required `--jsonl`/`--capture-dir` output could not be created, or a `probe`/`inspect`/control reply would not serialize). An environment/resource condition the caller can usually act on (a bad path, missing permissions, exhausted resources), **not** a runner bug — that stays `INTERNAL` (104). See "Setup failures vs internal faults" below. |
+| 111  | `SETUP`           | A fail-closed **setup / support failure**: a prerequisite the runner needs to run — or to report a result — could not be established or produced for an ordinary reason (its async runtime would not build, a required `--jsonl`/`--capture-dir` output or `--stdin-file` input could not be opened, or a `probe`/`inspect`/control reply would not serialize). An environment/resource condition the caller can usually act on (a bad path, missing permissions, exhausted resources), **not** a runner bug — that stays `INTERNAL` (104). See "Setup failures vs internal faults" below. |
 
 Codes `112`–`119` are **reserved** for future runner-own conditions. `--help`
 and `--version` are not failures: they print to stdout and exit `0`.
@@ -99,8 +99,9 @@ caller which one happened:
 - `SETUP` (111) is a **fail-closed setup / support failure**: the runner could not
   establish a prerequisite it needs, or produce a result it must emit, for an *ordinary*
   reason the caller can usually act on. It covers a `run` whose async runtime will not
-  build; a required `--jsonl` events file or `--capture-dir` the operator asked for but
-  that cannot be created (an unwritable path, a missing parent, denied permissions); and a
+  build; a required `--jsonl` events file, `--capture-dir`, or `--stdin-file` the
+  operator asked for but that cannot be opened or created (an unwritable path, a missing
+  parent, denied permissions); and a
   `probe` / `inspect` / control (`cancel`/`kill`) reply that cannot be serialized. In every
   case the runner's own run-tracking logic is intact — a peripheral support step just
   failed — so reporting it as an `INTERNAL` "runner bug" would mislead the consumer. A

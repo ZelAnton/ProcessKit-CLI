@@ -27,7 +27,7 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Run a program inside a ProcessKit container and report its lifecycle.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// Query a live run over local IPC.
     Inspect(InspectArgs),
     /// Ask a live run to cancel (graceful where supported, then a hard kill).
@@ -46,6 +46,7 @@ pub enum Command {
 
 /// `run [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl> [--create-no-window]
 /// [--timeout <duration>] [--grace <duration>] [--capture-dir <dir>] [--argv-raw]
+/// [--inherit-stdin | --stdin-file <file>]
 /// -- <program> <args...>`
 //
 // `run` consumes every field: `cwd`, `create_no_window`, `timeout`, `grace`,
@@ -90,6 +91,16 @@ pub struct RunArgs {
     /// truncation flag are reported in the `output_captured` JSONL event.
     #[arg(long, value_name = "dir")]
     pub capture_dir: Option<PathBuf>,
+
+    /// Give the child the runner's own stdin (terminal, file, or pipe). This does
+    /// not create a PTY and cannot be combined with `--stdin-file`.
+    #[arg(long, conflicts_with = "stdin_file")]
+    pub inherit_stdin: bool,
+
+    /// Stream this file to the child's stdin, then close it at EOF. The file's
+    /// bytes stay out of argv and cannot be combined with `--inherit-stdin`.
+    #[arg(long, value_name = "file", conflicts_with = "inherit_stdin")]
+    pub stdin_file: Option<PathBuf>,
 
     /// Record the raw argv in diagnostics instead of the redacted hash + hint.
     #[arg(long)]
@@ -536,6 +547,58 @@ mod tests {
         };
         assert_eq!(args.timeout, Some(Duration::from_secs(5)));
         assert_eq!(args.grace, Some(Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn run_parses_each_stdin_mode_and_rejects_their_combination() {
+        let inherited = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--inherit-stdin",
+            "--",
+            "true",
+        ])
+        .expect("--inherit-stdin is a valid opt-in");
+        let Command::Run(args) = inherited.command else {
+            panic!("expected the run subcommand");
+        };
+        assert!(args.inherit_stdin);
+        assert!(args.stdin_file.is_none());
+
+        let file = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--stdin-file",
+            "input.txt",
+            "--",
+            "true",
+        ])
+        .expect("--stdin-file is a valid opt-in");
+        let Command::Run(args) = file.command else {
+            panic!("expected the run subcommand");
+        };
+        assert!(!args.inherit_stdin);
+        assert_eq!(args.stdin_file, Some(PathBuf::from("input.txt")));
+
+        assert!(
+            Cli::try_parse_from([
+                "processkit-cli",
+                "run",
+                "--jsonl",
+                "events.jsonl",
+                "--inherit-stdin",
+                "--stdin-file",
+                "input.txt",
+                "--",
+                "true",
+            ])
+            .is_err(),
+            "the two stdin modes are contradictory and must fail at parse time"
+        );
     }
 
     #[test]

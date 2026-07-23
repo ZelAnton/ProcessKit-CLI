@@ -294,6 +294,8 @@ mod tests {
             "probe",
             "run:--jsonl",
             "run:--capture-dir",
+            "run:--inherit-stdin",
+            "run:--stdin-file",
             "run:--timeout",
             "inspect:--json",
             "cancel:--run-id",
@@ -376,6 +378,10 @@ mod tests {
             "probe",
             "--require-surface",
             "run:--capture-dir",
+            "--require-surface",
+            "run:--inherit-stdin",
+            "--require-surface",
+            "run:--stdin-file",
         ]);
         assert!(
             evaluate(&ok).is_empty(),

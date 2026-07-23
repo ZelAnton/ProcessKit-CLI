@@ -106,6 +106,8 @@ fn probe_reports_a_consistent_compatible_surface() {
         "probe",
         "run:--jsonl",
         "run:--capture-dir",
+        "run:--inherit-stdin",
+        "run:--stdin-file",
         "inspect:--json",
         "probe:--require-schema-version",
     ] {
@@ -221,6 +223,10 @@ fn incompatible_band_and_surface_fail_closed_and_real_ones_pass() {
             "probe",
             "--require-surface",
             "run:--capture-dir",
+            "--require-surface",
+            "run:--inherit-stdin",
+            "--require-surface",
+            "run:--stdin-file",
         ],
     );
     assert_eq!(surface_ok.status.code(), Some(0));

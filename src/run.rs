@@ -49,7 +49,7 @@ use std::time::{Duration, SystemTime};
 
 use processkit::{
     Command as PkCommand, Error as PkError, Outcome, OutputBufferPolicy, ProcessGroup,
-    RunningProcess, Signal,
+    RunningProcess, Signal, Stdin,
 };
 
 use crate::capture::{CAPTURE_INFLIGHT_MAX_BYTES, Capture};
@@ -189,6 +189,21 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
         None => None,
     };
 
+    // `Stdin::from_file` opens and streams the file through ProcessKit's own pump.
+    // Open it once here too, before a child exists, so an ordinary bad path or
+    // permission error is a fail-closed SETUP result rather than a child that ran
+    // with accidentally absent input. The core opens it again when it starts the
+    // writer; a later filesystem race still surfaces as its truthful stdin error.
+    if let Some(path) = args.stdin_file.as_deref()
+        && let Err(err) = std::fs::File::open(path)
+    {
+        let error = RunnerError::new(
+            exit::SETUP,
+            format!("could not open stdin file `{}`: {err}", path.display()),
+        );
+        return Err(finish(&mut emitter, "setup", None, error));
+    }
+
     // We own this group; the child — and anything it spawns — is a member. When
     // `group` drops at the end of this scope (every path below), the kernel reaps
     // the whole tree. Containment/teardown is the group's job; we never duplicate
@@ -281,6 +296,15 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     // extra host on its own account. (See README, "Windows console".)
     if args.create_no_window {
         command = command.create_no_window();
+    }
+    // Stdin defaults to ProcessKit's closed/null mode. Both opt-ins delegate to
+    // ProcessKit: inheritance shares this runner's real stdin, while a file is
+    // streamed through its managed pipe and closed at EOF. Clap rejects the
+    // contradictory pair before this point, matching the core's own guard.
+    if args.inherit_stdin {
+        command = command.inherit_stdin();
+    } else if let Some(path) = args.stdin_file.as_deref() {
+        command = command.stdin(Stdin::from_file(path));
     }
     // Pipe + echo: the pump reads the child's piped stdout/stderr and tees each
     // decoded line to our own stdout/stderr. This is the live-output mechanism —

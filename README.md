@@ -97,6 +97,7 @@ owned container's ordinary teardown path on every supported platform.
 processkit-cli run     [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl>
                        [--create-no-window] [--timeout <duration>]
                        [--grace <duration>] [--capture-dir <dir>] [--argv-raw]
+                       [--inherit-stdin | --stdin-file <file>]
                        [--env-clear] [--env-remove <KEY>]... [--env <KEY=VALUE>]...
                        -- <program> <args...>
 processkit-cli inspect --run-id <id> --json
@@ -126,6 +127,28 @@ own stdout/stderr. A deliberate, honest consequence is that the child sees **no
 TTY**, so terminal-dependent behavior can degrade — colors, progress bars, and
 other cursor tricks may render as plain, line-oriented text. A true PTY is not
 implemented here (PTY support is deferred in the core crate).
+
+## Standard input
+
+By default the child receives closed/null stdin, so a noninteractive command cannot
+wait forever for bytes the runner does not own. Two explicit, mutually exclusive
+opt-ins change that default:
+
+- `--inherit-stdin` gives the child the runner's own stdin handle. It can read from
+  the caller's terminal, file, or pipe directly; the runner neither mediates nor
+  records those bytes.
+- `--stdin-file <file>` streams the named readable file through
+  `processkit::Stdin::from_file` and closes the child's stdin at EOF. Input bytes
+  never appear in the child argv or lifecycle JSONL. The file is checked before a
+  child is spawned; an unreadable path is a `SETUP` (111) failure.
+
+Neither mode creates a PTY: stdout/stderr remain pipe-and-echo, and the child still
+must not assume terminal capabilities. `Ctrl-C` remains a runner-owned cancellation:
+the runner observes it and tears down the ProcessKit container. The CLI does not
+forward Ctrl-C as input bytes or synthesize a separate child signal, but native
+console-signal delivery to processes sharing a console is platform- and host-
+dependent. Callers must therefore not rely on exactly one recipient; the runner's
+own outcome remains the documented `cancelled` event and exit code `107`.
 
 `inspect`, `cancel`, and `kill` all communicate with a live `run` process over the
 same local IPC control plane, addressing it by `run_id` through the per-user registry

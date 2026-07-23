@@ -8,7 +8,9 @@
 
 mod common;
 
+use std::io::Write;
 use std::path::Path;
+use std::process::Stdio;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -65,6 +67,98 @@ fn passes_child_streams_through_without_mixing() {
         !stdout.contains("processkit-cli"),
         "no runner diagnostic may appear on the child's stdout: {stdout:?}"
     );
+}
+
+/// `--inherit-stdin` gives the child the runner's input handle without changing
+/// the output or lifecycle contracts. The parent pipe makes this deterministic on
+/// Windows and Unix while exercising the same inheritance mode a terminal uses.
+#[test]
+fn inherited_stdin_reaches_the_child_and_preserves_the_terminal_event() {
+    let dir = scratch("inherit-stdin");
+    let mut runner =
+        common::command_with_flags(&dir, &[], &["--inherit-stdin"], stdin_reader_program(&dir))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the runner with a piped stdin");
+    let mut stdin = runner
+        .stdin
+        .take()
+        .expect("the runner receives the test pipe");
+    stdin
+        .write_all(b"inherited line\n")
+        .expect("write one line for the child");
+    drop(stdin);
+
+    let out = runner
+        .wait_with_output()
+        .expect("the runner exits after the child reads stdin");
+    assert_eq!(out.status.code(), Some(0), "child exit is forwarded");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("stdin:inherited line"),
+        "the child read the inherited line: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_child_exit_event(&dir);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--stdin-file` keeps input bytes out of the command tail and streams them via
+/// ProcessKit, closing the child's stdin once the file reaches EOF.
+#[test]
+fn stdin_file_reaches_the_child_and_preserves_the_terminal_event() {
+    let dir = scratch("stdin-file");
+    let input = dir.join("input.txt");
+    std::fs::write(&input, b"file line\n").expect("write stdin fixture");
+    let input_flag = path_arg(&input);
+
+    let out = run_with_flags(
+        &dir,
+        &[],
+        &["--stdin-file", &input_flag],
+        stdin_reader_program(&dir),
+    );
+    assert_eq!(out.status.code(), Some(0), "child exit is forwarded");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("stdin:file line"),
+        "the child read the file's line: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_child_exit_event(&dir);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A missing input file fails before the command starts, so the child cannot
+/// accidentally run with a different stdin mode than the caller requested.
+#[test]
+fn missing_stdin_file_is_a_pre_run_setup_failure() {
+    let dir = scratch("stdin-file-missing");
+    let missing = path_arg(&dir.join("does-not-exist.txt"));
+
+    let out = run_with_flags(
+        &dir,
+        &[],
+        &["--stdin-file", &missing],
+        shell_inline("echo child-must-not-start"),
+    );
+    assert_eq!(out.status.code(), Some(111));
+    assert!(out.stdout.is_empty(), "no child output may be forwarded");
+
+    let events = read_run_events(&dir);
+    assert!(
+        !events.iter().any(|event| event["event"] == "run_started"),
+        "the child must not start when stdin setup fails"
+    );
+    let terminal = events.last().expect("terminal runner_exit event");
+    assert_eq!(terminal["event"], "runner_exit");
+    assert_eq!(terminal["source"], "setup");
+    assert_eq!(terminal["code"], 111);
+    assert!(terminal["child_code"].is_null());
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A program that cannot be started is a runner-own failure, so the runner exits
@@ -261,6 +355,43 @@ fn read_run_events(dir: &Path) -> Vec<Value> {
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str::<Value>(line).expect("each event line is valid JSON"))
         .collect()
+}
+
+/// A natural stdin-consuming run remains a normal child exit: cleanup completes
+/// and the terminal event retains the child's code rather than minting a runner code.
+fn assert_child_exit_event(dir: &Path) {
+    let events = read_run_events(dir);
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event"] == "cleanup_finished"),
+        "stdin does not bypass containment cleanup: {events:?}"
+    );
+    let terminal = events.last().expect("a terminal event");
+    assert_eq!(terminal["event"], "runner_exit");
+    assert_eq!(terminal["source"], "child_exit");
+    assert_eq!(terminal["code"], 0);
+    assert_eq!(terminal["child_code"], 0);
+}
+
+/// A batch file avoids cmd.exe's single-line variable-expansion rules while the
+/// POSIX script uses the same one-line input contract.
+fn stdin_reader_program(dir: &Path) -> Vec<String> {
+    if cfg!(windows) {
+        let script = dir.join("read-stdin.bat");
+        std::fs::write(
+            &script,
+            "@echo off\r\nset /p line=\r\necho stdin:%line%\r\n",
+        )
+        .expect("write Windows stdin reader");
+        vec!["cmd".into(), "/c".into(), path_arg(&script)]
+    } else {
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "IFS= read -r line; printf 'stdin:%s\\n' \"$line\"".into(),
+        ]
+    }
 }
 
 /// Whether `v` is a JSON string of 64 lowercase-hex characters (a SHA-256 digest).

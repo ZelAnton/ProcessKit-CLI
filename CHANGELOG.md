@@ -12,7 +12,10 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+- `run --inherit-stdin` and `run --stdin-file <file>` opt-ins. The former shares
+  the runner's stdin with the child; the latter streams a readable file through
+  ProcessKit and closes stdin at EOF. The modes are mutually exclusive, leave the
+  default closed stdin unchanged, and are advertised through probe surface tokens.
 
 ### Changed
 -

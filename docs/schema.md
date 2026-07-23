@@ -242,9 +242,9 @@ When `source` is `child_exit`, `code` equals `child_code`. For a runner-imposed
 ending (`timeout` / `cancelled` / `control_cancel` / `control_kill`) or a pre-run
 failure (`spawn_error` / `container_error` / `setup`), `child_code` is `null` and
 `code` is the runner-band value. `setup` names a fail-closed setup failure — a
-required output (`--jsonl` / `--capture-dir`) that could not be created — and
-carries the reserved `SETUP` code (111), distinct from `internal` (a genuine runner
-fault) so a consumer never reads a bad path as a runner bug (see
+required output (`--jsonl` / `--capture-dir`) or `--stdin-file` input that could
+not be opened — and carries the reserved `SETUP` code (111), distinct from `internal`
+(a genuine runner fault) so a consumer never reads a bad path as a runner bug (see
 `docs/exit-codes.md`).
 
 ### `output_captured`
