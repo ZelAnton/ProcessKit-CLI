@@ -22,15 +22,16 @@ name: Release
 #
 # Prebuilt binaries: once the `release` job has published + tagged + created the
 # GitHub Release, a downstream `build-artifacts` matrix fans out across the
-# supported platforms (Windows/Linux/macOS x x86_64/aarch64, plus a static
-# musl Linux build), builds each `--release` binary from the freshly-tagged
-# commit, and attaches it to that SAME Release. It is a strictly-downstream
-# enhancement, NOT a second release path: it never bumps, publishes to
-# crates.io, tags, or creates a Release. Because it runs AFTER the sole
-# irreversible step (crates.io), a build failure on one target strands nothing —
-# `cargo install processkit-cli` and the Release still work, and the missing
-# asset can be built + `gh release upload`ed by hand (or the job re-run; upload
-# is `--clobber`-idempotent). This does not change the release ordering above.
+# supported platforms (Windows/Linux x x86_64/aarch64, macOS aarch64 (Apple
+# Silicon), plus a static musl Linux build), builds each `--release` binary
+# from the freshly-tagged commit, and attaches it to that SAME Release. It is
+# a strictly-downstream enhancement, NOT a second release path: it never
+# bumps, publishes to crates.io, tags, or creates a Release. Because it runs
+# AFTER the sole irreversible step (crates.io), a build failure on one target
+# strands nothing — `cargo install processkit-cli` and the Release still
+# work, and the missing asset can be built + `gh release upload`ed by hand
+# (or the job re-run; upload is `--clobber`-idempotent). This does not change
+# the release ordering above.
 
 on:
   workflow_dispatch:
@@ -479,10 +480,8 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             apt: musl-tools
-          # macOS: Intel on the x86_64 runner image, Apple Silicon on the arm64 one
-          # (both native, no cross toolchain needed).
-          - target: x86_64-apple-darwin
-            os: macos-13
+          # macOS: Apple Silicon on the default (arm64) runner image, native,
+          # no cross toolchain needed.
           - target: aarch64-apple-darwin
             os: macos-latest
     steps:

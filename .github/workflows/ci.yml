@@ -154,17 +154,16 @@ jobs:
       # each platform skip (e.g. the `dotnet`-absent skip).
       - run: cargo test --features e2e --test e2e -- --nocapture
 
-  # release.yml's build-artifacts matrix ships seven target triplets; the
+  # release.yml's build-artifacts matrix ships six target triplets; the
   # `test` job above only exercises each runner's host triplet (x86_64 on
   # ubuntu-latest/windows-latest, aarch64 on macos-latest — the default
-  # macos-latest image is Apple Silicon). This job cross-checks the four
+  # macos-latest image is Apple Silicon). This job cross-checks the three
   # remaining release targets with `cargo check --all-targets` (no test run,
   # just a compile check) so a platform regression surfaces here instead of on
   # release day. musl and aarch64-linux use the same apt cross toolchains as
   # release.yml's build-artifacts job; aarch64-pc-windows-msvc cross-compiles
   # from windows-latest (the ARM64 MSVC tools are present on the hosted
-  # image, same as release.yml); x86_64-apple-darwin cross-compiles from the
-  # arm64 macos-latest host.
+  # image, same as release.yml).
   target-check:
     name: target-check (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
@@ -180,8 +179,6 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             apt: musl-tools
-          - target: x86_64-apple-darwin
-            os: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@stable # rolling toolchain selector — intentionally unpinned
