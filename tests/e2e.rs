@@ -1037,7 +1037,7 @@ fn inherited_stdio_preserves_real_windows_console_handles() {
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn the dedicated Windows console host");
     let mut host = ChildGuard::new(host);
@@ -1109,7 +1109,9 @@ fn inherited_stdio_preserves_a_usable_posix_terminal() {
     assert_eq!(
         status.code(),
         Some(0),
-        "the pty-hosted inherited-stdio run must complete cleanly"
+        "the pty-hosted inherited-stdio run must complete cleanly; child report={:?}; JSONL={:?}",
+        std::fs::read_to_string(&report),
+        std::fs::read_to_string(&jsonl),
     );
 
     let observed = std::fs::read_to_string(&report).expect("read terminal-status report");

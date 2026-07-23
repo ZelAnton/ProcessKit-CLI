@@ -267,11 +267,31 @@ fn pty_parent(args: &[String]) -> ExitCode {
             eprintln!("e2e-helper pty-parent: could not write test input: {err}");
             return ExitCode::from(5);
         }
-        match runner.wait() {
-            Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
-            Err(err) => {
-                eprintln!("e2e-helper pty-parent: could not wait for the runner: {err}");
-                ExitCode::from(5)
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            match runner.try_wait() {
+                Ok(Some(status)) => return ExitCode::from(status.code().unwrap_or(1) as u8),
+                Ok(None) if Instant::now() < deadline => sleep(Duration::from_millis(50)),
+                Ok(None) => {
+                    let pid = runner.id().to_string();
+                    let snapshot = Command::new("ps")
+                        .args(["-o", "pid=,ppid=,pgid=,tpgid=,stat=,command=", "-p", &pid])
+                        .output()
+                        .map_or_else(
+                            |err| format!("ps failed: {err}"),
+                            |output| String::from_utf8_lossy(&output.stdout).into_owned(),
+                        );
+                    eprintln!(
+                        "e2e-helper pty-parent: runner {pid} did not exit within 20s; ps: {snapshot:?}"
+                    );
+                    let _ = runner.kill();
+                    let _ = runner.wait();
+                    return ExitCode::from(5);
+                }
+                Err(err) => {
+                    eprintln!("e2e-helper pty-parent: could not poll the runner: {err}");
+                    return ExitCode::from(5);
+                }
             }
         }
     }
