@@ -182,6 +182,5 @@ overview only sketches how they connect:
 - [`docs/exit-codes.md`](exit-codes.md) — the reserved runner-own exit-code
   band and the child-fidelity rule.
 - [`docs/schema.md`](schema.md) — the versioned JSONL lifecycle-event schema.
-- [`docs/ROADMAP.md`](ROADMAP.md) — the intended delivery order for the
-  project as a whole (this document describes what exists today, not the
-  plan).
+- [`docs/ROADMAP.md`](ROADMAP.md) — the delivery status and the remaining
+  ProcessKit-rs dependencies (this document describes the implementation).

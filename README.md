@@ -62,7 +62,6 @@ column is the kernel-backed containment the runner *actually* reports in the
 | Linux x86_64 (glibc) | `x86_64-unknown-linux-gnu` | cgroup v2 (`cgroup_v2`) |
 | Linux aarch64 (glibc) | `aarch64-unknown-linux-gnu` | cgroup v2 (`cgroup_v2`) |
 | Linux x86_64 (musl, static) | `x86_64-unknown-linux-musl` | cgroup v2 (`cgroup_v2`) |
-| macOS x86_64 (Intel) | `x86_64-apple-darwin` | process group (`process_group`) |
 | macOS aarch64 (Apple Silicon) | `aarch64-apple-darwin` | process group (`process_group`) |
 
 The **musl** build links libc statically, so it runs on minimal, glibc-less
@@ -326,8 +325,8 @@ entry, live or stale, as a table or (with `--json`) as JSON Lines — the discov
 counterpart for a caller that has lost or never had a `run_id`. `probe` reports and
 verifies the binary's compatibility surface for a consumer's fail-closed launcher
 preflight, with no side effects, exiting `PROBE_INCOMPATIBLE` (110) on an
-incompatible candidate. See [the roadmap](docs/ROADMAP.md) for the intended
-delivery order.
+incompatible candidate. See [the roadmap](docs/ROADMAP.md) for delivery status
+and the remaining ProcessKit-rs dependencies.
 
 ## Development
 
@@ -336,6 +335,7 @@ cargo build
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
+cargo run --bin processkit-cli -- --help
 ```
 
 ## Safety boundaries

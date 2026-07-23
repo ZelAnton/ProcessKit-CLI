@@ -1,9 +1,8 @@
 //! Command-line surface for processkit-cli.
 //!
 //! This is the *CLI flags* half of the compatibility surface fixed by
-//! `AGENTS.md`; the shapes here are normative and mirror README's "Planned
-//! interface". Parsing and form validation are settled in this task; executing
-//! each subcommand lands in later tasks (see docs/ROADMAP.md).
+//! `AGENTS.md`; the shapes here are normative and mirror README's "Command
+//! interface".
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -50,8 +49,8 @@ pub enum Command {
 /// -- <program> <args...>`
 //
 // `run` consumes every field: `cwd`, `create_no_window`, `timeout`, `grace`,
-// `command`, `jsonl`, `run_id`, `argv_raw` (the JSONL schema, T-004), and now
-// `capture_dir` — bounded stdout/stderr capture to files (see `src/capture.rs`).
+// `command`, `jsonl`, `run_id`, `argv_raw`, and `capture_dir` — bounded
+// stdout/stderr capture to files (see `src/capture.rs`).
 #[derive(Debug, Args)]
 pub struct RunArgs {
     /// Identifier for this run; a value is generated when omitted.
@@ -185,15 +184,14 @@ pub struct PruneArgs {
 /// `probe --json [--require-schema-version <N>] [--require-exit-code-band <s>-<e>]
 /// [--require-surface <token>]...`
 ///
-/// The **preflight** surface of the fail-closed launcher contract
-/// It reports — and, when asked, *verifies* — this binary's
+/// The **preflight** reports — and, when asked, *verifies* — this binary's
 /// compatibility surface (the JSONL `schema_version`, the reserved exit-code band,
-/// and the CLI surface tokens) so a consumer can confirm a `CC_PROCESSKIT_RUN`
-/// candidate **before** launching any payload. It spawns nothing and touches no
-/// registry or container: it is a pure self-report, so running it has no side
-/// effects. The `--require-*` flags are the machine-checkable half — each one a
-/// consumer expectation; any that this binary cannot meet makes `probe` fail closed
-/// with [`crate::exit::PROBE_INCOMPATIBLE`] (110) instead of a false "ok".
+/// and the CLI surface tokens) so a consumer can confirm a candidate **before**
+/// launching any payload. It spawns nothing and touches no registry or container:
+/// it is a pure self-report, so running it has no side effects. The `--require-*`
+/// flags are the machine-checkable half — each one a consumer expectation; any that
+/// this binary cannot meet makes `probe` fail closed with
+/// [`crate::exit::PROBE_INCOMPATIBLE`] (110) instead of a false "ok".
 #[derive(Debug, Args)]
 pub struct ProbeArgs {
     /// Emit the report as JSON. Required to match the fixed form (JSON is the only
