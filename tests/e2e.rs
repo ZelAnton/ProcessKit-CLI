@@ -1097,8 +1097,15 @@ fn inherited_stdio_preserves_a_usable_posix_terminal() {
         .spawn()
         .expect("spawn the dedicated Unix pty host");
     let mut host = ChildGuard::new(host);
-    let status = wait_child_bounded(host.child_mut(), Duration::from_secs(30))
-        .expect("the pty-hosted runner exited");
+    let status = wait_child_bounded(host.child_mut(), Duration::from_secs(30)).unwrap_or_else(|| {
+        let report_state = std::fs::read_to_string(&report)
+            .map_or_else(|err| format!("unavailable: {err}"), |text| format!("{text:?}"));
+        let event_state = std::fs::read_to_string(&jsonl)
+            .map_or_else(|err| format!("unavailable: {err}"), |text| format!("{text:?}"));
+        panic!(
+            "the pty-hosted runner did not exit; child report={report_state}; JSONL={event_state}"
+        )
+    });
     assert_eq!(
         status.code(),
         Some(0),
