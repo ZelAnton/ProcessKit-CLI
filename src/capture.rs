@@ -129,7 +129,16 @@ impl StreamCapture {
     pub fn absorb(&mut self, bytes: &[u8]) {
         self.seen = self.seen.saturating_add(bytes.len() as u64);
         if !self.write_error && self.written < self.max_bytes {
-            let room = (self.max_bytes - self.written) as usize;
+            // Saturate rather than truncate the `u64 -> usize` cast: on a 32-bit
+            // target with a `--capture-max-bytes` ceiling above `usize::MAX`
+            // (the flag accepts any `u64`, e.g. `8g`), an `as usize` cast would
+            // wrap the remaining-room value modulo 2^32, making `room` (and thus
+            // `take`) hit zero far short of the real ceiling — bytes would then
+            // silently stop reaching disk without `truncated` or `write_error`
+            // being set, breaking the "an incomplete capture is always visible
+            // in the flags" invariant. On every 64-bit target in the release
+            // matrix today this is a no-op (the subtraction always fits).
+            let room = usize::try_from(self.max_bytes - self.written).unwrap_or(usize::MAX);
             let take = room.min(bytes.len());
             match self.file.write_all(&bytes[..take]) {
                 Ok(()) => {

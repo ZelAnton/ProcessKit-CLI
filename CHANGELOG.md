@@ -12,6 +12,28 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- **Unix: `SIGTERM` and `SIGHUP` now end a run through the full cancel teardown**
+  instead of killing the runner where it stands. The standard external stop — a plain
+  `kill <pid>`, a `systemctl stop`, a cancelled CI job, a supervisor's shutdown
+  timeout — and a hung-up controlling terminal join `Ctrl-C` in the same race, so they
+  get the same soft-stop → `--grace` → hard-kill teardown, the same terminal JSONL
+  events (`cancelled`, `cleanup_started`, `cleanup_finished`, `runner_exit`), the same
+  registry-entry removal, and the same reserved `CANCELLED` (107) exit. Previously
+  their default disposition terminated the runner outright: the events were never
+  written, the registry entry was left behind stale, and — the guarantee that matters —
+  the container was never explicitly killed, so on Linux only the direct child was
+  reaped (`PDEATHSIG`) and on macOS/BSD nothing was. Which signal arrived is reported
+  honestly rather than flattened onto a keyboard interrupt: the `cancelled` event's
+  `source` gained the additive values **`sigterm`** and **`sighup`** alongside `ctrl_c`
+  (`schema_version` unchanged — a new value of an existing string field), and the
+  stderr line names the signal. All three keep the one `CANCELLED` (107) code, the same
+  class of ending. A signal the environment deliberately neutralized before launching
+  the runner (`SIG_IGN`, as `nohup` does to `SIGHUP`) is left alone rather than
+  un-ignored — `nohup processkit-cli run …` keeps surviving a hangup, and nothing is
+  lost, because an ignored signal would not have stopped the runner either. Windows is
+  unchanged and still listens for `Ctrl-C` only; its
+  console-close/logoff/shutdown handler is a separate mechanism, not covered here. See
+  README.md, "Timeouts, cancel, and grace", and docs/schema.md / docs/exit-codes.md.
 - `run` gained `--idle-timeout <duration>`, a deadline on child **silence** for the
   stuck-worker case (a child that is alive but has long stopped producing output).
   The deadline is re-armed on every chunk of the child's output, so a child that
