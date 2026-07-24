@@ -76,8 +76,8 @@ jobs:
       # not an App), and a PAT would expire; an App token is short-lived, auto-revoked,
       # and needs no rotation. Configure repo variable `RELEASE_APP_ID` + secret
       # `RELEASE_APP_PRIVATE_KEY`; until then this step is skipped and the push falls
-      # back to the default `GITHUB_TOKEN` (fine while `main` is unprotected). See the
-      # release-token-bypass.md recipe.
+      # back to the default `GITHUB_TOKEN` (fine while `main` is unprotected). See
+      # docs/release-process.md's "GitHub App bypass" recipe.
       - name: Mint GitHub App token
         id: app-token
         if: ${{ vars.RELEASE_APP_ID != '' }}
