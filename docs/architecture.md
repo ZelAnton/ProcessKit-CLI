@@ -237,5 +237,10 @@ overview only sketches how they connect:
 - [`docs/exit-codes.md`](exit-codes.md) — the reserved runner-own exit-code
   band and the child-fidelity rule.
 - [`docs/schema.md`](schema.md) — the versioned JSONL lifecycle-event schema.
+- [`docs/threat-model.md`](threat-model.md) — untrusted inputs, the trusted
+  principal and boundary, and which security threats the mechanisms sketched
+  above (owner-only registry/transport, argv redaction, bounded control-plane
+  reads, fail-closed `probe`, bounded output capture, supply-chain scanning)
+  actually close.
 - [`docs/ROADMAP.md`](ROADMAP.md) — the delivery status and the remaining
   ProcessKit-rs dependencies (this document describes the implementation).
