@@ -23,6 +23,11 @@ to a dated version section.
   client) instead of an unbounded `read_line`, so a broken or hostile owner-local
   control client sending data with no `\n` can no longer make a live run's memory
   grow without limit.
+- `inspect`/`cancel`/`kill` now open the run registry read-only, like `list`/
+  `prune` already did, instead of the mutating open `run` uses: a simple query or
+  control command against a run no longer creates the registry directory or
+  re-asserts its owner-only permissions as a side effect when the directory does
+  not yet exist.
 
 ## [0.2.2] - 2026-07-24
 

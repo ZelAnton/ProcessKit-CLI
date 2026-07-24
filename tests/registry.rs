@@ -538,6 +538,39 @@ fn cancel_and_kill_report_no_such_run_with_the_control_code() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// `inspect`/`cancel`/`kill` are documented as read-only against the registry (like
+/// `list`/`prune`) and must never mutate registry state just to look at it: running
+/// any of them against a never-yet-created registry must leave the registry
+/// directory absent, not create it (and re-assert owner-only permissions on it) as a
+/// side effect of the lookup.
+#[test]
+fn control_clients_do_not_create_the_registry_directory() {
+    let dir = scratch("control-no-create");
+    let registry = registry_dir(&dir);
+    assert!(
+        !registry.exists(),
+        "the scratch registry directory starts absent"
+    );
+
+    let out = inspect(&registry, "ghost");
+    assert_eq!(out.status.code(), Some(103), "inspect fails as usual");
+    assert!(
+        !registry.exists(),
+        "a read-only `inspect` must not create the registry directory as a side effect"
+    );
+
+    for verb in ["cancel", "kill"] {
+        let out = control_client(&registry, verb, "ghost");
+        assert_eq!(out.status.code(), Some(103), "{verb} fails as usual");
+        assert!(
+            !registry.exists(),
+            "a read-only `{verb}` must not create the registry directory as a side effect"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Run `list [--json]` against `registry` and wait for it to finish.
 fn list(registry: &Path, json: bool) -> Output {
     let mut cmd = Command::new(bin());
