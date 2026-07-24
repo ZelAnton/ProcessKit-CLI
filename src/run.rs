@@ -476,7 +476,18 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             });
             let child_code = match exit_code_for(outcome) {
                 Ok(child_code) => child_code,
-                Err(error) => return Err(finish(&mut emitter, "internal", None, error)),
+                Err(error) => {
+                    // The outcome decoded, but it is not one `exit_code_for` can turn
+                    // into a child exit code (an untimed `Outcome::TimedOut`, or an
+                    // unrecognized `#[non_exhaustive]` variant). The container was
+                    // still spawned and may still hold live members, so this is a
+                    // decided ending like any other and must run the same teardown
+                    // tail as every other branch rather than returning through the
+                    // bare `finish` a setup-time failure uses. Same shared hard-kill
+                    // path as the sibling wait-failure arm above (T-157).
+                    emit_hard_teardown(&mut emitter, &group, &capture, &registration);
+                    return Err(finish(&mut emitter, "internal", None, error));
+                }
             };
             // Reap any descendant the exited child leaked behind, report the
             // capture, and drop the registry entry — the shared hard-teardown tail
@@ -1350,17 +1361,21 @@ mod tests {
     /// Forcing a real wait *failure* through the child's actual OS-level wait
     /// call is practically unreachable from a test (`RunningProcess::wait`'s own
     /// `Err` path is backend-internal plumbing, not something a spawned test
-    /// child can be made to trigger deterministically). So this proves the
-    /// thing that *is* reachable and is the actual fix: [`emit_hard_teardown`],
-    /// the exact shared tail the wait-failure branch now runs (see the
-    /// `Err(err)` arm of `Ending::Exited` in `run_async`), fires
+    /// child can be made to trigger deterministically) — and the same is true
+    /// of forcing `exit_code_for` into its own `Err` arm (an untimed
+    /// `Outcome::TimedOut` or an unrecognized `#[non_exhaustive]` variant is not
+    /// producible by this crate's real backend from the test arsenal either).
+    /// So this proves the thing that *is* reachable and is the actual fix:
+    /// [`emit_hard_teardown`], the exact shared tail both of those `Ending::Exited`
+    /// error arms now run (see the `Err(err)` arm on the wait itself, and the
+    /// `Err(error)` arm on `exit_code_for(outcome)`, in `run_async`), fires
     /// `cleanup_started` → the hard kill via `cleanup_finished` (with no
     /// soft-terminate tier) → `output_captured` → nothing else, in that order,
-    /// for *any* caller — natural exit, control-kill, and the wait-failure path
-    /// alike. A future edit that special-cases one of those callers back out of
-    /// this shared function (as the wait-failure path used to be) has nowhere
-    /// to silently diverge: it would have to stop calling this helper, which is
-    /// visible on review.
+    /// for *any* caller — natural exit, control-kill, and both decode-failure
+    /// paths alike. A future edit that special-cases one of those callers back
+    /// out of this shared function (as the wait-failure path used to be) has
+    /// nowhere to silently diverge: it would have to stop calling this helper,
+    /// which is visible on review.
     #[tokio::test]
     async fn hard_teardown_tail_emits_the_shared_sequence_in_order() {
         let group = ProcessGroup::new().expect("create a ProcessGroup");
