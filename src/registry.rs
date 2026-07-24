@@ -165,9 +165,10 @@ impl Registry {
     /// This is the *mutating* open used by [`Registry::register`]'s caller (`run`):
     /// it must create the directory (and re-assert its owner-only permissions on a
     /// pre-existing one) because a run is about to write a record into it. A caller
-    /// that only wants to *read* the registry — `list` — must use
-    /// [`Registry::open_read_only`] instead, so a read-only scan cannot itself
-    /// create registry state or touch its permissions.
+    /// that only wants to *read* the registry — `list`/`prune`, and the control
+    /// clients `inspect`/`cancel`/`kill` — must use [`Registry::open_read_only`]
+    /// instead, so a read-only scan cannot itself create registry state or touch
+    /// its permissions.
     pub fn open() -> io::Result<Self> {
         Self::open_in(resolve_dir()?)
     }
@@ -181,8 +182,9 @@ impl Registry {
     }
 
     /// Open the per-user registry **without** creating its directory or touching its
-    /// permissions — the read-only counterpart of [`Registry::open`], for a caller
-    /// (`list`) that must never mutate registry state just to look at it. The
+    /// permissions — the read-only counterpart of [`Registry::open`], for callers
+    /// (`list`/`prune`, and the control clients `inspect`/`cancel`/`kill`) that
+    /// must never mutate registry state just to look at it. The
     /// location is resolved exactly as [`Registry::open`] resolves it
     /// ([`REGISTRY_DIR_ENV`] if set, else the platform default); a directory that
     /// does not exist yet is not an error here either — [`Registry::entries`]

@@ -26,7 +26,7 @@ an event's wire shape fails the build.
   intentional schema change (an additive one, or a version-bumped breaking one) with:
 
   ```sh
-  UPDATE_SCHEMA_GOLDEN=1 cargo test --bin processkit-cli \
+  UPDATE_SCHEMA_GOLDEN=1 cargo test --lib \
       events::tests::golden_stream_matches_the_fixture
   ```
 

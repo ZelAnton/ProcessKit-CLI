@@ -19,7 +19,14 @@ to a dated version section.
   linking the existing normative documents rather than duplicating them.
 
 ### Changed
--
+- The crate is now a thin binary over an internal library target (`src/lib.rs`,
+  `processkit_cli`): every module moved into the library, and `src/main.rs` only
+  parses argv and dispatches into it. This is purely a build-structure change —
+  the CLI flags, subcommands, exit codes, and JSONL `schema_version` are
+  byte-for-byte unchanged. The library is **not** a stable public API (every
+  module is `#[doc(hidden)]` and exempt from semantic versioning); it exists only
+  so the crate's own test, fuzz, and benchmark tiers can reach the runner's
+  internals directly. The supported compatibility surface remains the binary's.
 
 ### Fixed
 - The control-plane wire protocol now reads its one request/response line under an
@@ -27,6 +34,18 @@ to a dated version section.
   client) instead of an unbounded `read_line`, so a broken or hostile owner-local
   control client sending data with no `\n` can no longer make a live run's memory
   grow without limit.
+- Both interactive terminal-handoff failure paths (a failed foreground-control
+  handoff, and the failed post-handoff process-group resume) now emit a
+  `container_failed` event — with a new `phase: "foreground"` — before the terminal
+  `runner_exit`, so the failure reason reaches the `--jsonl` stream instead of only
+  stderr and the "a `container_error` exit is always preceded by `container_failed`"
+  invariant holds on these paths too. `foreground` is an additive value in the v1
+  `container_failed.phase` enum (no `schema_version` bump).
+- `inspect`/`cancel`/`kill` now open the run registry read-only, like `list`/
+  `prune` already did, instead of the mutating open `run` uses: a simple query or
+  control command against a run no longer creates the registry directory or
+  re-asserts its owner-only permissions as a side effect when the directory does
+  not yet exist.
 
 ## [0.2.2] - 2026-07-24
 

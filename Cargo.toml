@@ -13,6 +13,27 @@ readme = "README.md"
 rust-version = "1.88"
 
 # ---------------------------------------------------------------------------
+# Library target
+#
+# The crate is a thin binary (`src/main.rs`) over an internal library
+# (`src/lib.rs`): every `src/*.rs` module lives in the library, and the binary
+# only parses argv and dispatches into it. The library exists so the crate's own
+# unit/property tests (`cargo test`, i.e. `--lib`) — and future fuzz (`cargo-fuzz`)
+# and benchmark (criterion) tiers, which each need a `[lib]` target — can reach the
+# runner's internals directly, not only through the shipped binary.
+#
+# The target name follows Cargo's implicit convention (the package name with `-`
+# normalized to `_`), so the binary imports it as `use processkit_cli::...`; it does
+# not collide with the `processkit-cli` binary target, which Cargo lets a library
+# and a binary share. This library is NOT a stable public API — every module is
+# `#[doc(hidden)]` and exempt from semver; the supported surface stays the binary's
+# CLI flags, exit codes, and JSONL `schema_version` (see `src/lib.rs`).
+# ---------------------------------------------------------------------------
+[lib]
+name = "processkit_cli"
+path = "src/lib.rs"
+
+# ---------------------------------------------------------------------------
 # Dependencies
 #
 # Convention (see CONTRIBUTING.md "Conventions"): this project fixes NO

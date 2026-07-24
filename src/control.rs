@@ -617,7 +617,7 @@ async fn resolve_live_endpoint(action: &str, run_id: &str) -> Result<String, Run
 /// Open the env/platform-resolved registry, mapping a failure to the same
 /// distinguishable [`exit::CONTROL`] shape every other unreachable-run result uses.
 fn open_registry(action: &str, run_id: &str) -> Result<registry::Registry, RunnerError> {
-    registry::Registry::open().map_err(|err| {
+    registry::Registry::open_read_only().map_err(|err| {
         unreachable_run(
             action,
             run_id,

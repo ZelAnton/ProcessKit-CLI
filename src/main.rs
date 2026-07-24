@@ -1,44 +1,22 @@
-//! processkit-cli — run one shell-free command inside ProcessKit's containment
-//! boundary and report its lifecycle.
+//! Thin binary entry point for `processkit-cli`.
 //!
-//! The `run` subcommand is implemented here (see [`run`]): it spawns the child
-//! into a ProcessKit container this process owns, echoes the child's output
-//! live, forwards its exit code faithfully, and writes the versioned JSONL
-//! lifecycle events (see [`events`] and `docs/schema.md`) to the `--jsonl` file.
-//! The control plane's clients live in [`control`]: `inspect` reaches a live `run`
-//! over the per-user registry and local transport and prints a machine-readable
-//! snapshot, and `cancel`/`kill` reach the same live runner over the same transport
-//! to end it — a graceful soft-stop → grace → hard-kill for `cancel`, an immediate
-//! hard kill for `kill` — each a distinguishable outcome in the JSONL stream and by
-//! exit code. [`list`] is the discovery counterpart: it scans the same registry and
-//! prints every entry, live or stale, for a caller that has lost (or never had) a
-//! `run_id`; [`prune`] is the cleanup counterpart, reaping the confirmed-stale
-//! leftovers of runners that died abruptly while never touching a live entry.
-//! The compatibility surface — CLI flags (see [`cli`]), the exit-code
-//! contract (see [`exit`] and `docs/exit-codes.md`), and the JSONL `schema_version`
-//! (see [`events`] and `docs/schema.md`) — is fixed.
-
-mod capture;
-mod cli;
-mod control;
-mod events;
-mod exit;
-mod hash;
-mod list;
-mod probe;
-mod prune;
-mod registry;
-mod run;
-#[cfg(windows)]
-mod win_security;
+//! All behavior lives in this crate's internal library (`processkit_cli`, see
+//! `src/lib.rs`); this file only parses argv with clap and dispatches each
+//! subcommand into that library. Keeping the binary thin lets the runner's
+//! internals be exercised directly by the crate's unit/property/fuzz/bench tiers
+//! through the library target, while the shipped binary — its CLI flags, exit
+//! codes, and JSONL `schema_version` — remains the only supported compatibility
+//! surface. The library is explicitly **not** a stable public Rust API; see the
+//! library crate's own docs (`src/lib.rs`) for that disclaimer and the module map.
 
 use std::process::ExitCode;
 
 use clap::Parser;
 use clap::error::ErrorKind;
 
-use cli::{Cli, Command};
-use exit::RunnerError;
+use processkit_cli::cli::{Cli, Command};
+use processkit_cli::exit::{self, RunnerError};
+use processkit_cli::{control, list, probe, prune, run};
 
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {

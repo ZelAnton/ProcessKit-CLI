@@ -272,10 +272,11 @@ mod tests {
     }
 
     // Property-based tier (T-167). Placed in this same `#[cfg(test)]` module
-    // rather than a new `tests/properties.rs`: this crate is bin-only (no
-    // `[lib]` target — see K-006), so an integration test under `tests/` cannot
-    // link against `sha256_hex`/`Sha256`/`to_hex` at all — only in-module tests
-    // run via `cargo test --bin processkit-cli` can reach them.
+    // rather than a new `tests/properties.rs`: these tests exercise the
+    // module-private `to_hex` (alongside the `sha2` reference cross-check), which
+    // an integration test under `tests/` — linking only against the crate's public
+    // surface — cannot reach; only an in-crate unit test can. They run under the
+    // library unit-test tier (a plain `cargo test`, i.e. `--lib`).
     mod proptests {
         use super::*;
         use proptest::prelude::*;

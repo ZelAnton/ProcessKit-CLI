@@ -143,10 +143,11 @@ pub enum Event {
     /// The program could not be started (not found / not executable / bad cwd):
     /// the child never ran. `code` is the runner-band exit code (`SPAWN`).
     SpawnFailed { code: u8, message: String },
-    /// Creating the container or joining the child to it failed. `phase` is
-    /// `create` (the group could not be created) or `attach` (the launch into the
-    /// group failed for a non-spawn reason). `code` is the runner-band exit code
-    /// (`BACKEND`).
+    /// Creating the container, joining the child to it, or handing the terminal to
+    /// an interactive child failed. `phase` is `create` (the group could not be
+    /// created), `attach` (the launch into the group failed for a non-spawn reason),
+    /// or `foreground` (the interactive terminal-foreground handoff failed after the
+    /// child had already spawned). `code` is the runner-band exit code (`BACKEND`).
     ContainerFailed {
         phase: &'static str,
         code: u8,
@@ -854,10 +855,11 @@ mod tests {
     }
 
     // Property-based tier (T-167). Placed in this same `#[cfg(test)]` module
-    // rather than a new `tests/properties.rs`: this crate is bin-only (no
-    // `[lib]` target — see K-006), so an integration test under `tests/` cannot
-    // reach the private `classify_hint`/`HINT_RULES` at all — only an in-module
-    // test run via `cargo test --bin processkit-cli` can.
+    // rather than a new `tests/properties.rs`: `classify_hint`/`HINT_RULES` are
+    // private to this module, so an integration test under `tests/` — which links
+    // only against the crate's public surface — cannot reach them; only an
+    // in-crate unit test can. These run under the library unit-test tier (a plain
+    // `cargo test`, i.e. `--lib`).
     //
     // The generator is deliberately *not* fully random bytes: `classify_hint` is
     // a documented, rule-driven substring matcher (`HINT_RULES`), so a

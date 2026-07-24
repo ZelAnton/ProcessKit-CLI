@@ -357,12 +357,24 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
         match TerminalForegroundGuard::acquire(args.inherit_stdio, group_mechanism, root_pid) {
             Ok(guard) => guard,
             Err(err) => {
+                // The interactive terminal-foreground handoff failed. The container
+                // was already created and the child already spawned (we hold
+                // `running`), so this is a `foreground`-phase container failure —
+                // reported to the JSONL stream before the shared teardown tail, not
+                // left only on stderr (see `finish_foreground_failure` for the
+                // phase-choice rationale).
                 let error = RunnerError::new(
                     exit::BACKEND,
                     format!("could not give the interactive child terminal control: {err}"),
                 );
-                emit_hard_teardown(&mut emitter, &group, &capture, &registration);
-                return Err(finish(&mut emitter, "container_error", None, error));
+                return Err(finish_foreground_failure(
+                    &mut emitter,
+                    &group,
+                    &capture,
+                    &registration,
+                    error,
+                    err.to_string(),
+                ));
             }
         };
     // The POSIX process-group backend must place the child in its own group for
@@ -372,12 +384,23 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     if terminal_foreground.is_active()
         && let Err(err) = group.resume()
     {
+        // The other half of the interactive terminal handoff — resuming the child
+        // that a stray SIGTTIN may have stopped in the tiny pre-handoff window —
+        // failed. Same `foreground`-phase container failure as the sibling acquire
+        // path above (the child is spawned but `run_started` is not yet written),
+        // reported to the stream before the teardown tail.
         let error = RunnerError::new(
             exit::BACKEND,
             format!("could not resume the interactive child process group: {err}"),
         );
-        emit_hard_teardown(&mut emitter, &group, &capture, &registration);
-        return Err(finish(&mut emitter, "container_error", None, error));
+        return Err(finish_foreground_failure(
+            &mut emitter,
+            &group,
+            &capture,
+            &registration,
+            error,
+            err.to_string(),
+        ));
     }
 
     let mechanism = events::mechanism_str(group_mechanism);
@@ -845,6 +868,50 @@ fn emit_hard_teardown(
     emit_cleanup_finished(emitter, group, None);
     emit_output_captured(emitter, capture);
     clear_registration(registration);
+}
+
+/// Report a failed interactive terminal-foreground handoff to the JSONL stream and
+/// end the run — the shared tail both terminal-handoff failure paths in
+/// [`run_async`] take (a failed [`TerminalForegroundGuard::acquire`], and the
+/// failed post-handoff [`ProcessGroup::resume`]).
+///
+/// **Why a new `phase`.** Both paths sit *after* the child has spawned (the
+/// container exists and may hold live members) but *before* the `run_started` event
+/// is written. Neither existing `phase` describes them: `create` is "the container
+/// could not be created" and `attach` is "the launch into it failed" — here both
+/// already succeeded, and it is the *interactive terminal handoff* that failed. So
+/// this emits `container_failed` with the additive `phase: "foreground"`, an
+/// additive value in the v1 schema's `phase` enum (no `schema_version` bump, per the
+/// schema's versioning policy: adding an enum value only widens what a reader may
+/// see, it does not change any existing shape). Emitting it here restores the stream
+/// invariant that a terminal `runner_exit` with `source: "container_error"` is
+/// always preceded by a describing `container_failed`, which these two paths
+/// previously broke by leaving the reason on stderr alone.
+///
+/// **Order.** `container_failed` first, then the shared [`emit_hard_teardown`] tail
+/// (the child was spawned, so the container must be torn down), then the terminal
+/// [`finish`] `runner_exit` — mirroring the pre-spawn `container_failed` paths
+/// ([`ProcessGroup::new`]/[`ProcessGroup::start`] failures), which likewise emit the
+/// event before ending. Routing both paths through this one site keeps them from
+/// drifting apart, exactly as [`emit_hard_teardown`] does for the hard-teardown
+/// callers. `message` carries the underlying error verbatim (the sibling
+/// `container_failed` paths use the same raw-error convention); the runner's own
+/// contextual framing rides on `error` to stderr.
+fn finish_foreground_failure(
+    emitter: &mut Emitter,
+    group: &ProcessGroup,
+    capture: &Option<Capture>,
+    registration: &Option<registry::Registration>,
+    error: RunnerError,
+    message: String,
+) -> RunnerError {
+    emitter.emit(&Event::ContainerFailed {
+        phase: "foreground",
+        code: error.code(),
+        message,
+    });
+    emit_hard_teardown(emitter, group, capture, registration);
+    finish(emitter, "container_error", None, error)
 }
 
 /// Open the per-user run registry so control-plane clients (`inspect`, T-008) can
@@ -1427,6 +1494,117 @@ mod tests {
             "the hard-teardown tail never soft-stops, so cleanup_finished's \
              soft_terminate must be null: {:?}",
             lines[1]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Both interactive terminal-handoff failure paths — a failed
+    /// `TerminalForegroundGuard::acquire` and the failed post-handoff
+    /// `group.resume()`, both in `run_async` — now route through
+    /// [`finish_foreground_failure`], which restores the stream invariant that a
+    /// terminal `runner_exit` with `source: "container_error"` is always preceded by
+    /// a describing `container_failed` (previously these two paths emitted only the
+    /// teardown pair and the terminal exit, leaving the reason on stderr alone).
+    ///
+    /// Driving `run_async` itself into those branches needs a real controlling
+    /// terminal plus a `tcsetpgrp`/`resume` that fails on demand — not reachable
+    /// deterministically from a test. So, like the sibling
+    /// `hard_teardown_tail_emits_the_shared_sequence_in_order`, this exercises the
+    /// exact shared site both paths take, with a real `ProcessGroup`/`Emitter`
+    /// (K-015, no mocks), and pins the emitted sequence and the ordering invariant.
+    #[tokio::test]
+    async fn foreground_failure_emits_container_failed_before_the_terminal_exit() {
+        let group = ProcessGroup::new().expect("create a ProcessGroup");
+        let command = if cfg!(windows) {
+            PkCommand::new("cmd").args(["/c", "exit", "0"])
+        } else {
+            PkCommand::new("true")
+        };
+        let running = group
+            .start(&command)
+            .await
+            .expect("start a trivial, fast-exiting child");
+        running.wait().await.expect("the trivial child exits");
+
+        let dir = std::env::temp_dir().join(format!(
+            "processkit-cli-run-unit-foreground-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the epoch")
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).expect("create the scratch dir");
+        let jsonl = dir.join("events.jsonl");
+        let mut emitter = Emitter::create(&jsonl).expect("create the events file");
+
+        // The `RunnerError` carries the runner's contextual framing (→ stderr); the
+        // separate `message` is the underlying error the `container_failed` records.
+        let error = RunnerError::new(
+            exit::BACKEND,
+            "could not give the interactive child terminal control: simulated".to_string(),
+        );
+        let returned = finish_foreground_failure(
+            &mut emitter,
+            &group,
+            &None,
+            &None,
+            error,
+            "simulated terminal-handoff failure".to_string(),
+        );
+        // Like `finish`, the error is returned unchanged (the reserved BACKEND code).
+        assert_eq!(returned.code(), exit::BACKEND);
+
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&jsonl)
+            .expect("read the events file back")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each line is one JSON object"))
+            .collect();
+        let kinds: Vec<&str> = lines
+            .iter()
+            .map(|value| value["event"].as_str().expect("every event has a tag"))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "container_failed",
+                "cleanup_started",
+                "cleanup_finished",
+                "runner_exit",
+            ],
+            "a terminal-handoff failure emits the describing container_failed first, \
+             then the hard-teardown pair, then the terminal runner_exit"
+        );
+
+        // The describing event carries the new `foreground` phase, the BACKEND code,
+        // and the raw underlying message.
+        assert_eq!(lines[0]["phase"], "foreground");
+        assert_eq!(lines[0]["code"], exit::BACKEND);
+        assert_eq!(lines[0]["message"], "simulated terminal-handoff failure");
+
+        // The invariant this task restores: the terminal `container_error`
+        // `runner_exit` is preceded by a `container_failed` — it is no longer the
+        // lone record of the failure.
+        let runner_exit = lines.last().expect("a terminal event");
+        assert_eq!(runner_exit["event"], "runner_exit");
+        assert_eq!(runner_exit["source"], "container_error");
+        assert_eq!(runner_exit["code"], i32::from(exit::BACKEND));
+        assert!(
+            runner_exit["child_code"].is_null(),
+            "a runner-own failure forwards no child code: {runner_exit}"
+        );
+        let container_failed_at = kinds
+            .iter()
+            .position(|k| *k == "container_failed")
+            .expect("container_failed present");
+        let runner_exit_at = kinds
+            .iter()
+            .position(|k| *k == "runner_exit")
+            .expect("runner_exit present");
+        assert!(
+            container_failed_at < runner_exit_at,
+            "container_failed must precede the terminal runner_exit: {kinds:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

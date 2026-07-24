@@ -11,14 +11,17 @@ sketched from the code as of this writing rather than from memory.
 
 ## Module map
 
-`processkit-cli` is a single bin crate (`src/main.rs`); every other file under
-`src/` is a `mod` of it. Responsibilities, in the order data flows through a
-`run`:
+`processkit-cli` is a thin binary (`src/main.rs`) over an internal library
+(`src/lib.rs`): every other `src/*.rs` file is a `mod` of the library, and the
+binary only parses argv and dispatches into it (see "Target structure: library
+and binary" below for why the split exists and what stays stable).
+Responsibilities, in the order data flows through a `run`:
 
 | Module | Responsibility |
 | --- | --- |
-| [`src/cli.rs`](../src/cli.rs) | The CLI-flags half of the compatibility surface: the clap-derived `Cli`/`Command` types for `run`, `inspect`, `cancel`, `kill`, and `probe`. Parsing and shape validation only — each subcommand's behavior lives in its own module. |
-| [`src/main.rs`](../src/main.rs) | Entry point. Parses `Cli`, dispatches to the subcommand module, and maps the result onto a process exit code: `run` owns its own exit path (it hard-exits with the child's code and never returns here); every other subcommand's `Result<(), RunnerError>` is mapped through `RunnerError::code()`, and a clap parse failure is mapped onto the runner's own `USAGE` code rather than clap's default. |
+| [`src/lib.rs`](../src/lib.rs) | The internal library crate root: declares every `src/*.rs` module and re-exports nothing publicly-supported. It carries the "not a stable public API" disclaimer and marks each module `#[doc(hidden)]`, so the library is only a foundation for the crate's own tooling — never a semver-stable Rust surface. |
+| [`src/main.rs`](../src/main.rs) | The thin binary entry point. Parses `Cli`, dispatches into the library's subcommand module, and maps the result onto a process exit code: `run` owns its own exit path (it hard-exits with the child's code and never returns here); every other subcommand's `Result<(), RunnerError>` is mapped through `RunnerError::code()`, and a clap parse failure is mapped onto the runner's own `USAGE` code rather than clap's default. |
+| [`src/cli.rs`](../src/cli.rs) | The CLI-flags half of the compatibility surface: the clap-derived `Cli`/`Command` types for `run`, `inspect`, `cancel`, `kill`, `list`, `prune`, and `probe`. Parsing and shape validation only — each subcommand's behavior lives in its own module. |
 | [`src/run.rs`](../src/run.rs) | The `run` subcommand itself: spawns the child into a `processkit::ProcessGroup` this module owns, selects either default pipe-and-echo I/O or direct inherited stdio, temporarily hands a POSIX terminal to a separate child process group when required, races the child's exit against `--timeout`/`Ctrl-C`/a control-plane command, and drives the shared teardown tiers — the graceful soft stop → grace → hard kill for `timeout`/`Ctrl-C`/`cancel`, and the immediate hard kill (no soft stop, no grace) for a control-plane `kill`. Exit-code fidelity — the child's exact code on a normal completion, a reserved-band code for every runner-imposed ending — is enforced here. |
 | [`src/events.rs`](../src/events.rs) | The versioned JSONL lifecycle-event schema and its emitter — this repository's normative, golden-tested public event contract (see [`docs/schema.md`](schema.md)). Also owns argv redaction: the default SHA-256 `argv_sha256` fingerprint and the `HINT_RULES` worker-shape classifier. |
 | [`src/capture.rs`](../src/capture.rs) | `--capture-dir` bounded per-stream stdout/stderr capture to files, riding the same tee `run` already echoes through (no second output-reading path). Records, per stream, a full byte counter, a SHA-256 of the bytes written, and independent explicit `truncated`/`write_error` flags, surfaced in the `output_captured` event. |
@@ -27,6 +30,40 @@ sketched from the code as of this writing rather than from memory.
 | [`src/control.rs`](../src/control.rs) | The live-run control plane: the per-run local IPC transport (unix domain socket / Windows named pipe, owner-restricted) stood up inside `run`, its line-oriented `inspect`/`cancel`/`kill` wire protocol, and the three clients that speak it (see [`docs/control-plane.md`](control-plane.md)). |
 | [`src/probe.rs`](../src/probe.rs) | The side-effect-free `probe` subcommand: reports (and, with `--require-*`, verifies) this binary's version/`schema_version`/exit-code band/CLI surface as one JSON line. |
 | [`src/exit.rs`](../src/exit.rs) | The reserved runner-own exit-code band (`100`–`119`) constants — the exit-code half of the compatibility surface (see [`docs/exit-codes.md`](exit-codes.md)). |
+
+## Target structure: library and binary
+
+The crate builds two targets from one source tree:
+
+- an **internal library** (`src/lib.rs`, Cargo target `processkit_cli`) that owns
+  every module under `src/`, and
+- a **thin binary** (`src/main.rs`, Cargo target `processkit-cli`) that does
+  nothing but parse argv with clap and dispatch each subcommand into the library.
+
+The library exists as a *foundation for the crate's own tooling*, not as a
+reusable dependency. Keeping the runner's internals in a `[lib]` target lets:
+
+- **unit and property tests** live in each module's `#[cfg(test)] mod tests` and
+  run as the library's `--lib` tier under a plain `cargo test`, reaching
+  module-private helpers directly — retiring the `cargo test --bin` workaround the
+  old bin-only layout required;
+- **future fuzz targets** (`cargo-fuzz`, planned as T-186) link the library and
+  drive internal primitives such as the argv-redaction `HINT_RULES` classifier
+  (`src/events.rs`), the hand-rolled SHA-256 hasher (`src/hash.rs`), and the CLI
+  duration grammar (`src/cli.rs`) — a `[lib]` target is a hard prerequisite
+  `cargo-fuzz` cannot work without;
+- **future benchmarks** (criterion, planned as T-187) reach those same internal
+  primitives to measure them in isolation.
+
+Because the crate is published to crates.io, the library surface is deliberately
+**not** a stable public Rust API: every module is `#[doc(hidden)]`, the crate-root
+rustdoc says so in as many words, and no item carries a semver guarantee. The only
+supported compatibility surface stays the *binary's* contract — the CLI flags
+(`src/cli.rs`), the reserved exit-code band (`src/exit.rs`,
+[`docs/exit-codes.md`](exit-codes.md)), and the JSONL `schema_version`
+(`src/events.rs`, [`docs/schema.md`](schema.md)) — exactly as before this split.
+This document records only the target structure; it does not implement the
+fuzz/bench tiers themselves (T-186/T-187), which build on it.
 
 ## Data flow of one `run`
 
@@ -158,10 +195,11 @@ Three tiers, increasing in weight and decreasing in how often they run:
 
 - **Unit.** Each `src/*.rs` module carries its own `#[cfg(test)] mod tests`
   (for example the SHA-256 vector tests in `src/hash.rs`, or the
-  `ProcessGroup`/`Emitter`-driven helper tests in `src/run.rs`) exercised by a
-  plain `cargo test --bin processkit-cli` (this crate is bin-only — there is
-  no `--lib` target). Internal helpers are tested against real
-  `processkit`/`Emitter` objects, never a mock layer.
+  `ProcessGroup`/`Emitter`-driven helper tests in `src/run.rs`). The modules now
+  live in the library (`src/lib.rs`), so these run as its `--lib` tier under a
+  plain `cargo test` — no `cargo test --bin processkit-cli` workaround, which the
+  earlier bin-only layout needed to reach module-private helpers. Internal helpers
+  are tested against real `processkit`/`Emitter` objects, never a mock layer.
 - **Integration.** `tests/` drives the *built binary*
   (`env!("CARGO_BIN_EXE_processkit-cli")`), not the library, because the value
   this crate adds over ProcessKit-rs's own suite is the binary plus its
