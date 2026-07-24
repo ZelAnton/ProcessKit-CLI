@@ -407,8 +407,8 @@ per-stream `write_error` flag was added this way within v1. Filling a
 field that was reserved-as-`null` is **not** a breaking change: the field already
 exists and its type is unchanged. The `argv_sha256` and
 `hint` fields were filled this way — they now carry values on every run instead of
-always `null`; the enriched member fields remain reserved and `null` until
-ProcessKit ships `members_info()`. Adding a new `hint` label to the classifier
+always `null`; the enriched member fields (see "Enriched member fields" above) were
+filled the same way once ProcessKit shipped `members_info()`. Adding a new `hint` label to the classifier
 catalog is likewise additive, but renaming or removing an existing `hint` label, or
 changing the fingerprint's canonical encoding, changes the meaning of a value and
 so is a breaking change.
