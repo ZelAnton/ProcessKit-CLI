@@ -9,12 +9,13 @@
 use libfuzzer_sys::fuzz_target;
 use processkit_cli::cli::{
     parse_cpu_quota, parse_duration, parse_env_kv, parse_exit_code_band, parse_max_processes,
-    parse_size,
+    parse_positive_duration, parse_size,
 };
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(text) = std::str::from_utf8(data) {
         let _ = parse_duration(text);
+        let _ = parse_positive_duration(text);
         let _ = parse_exit_code_band(text);
         let _ = parse_env_kv(text);
         let _ = parse_size(text);

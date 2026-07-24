@@ -324,7 +324,15 @@ grandchild — is reaped on every ending.
 
 Durations use a small grammar: a non-negative integer with an optional unit —
 `ms`, `s` (the default), `m`, or `h` (e.g. `30`, `500ms`, `5s`, `2m`, `1h`). A
-malformed value is a usage error (exit `100`), not a surprise at runtime.
+malformed value is a usage error (exit `100`), not a surprise at runtime. `0` is
+legal for `--grace` — it means "no pause" between the soft stop and the hard
+kill. It is **not** legal for `--timeout`/`--idle-timeout`: a `0` there would arm
+a deadline that is already elapsed on the very first poll, tearing the child down
+immediately after spawn — almost certainly an operator typo rather than an
+intentional immediate teardown — so both flags reject a total of `0` (in any
+unit) at parse time, the same "degenerate cap" treatment `--max-memory`,
+`--max-processes`, and `--cpu-quota` already give their own `0`. Omit either flag
+to leave that deadline unbounded instead.
 
 **Honest degradation on Windows.** The soft-stop tier is not yet implemented in the
 ProcessKit kernel on Windows (tracked in ProcessKit-rs's backlog). Until it lands,

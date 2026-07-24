@@ -78,6 +78,14 @@ to a dated version section.
   README.md, "Bounded output capture".
 
 ### Changed
+- `run --timeout 0` and `run --idle-timeout 0` are now rejected at parse time
+  (`USAGE`, exit `100`) instead of arming an already-elapsed deadline that tore
+  the child down immediately after spawn — almost certainly an operator typo,
+  never a useful deadline in its own right. This mirrors the existing
+  "degenerate cap" rejection `--max-memory 0`/`--max-processes 0`/`--cpu-quota
+  0` already receive. `--grace 0` is unaffected and stays legal ("no pause"
+  between the soft stop and the hard kill is a real, useful setting). See
+  README.md, "Timeouts, cancel, and grace".
 - The JSONL `members_snapshot` event and the control-plane `inspect` snapshot now
   populate the enriched per-member fields (`ppid`, executable `name`,
   `start_time`) from ProcessKit's `ProcessGroup::members_info()` (shipped in
