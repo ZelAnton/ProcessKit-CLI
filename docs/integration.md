@@ -237,9 +237,9 @@ processkit-cli prune --json   # reap only the confirmed-stale entries
   runner that died abruptly) is exactly what an operator or adapter wants
   visible here, not hidden.
 - **`prune --json`** deletes only entries it can *confirm* are stale, printing
-  a tally: `{"pruned":N,"live":N,"unprobed":N}`. A live run is never touched,
-  and an entry whose liveness could not even be probed is left in place rather
-  than guessed at — see "The reaping safety invariant" in
+  a tally: `{"pruned":N,"live":N,"unprobed":N,"orphaned_locks":N}`. A live run
+  is never touched, and an entry whose liveness could not even be probed is
+  left in place rather than guessed at — see "The reaping safety invariant" in
   [`docs/registry.md`](registry.md#the-reaping-safety-invariant).
 
 Both are read-only with respect to any *live* run's control transport; neither

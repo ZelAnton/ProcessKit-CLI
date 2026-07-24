@@ -272,11 +272,15 @@ unknown, not confirmed dead) is **left in place**, on every repeated run; and no
 entry is ever addressed by PID — a stale record is reaped through the path the scan
 already found, so PID reuse can never misdirect a deletion. A confirmed-stale entry
 is removed while its lock is still held, so a second concurrent prune cannot race on
-the same files. Without `--json` it prints a one-line summary (`no stale entries to
+the same files. A separate pass applies the same confirm-before-delete rule to
+**orphaned lock files** — a lone `.lock` with no `.json` sibling, which the pass
+above can never see — and reaps those too, tallied separately since it deletes one
+file, not a pair. Without `--json` it prints a one-line summary (`no stale entries to
 prune` when there was nothing to do); with `--json` it prints a single JSON object
-`{"pruned":N,"live":N,"unprobed":N}`. An empty or never-created registry is not an
-error — `prune` reports a zero tally and exits `0`, and pruning a missing registry
-does not create it. See [`docs/registry.md`](docs/registry.md), "Reaping — `prune`".
+`{"pruned":N,"live":N,"unprobed":N,"orphaned_locks":N}`. An empty or never-created
+registry is not an error — `prune` reports a zero tally and exits `0`, and pruning a
+missing registry does not create it. See [`docs/registry.md`](docs/registry.md),
+"Reaping — `prune`".
 
 ## Exit codes
 

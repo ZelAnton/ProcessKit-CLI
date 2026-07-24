@@ -11,8 +11,11 @@
 //! **only** an entry whose liveness probe *succeeded and returned stale*, never a live
 //! entry and never one whose probe merely failed (liveness unknown ⇒ left in place),
 //! and it never addresses an entry by PID — it reaps through the record path the scan
-//! produced. This module is only the thin CLI wrapper: it opens the registry, calls
-//! `prune`, and reports the tally.
+//! produced. It also reaps a second, rarer kind of leftover the same way: a lone
+//! `.lock` file whose `.json` never landed (or whose `.json` was removed but its
+//! `.lock` delete failed), tallied separately as `orphaned_locks` since it deletes
+//! one file, not a `.json`/`.lock` pair. This module is only the thin CLI wrapper: it
+//! opens the registry, calls `prune`, and reports the tally.
 //!
 //! Like `list`, `prune` opens the registry through
 //! [`registry::Registry::open_read_only`] — **not** the mutating [`registry::Registry::open`]
@@ -31,12 +34,19 @@ use crate::registry::{self, PruneOutcome};
 /// contract, the same decoupling `list` uses for its rows.
 #[derive(Debug, Serialize)]
 struct PruneReport {
-    /// Confirmed-stale entries whose files were reaped.
+    /// Confirmed-stale entries (`.json`/`.lock` pairs) whose files were reaped.
     pruned: usize,
-    /// Live entries left untouched.
+    /// Live entries left untouched — paired records and lone orphaned lock files
+    /// alike.
     live: usize,
-    /// Entries whose liveness could not be probed and were left in place.
+    /// Entries whose liveness could not be probed and were left in place — paired
+    /// records and lone orphaned lock files alike.
     unprobed: usize,
+    /// Confirmed-stale orphaned `.lock` files (no paired `.json`) that were reaped.
+    /// Kept as its own field rather than folded into `pruned`, since a pruned entry
+    /// deletes a `.json`/`.lock` pair while an orphaned-lock reap deletes only the
+    /// one `.lock` file — see [`registry::PruneOutcome::orphaned_locks`].
+    orphaned_locks: usize,
 }
 
 impl From<PruneOutcome> for PruneReport {
@@ -45,6 +55,7 @@ impl From<PruneOutcome> for PruneReport {
             pruned: outcome.pruned,
             live: outcome.live,
             unprobed: outcome.unprobed,
+            orphaned_locks: outcome.orphaned_locks,
         }
     }
 }
@@ -94,17 +105,21 @@ fn print_json(outcome: PruneOutcome) -> Result<(), RunnerError> {
     Ok(())
 }
 
-/// Print a concise, human-readable summary line: how many stale entries were reaped,
-/// and — when any were kept back — how many live and how many unprobeable ones were
-/// deliberately left alone.
+/// Print a concise, human-readable summary line: how many stale entries (and
+/// orphaned lock files) were reaped, and — when any were kept back — how many live
+/// and how many unprobeable ones were deliberately left alone.
 fn print_summary(outcome: PruneOutcome) {
-    if outcome.pruned == 0 && outcome.live == 0 && outcome.unprobed == 0 {
+    if outcome.pruned == 0
+        && outcome.live == 0
+        && outcome.unprobed == 0
+        && outcome.orphaned_locks == 0
+    {
         println!("no stale entries to prune");
         return;
     }
     println!(
-        "pruned {} stale, kept {} live, left {} unprobeable",
-        outcome.pruned, outcome.live, outcome.unprobed
+        "pruned {} stale ({} orphaned locks), kept {} live, left {} unprobeable",
+        outcome.pruned, outcome.orphaned_locks, outcome.live, outcome.unprobed
     );
 }
 
@@ -120,11 +135,13 @@ mod tests {
             pruned: 2,
             live: 1,
             unprobed: 3,
+            orphaned_locks: 4,
         });
         let json = serde_json::to_string(&report).expect("a prune report serializes");
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(value["pruned"], 2);
         assert_eq!(value["live"], 1);
         assert_eq!(value["unprobed"], 3);
+        assert_eq!(value["orphaned_locks"], 4);
     }
 }
