@@ -25,19 +25,35 @@ point of the project.
 ### Prebuilt binaries (recommended)
 
 Every release attaches a prebuilt archive per platform to its
-[GitHub Release](https://github.com/ZelAnton/ProcessKit-CLI/releases). Download
-the archive for your platform, extract the single `processkit-cli` binary
-(`processkit-cli.exe` on Windows), and put it on your `PATH`:
+[GitHub Release](https://github.com/ZelAnton/ProcessKit-CLI/releases), each with
+a `<archive>.sha256` checksum next to it. Download the archive for your platform,
+verify it against its published SHA-256 checksum, extract the single
+`processkit-cli` binary (`processkit-cli.exe` on Windows), and put it on your
+`PATH`:
 
 ```sh
 # Linux x86_64 (glibc), for the vX.Y.Z release:
-curl -sSL -o processkit-cli.tar.gz \
-  https://github.com/ZelAnton/ProcessKit-CLI/releases/download/vX.Y.Z/processkit-cli-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
-tar -xzf processkit-cli.tar.gz
+archive=processkit-cli-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
+base=https://github.com/ZelAnton/ProcessKit-CLI/releases/download/vX.Y.Z
+curl -sSL -O "$base/$archive"          # the archive
+curl -sSL -O "$base/$archive.sha256"   # its SHA-256 checksum
+sha256sum -c "$archive.sha256"         # macOS: shasum -a 256 -c "$archive.sha256"
+tar -xzf "$archive"
 ```
 
 Archives are named `processkit-cli-v<version>-<target-triple>.<ext>` — `.tar.gz`
-for Linux and macOS, `.zip` for Windows.
+for Linux and macOS, `.zip` for Windows — and each ships a matching
+`<archive>.sha256`.
+
+Every archive also carries a signed [build-provenance
+attestation](https://docs.github.com/actions/security-guides/using-artifact-attestations).
+For a stronger, cryptographic check that the archive was built by this
+repository's release workflow (not just that its bytes are intact), verify it
+with the [GitHub CLI](https://cli.github.com):
+
+```sh
+gh attestation verify "$archive" --repo ZelAnton/ProcessKit-CLI
+```
 
 ### From crates.io
 

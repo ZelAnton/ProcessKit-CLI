@@ -24,14 +24,20 @@ name: Release
 # GitHub Release, a downstream `build-artifacts` matrix fans out across the
 # supported platforms (Windows/Linux x x86_64/aarch64, macOS aarch64 (Apple
 # Silicon), plus a static musl Linux build), builds each `--release` binary
-# from the freshly-tagged commit, and attaches it to that SAME Release. It is
-# a strictly-downstream enhancement, NOT a second release path: it never
-# bumps, publishes to crates.io, tags, or creates a Release. Because it runs
-# AFTER the sole irreversible step (crates.io), a build failure on one target
-# strands nothing — `cargo install processkit-cli` and the Release still
-# work, and the missing asset can be built + `gh release upload`ed by hand
-# (or the job re-run; upload is `--clobber`-idempotent). This does not change
-# the release ordering above.
+# from the freshly-tagged commit, and attaches it to that SAME Release. Each
+# archive ships with a `<archive>.sha256` checksum next to it and a signed
+# build-provenance attestation (`actions/attest-build-provenance`) so a
+# download can be verified end to end. It is a strictly-downstream
+# enhancement, NOT a second release path: it never bumps, publishes to
+# crates.io, tags, or creates a Release. Because it runs AFTER the sole
+# irreversible step (crates.io), a build failure on one target strands
+# nothing — `cargo install processkit-cli` and the Release still work, and
+# the missing asset (archive + `.sha256` + attestation) can be built +
+# `gh release upload`ed by hand (or the job re-run; upload is
+# `--clobber`-idempotent, attestation is regenerated). The checksum and
+# attestation are computed per target, inside each already-non-critical
+# matrix leg, so they never become a blocking/critical path. This does not
+# change the release ordering above.
 
 on:
   workflow_dispatch:
@@ -448,7 +454,8 @@ jobs:
 
   # Build the prebuilt binaries and attach them to the Release the `release` job
   # just created. Strictly downstream (`needs: release`) so the tag + Release
-  # already exist; it only uploads assets — never bumps/publishes/tags/creates a
+  # already exist; it only uploads assets (archive + `.sha256` checksum) and
+  # records a provenance attestation — never bumps/publishes/tags/creates a
   # Release, so there is still exactly one release path. `fail-fast: false` means
   # one platform failing to build does not cancel the others or strand the
   # Release (the successful assets still upload; a missing one is a manual
@@ -457,6 +464,18 @@ jobs:
     needs: release
     name: artifact (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    # This job needs a broader permission set than the top-level default because
+    # a job-level `permissions:` block REPLACES (does not merge with) the inherited
+    # top-level `contents: write`, so it is re-declared here alongside the two
+    # tokens `actions/attest-build-provenance` requires. The `release` job is left
+    # untouched — it keeps only the top-level `contents: write` it already had.
+    #   contents: write     — `gh release upload` attaches the archive + checksum
+    #   id-token: write      — mint the OIDC token for Sigstore keyless signing
+    #   attestations: write  — record the provenance attestation via the API
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -531,7 +550,13 @@ jobs:
           # (bare `processkit-cli.exe`), not under a nested target/<triple>/ path.
           cp "target/${TARGET}/release/processkit-cli.exe" processkit-cli.exe
           7z a "${name}.zip" processkit-cli.exe
+          # Checksum the archive right after building it (the `shell: bash` on the
+          # windows runner is Git Bash, which bundles coreutils `sha256sum`). The
+          # file records the bare archive name, so `sha256sum -c <name>.zip.sha256`
+          # verifies against a download kept under its published name.
+          sha256sum "${name}.zip" > "${name}.zip.sha256"
           echo "ASSET=${name}.zip" >> "$GITHUB_ENV"
+          echo "CHECKSUM=${name}.zip.sha256" >> "$GITHUB_ENV"
 
       - name: Package archive (Unix)
         if: ${{ runner.os != 'Windows' }}
@@ -543,13 +568,39 @@ jobs:
           set -euo pipefail
           name="processkit-cli-v${VERSION}-${TARGET}"
           tar -czf "${name}.tar.gz" -C "target/${TARGET}/release" processkit-cli
+          # Checksum the archive right after building it. Linux runners have
+          # coreutils `sha256sum`; the macOS runner ships BSD tools without it, so
+          # fall back to `shasum -a 256` (identical `<hash>  <file>` output). The
+          # file records the bare archive name so `sha256sum -c <name>.tar.gz.sha256`
+          # verifies against a download kept under its published name.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          else
+            shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          fi
           echo "ASSET=${name}.tar.gz" >> "$GITHUB_ENV"
+          echo "CHECKSUM=${name}.tar.gz.sha256" >> "$GITHUB_ENV"
 
-      # Attach the archive to the Release the `release` job created. `--clobber`
-      # replaces rather than duplicates on a re-run, keeping upload idempotent.
+      # Attach the archive and its `.sha256` checksum to the Release the `release`
+      # job created. `--clobber` replaces rather than duplicates on a re-run,
+      # keeping the upload idempotent for both files.
       - name: Upload artifact to release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.release.outputs.tag }}
-        run: gh release upload "$TAG" "$ASSET" --clobber
+        run: gh release upload "$TAG" "$ASSET" "$CHECKSUM" --clobber
+
+      # Record a signed SLSA build-provenance attestation for the archive, so a
+      # downloader can `gh attestation verify <archive> --repo ZelAnton/ProcessKit-CLI`
+      # to prove it was built by THIS workflow from the tagged commit — the
+      # provenance half of the task, complementing the `.sha256` integrity check.
+      # Kept LAST in the leg, downstream of the upload: the archive + checksum are
+      # already on the Release before this runs, so an attestation hiccup blocks
+      # nothing that matters (fail-fast: false, and the whole job is already past
+      # the sole irreversible step). Re-running the job regenerates it. SHA-pinned
+      # like every other third-party action in this file.
+      - name: Attest build provenance for the archive
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: ${{ env.ASSET }}
