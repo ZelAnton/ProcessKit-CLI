@@ -48,18 +48,25 @@ Each entry names the threat, the mechanism that closes it, and the exact
 code/docs it is implemented and described in.
 
 - **A different OS user reading or connecting to the registry/transport.**
-  The per-user registry directory is created (and re-asserted on every
-  mutating open) with owner-only permissions: `0o700` plus a
-  matching-mode check on Unix, a protected owner-only DACL on Windows
-  (`src/registry.rs`, `Registry::open`, `platform::is_owner_only`). The
-  control-plane transport gets the matching per-platform restriction: Unix
-  socket file permissions inherited from the same owner-only directory, and a
-  Windows named pipe built with its own non-inheritable owner-only DACL. Both
-  platforms' DACL construction shares one FFI-glue module,
-  `src/win_security.rs` (`SecurityDescriptor`, `to_wide`), so a fix to the
-  unsafe conversion/lifetime code lands in both the registry directory's and
-  the pipe's ACL at once — the two access policies (inheritable vs.
-  non-inheritable SDDL) stay distinct, only the glue is shared.
+  The per-user registry directory's permissions are re-asserted on every
+  mutating open, not merely checked: `0o700` re-applied via `chmod` on Unix
+  (bypassing umask), a protected owner-only DACL replaced on Windows
+  (`src/registry.rs`, `Registry::open`/`open_in`,
+  `platform::create_owner_only_dir`, `platform::restrict_to_current_user`).
+  The control-plane transport is deliberately **not** derived from that
+  directory: each run atomically reserves its own short-lived `0o700`
+  directory under `/tmp` (falling back to the platform temp directory) and
+  binds the Unix socket inside it, with the socket file itself given `0o600`
+  on a best-effort basis afterward (`src/control.rs`,
+  `imp::ControlServer::bind`, `create_private_socket_dir`); the path is kept
+  independent of the registry directory specifically so a long registry path
+  cannot push the socket path past `sockaddr_un::sun_path` on macOS (see
+  [`docs/control-plane.md`](control-plane.md), "Local transport"). On
+  Windows, the control-plane's named pipe is built with its own
+  non-inheritable owner-only DACL, sharing only the FFI-glue module
+  `src/win_security.rs` (`SecurityDescriptor`, `to_wide`) with the registry
+  directory's DACL construction — that sharing is Windows-only; the Unix
+  socket has no DACL and no relationship to `src/win_security.rs`.
 - **The command line leaking into diagnostics.** `run_started`'s `command`
   field is redacted by default: the raw argv is not recorded, only a
   one-way SHA-256 fingerprint (`argv_sha256`) and a categorical worker-shape
@@ -98,10 +105,17 @@ code/docs it is implemented and described in.
   write on either the default echo path or the `--capture-dir` tee), closing
   the case of a child that neither exits nor produces bounded output
   (`src/capture.rs`).
-- **Supply-chain compromise of the build or release pipeline.** Every GitHub
-  Actions step in `.github/workflows/ci.yml` and `.github/workflows/release.yml`
-  is pinned to a full commit SHA (not a floating tag), so a compromised or
-  re-tagged action cannot silently change what CI or a release build runs.
+- **Supply-chain compromise of the build or release pipeline.** Every
+  third-party GitHub Actions step in `.github/workflows/ci.yml` and
+  `.github/workflows/release.yml` is pinned to a full commit SHA (not a
+  floating tag) **except** the toolchain selector,
+  `dtolnay/rust-toolchain@stable`/`@master`, which both workflows leave
+  intentionally unpinned (each occurrence carries an explicit
+  "intentionally unpinned" comment) so CI and releases keep tracking the
+  rolling `stable`/MSRV toolchain; that one exception means trust in
+  `dtolnay/rust-toolchain`'s owner is accepted, not eliminated (see "What is
+  not closed" below). Everywhere else, a compromised or re-tagged action
+  cannot silently change what CI or a release build runs.
   `cargo deny check advisories bans` runs on every pull request and push to
   `main` (`deny.toml`, `.github/workflows/ci.yml`), failing the build on a
   known RustSec advisory, a yanked crate, or a wildcard version requirement.
@@ -130,6 +144,12 @@ explicitly **out of scope** for this project's own security mechanisms:
   mechanism against it (no additional sandboxing, no cross-process
   capability restriction beyond the owner-only ACLs that already keep out
   *other* users).
+- **Trust in the `dtolnay/rust-toolchain` action owner.** Both workflows
+  deliberately leave that one action unpinned (a floating `@stable`/`@master`
+  tag rather than a commit SHA) so CI and releases keep tracking the rolling
+  stable/MSRV toolchain; a compromise of that action's owner or repository
+  could change what CI or a release build runs, and the project accepts that
+  residual risk rather than freezing the toolchain version.
 - **Denial of service through the operating system itself.** Beyond the
   opt-in, best-effort `--max-memory`/`--max-processes`/`--cpu-quota` caps on
   the child's own process tree (platform-limited: real Windows Job Object or
