@@ -273,6 +273,11 @@ exits `0`.
   the child its faithfully forwarded exit code (`AGENTS.md`, "Exit-code fidelity").
 - **Remove.** On a clean exit the entry is removed from the **same teardown site as
   the container reap** in `src/run.rs`, on **every decided ending** — a normal child
-  exit, a `--timeout`, or a `Ctrl-C` cancel — not just the happy path.
+  exit, a `--timeout`, a local stop-signal cancel (`Ctrl-C`, or on Unix a
+  `SIGTERM`/`SIGHUP`, all of which the runner catches), or a control-plane
+  `cancel`/`kill` — not just the happy path.
 - **Leak → stale.** An abrupt death skips that removal by definition, leaving the
   record on disk. The released lock makes it detectably stale, per the section above.
+  This is genuinely abrupt death only — a crash, a `SIGKILL`, an outer Job Object
+  terminate — not an ordinary Unix `SIGTERM`/`SIGHUP`, which the runner catches and
+  turns into the clean removal above.
