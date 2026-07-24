@@ -1157,7 +1157,7 @@ fn inherited_stdio_preserves_a_usable_posix_terminal() {
     assert_eq!(runner_exit["child_code"], 0);
 }
 
-/// The project's raison d'être, cross-platform and deterministic: a leaked,
+/// The project's reason for existing, cross-platform and deterministic: a leaked,
 /// long-lived worker of the **MSBuild node-reuse shape** does not survive `run`. The
 /// runner's program argv carries the reusable-node markers (`MSBuild.dll`,
 /// `/nodemode:1`, `/nodeReuse:true`), so the binary must also classify the run with

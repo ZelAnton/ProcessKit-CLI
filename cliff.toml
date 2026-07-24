@@ -40,7 +40,7 @@ filter_unconventional = false
 sort_commits = "oldest"
 
 commit_parsers = [
-	{ message = "^[Rr]elease v?\\d", skip = true },
+	{ message = "^(Release|release) v?\\d", skip = true },
 	{ message = "^[Mm]erge ", skip = true },
 	{ message = "(?i)^(doc|docs|chore|test|tests|style)\\b", skip = true },
 	{ message = "(?i)^(feat|add)\\b", group = "Added" },

@@ -114,7 +114,7 @@
 //! buffer an unbounded amount of memory just to find one out. Exceeding the ceiling
 //! is a protocol violation, not silent truncation: the server answers with the same
 //! structured-error closing path an unrecognized verb gets, and the client surfaces
-//! the same `io::Error` shape an unparseable reply already does.
+//! the same `io::Error` shape an unparsable reply already does.
 
 use std::convert::Infallible;
 use std::io;
@@ -797,7 +797,7 @@ async fn connect_live(
 /// parameterizes. A closed connection before a complete line (runner died
 /// mid-conversation), a reply over [`MAX_LINE_BYTES`] with no terminating `\n`
 /// (bounded by [`read_bounded_line`], the same ceiling [`serve_one`] reads its
-/// request under), or an unparseable line all surface as the same `io::Error` shape
+/// request under), or an unparsable line all surface as the same `io::Error` shape
 /// the caller maps to [`exit::CONTROL`].
 ///
 /// A reply that fails to parse as `T` is not necessarily garbage: `serve_one` answers
@@ -1506,7 +1506,7 @@ mod tests {
     /// (T-173) `converse`'s reply read is bounded by the same [`MAX_LINE_BYTES`]
     /// ceiling: a reply over the cap with no terminating `\n` (a wedged or
     /// misbehaving runner) surfaces as the same `InvalidData` `io::Error` shape an
-    /// unparseable reply already does, never an unbounded read on the client side.
+    /// unparsable reply already does, never an unbounded read on the client side.
     #[tokio::test]
     async fn converse_rejects_an_oversized_response_line_without_unbounded_buffering() {
         let (client_stream, mut server_stream) = tokio::io::duplex(MAX_LINE_BYTES + 4096);
@@ -1523,7 +1523,7 @@ mod tests {
         assert_eq!(
             err.kind(),
             io::ErrorKind::InvalidData,
-            "matches the existing unparseable-reply error kind: {err}"
+            "matches the existing unparsable-reply error kind: {err}"
         );
     }
 
@@ -1552,7 +1552,7 @@ mod tests {
         assert_eq!(
             err.kind(),
             io::ErrorKind::InvalidData,
-            "matches the existing unparseable-reply error kind: {err}"
+            "matches the existing unparsable-reply error kind: {err}"
         );
         let message = err.to_string();
         assert!(
@@ -1598,7 +1598,7 @@ mod tests {
         assert_eq!(
             err.kind(),
             io::ErrorKind::InvalidData,
-            "matches the existing unparseable-reply error kind: {err}"
+            "matches the existing unparsable-reply error kind: {err}"
         );
         let message = err.to_string();
         assert!(

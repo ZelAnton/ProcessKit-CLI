@@ -42,6 +42,38 @@ cargo fmt --check
 cargo deny check advisories bans
 ```
 
+## Documentation quality
+
+CI gates two checks over the tracked documentation set (`README.md`,
+`CONTRIBUTING.md`, `SECURITY.md`, `CHANGELOG.md`, `docs/**/*.md`): a spelling
+check ([`typos`]) and a link check ([`lychee`]) for internal relative paths
+and section anchors. A separate, non-gating job additionally checks external
+`http(s)` URLs in the same docs — a real network request in CI can flake for
+reasons unrelated to this repo, so it never blocks a merge.
+
+Run the same checks locally before opening a pull request:
+
+```sh
+typos .
+lychee --offline --config .lychee.toml README.md CONTRIBUTING.md SECURITY.md CHANGELOG.md 'docs/**/*.md'
+```
+
+Install both once:
+
+```sh
+cargo install typos-cli --locked
+cargo install lychee --locked
+```
+
+A spelling finding is either a genuine typo (fix the text) or, rarely, a real
+domain term (a flag name, event name, crate name) that needs an exclusion —
+add it to [`typos.toml`](typos.toml)'s `[default.extend-words]` table, but
+only after confirming it is not actually a misspelling. Link-checker
+configuration lives in [`.lychee.toml`](.lychee.toml).
+
+[`typos`]: https://github.com/crate-ci/typos
+[`lychee`]: https://github.com/lycheeverse/lychee
+
 ## End-to-end tests
 
 Beyond the unit and through-the-binary integration tests, a heavier
@@ -250,5 +282,5 @@ crate, not the implementer. Pure internal refactors are exempt.
 ## Contributions and direct publishing
 
 Keep changes focused and ensure CI (fmt, clippy, build/test on Linux, Windows,
-macOS, cargo-deny, and MSRV) passes after each pull request or direct
-publication to `main`.
+macOS, cargo-deny, MSRV, typos, and the internal-docs link check) passes after
+each pull request or direct publication to `main`.

@@ -252,6 +252,71 @@ jobs:
         with:
           command: check advisories bans
 
+  typos:
+    name: typos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Spell-checks the tracked tree (source, docs, config — `typos` respects
+      # `.gitignore`, so this pipeline's own gitignored `.work/` scratch tree
+      # is never in scope). Picks up the root `typos.toml` automatically; see
+      # CONTRIBUTING.md's "Documentation quality" section for the local
+      # equivalent (`typos .`). Gating: every finding to date has been a
+      # genuine misspelling fixed in the source, not a domain term needing an
+      # exclusion (see `typos.toml`'s own comments).
+      - uses: crate-ci/typos@bee27e3a4fd1ea2111cf90ab89cd076c870fce14 # v1.48.0
+
+  docs-links:
+    name: docs links (internal)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Gating: checks internal relative paths and section anchors across the
+      # tracked documentation set only (README.md, CONTRIBUTING.md,
+      # SECURITY.md, CHANGELOG.md, docs/**/*.md — not `.work/**`, this
+      # pipeline's own gitignored scratch tree). `--offline` blocks every
+      # network request, so http(s) links are skipped (reported as
+      # "Excluded", never as a failure) rather than attempted here — see the
+      # non-gating `docs-links-external` job below for those.
+      # `include_fragments` (anchor checking) comes from `.lychee.toml`.
+      - name: Check internal links and section anchors
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: >-
+            --offline --no-progress --verbose --config .lychee.toml
+            README.md CONTRIBUTING.md SECURITY.md CHANGELOG.md 'docs/**/*.md'
+          format: markdown
+          fail: true
+
+  docs-links-external:
+    name: docs links (external)
+    runs-on: ubuntu-latest
+    # Non-gating: external http(s) URLs go over a real network connection in
+    # CI, which can flake (rate limiting, a transient DNS/TLS hiccup, a
+    # momentarily-down third-party site) for reasons unrelated to this repo —
+    # same informational, continue-on-error pattern as the `coverage`/`perf`
+    # jobs above (see K-029). Internal links/anchors are already gated by the
+    # `docs-links` job above; this job additionally covers the network-only
+    # half over the same scope.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Cache lychee's own request cache (`.lycheecache`) across runs to ease
+      # up on external hosts and speed up repeat checks of unchanged URLs.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .lycheecache
+          key: lychee-external-cache-${{ github.run_id }}
+          restore-keys: lychee-external-cache-
+      - name: Check all links, including external
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: >-
+            --no-progress --verbose --cache --max-cache-age 1d --config .lychee.toml
+            README.md CONTRIBUTING.md SECURITY.md CHANGELOG.md 'docs/**/*.md'
+          format: markdown
+          fail: false
+
   msrv:
     name: msrv (1.88)
     runs-on: ubuntu-latest

@@ -1,0 +1,14 @@
+# typos configuration — used by the CI `typos` job (see
+# .github/workflows/ci.yml) and the local `typos .` command documented in
+# CONTRIBUTING.md. `typos` already respects `.gitignore` (via the `ignore`
+# crate it's built on), so generated/vendored paths (`target/`, `Cargo.lock`
+# checksums, `fuzz/corpus`/`fuzz/artifacts`, this pipeline's own gitignored
+# `.work/` scratch tree) need no explicit exclusion here.
+#
+# No domain-term exclusion exists today: every baseline finding when this
+# file was introduced (T-203) was a genuine misspelling, fixed in the source
+# instead of excluded. Before adding an entry below for a future finding,
+# confirm it is actually a domain term (a flag name, event name, crate name,
+# etc.) and not a real typo — see CONTRIBUTING.md's "Documentation quality"
+# section.
+[default.extend-words]

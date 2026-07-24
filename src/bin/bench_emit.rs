@@ -65,7 +65,7 @@ fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         .map(String::as_str)
 }
 
-/// A `u64` flag, or `default` when absent or unparseable.
+/// A `u64` flag, or `default` when absent or unparsable.
 fn u64_flag(args: &[String], name: &str, default: u64) -> u64 {
     flag_value(args, name)
         .and_then(|value| value.parse().ok())

@@ -1,0 +1,19 @@
+# lychee link-checker configuration — shared by both `.github/workflows/ci.yml`
+# jobs (`docs-links`, gating internal check; `docs-links-external`, non-gating
+# full check including the network) and the local `lychee` command documented
+# in CONTRIBUTING.md's "Documentation quality" section.
+
+# Check anchor fragments (`#section-name`) as well as plain paths — a renamed
+# or removed section heading must be caught, not just a moved/renamed file.
+include_fragments = "anchor-only"
+
+# Not this project's documentation: this pipeline's own gitignored scratch
+# tree, and anything vendored/generated. A checked-out tree never actually
+# contains `.work/` (gitignored, never committed), so this is belt-and-braces
+# — it keeps a local run from a directory that happens to have these around
+# from behaving differently than CI.
+exclude_path = [
+    "^\\.work/",
+    "^target/",
+    "^fuzz/(corpus|artifacts|target)/",
+]
