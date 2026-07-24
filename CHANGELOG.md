@@ -23,6 +23,13 @@ to a dated version section.
   client) instead of an unbounded `read_line`, so a broken or hostile owner-local
   control client sending data with no `\n` can no longer make a live run's memory
   grow without limit.
+- Both interactive terminal-handoff failure paths (a failed foreground-control
+  handoff, and the failed post-handoff process-group resume) now emit a
+  `container_failed` event — with a new `phase: "foreground"` — before the terminal
+  `runner_exit`, so the failure reason reaches the `--jsonl` stream instead of only
+  stderr and the "a `container_error` exit is always preceded by `container_failed`"
+  invariant holds on these paths too. `foreground` is an additive value in the v1
+  `container_failed.phase` enum (no `schema_version` bump).
 
 ## [0.2.2] - 2026-07-24
 

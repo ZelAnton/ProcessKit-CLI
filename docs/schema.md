@@ -217,11 +217,12 @@ child never ran.
 
 ### `container_failed`
 
-Creating the container, or joining the child to it, failed.
+Creating the container, joining the child to it, or handing the terminal to an
+interactive child failed.
 
 | Field     | Type    | Notes                                                                 |
 |-----------|---------|-----------------------------------------------------------------------|
-| `phase`   | string  | `create` (the container could not be created) or `attach` (the launch into it failed). |
+| `phase`   | string  | `create` (the container could not be created), `attach` (the launch into it failed), or `foreground` (handing the terminal to an interactive child failed after it had already spawned). |
 | `code`    | integer | The runner-band exit code (`BACKEND`, 102).                           |
 | `message` | string  | Human-readable failure reason.                                        |
 
@@ -305,9 +306,14 @@ When `--capture-dir` is set, an `output_captured` event is inserted after
 the child (natural exit, timeout, cancel, and kill alike). Without `--capture-dir` it
 is absent.
 
-A failure before the child runs emits its error event (`container_failed` or
-`spawn_failed`) and then `runner_exit`, with no `run_started` (and no
-`output_captured` — the child never produced output).
+A failure before the child is spawned emits its error event (`container_failed`
+with `phase` `create` or `attach`, or `spawn_failed`) and then `runner_exit`, with
+no `run_started` (and no `output_captured` — the child never produced output). A
+`container_failed` with `phase` `foreground` comes later: the child had already
+spawned, so `cleanup_started`/`cleanup_finished` tear the container down before the
+terminal `runner_exit`. `run_started` is still never written (the handoff fails
+first), and the interactive mode this path only occurs in cannot set
+`--capture-dir`, so there is still no `output_captured`.
 
 ## Command redaction
 

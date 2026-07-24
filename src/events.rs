@@ -143,10 +143,11 @@ pub enum Event {
     /// The program could not be started (not found / not executable / bad cwd):
     /// the child never ran. `code` is the runner-band exit code (`SPAWN`).
     SpawnFailed { code: u8, message: String },
-    /// Creating the container or joining the child to it failed. `phase` is
-    /// `create` (the group could not be created) or `attach` (the launch into the
-    /// group failed for a non-spawn reason). `code` is the runner-band exit code
-    /// (`BACKEND`).
+    /// Creating the container, joining the child to it, or handing the terminal to
+    /// an interactive child failed. `phase` is `create` (the group could not be
+    /// created), `attach` (the launch into the group failed for a non-spawn reason),
+    /// or `foreground` (the interactive terminal-foreground handoff failed after the
+    /// child had already spawned). `code` is the runner-band exit code (`BACKEND`).
     ContainerFailed {
         phase: &'static str,
         code: u8,
