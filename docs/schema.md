@@ -214,17 +214,42 @@ path. `source` names the trigger, and the terminal `runner_exit` carries the mat
 reserved code:
 
 - `ctrl_c` — a local interactive `Ctrl-C`; terminal code `CANCELLED` (107).
+- `sigterm` — **Unix only**: the runner received `SIGTERM`, the standard external stop
+  (`kill <pid>`, `systemctl stop`, a cancelled CI job, a supervisor's shutdown
+  timeout); terminal code `CANCELLED` (107).
+- `sighup` — **Unix only**: the runner received `SIGHUP` — its controlling terminal
+  went away (a closed terminal, a dropped SSH session); terminal code `CANCELLED`
+  (107).
 - `control_cancel` — a `cancel` command that reached the live runner over its control
   plane (see [`docs/control-plane.md`](control-plane.md)); terminal code
   `CONTROL_CANCELLED` (108).
 
-Both share this event because they share the teardown; only the `source` and the
-terminal code tell them apart.
+They all share this event because they share the teardown; the `source` and the
+terminal code tell them apart. The three local signals deliberately share the one
+`CANCELLED` code — they are the same class of ending (a local signal stopped the run) —
+so a consumer that needs to know *which* signal arrived reads this `source`, one event
+before the terminal `runner_exit`. The Unix signal values are **additive**: a run that
+is never signalled emits exactly the stream it did before, and a consumer that only
+knows `ctrl_c`/`control_cancel` still sees a well-formed `cancelled` event with the
+same fields.
 
-| Field      | Type              | Notes                                            |
-|------------|-------------------|--------------------------------------------------|
-| `source`   | string            | `ctrl_c` or `control_cancel`.                    |
-| `grace_ms` | integer, nullable | The `--grace` window, ms; `null` if unset.       |
+Catching `SIGTERM`/`SIGHUP` is what makes this teardown happen at all on those paths:
+their default disposition terminates the runner outright, which would skip the
+`cancelled` / `cleanup_started` / `cleanup_finished` / `runner_exit` events, leave the
+run's registry entry behind, and — the guarantee that matters — never explicitly kill
+the container, whose abrupt-owner-death reap covers only the direct child on Linux and
+nothing on macOS/BSD (see `cleanup_finished` and `docs/registry.md`). One exception,
+deliberate: a signal whose disposition is already `SIG_IGN` when the runner starts
+(what `nohup` does to `SIGHUP`) is left ignored rather than un-ignored behind the
+operator's back, so no `cancelled` event is produced for it — and none is owed, since
+an ignored signal would not have ended the run either. Windows keeps the
+`Ctrl-C` listener only; its console-close/logoff/shutdown half is a separate mechanism
+and is not covered by this event yet.
+
+| Field      | Type              | Notes                                                        |
+|------------|-------------------|--------------------------------------------------------------|
+| `source`   | string            | `ctrl_c`, `sigterm` (Unix), `sighup` (Unix), or `control_cancel`. |
+| `grace_ms` | integer, nullable | The `--grace` window, ms; `null` if unset.                   |
 
 ### `killed`
 
@@ -332,9 +357,9 @@ A normal run emits, in order: `run_started`, `members_snapshot`, then either
   `cleanup_started`, `cleanup_finished`, `runner_exit`.
 
 The reason event names *which* ending it was: `timeout` (with `reason` `overall` or
-`idle`) for a `--timeout` or a `--idle-timeout`, `cancelled` (with `source` `ctrl_c`
-or `control_cancel`) for a Ctrl-C or a control-plane cancel, and `killed` (`source`
-`control_kill`) for a control-plane kill.
+`idle`) for a `--timeout` or a `--idle-timeout`, `cancelled` (with `source` `ctrl_c`,
+`sigterm`, `sighup`, or `control_cancel`) for a local stop signal or a control-plane
+cancel, and `killed` (`source` `control_kill`) for a control-plane kill.
 
 When `--capture-dir` is set, an `output_captured` event is inserted after
 `cleanup_finished` and before the terminal `runner_exit`, on every ending that ran
@@ -444,7 +469,13 @@ type, and meaning intact — is additive in the same way: a consumer that reads 
 fields it knows is unaffected and simply ignores the new one. The `output_captured`
 per-stream `write_error` flag was added this way within v1, as was the `timeout`
 event's `reason` field (when `--idle-timeout` joined `--timeout` on that event).
-Filling a
+Adding a **new value** to an open-ended
+descriptive string field — a new `cancelled` `source`, for instance, as `sigterm` and
+`sighup` were added within v1 when the runner started catching those signals — is
+additive too: no existing value changes meaning, every other field keeps its name,
+type, and meaning, and a consumer that switches on the values it knows sees a
+well-formed event it can still route by event type (treat an unknown `source` as "some
+other trigger", not as a parse error). Filling a
 field that was reserved-as-`null` is **not** a breaking change: the field already
 exists and its type is unchanged. The `argv_sha256` and
 `hint` fields were filled this way — they now carry values on every run instead of
