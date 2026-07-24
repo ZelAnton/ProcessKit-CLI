@@ -171,6 +171,38 @@ impl ControlCommand {
     }
 }
 
+/// Which verb a request line names — the exact classification [`serve_one`]
+/// applies to the one line it reads before deciding what to write back. `None`
+/// covers everything else (an unrecognized verb gets the structured error
+/// response, see [`serve_one`]). Pure — matches on the trimmed text only, no
+/// I/O — so it can be driven directly with arbitrary bytes without a live
+/// transport, which is what lets it double as half of the control-plane wire
+/// fuzz target (`fuzz/fuzz_targets/control_wire.rs`, T-186; the other half is
+/// the client-side JSON decode of [`Snapshot`]/[`ControlAck`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum RequestVerb {
+    /// The read-only request. Named explicitly or by an empty line.
+    Inspect,
+    /// The mutating soft-stop → grace → hard-kill request.
+    Cancel,
+    /// The mutating immediate hard-kill request.
+    Kill,
+}
+
+/// Classify a request line's trimmed text into the [`RequestVerb`] it names, or
+/// `None` for anything unrecognized. See [`RequestVerb`] for why this is a
+/// standalone pure function.
+#[doc(hidden)]
+pub fn classify_request(line: &str) -> Option<RequestVerb> {
+    match line.trim() {
+        INSPECT_REQUEST | "" => Some(RequestVerb::Inspect),
+        CANCEL_REQUEST => Some(RequestVerb::Cancel),
+        KILL_REQUEST => Some(RequestVerb::Kill),
+        _ => None,
+    }
+}
+
 /// The channel the control server pushes a mutating command into, handed to the
 /// run's main loop. An **unbounded** sender so the server's send is synchronous and
 /// cannot yield or block between writing its ack and signaling teardown: the ack is
@@ -410,11 +442,11 @@ where
     let mut reader = BufReader::new(read_half);
     let mut request = String::new();
     match read_bounded_line(&mut reader, &mut request).await {
-        Ok(_) => match request.trim() {
-            INSPECT_REQUEST | "" => {
+        Ok(_) => match classify_request(&request) {
+            Some(RequestVerb::Inspect) => {
                 write_response(&mut write_half, &serialize_snapshot(&source.snapshot())).await?;
             }
-            CANCEL_REQUEST => {
+            Some(RequestVerb::Cancel) => {
                 write_response(&mut write_half, &serialize_ack(&source.ack(CANCEL_REQUEST)))
                     .await?;
                 // Ack delivered — now ask the run's main loop to tear down. The send is
@@ -422,12 +454,13 @@ where
                 // the run is already ending.
                 let _ = commands.send(ControlCommand::Cancel);
             }
-            KILL_REQUEST => {
+            Some(RequestVerb::Kill) => {
                 write_response(&mut write_half, &serialize_ack(&source.ack(KILL_REQUEST))).await?;
                 let _ = commands.send(ControlCommand::Kill);
             }
-            other => {
-                let error = serialize_error(&format!("unknown control request `{other}`"));
+            None => {
+                let error =
+                    serialize_error(&format!("unknown control request `{}`", request.trim()));
                 write_response(&mut write_half, &error).await?;
             }
         },

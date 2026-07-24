@@ -1,0 +1,2 @@
+inspect
+{"snapshot_version":1,"run_id":"abc","mechanism":"job_object","root_pid":1234,"started_at":"2026-07-24T10:37:36.000Z","members":[{"pid":1234,"ppid":null,"name":null,"start_time":null}]}

@@ -376,30 +376,9 @@ impl Registry {
             let Ok(text) = fs::read_to_string(&path) else {
                 continue;
             };
-            let Ok(record) = serde_json::from_str::<Record>(&text) else {
+            let Some(record) = parse_and_validate_record(&text) else {
                 continue;
             };
-            // `started_at` is untrusted deserialized data too: a record written by a
-            // well-behaved runner always carries an [`events::format_rfc3339_utc`]
-            // value, but a corrupted or hand-edited record could carry anything
-            // `serde_json` will accept into a `String` field. A malformed value is
-            // corrupt-record noise, not a real start time — skip it like any other
-            // corrupt entry rather than listing (and sorting) garbage as if it were
-            // valid.
-            if !is_valid_rfc3339_millis_utc(&record.started_at) {
-                continue;
-            }
-            // The `lock_file` field is untrusted deserialized data. Validate it as a
-            // simple, single-component, relative `.lock` name *before* joining it onto
-            // the registry directory — a value carrying `..`, a path separator, an
-            // absolute path, a NUL/control character, or a Windows reserved device
-            // name (even in the name-plus-extension aliasing form) would otherwise let
-            // a corrupt or adversarial record steer the liveness probe at a file
-            // outside the owner-only registry directory. A failing value is a corrupt
-            // record and is skipped, exactly like an unreadable or unparsable file.
-            if !is_simple_lock_file_name(&record.liveness.lock_file) {
-                continue;
-            }
             let lock_path = self.dir.join(&record.liveness.lock_file);
             scanned.push(ScannedRecord {
                 record,
@@ -600,6 +579,42 @@ fn probe_for_prune(lock_path: &Path) -> io::Result<PruneProbe> {
     } else {
         Ok(PruneProbe::Live)
     }
+}
+
+/// Parse and validate a registry record from raw on-disk text, applying the same
+/// corruption guards [`Registry::scan`] applies to every `.json` file it reads —
+/// valid JSON deserializing to [`Record`], a well-formed `started_at`
+/// ([`is_valid_rfc3339_millis_utc`]), and a simple in-directory `lock_file` name
+/// ([`is_simple_lock_file_name`]) — and returns `None` for anything that fails
+/// any of those guards, the same "corrupt record, skip it" verdict `scan` uses.
+/// Pure — it never touches the filesystem, unlike `scan` itself, which is what
+/// lets this double as the bytes → parse/validate target of the registry-record
+/// fuzz tier (`fuzz/fuzz_targets/registry_record.rs`, T-186) without spinning up
+/// a real registry directory.
+#[doc(hidden)]
+pub fn parse_and_validate_record(text: &str) -> Option<Record> {
+    let record = serde_json::from_str::<Record>(text).ok()?;
+    // `started_at` is untrusted deserialized data too: a record written by a
+    // well-behaved runner always carries an [`events::format_rfc3339_utc`] value,
+    // but a corrupted or hand-edited record could carry anything `serde_json`
+    // will accept into a `String` field. A malformed value is corrupt-record
+    // noise, not a real start time — reject it like any other corrupt entry
+    // rather than listing (and sorting) garbage as if it were valid.
+    if !is_valid_rfc3339_millis_utc(&record.started_at) {
+        return None;
+    }
+    // The `lock_file` field is untrusted deserialized data. Validate it as a
+    // simple, single-component, relative `.lock` name *before* it is ever joined
+    // onto the registry directory — a value carrying `..`, a path separator, an
+    // absolute path, a NUL/control character, or a Windows reserved device name
+    // (even in the name-plus-extension aliasing form) would otherwise let a
+    // corrupt or adversarial record steer the liveness probe at a file outside
+    // the owner-only registry directory. A failing value is a corrupt record and
+    // is rejected, exactly like an unreadable or unparsable file.
+    if !is_simple_lock_file_name(&record.liveness.lock_file) {
+        return None;
+    }
+    Some(record)
 }
 
 /// Validate that `value` has the exact shape [`events::format_rfc3339_utc`]

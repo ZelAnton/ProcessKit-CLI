@@ -1,0 +1,50 @@
+[package]
+name = "processkit-cli-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+# libFuzzer harness glue (the `fuzz_target!` macro and the `main` it generates).
+libfuzzer-sys = "0.4"
+# Deserializes the control-plane wire replies (`Snapshot`/`ControlAck`) the same
+# way the real client does, in the `control_wire` target.
+serde_json = "1"
+
+[dependencies.processkit-cli]
+# The crate under fuzz. Every target links its library target
+# (`processkit_cli`, see the parent `Cargo.toml`'s `[lib]` doc comment) — never
+# the binary — so it can drive the parsers directly on raw bytes.
+path = ".."
+
+# Deliberately outside the parent crate's implicit single-package workspace: an
+# empty `[workspace]` table here stops Cargo from trying to fold this crate into
+# one. Keeps `cargo fmt --all --check` / `cargo clippy --all-targets` at the
+# repo root out of this crate's scope (see CONTRIBUTING.md, "Fuzzing") — it is
+# built and run only through `cargo fuzz`, which needs the nightly toolchain's
+# sanitizer support this crate is not expected to compile without.
+[workspace]
+
+[[bin]]
+name = "registry_record"
+path = "fuzz_targets/registry_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control_wire"
+path = "fuzz_targets/control_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cli_parsers"
+path = "fuzz_targets/cli_parsers.rs"
+test = false
+doc = false
+bench = false

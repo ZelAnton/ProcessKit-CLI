@@ -1,0 +1,18 @@
+//! Fuzz the three defensive CLI value parsers (`src/cli.rs`), each fed the same
+//! raw text independently — they never interact, and each is expected to
+//! reject anything outside its own strict grammar rather than panic or
+//! silently reinterpret it (see each function's own doc comment for its
+//! grammar: `--timeout`/`--grace` duration, `--require-exit-code-band`,
+//! `--env`).
+#![no_main]
+
+use libfuzzer_sys::fuzz_target;
+use processkit_cli::cli::{parse_duration, parse_env_kv, parse_exit_code_band};
+
+fuzz_target!(|data: &[u8]| {
+    if let Ok(text) = std::str::from_utf8(data) {
+        let _ = parse_duration(text);
+        let _ = parse_exit_code_band(text);
+        let _ = parse_env_kv(text);
+    }
+});

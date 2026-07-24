@@ -1,0 +1,1 @@
+{"registry_version":1,"run_id":"abc","endpoint":null,"started_at":"2026-02-31T00:00:00.000Z","liveness":{"kind":"advisory_lock","lock_file":"run-abc.lock"}}

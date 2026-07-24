@@ -1,0 +1,95 @@
+name: Fuzz
+
+# Non-gating coverage-guided fuzz tier (`fuzz/`, T-186) over the CLI's parsers
+# of untrusted/semi-trusted input: the registry record bytes -> parse/validate
+# path (`registry_record`), the control plane's server-side request-line
+# classifier and client-side response-line JSON decode together
+# (`control_wire`), and the CLI's `--timeout`/`--grace`/`--require-exit-code-band`/
+# `--env` value parsers (`cli_parsers`) — see fuzz/fuzz_targets/*.rs and
+# CONTRIBUTING.md, "Fuzzing".
+#
+# Deliberately scheduled + manual-only (no `push:`/`pull_request:` trigger) and
+# every step that can fail on a genuine finding uses `continue-on-error`, so a
+# crash here is reported (job summary + an uploaded crash-artifact/corpus
+# archive) but never turns this workflow red in a way that blocks an unrelated
+# PR — this is a discovery tier, not a required check.
+
+on:
+  schedule:
+    # Weekly, off-peak UTC. Tune the cadence if this proves noisy or too
+    # infrequent for the corpus it accumulates.
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Per-target fuzzing budget, in seconds
+        required: false
+        default: '120'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    # Comfortably above the per-target budget (build + a few minutes of
+    # libFuzzer time), so a hung target is bounded rather than eating the
+    # whole scheduled run's quota.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [registry_record, control_wire, cli_parsers]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@nightly # rolling toolchain selector — intentionally unpinned
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # `fuzz/` is its own crate outside the parent's implicit workspace
+          # (see fuzz/Cargo.toml) with its own lockfile and target dir.
+          workspaces: fuzz -> target
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # Runs libFuzzer for the requested wall-clock budget, seeded from the
+      # committed corpus (fuzz/corpus/<target>). A crash/hang/leak finding is a
+      # real result of this step, not an infrastructure failure — continue past
+      # it so the summary and artifact-upload steps below still run and every
+      # matrix leg still reports, instead of the job aborting mid-way.
+      - name: Fuzz ${{ matrix.target }}
+        id: fuzz
+        continue-on-error: true
+        working-directory: fuzz
+        run: |
+          cargo +nightly fuzz run "${{ matrix.target }}" -- \
+            -max_total_time="${{ github.event.inputs.seconds || '120' }}"
+
+      - name: Report outcome
+        if: always()
+        run: |
+          {
+            echo "### Fuzz target \`${{ matrix.target }}\`: ${{ steps.fuzz.outcome }}"
+            if [ "${{ steps.fuzz.outcome }}" != "success" ]; then
+              echo
+              echo "A finding was reported — see the \"Fuzz ${{ matrix.target }}\" step log" \
+                   "above and the \`fuzz-crash-${{ matrix.target }}\` artifact for the" \
+                   "reproducing input."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Only uploaded on a finding: cargo-fuzz writes the minimized reproducing
+      # input(s) under fuzz/artifacts/<target>/ when a target crashes, hangs, or
+      # (with the sanitizer this build enables) leaks.
+      - name: Upload crash artifacts
+        if: steps.fuzz.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

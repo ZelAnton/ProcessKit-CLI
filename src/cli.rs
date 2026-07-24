@@ -258,7 +258,11 @@ pub struct ProbeArgs {
 ///
 /// Returns the message that clap renders on failure (which the binary maps to the
 /// `USAGE` exit code); on success it hands `run` a ready `Duration`.
-fn parse_duration(raw: &str) -> Result<Duration, String> {
+///
+/// `pub`/`#[doc(hidden)]` (not exported clap surface) so the CLI-parsers fuzz
+/// target can drive it directly with arbitrary text (`fuzz/fuzz_targets/cli_parsers.rs`, T-186).
+#[doc(hidden)]
+pub fn parse_duration(raw: &str) -> Result<Duration, String> {
     if raw.is_empty() {
         return Err("empty duration; expected e.g. `30`, `500ms`, `5s`, `2m`, or `1h`".to_string());
     }
@@ -301,7 +305,10 @@ fn parse_duration(raw: &str) -> Result<Duration, String> {
 /// the `USAGE` exit) rather than being reinterpreted into a band the consumer did
 /// not mean. Returns the message clap renders on failure; on success it hands the
 /// probe a ready `(start, end)` pair to compare against the reserved band.
-fn parse_exit_code_band(raw: &str) -> Result<(u8, u8), String> {
+///
+/// `pub`/`#[doc(hidden)]` — see [`parse_duration`]'s note on why (fuzz target).
+#[doc(hidden)]
+pub fn parse_exit_code_band(raw: &str) -> Result<(u8, u8), String> {
     let (start, end) = raw.split_once('-').ok_or_else(|| {
         format!("exit-code band `{raw}` must be two numbers as `start-end`, e.g. `100-119`")
     })?;
@@ -323,7 +330,10 @@ fn parse_exit_code_band(raw: &str) -> Result<(u8, u8), String> {
 /// containing `=` is preserved verbatim rather than truncated). A missing `=` or
 /// an empty `KEY` is rejected at parse time — mapped to the `USAGE` exit — rather
 /// than silently accepted as a malformed environment variable name.
-fn parse_env_kv(raw: &str) -> Result<(String, String), String> {
+///
+/// `pub`/`#[doc(hidden)]` — see [`parse_duration`]'s note on why (fuzz target).
+#[doc(hidden)]
+pub fn parse_env_kv(raw: &str) -> Result<(String, String), String> {
     let (key, value) = raw.split_once('=').ok_or_else(|| {
         format!(
             "`--env` value `{raw}` must be `KEY=VALUE` (a literal `=` separating name and value)"

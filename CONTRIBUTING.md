@@ -81,6 +81,61 @@ and the harness never kills by (recyclable) PID. CI runs this tier as a separate
 
 [`tests/e2e.rs`]: tests/e2e.rs
 
+## Fuzzing
+
+Beyond the grammar-shaped generators the [proptest] property tier drives,
+[`fuzz/`] is a [`cargo-fuzz`] tier that explores the parsers of untrusted or
+semi-trusted input with unconstrained, coverage-guided bytes. Three targets,
+each linking the crate's library target directly (never the binary):
+
+- `registry_record` — the run registry's bytes → parse/validate path
+  ([`Registry::scan`]'s per-record guards: JSON, `started_at`, `lock_file`).
+- `control_wire` — the control plane's server-side request-line classifier and
+  client-side response-line JSON decode (`src/control.rs`).
+- `cli_parsers` — the CLI's `--timeout`/`--grace`, `--require-exit-code-band`,
+  and `--env` value parsers (`src/cli.rs`).
+
+Each target ships a small seed corpus under `fuzz/corpus/<target>/`, including
+historically found edge cases (a NUL/control byte or a Windows reserved device
+name in a registry `lock_file`, a calendar-invalid `started_at` like
+`2026-02-31`).
+
+Requires a nightly toolchain (`rustup toolchain install nightly` — the pinned
+`stable` from [Prerequisites](#prerequisites) is not enough, since `cargo-fuzz`
+needs nightly's sanitizer support) and [`cargo-fuzz`]:
+
+```sh
+rustup toolchain install nightly
+cargo install cargo-fuzz --locked
+```
+
+Run one target for a bounded time, seeded from its committed corpus:
+
+```sh
+cd fuzz
+cargo +nightly fuzz run registry_record -- -max_total_time=60
+```
+
+A crash minimizes to a reproducing input under `fuzz/artifacts/<target>/`; feed
+it back to `cargo +nightly fuzz run <target> <path-to-input>` to reproduce.
+`cargo +nightly fuzz build` alone (no `run`) is enough to confirm the fuzz crate
+still compiles without spending any fuzzing time.
+
+The tier is deliberately **outside** the main crate's lint/build gates:
+`fuzz/` is its own crate (`fuzz/Cargo.toml` carries its own empty
+`[workspace]`) with its own `Cargo.lock`, so `cargo fmt --all --check` and
+`cargo clippy --all-targets --all-features` at the repo root never touch it,
+and it needs the nightly toolchain's sanitizer support the rest of the crate
+does not. CI runs it as a separate, **non-gating** `fuzz.yml` workflow on a
+weekly schedule and by manual dispatch — never on push/pull request — so a
+finding never blocks an unrelated PR; see the workflow file for how a crash is
+reported.
+
+[proptest]: https://github.com/proptest-rs/proptest
+[`fuzz/`]: fuzz
+[`cargo-fuzz`]: https://github.com/rust-fuzz/cargo-fuzz
+[`Registry::scan`]: src/registry.rs
+
 ## Code coverage
 
 CI measures line/region coverage with [`cargo-llvm-cov`] in a dedicated

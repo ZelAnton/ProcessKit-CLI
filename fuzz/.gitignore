@@ -1,0 +1,7 @@
+# Build output and crash/hang artifacts cargo-fuzz writes locally — never
+# committed. `corpus/` IS committed (see CONTRIBUTING.md, "Fuzzing"): it starts
+# as this crate's small curated seed corpus, but a local fuzzing run grows it
+# with generated inputs in place, so keep new local growth out of `git status`
+# noise by tracking only the seeds you explicitly `git add`.
+/target
+/artifacts
