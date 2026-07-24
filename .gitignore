@@ -1,5 +1,11 @@
 /target
 
+# Build/log output `cargo mutants` writes locally (see CONTRIBUTING.md,
+# "Mutation testing") — never committed, same treatment as fuzz/.gitignore's
+# /artifacts for cargo-fuzz's local output.
+/mutants.out
+/mutants.out.old
+
 # Per-user scratch notes — never committed. Use these names freely for
 # throwaway planning/working files.
 *.local.md

@@ -2,10 +2,12 @@
 # non-gating `.github/workflows/mutants.yml` weekly/manual CI tier — see
 # CONTRIBUTING.md, "Mutation testing".
 #
-# Root-level `mutants.toml` (over the other documented location,
-# `.cargo/mutants.toml`) matches this repo's convention of keeping tool config
-# at the repository root (`deny.toml`, `cliff.toml`) rather than nested under
-# `.cargo/`.
+# `.cargo/mutants.toml` is cargo-mutants' one auto-discovered config path (see
+# `cargo mutants --help`: `--config <FILE>  Read configuration from this file
+# instead of .cargo/mutants.toml`); there is no root-level alternative it
+# searches. Keeping it here means both the CI job and the plain `cargo
+# mutants` command documented in CONTRIBUTING.md pick it up with no extra
+# flag, so local and CI scope are guaranteed to match.
 
 # Scope mutation to the crate's own library modules.
 examine_globs = ["src/**/*.rs"]
