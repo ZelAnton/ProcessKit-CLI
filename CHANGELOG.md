@@ -15,7 +15,14 @@ to a dated version section.
 -
 
 ### Changed
--
+- The crate is now a thin binary over an internal library target (`src/lib.rs`,
+  `processkit_cli`): every module moved into the library, and `src/main.rs` only
+  parses argv and dispatches into it. This is purely a build-structure change —
+  the CLI flags, subcommands, exit codes, and JSONL `schema_version` are
+  byte-for-byte unchanged. The library is **not** a stable public API (every
+  module is `#[doc(hidden)]` and exempt from semantic versioning); it exists only
+  so the crate's own test, fuzz, and benchmark tiers can reach the runner's
+  internals directly. The supported compatibility surface remains the binary's.
 
 ### Fixed
 - The control-plane wire protocol now reads its one request/response line under an
