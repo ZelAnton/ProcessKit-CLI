@@ -44,12 +44,15 @@ cargo deny check advisories bans
 
 ## Documentation quality
 
-CI gates two checks over the tracked documentation set (`README.md`,
-`CONTRIBUTING.md`, `SECURITY.md`, `CHANGELOG.md`, `docs/**/*.md`): a spelling
-check ([`typos`]) and a link check ([`lychee`]) for internal relative paths
-and section anchors. A separate, non-gating job additionally checks external
-`http(s)` URLs in the same docs — a real network request in CI can flake for
-reasons unrelated to this repo, so it never blocks a merge.
+CI gates two checks, over two different scopes. A spelling check ([`typos`])
+gates the whole tracked tree (source, tests, docs, config — anything not
+covered by `.gitignore`, so this pipeline's own gitignored `.work/` scratch
+tree is never in scope). A link check ([`lychee`]) gates internal relative
+paths and section anchors, but only over the tracked documentation set
+(`README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `CHANGELOG.md`,
+`docs/**/*.md`). A separate, non-gating job additionally checks external
+`http(s)` URLs over that same documentation set — a real network request in
+CI can flake for reasons unrelated to this repo, so it never blocks a merge.
 
 Run the same checks locally before opening a pull request:
 
