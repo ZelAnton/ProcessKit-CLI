@@ -150,8 +150,11 @@ in force rather than papering over the difference:
 
 Every `run_started` event reports this separate abrupt-owner-death contract as
 `abrupt_cleanup`: `whole_tree` on Windows, `direct_child_only` on Linux, and
-`none` on macOS/other Unix. Normal completion, timeout, and Ctrl-C still run the
-owned container's ordinary teardown path on every supported platform.
+`none` on macOS/other Unix. Normal completion, timeout, and a cancel signal — a
+`Ctrl-C`, or on Unix a `SIGTERM`/`SIGHUP`, all of which the runner catches — still run
+the owned container's ordinary teardown path on every supported platform; this
+tri-state applies only where the runner never gets to run it at all (a crash, a
+`SIGKILL`, an outer Job Object terminate).
 
 ## Command interface
 
@@ -279,7 +282,8 @@ does not create it. See [`docs/registry.md`](docs/registry.md), "Reaping — `pr
 
 The runner's exit code **is** the child's exit code; the runner's own failures
 (bad arguments, spawn failure, backend error) and the four runner-*imposed*
-endings — a `--timeout` (`106`), a `Ctrl-C` cancel (`107`), a control-plane `cancel`
+endings — a `--timeout` (`106`), a local stop-signal cancel (`107`: `Ctrl-C`, or on
+Unix `SIGTERM`/`SIGHUP`), a control-plane `cancel`
 (`108`), and a control-plane `kill` (`109`) — use a distinct, reserved code band so
 they can never be mistaken for a child result, and so each ending is tellable from the
 others by code alone. This is part of the project's compatibility surface — see
@@ -290,8 +294,8 @@ candidate.
 ## Timeouts, cancel, and grace
 
 In the default and input-only I/O modes, `run` bounds a run three ways — a
-whole-run deadline, an idle (no-output) deadline, and an interactive cancel — and
-all of them end in the **same** teardown path:
+whole-run deadline, an idle (no-output) deadline, and a cancel signal (interactive
+or external) — and all of them end in the **same** teardown path:
 
 - `--timeout <duration>` is a hard deadline for the whole run. When it elapses the
   runner ends the run and exits with the reserved `TIMEOUT` code (`106`) — never
@@ -311,6 +315,22 @@ all of them end in the **same** teardown path:
   reserved `CANCELLED` code (`107`), distinct from a timeout and from any child
   code, so "I interrupted it" is never confused with "it ran too long" or with a
   child that merely returned non-zero.
+- **`SIGTERM` and `SIGHUP` (Unix)** are caught too, and take the *same* path: an
+  external `kill <pid>`, a `systemctl stop`, a cancelled CI job, or a hung-up
+  terminal ends the run through the full teardown rather than killing the runner
+  where it stands. This matters because the default disposition of those signals
+  would skip teardown entirely — no terminal JSONL events, a registry entry left
+  behind, and no explicit kill of the container, whose abrupt-owner-death reap
+  covers only the direct child on Linux and nothing on macOS (the `abrupt_cleanup`
+  tri-state under [Platform matrix](#platform-matrix)). All three signals share the
+  `CANCELLED` code (`107`); which one arrived is recorded in the JSONL `cancelled`
+  event's `source` field (`ctrl_c` / `sigterm` / `sighup`). A signal your environment
+  has deliberately neutralized before launching the runner (`SIG_IGN` — which is
+  exactly what `nohup` does to `SIGHUP`) is **left alone**: the runner does not
+  un-ignore it behind your back, and nothing is lost by that, since an ignored signal
+  would not have stopped the runner either. Windows keeps the
+  `Ctrl-C` listener only — its console-close/logoff/shutdown handler is a separate
+  mechanism and is not covered yet.
 
 With `--inherit-stdio`, native terminal delivery takes precedence; see
 [Standard I/O](#standard-io) for the platform-dependent reporting contract.
@@ -324,7 +344,15 @@ grandchild — is reaped on every ending.
 
 Durations use a small grammar: a non-negative integer with an optional unit —
 `ms`, `s` (the default), `m`, or `h` (e.g. `30`, `500ms`, `5s`, `2m`, `1h`). A
-malformed value is a usage error (exit `100`), not a surprise at runtime.
+malformed value is a usage error (exit `100`), not a surprise at runtime. `0` is
+legal for `--grace` — it means "no pause" between the soft stop and the hard
+kill. It is **not** legal for `--timeout`/`--idle-timeout`: a `0` there would arm
+a deadline that is already elapsed on the very first poll, tearing the child down
+immediately after spawn — almost certainly an operator typo rather than an
+intentional immediate teardown — so both flags reject a total of `0` (in any
+unit) at parse time, the same "degenerate cap" treatment `--max-memory`,
+`--max-processes`, and `--cpu-quota` already give their own `0`. Omit either flag
+to leave that deadline unbounded instead.
 
 **Honest degradation on Windows.** The soft-stop tier is not yet implemented in the
 ProcessKit kernel on Windows (tracked in ProcessKit-rs's backlog). Until it lands,
@@ -498,7 +526,8 @@ report them (nullable per-field on platforms/members it can't).
 `run` is implemented: it spawns the child into a ProcessKit container the runner
 owns, echoes the child's output live by default or directly inherits all three
 standard handles with `--inherit-stdio`, forwards the child's exit code exactly,
-enforces `--timeout`, `--grace`, and `Ctrl-C` cancellation with a guaranteed
+enforces `--timeout`, `--grace`, and stop-signal cancellation (`Ctrl-C`, plus
+`SIGTERM`/`SIGHUP` on Unix) with a guaranteed
 teardown of the whole tree (see "Timeouts, cancel, and grace"), and writes the
 versioned JSONL event stream to `--jsonl` (see "JSONL event schema"). `--run-id`
 and `--argv-raw` are consumed by that stream, and `--capture-dir` records a bounded

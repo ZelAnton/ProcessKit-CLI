@@ -35,8 +35,8 @@ failure is not mistaken for a child result.
 | 104  | `INTERNAL`        | Unexpected runner fault: the runner reached a state its own logic rules out, or lost a trustworthy view of the run (a `wait` on the child failed and its fate is unknown; the backend returned an outcome this build cannot render). Reported with this code instead of panicking. **A genuine runner bug** — an ordinary setup failure is `SETUP` (111), not this. |
 | 105  | `NOT_IMPLEMENTED` | **Retired.** Formerly minted for a defined-but-not-yet-built code path; every subcommand is now implemented, so no active path mints it. The number stays permanently reserved (see "Stability" below) — it is never reused for a different meaning. |
 | 106  | `TIMEOUT`         | The run exceeded a runner deadline — the whole-run `--timeout`, or the `--idle-timeout` (the child went silent past the idle window) — and the runner tore the process tree down. A runner-*imposed outcome*, not a child exit. The two are told apart by the `timeout` event's `reason` (`overall` / `idle`), not by the code; both reuse `106` (see "Timeout, cancel, and kill" below). |
-| 107  | `CANCELLED`       | The run was cancelled interactively (`Ctrl-C`): the runner tore the process tree down. Distinct from `TIMEOUT` and from any child result. |
-| 108  | `CONTROL_CANCELLED` | The run was cancelled by a control-plane `cancel` command (over the local control channel): the runner ran the same soft-stop → grace → hard-kill teardown as a Ctrl-C. Distinct from `CANCELLED` so "a control client cancelled it" is told from "the operator pressed Ctrl-C". |
+| 107  | `CANCELLED`       | The run was cancelled by a **local stop signal** — an interactive `Ctrl-C`, or on Unix a `SIGTERM` / `SIGHUP` (a `kill`, a `systemctl stop`, a cancelled CI job, a hung-up terminal) — and the runner tore the process tree down. The signals share this one code (the same class of ending); *which* one arrived is named by the `cancelled` event's `source` (`ctrl_c` / `sigterm` / `sighup`). Distinct from `TIMEOUT` and from any child result. |
+| 108  | `CONTROL_CANCELLED` | The run was cancelled by a control-plane `cancel` command (over the local control channel): the runner ran the same soft-stop → grace → hard-kill teardown as a Ctrl-C. Distinct from `CANCELLED` so "a control client cancelled it" is told from "a local signal stopped it". |
 | 109  | `CONTROL_KILLED`  | The run was killed by a control-plane `kill` command: the runner hard-killed the whole tree immediately (no soft stop, no grace). Distinct from every other runner-imposed ending. |
 | 110  | `PROBE_INCOMPATIBLE` | The **preflight probe** (`processkit-cli probe`) found this binary's compatibility surface does not satisfy a `--require-*` expectation. A *pre-launch* verdict, not a run outcome — no child is ever spawned by a probe. See "Preflight probe" below. |
 | 111  | `SETUP`           | A fail-closed **setup / support failure**: a prerequisite the runner needs to run — or to report a result — could not be established or produced for an ordinary reason (its async runtime would not build, a required `--jsonl`/`--capture-dir` output or `--stdin-file` input could not be opened, or a `probe`/`inspect`/control reply would not serialize). An environment/resource condition the caller can usually act on (a bad path, missing permissions, exhausted resources), **not** a runner bug — that stays `INTERNAL` (104). See "Setup failures vs internal faults" below. |
@@ -56,7 +56,9 @@ takes a distinct reserved-band code so a caller can tell them apart:
 - the runner ended it because a deadline elapsed — the whole-run `--timeout`, or the
   `--idle-timeout` (no child output for the idle window) — both `106`, told apart by
   the `timeout` event's `reason` (`overall` / `idle`) rather than by a distinct code,
-- the runner ended it because the operator pressed `Ctrl-C` (`107`),
+- the runner ended it because a **local stop signal** reached it — the operator pressed
+  `Ctrl-C`, or on Unix a `SIGTERM`/`SIGHUP` arrived (`107` for all three, told apart by
+  the `cancelled` event's `source` rather than by a distinct code),
 - a control-plane `cancel` command ended it — the same graceful teardown as a Ctrl-C,
   but triggered over the network (`108`), and
 - a control-plane `kill` command force-killed it immediately, no grace (`109`).

@@ -1,5 +1,9 @@
 # Security Policy
 
+See [`docs/threat-model.md`](docs/threat-model.md) for what this project treats
+as untrusted input, the trusted principal and boundary, and which threats are
+(and are not) closed by which mechanism.
+
 ## Supported versions
 
 Security fixes are applied to the latest released version of **processkit-cli**.

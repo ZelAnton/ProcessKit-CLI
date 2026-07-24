@@ -142,12 +142,14 @@ pub enum Event {
         reason: &'static str,
     },
     /// The run was cancelled and torn down through the shared soft-stop → grace →
-    /// hard-kill path. `source` names the trigger: `ctrl_c` for a local `Ctrl-C`, or
+    /// hard-kill path. `source` names the trigger: `ctrl_c` for a local `Ctrl-C`,
+    /// `sigterm` / `sighup` for the Unix stop signals the runner catches (`kill`,
+    /// `systemctl stop`, a cancelled CI job; a hung-up controlling terminal), or
     /// `control_cancel` for a `cancel` command that reached the live runner over its
-    /// control plane (`docs/schema.md`, "cancelled"). Both share this event because
+    /// control plane (`docs/schema.md`, "cancelled"). They all share this event because
     /// they share the teardown; the `source` tells them apart (and the terminal
-    /// `runner_exit` carries the matching reserved code — `CANCELLED` vs
-    /// `CONTROL_CANCELLED`).
+    /// `runner_exit` carries the matching reserved code — `CANCELLED` for every local
+    /// signal, `CONTROL_CANCELLED` for the control-plane command).
     Cancelled {
         source: &'static str,
         grace_ms: Option<u64>,
