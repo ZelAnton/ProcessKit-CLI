@@ -116,9 +116,11 @@ code/docs it is implemented and described in.
   `dtolnay/rust-toolchain`'s owner is accepted, not eliminated (see "What is
   not closed" below). Everywhere else, a compromised or re-tagged action
   cannot silently change what CI or a release build runs.
-  `cargo deny check advisories bans` runs on every pull request and push to
-  `main` (`deny.toml`, `.github/workflows/ci.yml`), failing the build on a
-  known RustSec advisory, a yanked crate, or a wildcard version requirement.
+  `cargo deny check advisories bans licenses sources` runs on every pull
+  request and push to `main` (`deny.toml`, `.github/workflows/ci.yml`), failing
+  the build on a known RustSec advisory, a yanked crate, a wildcard version
+  requirement, a disallowed dependency license, or a dependency sourced from
+  outside crates.io.
   Released artifacts carry a SHA-256 checksum and a signed
   `actions/attest-build-provenance` attestation
   (`.github/workflows/release.yml`) a consumer can verify against the exact

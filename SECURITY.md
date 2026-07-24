@@ -38,11 +38,13 @@ guarded by Rust-native tooling:
 - **[cargo-deny](https://embarkstudios.github.io/cargo-deny/)** runs in CI on
   every pull request and every push to `main` (the `cargo-deny` job in
   [`.github/workflows/ci.yml`](.github/workflows/ci.yml), driven by
-  [`deny.toml`](deny.toml)). It runs `cargo deny check advisories bans`: the
-  dependency tree is checked against the [RustSec](https://rustsec.org/) advisory
-  database and the build fails on a security advisory, a yanked crate, or a
-  wildcard version requirement. (License and source gating are available in
-  cargo-deny but are not enabled here.)
+  [`deny.toml`](deny.toml)). It runs
+  `cargo deny check advisories bans licenses sources`: the dependency tree is
+  checked against the [RustSec](https://rustsec.org/) advisory database (the
+  build fails on a security advisory, a yanked crate, or a wildcard version
+  requirement), every dependency's license is checked against an allow-list of
+  permissive licenses, and every dependency's source is checked to be
+  `crates.io` (no `git` or third-party registries).
 - **[Dependabot](.github/dependabot.yml)** opens weekly pull requests to keep the
   `cargo` dependencies (and the pinned GitHub Actions) current, so advisory fixes
   land promptly.

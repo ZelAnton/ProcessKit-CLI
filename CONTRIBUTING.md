@@ -39,7 +39,7 @@ clean run is required:
 ```sh
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
-cargo deny check advisories bans
+cargo deny check advisories bans licenses sources
 ```
 
 ## Documentation quality
