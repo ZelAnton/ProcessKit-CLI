@@ -20,7 +20,8 @@ to a dated version section.
   same soft-stop → grace → hard-kill teardown as `--timeout`; the two are told apart
   by a new always-present `reason` field on the `timeout` JSONL event (`overall` vs
   `idle`), so `schema_version` is unchanged (additive field). Same duration grammar
-  as `--timeout`/`--grace`; a malformed value is a `USAGE` (100) parse-time error. It
+  as `--timeout`, including its parse-time rejection of `0` (see the `Changed` entry
+  below); a malformed value is a `USAGE` (100) parse-time error. It
   needs the runner's output pump, so it conflicts with `--inherit-stdio` at parse
   time (like `--capture-dir`) but composes with `--capture-dir`. The new flag appears
   in the `probe` surface tokens automatically. See README.md, "Timeouts, cancel, and
