@@ -25,6 +25,16 @@ to a dated version section.
   linking the existing normative documents rather than duplicating them.
 
 ### Changed
+- The JSONL `members_snapshot` event and the control-plane `inspect` snapshot now
+  populate the enriched per-member fields (`ppid`, executable `name`,
+  `start_time`) from ProcessKit's `ProcessGroup::members_info()` (shipped in
+  processkit 2.3.2), instead of always emitting `null`. Each field stays
+  independently nullable — `members_info()` itself reports a field `null`
+  wherever the platform can't read it (the "bare" BSDs report none of them) — and
+  `start_time` is an opaque, platform-specific start-time token rendered as its
+  decimal string, not a wall-clock timestamp (see `docs/schema.md`, "Enriched
+  member fields"). Filling a field the v1 schema always declared but reserved
+  `null` is a non-breaking change (`schema_version` unchanged).
 - The crate is now a thin binary over an internal library target (`src/lib.rs`,
   `processkit_cli`): every module moved into the library, and `src/main.rs` only
   parses argv and dispatches into it. This is purely a build-structure change —

@@ -416,11 +416,13 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
 
     // What the control server answers an `inspect` with. `members` is a live query of
     // the owning container, so a snapshot reflects the tree's composition *when
-    // inspected* — the same PID-only view the `members_snapshot` event carries.
+    // inspected* — the same enriched view the `members_snapshot` event carries
+    // (both read through `members_info()`, so `inspect` and the JSONL stream never
+    // drift on what a "container member" looks like).
     let members_provider = || {
         group
-            .members()
-            .map(|pids| pids.into_iter().map(Member::from_pid).collect())
+            .members_info()
+            .map(|infos| infos.into_iter().map(Member::from_info).collect())
             .unwrap_or_default()
     };
     let snapshot_source =
@@ -970,12 +972,17 @@ fn resolve_cwd(args: &RunArgs) -> Option<String> {
         .map(|path| path.to_string_lossy().into_owned())
 }
 
-/// Snapshot the container's members and emit a PID-only `members_snapshot`. A read
-/// failure is a diagnostics gap, not a run failure, so it warns and skips the event.
+/// Snapshot the container's members — enriched with `ppid`/executable
+/// `name`/`start_time` via [`ProcessGroup::members_info`] wherever the platform
+/// can report them (`events::Member::from_info`) — and emit `members_snapshot`. A
+/// read failure is a diagnostics gap, not a run failure, so it warns and skips the
+/// event; it shares the same error contract as the bare-PID `members()` this
+/// replaced (`Error::Io` only — a single vanished member is skipped, not an
+/// error).
 fn emit_members_snapshot(emitter: &mut Emitter, group: &ProcessGroup) {
-    match group.members() {
-        Ok(pids) => emitter.emit(&Event::MembersSnapshot {
-            members: pids.into_iter().map(Member::from_pid).collect(),
+    match group.members_info() {
+        Ok(infos) => emitter.emit(&Event::MembersSnapshot {
+            members: infos.into_iter().map(Member::from_info).collect(),
         }),
         Err(err) => {
             eprintln!("processkit-cli: warning: could not snapshot container members: {err}");
