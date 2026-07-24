@@ -286,14 +286,30 @@ pub struct Snapshot {
 /// client never asks for anything else, so it only ever sees a [`Snapshot`]; this
 /// exists so a future/foreign client gets a structured answer rather than silence.
 ///
-/// `Deserialize` is derived alongside `Serialize` so [`converse`] can read this same
-/// shape back: when the reply line does not parse as the expected `T`
-/// (`Snapshot`/`ControlAck`), it falls back to parsing it as `ErrorResponse` and, on
-/// success, surfaces `error` verbatim instead of a generic "unreadable response"
-/// message (see `converse`'s doc comment).
-#[derive(Debug, Serialize, Deserialize)]
+/// `error: &'a str` is zero-copy on the *serialize* side ([`serialize_error`] never
+/// needs to allocate), but that shape cannot be reused to deserialize a reply: serde
+/// can only borrow a JSON string field when it contains no escape sequence, so a
+/// server's diagnostic that happens to include a quote, backslash, or control
+/// character (a Windows named-pipe path, for instance) would fail to parse as this
+/// type and fall through to the generic "unreadable response" message the fallback
+/// exists to avoid. [`converse`] instead deserializes replies into the owned
+/// [`ErrorReply`] sibling below, which always parses regardless of escaping.
+#[derive(Debug, Serialize)]
 struct ErrorResponse<'a> {
     error: &'a str,
+}
+
+/// The owned counterpart to [`ErrorResponse`] that [`converse`] deserializes a reply
+/// line into: the client is reading untrusted wire text back (a future/foreign
+/// runner's diagnostic, or today's own `serialize_error` output), so it cannot rely
+/// on the escape-free borrowing `ErrorResponse` needs on the serialize side (see its
+/// doc comment). `#[doc(hidden)] pub` purely so the `control_wire` fuzz target can
+/// drive the exact type `converse`'s fallback parses into, the same way it already
+/// drives [`Snapshot`]/[`ControlAck`] (see `fuzz/fuzz_targets/control_wire.rs`).
+#[derive(Debug, Deserialize)]
+#[doc(hidden)]
+pub struct ErrorReply {
+    pub error: String,
 }
 
 /// The live facts the control server answers an `inspect` with. It borrows the run's
@@ -786,12 +802,13 @@ async fn connect_live(
 /// A reply that fails to parse as `T` is not necessarily garbage: `serve_one` answers
 /// an unrecognized verb or an oversized request line with a structured
 /// [`ErrorResponse`] (`{"error": "..."}`), which this client never asked for and so
-/// does not decode as `T`. Before giving up, this retries the same line as
-/// `ErrorResponse` and, if that parses, surfaces its `error` text verbatim — the
-/// server's own diagnostic (e.g. "control request rejected: line exceeded ...")
-/// rather than a generic "unreadable response" wrapped around a `serde` field-mismatch
-/// message. A line that parses as neither `T` nor `ErrorResponse` still falls through
-/// to that generic message unchanged.
+/// does not decode as `T`. Before giving up, this retries the same line as the owned
+/// [`ErrorReply`] and, if that parses, surfaces its (normalized — see
+/// [`normalize_peer_error_text`]) `error` text verbatim — the server's own diagnostic
+/// (e.g. "control request rejected: line exceeded ...") rather than a generic
+/// "unreadable response" wrapped around a `serde` field-mismatch message. A line that
+/// parses as neither `T` nor `ErrorReply` still falls through to that generic message
+/// unchanged.
 async fn converse<S, T>(stream: S, verb: &str) -> io::Result<T>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -813,16 +830,43 @@ where
     }
     let trimmed = line.trim();
     serde_json::from_str::<T>(trimmed).map_err(|err| {
-        match serde_json::from_str::<ErrorResponse>(trimmed) {
-            Ok(error_response) => {
-                io::Error::new(io::ErrorKind::InvalidData, error_response.error.to_string())
-            }
+        match serde_json::from_str::<ErrorReply>(trimmed) {
+            Ok(error_reply) => io::Error::new(
+                io::ErrorKind::InvalidData,
+                normalize_peer_error_text(&error_reply.error),
+            ),
             Err(_) => io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("the runner sent an unreadable response: {err}"),
             ),
         }
     })
+}
+
+/// A cap on how much of a peer's `error` text [`converse`] surfaces verbatim, well
+/// under [`MAX_LINE_BYTES`] (the peer's whole reply line, envelope included, is
+/// already bounded there) — this only guards against a needlessly huge single
+/// diagnostic dominating the CLI's output.
+const MAX_PEER_ERROR_CHARS: usize = 500;
+
+/// Make a peer-supplied error string safe to splice verbatim into a one-line CLI
+/// diagnostic: since [`ErrorReply`] now accepts any escaping the sender's JSON
+/// encoder produced, the text can contain newlines or other control characters that
+/// would otherwise let a peer reformat the CLI's output. Collapses control
+/// characters (including `\n`/`\r`/`\t`) to spaces, trims the result, and truncates
+/// to [`MAX_PEER_ERROR_CHARS`].
+fn normalize_peer_error_text(text: &str) -> String {
+    let single_line: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let trimmed = single_line.trim();
+    if trimmed.chars().count() > MAX_PEER_ERROR_CHARS {
+        let truncated: String = trimmed.chars().take(MAX_PEER_ERROR_CHARS).collect();
+        format!("{truncated}... (truncated)")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Run [`converse`] under [`CONVERSATION_DEADLINE`] and map both ways a runner can be
@@ -1484,7 +1528,7 @@ mod tests {
 
     /// (T-191) A structured `{"error": "..."}` reply — what `serve_one` answers an
     /// unrecognized verb or an oversized request line with — does not parse as
-    /// `Snapshot`/`ControlAck`, but `converse` must recognize it as `ErrorResponse` and
+    /// `Snapshot`/`ControlAck`, but `converse` must recognize it as `ErrorReply` and
     /// surface its `error` text verbatim, not the generic "unreadable response"
     /// `serde` field-mismatch message.
     #[tokio::test]
@@ -1517,6 +1561,81 @@ mod tests {
         assert!(
             !message.contains("unreadable response"),
             "a recognized structured error is distinguishable from real garbage: {message}"
+        );
+    }
+
+    /// (T-191 review R-01) A server error message containing characters JSON must
+    /// escape — a quote, backslashes (as in a Windows named-pipe path), an embedded
+    /// newline — used to make the previous borrowed-`&str` fallback silently fail to
+    /// parse: `serde_json` can only borrow a JSON string field when deserializing it
+    /// needs no unescaping, so any real, uncontrolled peer diagnostic containing such
+    /// a character fell all the way through to the generic "unreadable response"
+    /// message the fallback exists to avoid. `converse` must surface this text just
+    /// as reliably as the escape-free case above (built through the real
+    /// `serialize_error`, so this exercises an actual server round-trip rather than a
+    /// hand-picked "safe" literal), and the embedded newline must not survive into
+    /// the one-line CLI message verbatim.
+    #[tokio::test]
+    async fn converse_surfaces_a_structured_error_response_with_escaped_text() {
+        let (client_stream, mut server_stream) = tokio::io::duplex(MAX_LINE_BYTES + 4096);
+
+        let raw =
+            "unknown control request `say \"hi\"` at path \\\\.\\pipe\\processkit-x\nline two";
+        let error_line = serialize_error(raw);
+        server_stream
+            .write_all(error_line.as_bytes())
+            .await
+            .expect("write the structured error response into the duplex buffer");
+        server_stream
+            .write_all(b"\n")
+            .await
+            .expect("terminate the response line");
+
+        let err = converse::<_, Snapshot>(client_stream, INSPECT_REQUEST)
+            .await
+            .expect_err("a structured error response is still an error, not a Snapshot");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::InvalidData,
+            "matches the existing unparseable-reply error kind: {err}"
+        );
+        let message = err.to_string();
+        assert!(
+            !message.contains("unreadable response"),
+            "escaped server text must still be recognized as an ErrorReply, not garbage: {message}"
+        );
+        assert!(
+            message.contains("unknown control request"),
+            "the server's own diagnostic is still raised: {message}"
+        );
+        assert!(
+            message.contains("processkit-x"),
+            "the pipe path survives escaping and normalization: {message}"
+        );
+        assert!(
+            !message.contains('\n'),
+            "the embedded newline is collapsed so a peer cannot reformat CLI output: {message}"
+        );
+    }
+
+    /// (T-191 review R-01) `normalize_peer_error_text` collapses control characters
+    /// (so a peer cannot inject newlines into the CLI's one-line diagnostic) and caps
+    /// length (so a maximally-sized `MAX_LINE_BYTES` error text does not dominate the
+    /// CLI's output).
+    #[test]
+    fn normalize_peer_error_text_collapses_control_characters_and_caps_length() {
+        let normalized = normalize_peer_error_text("line one\nline two\ttabbed");
+        assert_eq!(normalized, "line one line two tabbed");
+
+        let long = "x".repeat(MAX_PEER_ERROR_CHARS + 50);
+        let normalized_long = normalize_peer_error_text(&long);
+        assert!(
+            normalized_long.ends_with("... (truncated)"),
+            "an oversized peer error text is truncated: {normalized_long}"
+        );
+        assert!(
+            normalized_long.len() < long.len(),
+            "the truncated text is strictly shorter than the input: {normalized_long}"
         );
     }
 
