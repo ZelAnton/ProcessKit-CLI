@@ -247,10 +247,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Scan the dependency tree for security advisories and banned/duplicate crates.
+      # Scan the dependency tree for security advisories, banned/duplicate
+      # crates, disallowed licenses, and non-crates.io sources.
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
-          command: check advisories bans
+          command: check advisories bans licenses sources
 
   typos:
     name: typos

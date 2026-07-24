@@ -1,5 +1,6 @@
-# cargo-deny configuration. CI runs `cargo deny check advisories bans`
-# (see .github/workflows/ci.yml). Licenses/sources are not gated for now.
+# cargo-deny configuration. CI runs
+# `cargo deny check advisories bans licenses sources` (see
+# .github/workflows/ci.yml). All four checks are gated.
 
 [advisories]
 # Fail on crates with a RustSec security advisory or that have been yanked.
@@ -11,3 +12,27 @@ yanked = "deny"
 multiple-versions = "warn"
 # Wildcard version requirements hide breakage; flag them.
 wildcards = "deny"
+
+[licenses]
+version = 2
+# Permissive licenses actually present across the dependency tree today (see
+# `cargo deny list`): the common MIT/Apache-2.0 dual license, plus the
+# license expressions that a handful of crates combine with it —
+# `encoding_rs`'s embedded WHATWG data (BSD-3-Clause), `unicode-ident`'s
+# embedded Unicode data tables (Unicode-3.0), and `memchr`'s dual
+# Unlicense/MIT choice. No exceptions needed: every crate in the tree
+# resolves to some combination of the licenses below.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Unlicense",
+]
+
+[sources]
+# Only accept crates published to the official crates.io registry — no git
+# dependencies, no third-party/alternate registries.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
