@@ -285,7 +285,13 @@ pub struct Snapshot {
 /// The error line a server sends for an unrecognized request verb. The `inspect`
 /// client never asks for anything else, so it only ever sees a [`Snapshot`]; this
 /// exists so a future/foreign client gets a structured answer rather than silence.
-#[derive(Debug, Serialize)]
+///
+/// `Deserialize` is derived alongside `Serialize` so [`converse`] can read this same
+/// shape back: when the reply line does not parse as the expected `T`
+/// (`Snapshot`/`ControlAck`), it falls back to parsing it as `ErrorResponse` and, on
+/// success, surfaces `error` verbatim instead of a generic "unreadable response"
+/// message (see `converse`'s doc comment).
+#[derive(Debug, Serialize, Deserialize)]
 struct ErrorResponse<'a> {
     error: &'a str,
 }
@@ -776,6 +782,16 @@ async fn connect_live(
 /// (bounded by [`read_bounded_line`], the same ceiling [`serve_one`] reads its
 /// request under), or an unparseable line all surface as the same `io::Error` shape
 /// the caller maps to [`exit::CONTROL`].
+///
+/// A reply that fails to parse as `T` is not necessarily garbage: `serve_one` answers
+/// an unrecognized verb or an oversized request line with a structured
+/// [`ErrorResponse`] (`{"error": "..."}`), which this client never asked for and so
+/// does not decode as `T`. Before giving up, this retries the same line as
+/// `ErrorResponse` and, if that parses, surfaces its `error` text verbatim — the
+/// server's own diagnostic (e.g. "control request rejected: line exceeded ...")
+/// rather than a generic "unreadable response" wrapped around a `serde` field-mismatch
+/// message. A line that parses as neither `T` nor `ErrorResponse` still falls through
+/// to that generic message unchanged.
 async fn converse<S, T>(stream: S, verb: &str) -> io::Result<T>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -795,11 +811,17 @@ where
             "the runner closed the connection before answering (it may have just exited)",
         ));
     }
-    serde_json::from_str::<T>(line.trim()).map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("the runner sent an unreadable response: {err}"),
-        )
+    let trimmed = line.trim();
+    serde_json::from_str::<T>(trimmed).map_err(|err| {
+        match serde_json::from_str::<ErrorResponse>(trimmed) {
+            Ok(error_response) => {
+                io::Error::new(io::ErrorKind::InvalidData, error_response.error.to_string())
+            }
+            Err(_) => io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the runner sent an unreadable response: {err}"),
+            ),
+        }
     })
 }
 
@@ -1457,6 +1479,44 @@ mod tests {
             err.kind(),
             io::ErrorKind::InvalidData,
             "matches the existing unparseable-reply error kind: {err}"
+        );
+    }
+
+    /// (T-191) A structured `{"error": "..."}` reply — what `serve_one` answers an
+    /// unrecognized verb or an oversized request line with — does not parse as
+    /// `Snapshot`/`ControlAck`, but `converse` must recognize it as `ErrorResponse` and
+    /// surface its `error` text verbatim, not the generic "unreadable response"
+    /// `serde` field-mismatch message.
+    #[tokio::test]
+    async fn converse_surfaces_a_structured_error_response_verbatim() {
+        let (client_stream, mut server_stream) = tokio::io::duplex(MAX_LINE_BYTES + 4096);
+
+        let error_line = serialize_error("control request rejected: line exceeded the byte limit");
+        server_stream
+            .write_all(error_line.as_bytes())
+            .await
+            .expect("write the structured error response into the duplex buffer");
+        server_stream
+            .write_all(b"\n")
+            .await
+            .expect("terminate the response line");
+
+        let err = converse::<_, Snapshot>(client_stream, INSPECT_REQUEST)
+            .await
+            .expect_err("a structured error response is still an error, not a Snapshot");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::InvalidData,
+            "matches the existing unparseable-reply error kind: {err}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("control request rejected: line exceeded the byte limit"),
+            "the server's own error text is raised verbatim: {message}"
+        );
+        assert!(
+            !message.contains("unreadable response"),
+            "a recognized structured error is distinguishable from real garbage: {message}"
         );
     }
 
