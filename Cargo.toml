@@ -26,8 +26,9 @@ rust-version = "1.88"
 # ---------------------------------------------------------------------------
 [dependencies]
 # Command-line parsing. The `derive` API expresses the normative CLI surface —
-# the four subcommands, their flags, and the verbatim `-- <program> <args...>`
-# tail — that AGENTS.md counts as part of the compatibility surface.
+# the seven subcommands (run/inspect/cancel/kill/list/prune/probe), their
+# flags, and the verbatim `-- <program> <args...>` tail — that AGENTS.md
+# counts as part of the compatibility surface.
 clap = { version = "4", features = ["derive"] }
 # (De)serialize the versioned JSONL event schema — this project's public,
 # golden-tested event contract. `derive` gives each event struct its `Serialize`

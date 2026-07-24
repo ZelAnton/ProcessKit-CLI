@@ -18,7 +18,11 @@ to a dated version section.
 -
 
 ### Fixed
--
+- The control-plane wire protocol now reads its one request/response line under an
+  explicit byte ceiling on both sides (`serve_one` on the server, `converse` on the
+  client) instead of an unbounded `read_line`, so a broken or hostile owner-local
+  control client sending data with no `\n` can no longer make a live run's memory
+  grow without limit.
 
 ## [0.2.2] - 2026-07-24
 

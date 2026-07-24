@@ -27,15 +27,12 @@ pub const RUNNER_RANGE_END: u8 = 119;
 pub const USAGE: u8 = 100;
 /// The target program could not be started (not found, not executable, bad cwd,
 /// permission denied) — a runner failure that happened before the child ran.
-#[allow(dead_code)] // Minted once `run` spawns a child (T-002+).
 pub const SPAWN: u8 = 101;
 /// ProcessKit backend/containment failure: the kernel container, job object, IPC
 /// endpoint, or run registry could not be established.
-#[allow(dead_code)] // Minted once the runner talks to the ProcessKit backend (T-002+).
 pub const BACKEND: u8 = 102;
 /// A control-plane command (`inspect`/`cancel`/`kill`) could not reach its target
 /// run: no such run id, a stale/dead registry entry, or an IPC failure.
-#[allow(dead_code)] // Minted once the control plane is wired (T-004+).
 pub const CONTROL: u8 = 103;
 /// Unexpected runner fault — the runner reached a state its own logic rules out,
 /// or lost a trustworthy view of the run it cannot recover from (a `wait` on the
@@ -46,7 +43,6 @@ pub const CONTROL: u8 = 103;
 /// not build, an unwritable `--jsonl`/`--capture-dir`, a report that will not
 /// serialize — is *not* an invariant violation and takes [`SETUP`] instead, so a
 /// consumer reading `104` can trust it means "a runner bug", never "a bad path".
-#[allow(dead_code)] // Minted on the runner's genuine invariant-violation paths.
 pub const INTERNAL: u8 = 104;
 /// Retired. Formerly minted for a defined-but-not-yet-built code path while the
 /// runner was under construction; every subcommand is now implemented, so no

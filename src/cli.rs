@@ -50,8 +50,9 @@ pub enum Command {
 /// -- <program> <args...>`
 //
 // `run` consumes every field: `cwd`, `create_no_window`, `timeout`, `grace`,
-// `command`, `jsonl`, `run_id`, `argv_raw`, and `capture_dir` — bounded
-// stdout/stderr capture to files (see `src/capture.rs`).
+// `command`, `jsonl`, `run_id`, `argv_raw`, `capture_dir` — bounded
+// stdout/stderr capture to files (see `src/capture.rs`) — `env_clear`,
+// `env_remove`, `env`, and `inherit_stdio`/`inherit_stdin`/`stdin_file`.
 #[derive(Debug, Args)]
 pub struct RunArgs {
     /// Identifier for this run; a value is generated when omitted.
