@@ -105,6 +105,15 @@
 //! `cancelled` / `killed` event and a terminal `runner_exit` with the matching
 //! `source` — so an observer reading `--jsonl` sees the external command, not just
 //! the control client.
+//!
+//! Both directions of that one line are read under the same [`MAX_LINE_BYTES`]
+//! ceiling: [`serve_one`] reading the request verb, and [`converse`] reading the
+//! reply. Owner-only does not mean trusted-not-to-misbehave — a broken or hostile
+//! local client that never sends a `\n` must not be able to make the live runner
+//! buffer an unbounded amount of memory just to find one out. Exceeding the ceiling
+//! is a protocol violation, not silent truncation: the server answers with the same
+//! structured-error closing path an unrecognized verb gets, and the client surfaces
+//! the same `io::Error` shape an unparseable reply already does.
 
 use std::convert::Infallible;
 use std::io;
@@ -112,7 +121,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, split};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+    split,
+};
 
 use crate::events::{self, Member};
 use crate::exit::{self, RunnerError};
@@ -194,6 +206,22 @@ const CONVERSATION_DEADLINE: Duration = Duration::from_secs(5);
 /// client that connects and then stalls cannot wedge the accept loop for other
 /// inspect clients (the run's own path is already independent of this).
 const CONNECTION_DEADLINE: Duration = Duration::from_secs(5);
+
+/// The byte ceiling on the *one* line either side of the wire protocol reads: the
+/// request verb ([`serve_one`]) and the JSON reply ([`converse`]). The protocol is
+/// deliberately tiny (module doc, "Wire protocol") — a request line is `inspect` /
+/// `cancel` / `kill` / empty plus `\n` (a handful of bytes), and a reply line is a
+/// [`Snapshot`] (JSON of a handful of scalar fields plus a PID-only `members` array),
+/// a [`ControlAck`], or an error object. `64 KiB` sits comfortably above even a
+/// generously large `members` list — the sole field with unbounded real-world size —
+/// while staying nowhere near "unbounded": a peer that never sends a `\n` (an
+/// owner-local client gone rogue, or a wedged runner on the reply side) is capped
+/// here instead of growing the live runner's — or the client's — memory without
+/// limit, which is the vulnerability this constant closes. It is not tuned to the
+/// wire's typical size (bytes to low kilobytes); it is tuned to be small relative to
+/// "no limit at all" while leaving generous headroom over anything the protocol
+/// legitimately sends.
+const MAX_LINE_BYTES: usize = 64 * 1024;
 
 /// The machine-readable state `inspect` prints: what a control-plane client can learn
 /// about a live run. `Serialize` on the server side, `Deserialize` on the client side
@@ -332,6 +360,36 @@ where
     let _ = tokio::time::timeout(CONNECTION_DEADLINE, serve_one(stream, source, commands)).await;
 }
 
+/// Read one `\n`-terminated line from `reader`, capped at [`MAX_LINE_BYTES`] total —
+/// the shared bound [`serve_one`] and [`converse`] both read their one line under.
+///
+/// Layered on `AsyncReadExt::take` over the buffered reader: once the cap is
+/// exhausted, `take` reports EOF *without ever polling the underlying transport
+/// again* (see `tokio::io::Take::poll_fill_buf`), so this returns deterministically
+/// — bounded work, not a hang — even if the peer keeps the connection open and never
+/// sends more. A line that reaches the cap without a trailing `\n` is the overflow
+/// case: it is reported as an `InvalidData` error rather than silently handed back
+/// truncated (which a caller could easily mistake for a short, valid line) or grown
+/// without bound (the bug this cap exists to close). A clean, empty read (peer closed
+/// before sending anything) still comes back as `Ok(0)`, matching
+/// `AsyncBufReadExt::read_line`'s own contract.
+async fn read_bounded_line<R>(reader: &mut R, line: &mut String) -> io::Result<usize>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let read = reader.take(MAX_LINE_BYTES as u64).read_line(line).await?;
+    if read > 0 && !line.ends_with('\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "line exceeded the {MAX_LINE_BYTES}-byte control-plane limit without a \
+                 terminating newline"
+            ),
+        ));
+    }
+    Ok(read)
+}
+
 /// The request/response exchange for one connection.
 ///
 /// A mutating verb (`cancel`/`kill`) writes its ack **before** it signals the run's
@@ -351,26 +409,36 @@ where
     let (read_half, mut write_half) = split(stream);
     let mut reader = BufReader::new(read_half);
     let mut request = String::new();
-    reader.read_line(&mut request).await?;
-    match request.trim() {
-        INSPECT_REQUEST | "" => {
-            write_response(&mut write_half, &serialize_snapshot(&source.snapshot())).await?;
-        }
-        CANCEL_REQUEST => {
-            write_response(&mut write_half, &serialize_ack(&source.ack(CANCEL_REQUEST))).await?;
-            // Ack delivered — now ask the run's main loop to tear down. The send is
-            // synchronous (unbounded) and best-effort: a dropped receiver only means
-            // the run is already ending.
-            let _ = commands.send(ControlCommand::Cancel);
-        }
-        KILL_REQUEST => {
-            write_response(&mut write_half, &serialize_ack(&source.ack(KILL_REQUEST))).await?;
-            let _ = commands.send(ControlCommand::Kill);
-        }
-        other => {
-            let error = serialize_error(&format!("unknown control request `{other}`"));
+    match read_bounded_line(&mut reader, &mut request).await {
+        Ok(_) => match request.trim() {
+            INSPECT_REQUEST | "" => {
+                write_response(&mut write_half, &serialize_snapshot(&source.snapshot())).await?;
+            }
+            CANCEL_REQUEST => {
+                write_response(&mut write_half, &serialize_ack(&source.ack(CANCEL_REQUEST)))
+                    .await?;
+                // Ack delivered — now ask the run's main loop to tear down. The send is
+                // synchronous (unbounded) and best-effort: a dropped receiver only means
+                // the run is already ending.
+                let _ = commands.send(ControlCommand::Cancel);
+            }
+            KILL_REQUEST => {
+                write_response(&mut write_half, &serialize_ack(&source.ack(KILL_REQUEST))).await?;
+                let _ = commands.send(ControlCommand::Kill);
+            }
+            other => {
+                let error = serialize_error(&format!("unknown control request `{other}`"));
+                write_response(&mut write_half, &error).await?;
+            }
+        },
+        // Oversized request line: not a transport failure, so it gets the same
+        // structured-error closing path an unrecognized verb does, not a bare
+        // connection drop.
+        Err(err) if err.kind() == io::ErrorKind::InvalidData => {
+            let error = serialize_error(&format!("control request rejected: {err}"));
             write_response(&mut write_half, &error).await?;
         }
+        Err(err) => return Err(err),
     }
     Ok(())
 }
@@ -669,8 +737,10 @@ async fn connect_live(
 /// is identical for every verb (write the verb line, flush, read one line back); only
 /// the verb sent and the reply type parsed differ, which is exactly what `T`
 /// parameterizes. A closed connection before a complete line (runner died
-/// mid-conversation) or an unparseable line surfaces as an error the caller maps to
-/// [`exit::CONTROL`].
+/// mid-conversation), a reply over [`MAX_LINE_BYTES`] with no terminating `\n`
+/// (bounded by [`read_bounded_line`], the same ceiling [`serve_one`] reads its
+/// request under), or an unparseable line all surface as the same `io::Error` shape
+/// the caller maps to [`exit::CONTROL`].
 async fn converse<S, T>(stream: S, verb: &str) -> io::Result<T>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -683,7 +753,7 @@ where
 
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
-    let read = reader.read_line(&mut line).await?;
+    let read = read_bounded_line(&mut reader, &mut line).await?;
     if read == 0 {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -1258,6 +1328,82 @@ mod tests {
         assert!(
             command.is_none(),
             "an unknown verb must never signal a teardown command"
+        );
+    }
+
+    /// (T-173) A request line over [`MAX_LINE_BYTES`] with no terminating `\n` — a
+    /// broken or hostile owner-local client — must not make `serve_one` buffer it
+    /// without bound. `read_bounded_line`'s `take`-based cap returns deterministically
+    /// once the ceiling is exhausted (it never needs the peer to send more or close
+    /// the connection), so this test proves both halves of the requirement in one
+    /// shot: the exchange completes at all (a hang would make this test itself time
+    /// out under the harness) and it completes with a structured error, the same
+    /// closing path an unrecognized verb gets — never a silent truncate-and-continue.
+    #[tokio::test]
+    async fn server_rejects_an_oversized_request_line_without_unbounded_buffering() {
+        let (mut client, server) = tokio::io::duplex(MAX_LINE_BYTES + 4096);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let members = || vec![Member::from_pid(1)];
+        let source = SnapshotSource::new(
+            "run-t",
+            "job_object",
+            Some(1),
+            SystemTime::UNIX_EPOCH,
+            &members,
+        );
+
+        // One byte past the ceiling, no trailing `\n` at all — exactly the shape that
+        // made `read_line` buffer without bound before this fix.
+        let oversized = vec![b'x'; MAX_LINE_BYTES + 1];
+        client
+            .write_all(&oversized)
+            .await
+            .expect("write past the byte ceiling into the duplex buffer");
+
+        serve_one(server, &source, &tx).await.expect(
+            "an oversized request still closes normally through the structured-error path, \
+             not a hard connection error",
+        );
+
+        let mut reader = BufReader::new(&mut client);
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .expect("read the structured error response");
+        let value: serde_json::Value = serde_json::from_str(line.trim())
+            .expect("a structured JSON error, not a hang or a panic");
+        assert!(
+            value.get("error").and_then(|v| v.as_str()).is_some(),
+            "an oversized request yields an error object: {line}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "an oversized request must never route a teardown command"
+        );
+    }
+
+    /// (T-173) `converse`'s reply read is bounded by the same [`MAX_LINE_BYTES`]
+    /// ceiling: a reply over the cap with no terminating `\n` (a wedged or
+    /// misbehaving runner) surfaces as the same `InvalidData` `io::Error` shape an
+    /// unparseable reply already does, never an unbounded read on the client side.
+    #[tokio::test]
+    async fn converse_rejects_an_oversized_response_line_without_unbounded_buffering() {
+        let (client_stream, mut server_stream) = tokio::io::duplex(MAX_LINE_BYTES + 4096);
+
+        let oversized = vec![b'y'; MAX_LINE_BYTES + 1];
+        server_stream
+            .write_all(&oversized)
+            .await
+            .expect("write past the byte ceiling into the duplex buffer");
+
+        let err = converse::<_, Snapshot>(client_stream, INSPECT_REQUEST)
+            .await
+            .expect_err("an oversized response line must be a hard error, not an unbounded read");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::InvalidData,
+            "matches the existing unparseable-reply error kind: {err}"
         );
     }
 
