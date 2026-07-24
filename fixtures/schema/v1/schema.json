@@ -269,15 +269,15 @@
     },
     "containerFailed": {
       "type": "object",
-      "description": "Creating the container, or joining the child to it, failed.",
+      "description": "Creating the container, joining the child to it, or handing the terminal to an interactive child failed.",
       "properties": {
         "schema_version": { "$ref": "#/$defs/schemaVersion" },
         "time": { "$ref": "#/$defs/time" },
         "event": { "const": "container_failed" },
         "phase": {
           "type": "string",
-          "enum": ["create", "attach"],
-          "description": "create (the container could not be created) or attach (the launch into it failed)."
+          "enum": ["create", "attach", "foreground"],
+          "description": "create (the container could not be created), attach (the launch into it failed), or foreground (handing the terminal to an interactive child failed after it had already spawned)."
         },
         "code": { "$ref": "#/$defs/u8", "description": "The runner-band exit code (BACKEND, 102)." },
         "message": { "type": "string", "description": "Human-readable failure reason." }
