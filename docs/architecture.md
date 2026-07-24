@@ -22,7 +22,7 @@ Responsibilities, in the order data flows through a `run`:
 | [`src/lib.rs`](../src/lib.rs) | The internal library crate root: declares every `src/*.rs` module and re-exports nothing publicly-supported. It carries the "not a stable public API" disclaimer and marks each module `#[doc(hidden)]`, so the library is only a foundation for the crate's own tooling — never a semver-stable Rust surface. |
 | [`src/main.rs`](../src/main.rs) | The thin binary entry point. Parses `Cli`, dispatches into the library's subcommand module, and maps the result onto a process exit code: `run` owns its own exit path (it hard-exits with the child's code and never returns here); every other subcommand's `Result<(), RunnerError>` is mapped through `RunnerError::code()`, and a clap parse failure is mapped onto the runner's own `USAGE` code rather than clap's default. |
 | [`src/cli.rs`](../src/cli.rs) | The CLI-flags half of the compatibility surface: the clap-derived `Cli`/`Command` types for `run`, `inspect`, `cancel`, `kill`, `list`, `prune`, and `probe`. Parsing and shape validation only — each subcommand's behavior lives in its own module. |
-| [`src/run.rs`](../src/run.rs) | The `run` subcommand itself: spawns the child into a `processkit::ProcessGroup` this module owns, selects either default pipe-and-echo I/O or direct inherited stdio, temporarily hands a POSIX terminal to a separate child process group when required, races the child's exit against `--timeout`/`--idle-timeout`/`Ctrl-C`/a control-plane command, and drives the shared teardown tiers — the graceful soft stop → grace → hard kill for `timeout` (whole-run or idle)/`Ctrl-C`/`cancel`, and the immediate hard kill (no soft stop, no grace) for a control-plane `kill`. Exit-code fidelity — the child's exact code on a normal completion, a reserved-band code for every runner-imposed ending — is enforced here. |
+| [`src/run.rs`](../src/run.rs) | The `run` subcommand itself: spawns the child into a `processkit::ProcessGroup` this module owns, selects either default pipe-and-echo I/O or direct inherited stdio, temporarily hands a POSIX terminal to a separate child process group when required, races the child's exit against `--timeout`/`--idle-timeout`/a local stop signal (`Ctrl-C`, and on Unix `SIGTERM`/`SIGHUP`)/a control-plane command, and drives the shared teardown tiers — the graceful soft stop → grace → hard kill for `timeout` (whole-run or idle)/a signal cancel/`cancel`, and the immediate hard kill (no soft stop, no grace) for a control-plane `kill`. Exit-code fidelity — the child's exact code on a normal completion, a reserved-band code for every runner-imposed ending — is enforced here. |
 | [`src/events.rs`](../src/events.rs) | The versioned JSONL lifecycle-event schema and its emitter — this repository's normative, golden-tested public event contract (see [`docs/schema.md`](schema.md)). Also owns argv redaction: the default SHA-256 `argv_sha256` fingerprint and the `HINT_RULES` worker-shape classifier. |
 | [`src/capture.rs`](../src/capture.rs) | `--capture-dir` bounded per-stream stdout/stderr capture to files, riding the same tee `run` already echoes through (no second output-reading path). Records, per stream, a full byte counter, a SHA-256 of the bytes written, and independent explicit `truncated`/`write_error` flags, surfaced in the `output_captured` event. |
 | [`src/hash.rs`](../src/hash.rs) | The one hand-rolled incremental/one-shot SHA-256 (FIPS 180-4) both `events` (argv fingerprint) and `capture` (streamed transcript hashing) build on, so the project has a single digest primitive and rendering style. |
@@ -79,7 +79,8 @@ implemented in `run::execute`/`run::run_async` (`src/run.rs`):
    `ProcessGroup` this process owns — not a shared or global one — so the
    group's kernel-backed kill-on-drop (Windows Job Object, Linux
    cgroup/POSIX-group, macOS process group) reaps the whole tree on every exit
-   path *this process lives to observe* (normal completion, timeout, `Ctrl-C`,
+   path *this process lives to observe* (normal completion, timeout, a local
+   stop signal — `Ctrl-C`, or on Unix `SIGTERM`/`SIGHUP` — and a
    control-plane `cancel`/`kill`). That guarantee does not extend to this
    process's own **abrupt** death (crash/`SIGKILL`/`TerminateProcess`), which
    skips `Drop` entirely: reaping a leaked grandchild after the runner itself
@@ -109,7 +110,8 @@ implemented in `run::execute`/`run::run_async` (`src/run.rs`):
    `output_captured` event, unless `--capture-dir` was passed; clap rejects
    `--capture-dir` together with `--inherit-stdio` before the child starts.
 4. **Teardown.** Runner-imposed endings split into two tiers, not one shared
-   path. `--timeout` elapsing, interactive `Ctrl-C`, and a control-plane
+   path. `--timeout` elapsing, a local stop signal (interactive `Ctrl-C`, or on
+   Unix a caught `SIGTERM`/`SIGHUP`), and a control-plane
    `cancel` reaching the live runner over `src/control.rs` all drive the
    *same* graceful path: a soft stop (`SIGTERM` to the tree on Unix; no
    soft-signal tier on Windows yet, so the grace window still elapses honestly

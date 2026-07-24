@@ -75,14 +75,17 @@ pub struct RunArgs {
     #[arg(long)]
     pub create_no_window: bool,
 
-    /// Hard deadline for the whole run; the tree is torn down when it elapses.
+    /// Hard deadline for the whole run; the tree is torn down when it elapses. A
+    /// value of `0` is rejected at parse time (see [`parse_positive_duration`]) —
+    /// it would arm a deadline that is already elapsed on the first poll, almost
+    /// certainly an operator typo rather than an intentional immediate teardown.
     // Parsed and validated *here*, at the CLI layer, rather than deferred to the
     // runner: a malformed duration is a form error like any other bad flag, so it
     // belongs with the parsing surface (this module) and surfaces as the same
     // documented `USAGE` (100) exit, not a mid-run failure. `run` then receives an
     // already-validated `Duration` and never re-parses a string. See
-    // [`parse_duration`] for the accepted grammar.
-    #[arg(long, value_name = "duration", value_parser = parse_duration)]
+    // [`parse_positive_duration`] for the accepted grammar.
+    #[arg(long, value_name = "duration", value_parser = parse_positive_duration)]
     pub timeout: Option<Duration>,
 
     /// Deadline on child **silence**: the tree is torn down when the child produces
@@ -93,15 +96,20 @@ pub struct RunArgs {
     /// An idle expiry reuses the same reserved `TIMEOUT` (106) exit and the same
     /// soft-stop → grace → hard-kill teardown as `--timeout`, told apart only by the
     /// `timeout` event's `reason` field (`idle` vs `overall`; see `docs/schema.md`).
-    /// Same grammar and parse-time validation as `--timeout` (see [`parse_duration`]).
+    /// Same grammar and parse-time validation as `--timeout` — including the
+    /// rejection of `0`, which would otherwise guarantee an immediate teardown
+    /// (`remaining` saturates to zero) — see [`parse_positive_duration`].
     /// Cannot be combined with `--inherit-stdio`: under direct inheritance the runner
     /// runs no output pump, so there is no point at which to observe the child and
     /// re-arm the deadline — the flags conflict at parse time, like `--capture-dir`.
-    #[arg(long, value_name = "duration", value_parser = parse_duration)]
+    #[arg(long, value_name = "duration", value_parser = parse_positive_duration)]
     pub idle_timeout: Option<Duration>,
 
-    /// Grace period between a cancel/timeout and the hard kill. Same grammar and
-    /// parse-time validation as `--timeout` (see [`parse_duration`]).
+    /// Grace period between a cancel/timeout and the hard kill. Same duration
+    /// grammar as `--timeout`/`--idle-timeout`, but — unlike them — `0` stays
+    /// legal here: it means "no pause", a real and useful setting, not a
+    /// degenerate one, so this flag keeps using the more permissive
+    /// [`parse_duration`] rather than [`parse_positive_duration`].
     #[arg(long, value_name = "duration", value_parser = parse_duration)]
     pub grace: Option<Duration>,
 
@@ -305,11 +313,14 @@ pub struct ProbeArgs {
     pub require_surface: Vec<String>,
 }
 
-/// Parse a human duration for `--timeout` / `--grace`.
+/// Parse a human duration for `--grace` (a zero-length duration is legal there —
+/// "no pause" between soft stop and hard kill — so this parser accepts `0`; see
+/// [`parse_positive_duration`] for `--timeout`/`--idle-timeout`, where `0` is
+/// rejected as a degenerate, almost-certainly-a-typo deadline).
 ///
 /// Grammar: a base-10, non-negative integer with an optional unit suffix — `ms`,
 /// `s` (the default when the suffix is omitted), `m`, or `h`. Examples: `30`
-/// (= 30 seconds), `500ms`, `5s`, `2m`, `1h`. Deliberately strict — a sign, a
+/// (= 30 seconds), `0`, `500ms`, `5s`, `2m`, `1h`. Deliberately strict — a sign, a
 /// fraction, surrounding whitespace, or an unknown unit is rejected rather than
 /// silently reinterpreted, so a typo fails loudly at parse time instead of arming
 /// a surprising deadline. The value is capped only by `u64` milliseconds; an
@@ -356,6 +367,39 @@ pub fn parse_duration(raw: &str) -> Result<Duration, String> {
     let millis = millis
         .ok_or_else(|| format!("duration `{raw}` is too large to represent in milliseconds"))?;
     Ok(Duration::from_millis(millis))
+}
+
+/// Parse a human duration for `--timeout` / `--idle-timeout`: same grammar as
+/// [`parse_duration`], but a total of `0` (in any unit — `0`, `0ms`, `0s`, `0m`,
+/// `0h`) is additionally rejected at parse time, mirroring the "degenerate cap"
+/// treatment `parse_size`/`parse_max_processes`/`parse_cpu_quota` give `0` for
+/// `--max-memory`/`--max-processes`/`--cpu-quota`.
+///
+/// A `--timeout 0` or `--idle-timeout 0` arms a deadline that is already elapsed
+/// on the very first poll — the child is torn down immediately after spawn (for
+/// `--idle-timeout`, unconditionally, since `remaining` saturates to zero) — which
+/// is indistinguishable in practice from an operator typo (`--timeout 0` instead
+/// of, say, `--timeout 30`) and never a useful deadline in its own right. Per this
+/// module's own philosophy ("a typo fails loudly at parse time instead of arming a
+/// surprising deadline", see [`parse_duration`]), that typo is rejected here rather
+/// than silently armed.
+///
+/// `--grace 0` stays legal and keeps using [`parse_duration`] directly: there `0`
+/// is meaningful ("no pause" between the soft stop and the hard kill), not
+/// degenerate, so it is not routed through this stricter parser.
+///
+/// `pub`/`#[doc(hidden)]` — see [`parse_duration`]'s note on why (fuzz target).
+#[doc(hidden)]
+pub fn parse_positive_duration(raw: &str) -> Result<Duration, String> {
+    let duration = parse_duration(raw)?;
+    if duration.is_zero() {
+        return Err(format!(
+            "duration `{raw}` must be greater than 0; a zero deadline is almost \
+             certainly a typo (it expires on the first check, tearing the child \
+             down immediately after spawn) — omit the flag to leave it unbounded"
+        ));
+    }
+    Ok(duration)
 }
 
 /// Parse a `--max-memory` byte size.
@@ -631,6 +675,10 @@ mod tests {
     #[test]
     fn parse_duration_accepts_the_documented_grammar() {
         assert_eq!(parse_duration("30").unwrap(), Duration::from_secs(30));
+        // `0` is legal for `parse_duration` (used directly by `--grace`, where a
+        // zero-length pause is a meaningful "no pause" setting, not degenerate);
+        // see `parse_positive_duration_rejects_zero_in_every_unit` for the
+        // stricter parser used by `--timeout`/`--idle-timeout`.
         assert_eq!(parse_duration("0").unwrap(), Duration::ZERO);
         assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
         assert_eq!(parse_duration("5s").unwrap(), Duration::from_secs(5));
@@ -656,6 +704,58 @@ mod tests {
         // wrapped-around tiny duration.
         assert!(parse_duration("99999999999999999999h").is_err());
         assert!(parse_duration(&format!("{}h", u64::MAX)).is_err());
+    }
+
+    #[test]
+    fn parse_positive_duration_accepts_the_same_grammar_minus_zero() {
+        // Everything `parse_duration` accepts, `parse_positive_duration` accepts
+        // too, as long as it is not a total of zero.
+        assert_eq!(
+            parse_positive_duration("30").unwrap(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            parse_positive_duration("500ms").unwrap(),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            parse_positive_duration("5s").unwrap(),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            parse_positive_duration("2m").unwrap(),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            parse_positive_duration("1h").unwrap(),
+            Duration::from_secs(3600)
+        );
+    }
+
+    #[test]
+    fn parse_positive_duration_rejects_zero_in_every_unit() {
+        // Used by `--timeout`/`--idle-timeout`: a zero deadline arms instantly, is
+        // almost certainly a typo, and is rejected as a form error (`USAGE`, 100)
+        // rather than silently arming a surprising immediate teardown — unlike
+        // `--grace`, which keeps accepting `0` through the plain `parse_duration`.
+        for zero in ["0", "0ms", "0s", "0m", "0h"] {
+            assert!(
+                parse_positive_duration(zero).is_err(),
+                "expected `{zero}` to be rejected as a degenerate zero duration"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_positive_duration_rejects_malformed_values() {
+        // Same malformed-input rejections as `parse_duration`, since it is
+        // delegated to first.
+        for bad in ["", "abc", "-5", "5x", "1.5s", "s", "5 s", " 5s", "ms"] {
+            assert!(
+                parse_positive_duration(bad).is_err(),
+                "expected `{bad}` to be rejected as a duration"
+            );
+        }
     }
 
     // Property-based tier (T-167). Placed in this same `#[cfg(test)]` module
@@ -743,9 +843,64 @@ mod tests {
     }
 
     #[test]
+    fn run_rejects_zero_timeout_and_idle_timeout_but_accepts_zero_grace() {
+        // `--timeout 0`/`--idle-timeout 0` would arm a deadline that expires on the
+        // very first poll — almost certainly a typo — and is rejected at parse
+        // time (see `parse_positive_duration`).
+        let zero_timeout = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--timeout",
+            "0",
+            "--",
+            "true",
+        ]);
+        assert!(
+            zero_timeout.is_err(),
+            "--timeout 0 must be rejected as a degenerate deadline"
+        );
+
+        let zero_idle_timeout = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--idle-timeout",
+            "0",
+            "--",
+            "true",
+        ]);
+        assert!(
+            zero_idle_timeout.is_err(),
+            "--idle-timeout 0 must be rejected as a degenerate deadline"
+        );
+
+        // `--grace 0` stays legal — "no pause" between the soft stop and the hard
+        // kill is a meaningful setting, not a degenerate one.
+        let cli = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--grace",
+            "0",
+            "--",
+            "true",
+        ])
+        .expect("--grace 0 is a legal 'no pause' setting");
+        let Command::Run(args) = cli.command else {
+            panic!("expected the run subcommand");
+        };
+        assert_eq!(args.grace, Some(Duration::ZERO));
+    }
+
+    #[test]
     fn run_parses_idle_timeout_into_a_duration_and_defaults_to_absent() {
-        // `--idle-timeout` reuses `parse_duration`, so it accepts the same grammar
-        // as `--timeout`/`--grace` and lands as a ready `Duration`.
+        // `--idle-timeout` reuses `parse_positive_duration`, so it accepts the same
+        // grammar as `--timeout` (a superset of `--grace`'s, minus `0`) and lands
+        // as a ready `Duration`.
         let cli = Cli::try_parse_from([
             "processkit-cli",
             "run",
