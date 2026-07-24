@@ -12,7 +12,11 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+- `docs/integration.md`: a consumer/adapter integration guide walking through
+  the fail-closed `probe` preflight, the recommended `run` invocation, reading
+  the JSONL event stream, control-plane supervision (`inspect`/`cancel`/
+  `kill`), registry housekeeping (`list`/`prune`), and typical error modes —
+  linking the existing normative documents rather than duplicating them.
 
 ### Changed
 -

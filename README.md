@@ -15,6 +15,9 @@ owner of containment, teardown, PID-reuse discipline, and lifecycle semantics.
 
 For a map of the modules below, the data flow of one run, and the
 control-plane contour, see [the architecture overview](docs/architecture.md).
+For a consumer/adapter walkthrough — preflight, launching a run, reading the
+JSONL stream, supervision, and housekeeping — see
+[the integration guide](docs/integration.md).
 
 ## Installation
 
