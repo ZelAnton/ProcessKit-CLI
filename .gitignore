@@ -20,6 +20,10 @@ progress.md
 /.claude/
 /PROCESSKIT_CLI_DEVELOPMENT_BRIEF.md
 
+# Agent-orchestration scratch tree (task queue, working state, logs) — local
+# to this checkout, never committed.
+/.work/
+
 # Rust
 **/*.rs.bk
 *.pdb
