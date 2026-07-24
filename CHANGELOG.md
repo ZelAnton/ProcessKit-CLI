@@ -146,6 +146,20 @@ to a dated version section.
   control command against a run no longer creates the registry directory or
   re-asserts its owner-only permissions as a side effect when the directory does
   not yet exist.
+- An orphaned registry `.lock` file — one with no paired `.json` record, which
+  `Registry::scan` never sees and so never reached `prune` — no longer accumulates
+  forever. `Registry::register` now backstops the reservation it makes before
+  writing the record: if the write never lands, the freshly created lock file is
+  deleted on drop instead of leaked. `prune [--json]` also gained a second pass that
+  reaps any orphaned `.lock` file already on disk (e.g. from a hand-edited registry,
+  or a `Registration::remove` whose `.json` delete succeeded while its `.lock`
+  delete did not), with the same confirm-before-delete safety as the existing
+  paired-record reap (a live lock is never touched; an unprobeable one is left in
+  place), plus a minimum-age floor so a lock file `Registry::register` has only just
+  reserved — created, but not yet locked — is never mistaken for a long-dead orphan
+  by a concurrently running `prune`. Its `--json` tally gained an additive
+  `orphaned_locks` field alongside the existing `pruned`/`live`/`unprobed`. See
+  README.md and [`docs/registry.md`](docs/registry.md), "Reaping — `prune`".
 
 ## [0.2.2] - 2026-07-24
 
