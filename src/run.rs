@@ -1085,7 +1085,10 @@ async fn wait_for_ctrl_c() {
 /// returns [`PkError::Unsupported`]: no soft signal is delivered, and we record
 /// that faithfully instead of pretending. Either way the grace window still
 /// elapses (giving a child that *can* stop — e.g. one that received the console's
-/// own `Ctrl-C` on Windows — a chance to exit first) before the atomic kill.
+/// own `Ctrl-C` on Windows — a chance to exit first) before the atomic kill — but
+/// only as an *upper bound*: [`wait_grace_or_empty`] cuts the wait short the
+/// moment the tree is observed empty, rather than always sleeping the whole
+/// window.
 async fn soft_terminate_then_grace(group: &ProcessGroup, grace: Option<Duration>) -> SoftTerminate {
     let soft = match group.signal(Signal::Term) {
         Ok(()) => SoftTerminate::Signalled,
@@ -1095,9 +1098,48 @@ async fn soft_terminate_then_grace(group: &ProcessGroup, grace: Option<Duration>
         Err(_) => SoftTerminate::Failed,
     };
     if let Some(grace) = grace {
-        tokio::time::sleep(grace).await;
+        wait_grace_or_empty(group, grace).await;
     }
     soft
+}
+
+/// The polling step used by [`wait_grace_or_empty`] to check for an early-empty
+/// container: short enough that a promptly-exiting tree does not hold the runner
+/// (and an already-acked control client) for a meaningfully longer tail than
+/// necessary, long enough not to turn teardown into a busy-poll.
+const GRACE_POLL_STEP: Duration = Duration::from_millis(25);
+
+/// Wait out `grace`, but return as soon as the container's tree is observed
+/// empty — `--grace` is an *upper bound* on how long we wait for a voluntary
+/// exit after the soft stop, not a mandatory delay. Polls
+/// [`ProcessGroup::members`] on [`GRACE_POLL_STEP`] instead of a single
+/// `sleep(grace)`, so a tree that dies well inside the window releases the
+/// runner (and any control-plane caller already ack'd) promptly instead of
+/// idling for the rest of `grace`.
+///
+/// POSIX caveat, deliberately accepted rather than worked around: a member that
+/// *just* exited can still be reported by `members()` until something reaps it
+/// (an un-reaped process is still "there" to a liveness check) — this is the
+/// same abrupt-cleanup tri-state documented at [`crate::events::abrupt_cleanup_str`]
+/// (K-005), not a Windows-only concern. The effect here is bounded and one-sided:
+/// it can make the empty-tree check lag the real exit by at most one poll step
+/// (negligible next to the grace window it shortens), and it can never
+/// *under*-report a live tree as empty — a still-running member is always seen —
+/// so an early return is always honest, only possibly a poll step late. A read
+/// failure is treated the same as "not yet empty": teardown falls back to the
+/// unmodified full-grace wait rather than guessing.
+async fn wait_grace_or_empty(group: &ProcessGroup, grace: Duration) {
+    let deadline = tokio::time::Instant::now() + grace;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        tokio::time::sleep(remaining.min(GRACE_POLL_STEP)).await;
+        if matches!(group.members(), Ok(members) if members.is_empty()) {
+            return;
+        }
+    }
 }
 
 /// Turn a runner-imposed ending into the reserved-band error it surfaces:

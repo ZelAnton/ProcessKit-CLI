@@ -67,6 +67,49 @@ a first-class path:
 cargo install processkit-cli
 ```
 
+Building from source also (re)generates the shell completions and man pages
+described below, in `target/assets/` — see "Shell completions and man pages".
+
+### Shell completions and man pages
+
+Every release archive (above) also ships a `completions/` directory (bash, zsh,
+fish, PowerShell, and Elvish) and a `man/man1/` directory (one page per
+subcommand, plus `processkit-cli.1`), generated straight from the CLI's own
+`clap` definition by `build.rs` at build time — there is no separate,
+hand-maintained copy of the flags to fall out of sync, and (unlike a
+`generate-completions` subcommand would) this never adds anything to the CLI's
+own runtime surface, so the fail-closed `probe --require-surface` preflight
+(see "Command interface" below) never sees it. `cargo install`/`cargo build`
+from source produce the same two directories under `target/assets/` — see
+`build.rs`'s module doc for the full mechanism.
+
+Install the completion script for your shell, e.g.:
+
+```sh
+# bash (adjust the destination to your distro's completion directory)
+install -Dm644 completions/processkit-cli.bash /etc/bash_completion.d/processkit-cli
+
+# zsh (anywhere on $fpath)
+install -Dm644 completions/_processkit-cli "$HOME/.zsh/completions/_processkit-cli"
+
+# fish
+install -Dm644 completions/processkit-cli.fish "$HOME/.config/fish/completions/processkit-cli.fish"
+```
+
+```powershell
+# PowerShell — dot-source it from your $PROFILE
+Copy-Item completions\_processkit-cli.ps1 $HOME\Documents\PowerShell\
+Add-Content $PROFILE '. $HOME\Documents\PowerShell\_processkit-cli.ps1'
+```
+
+And the man pages, onto any directory on your `MANPATH`:
+
+```sh
+mkdir -p /usr/local/share/man/man1
+cp man/man1/*.1 /usr/local/share/man/man1/
+man processkit-cli-run
+```
+
 ### Platform matrix
 
 Prebuilt binaries are published for the targets below. The **Container mechanism**

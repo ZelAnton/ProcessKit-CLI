@@ -739,6 +739,41 @@ fn grace_holds_the_pause_before_the_hard_kill() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `--grace` is an *upper bound*, not a mandatory delay: a tree that dies
+/// promptly after the soft signal (no `trap` here, so `sleep` obeys the default
+/// `SIGTERM` disposition and exits immediately) must not hold the run for
+/// anywhere near the full window. Asserted through a loose upper bound on total
+/// elapsed time — never a tight/exact tail — so the poll-step granularity of the
+/// early-exit check cannot make this test flaky.
+#[cfg(unix)]
+#[test]
+fn grace_ends_early_once_the_tree_has_already_emptied() {
+    let dir = scratch("grace-early");
+    let start = std::time::Instant::now();
+    let out = run_with_flags(
+        &dir,
+        &[],
+        &["--timeout", "200ms", "--grace", "5s"],
+        shell_inline("sleep 300"),
+    );
+    let elapsed = start.elapsed();
+    assert_eq!(
+        out.status.code(),
+        Some(106),
+        "still a timeout, even though the child died to the soft signal rather than naturally"
+    );
+    // An unconditional full grace would run to roughly timeout(~0.2s) + grace(5s)
+    // ~= 5.2s; observing the emptied tree early must end the run in a small
+    // fraction of that — generous enough to absorb CI scheduling jitter, still
+    // far short of the un-shortened window.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the grace window was not cut short: the run took {elapsed:?}, expected well under \
+         the full ~5.2s (timeout + grace)"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A `Ctrl-C` mid-run is a **distinguishable** ending: the runner exits with the
 /// reserved `CANCELLED` code (107 — not a timeout, not a child code) and tears the
 /// tree down. Unix-only: it delivers a real `SIGINT` (the interactive Ctrl-C) to

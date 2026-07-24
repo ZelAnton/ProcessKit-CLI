@@ -126,6 +126,24 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
 ] }
 
+# ---------------------------------------------------------------------------
+# Build-time dependencies (`build.rs`)
+#
+# `build.rs` generates shell completions and man pages from the live CLI
+# definition (see that file's module doc for why this runs at build time
+# rather than as a CLI subcommand). It loads `src/cli.rs` as a module
+# (`#[path = "src/cli.rs"] mod cli;`), so it needs the same `clap` derive
+# machinery that file uses.
+# ---------------------------------------------------------------------------
+[build-dependencies]
+clap = { version = "4", features = ["derive"] }
+# Generates the bash/elvish/fish/PowerShell/zsh completion scripts from the
+# `clap::Command` tree `build.rs` builds via `Cli::command()`.
+clap_complete = "4"
+# Generates the roff (`man`) pages for the top-level command and every
+# subcommand from that same `clap::Command` tree.
+clap_mangen = "0.3"
+
 [dev-dependencies]
 # Validates the JSONL event golden fixture (and events emitted by the
 # through-the-binary tests) against the published JSON Schema
