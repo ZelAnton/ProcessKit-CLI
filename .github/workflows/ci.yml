@@ -84,8 +84,8 @@ jobs:
     # are unaffected either way.
     #
     # Scope mirrors the `test` job above: the default `cargo test` set (the
-    # `src/*.rs` unit tests baked into the `processkit-cli` binary — this crate
-    # is bin-only, there is no `--lib` target — plus the through-the-binary
+    # `src/*.rs` unit tests, which now live in the crate's library target and
+    # are picked up by a plain `cargo test`, plus the through-the-binary
     # integration tests under `tests/`; see docs/architecture.md, "Test
     # tiers"). ubuntu-latest + windows-latest covers both the `cfg(unix)` and
     # `cfg(windows)` platform halves. The feature-gated `e2e` tier is out of
