@@ -234,6 +234,101 @@ fn missing_program_uses_the_spawn_code() {
     );
 }
 
+/// A `--max-memory` cap the platform cannot apply is a **fail-fast, pre-spawn**
+/// failure: the run emits the resource-specific `limit_hit` event first, then the
+/// shared `container_failed{create}` → `runner_exit{container_error, 102}` tail,
+/// and never starts the child. Where the platform *can* apply the cap (a Windows
+/// Job Object, or a Linux cgroup v2 at the real hierarchy root) the trivial child
+/// simply runs — we honestly handle both outcomes rather than asserting an
+/// enforcement we cannot reproduce across every CI host (`AGENTS.md`, testing
+/// tiers; mirrors the `dotnet`-availability skip in the e2e tier). The end-to-end
+/// wiring under test (the `limit_hit`+tail sequence, and its exit code) is proved
+/// on every host that cannot apply the cap; the container-free `limit`-string
+/// mapping is unit-tested cross-platform in `src/run.rs`.
+#[test]
+fn resource_limit_that_cannot_be_applied_emits_limit_hit_and_the_backend_code() {
+    let dir = scratch("limit");
+    // A valid, ordinary cap: applied where a whole-tree container exists, and
+    // fail-fast `limit_hit` where none does — never a silent no-op either way.
+    let out = run_with_flags(&dir, &[], &["--max-memory", "64m"], shell_inline("exit 0"));
+    let events = read_run_events(&dir);
+    let position = |name: &str| events.iter().position(|event| event["event"] == name);
+
+    match events.iter().find(|event| event["event"] == "limit_hit") {
+        Some(limit_hit) => {
+            // The platform/environment could not apply the cap.
+            assert_eq!(
+                limit_hit["limit"], "memory",
+                "the emitted limit_hit names the memory cap: {limit_hit}"
+            );
+            assert!(
+                !limit_hit["detail"].is_null(),
+                "a human-readable detail accompanies the limit_hit: {limit_hit}"
+            );
+            // Pre-spawn: the child never started.
+            assert!(
+                position("run_started").is_none(),
+                "a pre-spawn limit failure never starts the child: {events:?}"
+            );
+            // The shared container-creation-failure tail follows, reusing BACKEND(102).
+            let container_failed = events
+                .iter()
+                .find(|event| event["event"] == "container_failed")
+                .expect("container_failed follows limit_hit on the create path");
+            assert_eq!(container_failed["phase"], "create");
+            assert_eq!(container_failed["code"], 102);
+            let terminal = events.last().expect("a terminal runner_exit event");
+            assert_eq!(terminal["event"], "runner_exit");
+            assert_eq!(terminal["source"], "container_error");
+            assert_eq!(terminal["code"], 102);
+            assert!(terminal["child_code"].is_null());
+            // Ordering: limit_hit before container_failed before runner_exit.
+            assert!(
+                position("limit_hit") < position("container_failed"),
+                "limit_hit must precede container_failed: {events:?}"
+            );
+            assert!(
+                position("container_failed") < position("runner_exit"),
+                "container_failed must precede the terminal runner_exit: {events:?}"
+            );
+            // The process exit code and stderr agree with the stream.
+            assert_eq!(
+                out.status.code(),
+                Some(102),
+                "a cap that could not be applied exits with the reserved BACKEND code"
+            );
+            assert!(
+                out.stdout.is_empty(),
+                "no child output when the child never ran"
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains("resource limit"),
+                "the limit failure is named on stderr: {stderr:?}"
+            );
+        }
+        None => {
+            // The platform applied the cap: the trivial child ran to completion. We
+            // deliberately do not assert the enforcement itself here (it is not
+            // reproducible on every host); only that this is a normal child exit with
+            // no limit failure and no BACKEND code.
+            assert!(
+                position("run_started").is_some(),
+                "an applied cap still starts the child: {events:?}"
+            );
+            let terminal = events.last().expect("a terminal runner_exit event");
+            assert_eq!(terminal["event"], "runner_exit");
+            assert_eq!(
+                terminal["source"], "child_exit",
+                "an applied cap leaves a normal child exit: {events:?}"
+            );
+            assert_eq!(out.status.code(), Some(0), "the trivial child exits 0");
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The headline guarantee: after `run` returns, a descendant the child leaked and
 /// abandoned does not survive. The child spawns a detached grandchild that
 /// appends to a heartbeat file on a ~1s cadence, then the child exits. Once `run`

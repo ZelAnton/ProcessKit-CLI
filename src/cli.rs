@@ -45,14 +45,17 @@ pub enum Command {
 }
 
 /// `run [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl> [--create-no-window]
-/// [--timeout <duration>] [--grace <duration>] [--capture-dir <dir>] [--argv-raw]
+/// [--timeout <duration>] [--grace <duration>] [--max-memory <size>]
+/// [--max-processes <n>] [--cpu-quota <cores>] [--capture-dir <dir>] [--argv-raw]
 /// [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
 /// -- <program> <args...>`
 //
 // `run` consumes every field: `cwd`, `create_no_window`, `timeout`, `grace`,
-// `command`, `jsonl`, `run_id`, `argv_raw`, `capture_dir` — bounded
-// stdout/stderr capture to files (see `src/capture.rs`) — `env_clear`,
-// `env_remove`, `env`, and `inherit_stdio`/`inherit_stdin`/`stdin_file`.
+// `max_memory`, `max_processes`, `cpu_quota` — the whole-tree ProcessKit
+// resource caps (see `src/run.rs`) — `command`, `jsonl`, `run_id`, `argv_raw`,
+// `capture_dir` — bounded stdout/stderr capture to files (see `src/capture.rs`)
+// — `env_clear`, `env_remove`, `env`, and
+// `inherit_stdio`/`inherit_stdin`/`stdin_file`.
 #[derive(Debug, Args)]
 pub struct RunArgs {
     /// Identifier for this run; a value is generated when omitted.
@@ -85,6 +88,32 @@ pub struct RunArgs {
     /// parse-time validation as `--timeout` (see [`parse_duration`]).
     #[arg(long, value_name = "duration", value_parser = parse_duration)]
     pub grace: Option<Duration>,
+
+    /// Cap the run's **whole process tree** total memory. Accepts a byte count
+    /// with an optional binary unit — `1048576`, `512k`, `256m`, `2g` (see
+    /// [`parse_size`] for the grammar). Enforcement needs a real whole-tree
+    /// container (Windows Job Object or Linux cgroup v2); where none exists the
+    /// run fails fast with a `limit_hit` rather than silently running unbounded
+    /// (see `README.md`, "Resource limits"). Omit to leave memory unbounded.
+    #[arg(long, value_name = "size", value_parser = parse_size)]
+    pub max_memory: Option<u64>,
+
+    /// Cap the number of live processes in the run's **whole tree**. A positive
+    /// integer (`0` is rejected at parse time). Same whole-tree-container
+    /// requirement and fail-fast `limit_hit` as `--max-memory`; note the Linux
+    /// asymmetry documented in `README.md` ("Resource limits"): there it bounds a
+    /// contained child's *descendants*, not the number of top-level launches into
+    /// the group. Omit to leave the count unbounded.
+    #[arg(long, value_name = "n", value_parser = parse_max_processes)]
+    pub max_processes: Option<u32>,
+
+    /// Cap the run's **whole-tree** CPU as a fraction of a single core: `0.5` is
+    /// half a core, `2` is two cores' worth. A finite value greater than `0`
+    /// (`0`, negatives, `NaN`, and infinities are rejected at parse time — see
+    /// [`parse_cpu_quota`]). Same whole-tree-container requirement and fail-fast
+    /// `limit_hit` as `--max-memory`. Omit to leave CPU unbounded.
+    #[arg(long, value_name = "cores", value_parser = parse_cpu_quota)]
+    pub cpu_quota: Option<f64>,
 
     /// Directory for bounded stdout/stderr capture files (`stdout.log`,
     /// `stderr.log`). When set, the child's output is teed into these files
@@ -297,6 +326,114 @@ pub fn parse_duration(raw: &str) -> Result<Duration, String> {
     let millis = millis
         .ok_or_else(|| format!("duration `{raw}` is too large to represent in milliseconds"))?;
     Ok(Duration::from_millis(millis))
+}
+
+/// Parse a `--max-memory` byte size.
+///
+/// Grammar: a base-10, positive integer with an optional **binary** unit suffix —
+/// `b` (bytes, the default when omitted), `k` (KiB, ×1024), `m` (MiB, ×1024²), or
+/// `g` (GiB, ×1024³); the suffix is case-insensitive (`512K` == `512k`). Examples:
+/// `1048576`, `512k`, `256m`, `2g`. Deliberately strict — a sign, a fraction,
+/// surrounding whitespace, an unknown unit, or a total of `0` bytes is rejected
+/// rather than silently reinterpreted, so a typo fails loudly at parse time
+/// (mapped to the `USAGE` exit) instead of arming a surprising or degenerate cap.
+///
+/// **This parser is the single source of truth for the flag's *form*** — it
+/// rejects the same nonsense (`0`, non-numeric) that ProcessKit's own
+/// `ResourceLimits` validation would (`LimitReason::Invalid`), so a malformed
+/// `--max-memory` surfaces as the documented `USAGE` (100) like any other bad
+/// flag, never reaching `ProcessGroup::with_options` (where it would otherwise be
+/// a mid-run `limit_hit`). The value is capped only by `u64` bytes; an overflow is
+/// reported, not wrapped.
+///
+/// `pub`/`#[doc(hidden)]` (not exported clap surface) so the CLI-parsers fuzz
+/// target can drive it directly (`fuzz/fuzz_targets/cli_parsers.rs`, T-186).
+#[doc(hidden)]
+pub fn parse_size(raw: &str) -> Result<u64, String> {
+    if raw.is_empty() {
+        return Err("empty size; expected e.g. `1048576`, `512k`, `256m`, or `2g`".to_string());
+    }
+
+    // Split the leading digit run from the unit suffix, exactly like
+    // `parse_duration`: a value that does not start with a digit (a sign, a bare
+    // unit, letters) leaves `number` empty.
+    let split = raw.find(|c: char| !c.is_ascii_digit()).unwrap_or(raw.len());
+    let (number, unit) = raw.split_at(split);
+    if number.is_empty() {
+        return Err(format!(
+            "size `{raw}` must start with a non-negative number; \
+             expected e.g. `1048576`, `512k`, `256m`, or `2g`"
+        ));
+    }
+
+    let value: u64 = number
+        .parse()
+        .map_err(|_| format!("size `{raw}` is out of range for a 64-bit byte count"))?;
+
+    // Case-insensitive so `512K` and `512k` are the same; binary (1024-based)
+    // units, documented above so the wire meaning is never ambiguous.
+    let bytes = match unit.to_ascii_lowercase().as_str() {
+        "" | "b" => Some(value),
+        "k" => value.checked_mul(1024),
+        "m" => value.checked_mul(1024 * 1024),
+        "g" => value.checked_mul(1024 * 1024 * 1024),
+        other => {
+            return Err(format!(
+                "size `{raw}` has an unknown unit `{other}`; use b, k, m, or g"
+            ));
+        }
+    };
+
+    let bytes = bytes.ok_or_else(|| format!("size `{raw}` is too large to represent in bytes"))?;
+    if bytes == 0 {
+        // `0` bytes is a degenerate cap ProcessKit itself rejects
+        // (`LimitReason::Invalid`); catch it here so it is a form error, not a
+        // mid-run `limit_hit`.
+        return Err(format!("size `{raw}` must be greater than 0 bytes"));
+    }
+    Ok(bytes)
+}
+
+/// Parse a `--max-processes` count: a base-10 integer strictly greater than `0`
+/// and within `u32`. Deliberately strict — a sign, a fraction, whitespace, `0`, or
+/// an out-of-range value fails loudly at parse time (mapped to the `USAGE` exit)
+/// rather than reaching `ProcessGroup::with_options` as a mid-run `limit_hit`.
+/// Like [`parse_size`], this parser is the single source of truth for the flag's
+/// form, mirroring ProcessKit's `max_processes(0)` → `LimitReason::Invalid`
+/// rejection at the CLI boundary instead of duplicating it downstream.
+///
+/// `pub`/`#[doc(hidden)]` — see [`parse_duration`]'s note on why (fuzz target).
+#[doc(hidden)]
+pub fn parse_max_processes(raw: &str) -> Result<u32, String> {
+    let n: u32 = raw.parse().map_err(|_| {
+        format!("`--max-processes` value `{raw}` must be an integer in 1..=4294967295")
+    })?;
+    if n == 0 {
+        return Err("`--max-processes` must be greater than 0".to_string());
+    }
+    Ok(n)
+}
+
+/// Parse a `--cpu-quota` value: a finite `f64` strictly greater than `0` (a
+/// fraction of a single core — `0.5` is half a core, `2` is two cores). `0`,
+/// negatives, `NaN`, and the infinities are rejected at parse time (mapped to the
+/// `USAGE` exit), mirroring ProcessKit's own `cpu_quota` validity rule
+/// (`LimitReason::Invalid`) at the CLI boundary so a nonsense quota is a loud form
+/// error, never a mid-run `limit_hit`. Like [`parse_size`]/[`parse_max_processes`]
+/// this parser is the single source of truth for the flag's form.
+///
+/// `pub`/`#[doc(hidden)]` — see [`parse_duration`]'s note on why (fuzz target).
+#[doc(hidden)]
+pub fn parse_cpu_quota(raw: &str) -> Result<f64, String> {
+    let cores: f64 = raw.parse().map_err(|_| {
+        format!("`--cpu-quota` value `{raw}` must be a number, e.g. `0.5`, `1`, `2`")
+    })?;
+    if !(cores.is_finite() && cores > 0.0) {
+        return Err(format!(
+            "`--cpu-quota` value `{raw}` must be a finite value greater than 0"
+        ));
+    }
+    Ok(cores)
 }
 
 /// Parse a `--require-exit-code-band` value: two `u8`s as `start-end` (e.g.
@@ -842,5 +979,144 @@ mod tests {
             .is_err(),
             "a malformed --timeout must fail at parse time"
         );
+    }
+
+    #[test]
+    fn parse_size_accepts_bytes_and_binary_units() {
+        assert_eq!(parse_size("1").unwrap(), 1);
+        assert_eq!(parse_size("1048576").unwrap(), 1_048_576);
+        assert_eq!(parse_size("512b").unwrap(), 512);
+        assert_eq!(parse_size("1k").unwrap(), 1024);
+        assert_eq!(parse_size("2m").unwrap(), 2 * 1024 * 1024);
+        assert_eq!(parse_size("3g").unwrap(), 3 * 1024 * 1024 * 1024);
+        // The unit is case-insensitive.
+        assert_eq!(parse_size("512K").unwrap(), 512 * 1024);
+    }
+
+    #[test]
+    fn parse_size_rejects_malformed_or_degenerate_values() {
+        // Empty, non-numeric, signed, fractional, whitespace, an unknown unit, and a
+        // bare unit all fail loudly. `0` (in any unit) is a degenerate cap ProcessKit
+        // itself rejects, so the parser catches it as a form error before with_options.
+        for bad in [
+            "", "abc", "-5", "1.5m", "5 m", " 5m", "5x", "m", "0", "0k", "0m", "0g",
+        ] {
+            assert!(
+                parse_size(bad).is_err(),
+                "expected `{bad}` to be rejected as a size"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_size_reports_overflow_instead_of_wrapping() {
+        assert!(parse_size(&format!("{}g", u64::MAX)).is_err());
+        assert!(parse_size("99999999999999999999").is_err());
+    }
+
+    #[test]
+    fn parse_max_processes_requires_a_positive_integer() {
+        assert_eq!(parse_max_processes("1").unwrap(), 1);
+        assert_eq!(parse_max_processes("64").unwrap(), 64);
+        // `0`, negatives, fractions, and non-numbers are rejected at parse time.
+        for bad in ["0", "-1", "1.5", "abc", "", "99999999999"] {
+            assert!(
+                parse_max_processes(bad).is_err(),
+                "expected `{bad}` to be rejected as a process count"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_cpu_quota_requires_a_finite_positive() {
+        assert_eq!(parse_cpu_quota("0.5").unwrap(), 0.5);
+        assert_eq!(parse_cpu_quota("1").unwrap(), 1.0);
+        assert_eq!(parse_cpu_quota("2").unwrap(), 2.0);
+        // `0`, negatives, NaN, the infinities, and non-numbers are rejected — the
+        // same values ProcessKit's `cpu_quota` validity rule treats as `Invalid`,
+        // caught here at the CLI boundary instead.
+        for bad in [
+            "0", "0.0", "-1", "-0.5", "nan", "NaN", "inf", "infinity", "abc", "",
+        ] {
+            assert!(
+                parse_cpu_quota(bad).is_err(),
+                "expected `{bad}` to be rejected as a CPU quota"
+            );
+        }
+    }
+
+    #[test]
+    fn run_parses_the_resource_limit_flags() {
+        let cli = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--max-memory",
+            "256m",
+            "--max-processes",
+            "64",
+            "--cpu-quota",
+            "1.5",
+            "--",
+            "true",
+        ])
+        .expect("a valid run invocation with resource limits");
+        let Command::Run(args) = cli.command else {
+            panic!("expected the run subcommand");
+        };
+        assert_eq!(args.max_memory, Some(256 * 1024 * 1024));
+        assert_eq!(args.max_processes, Some(64));
+        assert_eq!(args.cpu_quota, Some(1.5));
+    }
+
+    #[test]
+    fn run_resource_limit_flags_default_to_absent() {
+        let cli = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--",
+            "true",
+        ])
+        .expect("a valid run invocation");
+        let Command::Run(args) = cli.command else {
+            panic!("expected the run subcommand");
+        };
+        assert!(args.max_memory.is_none());
+        assert!(args.max_processes.is_none());
+        assert!(args.cpu_quota.is_none());
+    }
+
+    #[test]
+    fn run_rejects_malformed_resource_limit_flags() {
+        // Each nonsense value is a form error mapped to USAGE, never reaching the
+        // runner as a mid-run limit failure.
+        for (flag, value) in [
+            ("--max-memory", "0"),
+            ("--max-memory", "lots"),
+            ("--max-processes", "0"),
+            ("--max-processes", "-1"),
+            ("--cpu-quota", "0"),
+            ("--cpu-quota", "-1"),
+            ("--cpu-quota", "nan"),
+            ("--cpu-quota", "inf"),
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "processkit-cli",
+                    "run",
+                    "--jsonl",
+                    "events.jsonl",
+                    flag,
+                    value,
+                    "--",
+                    "true",
+                ])
+                .is_err(),
+                "a malformed `{flag} {value}` must fail at parse time"
+            );
+        }
     }
 }

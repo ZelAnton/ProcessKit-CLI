@@ -111,15 +111,19 @@ pub enum Event {
         remaining_pids: Vec<u32>,
         soft_terminate: Option<&'static str>,
     },
-    /// A configured ProcessKit resource limit was exceeded or could not be
-    /// applied. Part of the v1 schema so adapters pin its shape now; the runner
-    /// exposes no resource-limit knobs yet, so it is not emitted at runtime today
-    /// (see `docs/schema.md`, "limit_hit").
-    // Reserved for when resource-limit configuration lands; constructed by the
-    // golden test, so it is otherwise never built in this build.
-    #[allow(dead_code)]
+    /// A configured ProcessKit resource limit could not be applied. Emitted when a
+    /// `run` given `--max-memory`/`--max-processes`/`--cpu-quota` asks for a cap the
+    /// active mechanism cannot honor: it fires **pre-spawn** (the child never
+    /// started) and covers only the *"could not be applied"* branch of this event's
+    /// contract — a whole-tree container that is `Unsupported` (macOS/BSD, the Linux
+    /// process-group fallback) or `Unenforceable` (a Linux cgroup v2 whose
+    /// controllers can't be enabled). It precedes the same `container_failed{create}`
+    /// → `runner_exit` tail every group-creation failure takes (see `src/run.rs`,
+    /// `create_group`, and `docs/schema.md`, "limit_hit"). Nonsensical values
+    /// (`--max-memory 0`, a non-positive `--cpu-quota`) are rejected earlier as a
+    /// `USAGE` form error, so this event never carries ProcessKit's `Invalid` reason.
     LimitHit {
-        /// Which limit was hit, e.g. `processes` / `memory` / `cpu`.
+        /// Which limit could not be applied: `memory` / `processes` / `cpu`.
         limit: String,
         detail: Option<String>,
     },

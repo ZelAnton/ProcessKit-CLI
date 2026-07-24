@@ -48,8 +48,8 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 use processkit::{
-    Command as PkCommand, Error as PkError, Mechanism, Outcome, OutputBufferPolicy, ProcessGroup,
-    RunningProcess, Signal, Stdin, StdioMode,
+    Command as PkCommand, Error as PkError, LimitKind, Mechanism, Outcome, OutputBufferPolicy,
+    ProcessGroup, ProcessGroupOptions, RunningProcess, Signal, Stdin, StdioMode,
 };
 
 use crate::capture::{CAPTURE_INFLIGHT_MAX_BYTES, Capture};
@@ -207,14 +207,33 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     // We own this group; the child — and anything it spawns — is a member. When
     // `group` drops at the end of this scope (every path below), the kernel reaps
     // the whole tree. Containment/teardown is the group's job; we never duplicate
-    // it (`AGENTS.md`, "Never clean up by process name").
-    let group = match ProcessGroup::new() {
+    // it (`AGENTS.md`, "Never clean up by process name"). `create_group` uses the
+    // plain `ProcessGroup::new()` unless a `--max-*`/`--cpu-quota` flag asked for a
+    // whole-tree resource cap, in which case it goes through
+    // `ProcessGroup::with_options` (see that function's decision note).
+    let group = match create_group(&args) {
         Ok(group) => group,
         Err(err) => {
-            let error = RunnerError::new(
-                exit::BACKEND,
-                format!("could not create the ProcessKit container: {err}"),
-            );
+            // A requested resource cap the active mechanism cannot honor surfaces as
+            // `Error::ResourceLimit`, *pre-spawn* (no child ran). Emit the
+            // resource-specific `limit_hit` first — the dedicated, machine-readable
+            // signal that this creation failure was a limit, not a generic backend
+            // fault — then take the *same* `container_failed{create}` →
+            // `container_error`/`BACKEND` (102) tail every other group-creation
+            // failure uses (the exit-code reuse is a deliberate decision — see
+            // `create_group`). `limit_kind` reads the kind off the error without
+            // destructuring its `#[non_exhaustive]` variant, and is `None` for every
+            // non-limit error, so this branch fires only for a real limit failure.
+            let message = if let Some(kind) = err.limit_kind() {
+                emitter.emit(&Event::LimitHit {
+                    limit: limit_kind_str(kind).to_string(),
+                    detail: Some(err.to_string()),
+                });
+                format!("could not apply the requested resource limit: {err}")
+            } else {
+                format!("could not create the ProcessKit container: {err}")
+            };
+            let error = RunnerError::new(exit::BACKEND, message);
             emitter.emit(&Event::ContainerFailed {
                 phase: "create",
                 code: error.code(),
@@ -812,6 +831,81 @@ fn finish(
         child_code,
     });
     error
+}
+
+/// Create the owning [`ProcessGroup`], honoring any whole-tree resource cap the
+/// operator requested.
+///
+/// **Byte-for-byte-unchanged default.** With no `--max-memory`/`--max-processes`/
+/// `--cpu-quota` flag, [`build_limit_options`] returns `None` and this is exactly
+/// the previous unconditional `ProcessGroup::new()` — no `limits`-feature code runs
+/// at runtime, so a default run is unaffected. A cap is only ever requested when
+/// the operator asked to bound the tree, in which case the group is created through
+/// [`ProcessGroup::with_options`] with the caps mapped onto ProcessKit's own
+/// [`ProcessGroupOptions`] builder (`AGENTS.md`, "Build strictly on the public
+/// `processkit` API": the OS-level enforcement — a Windows Job Object or a Linux
+/// cgroup v2 — is the crate's, never reimplemented here).
+///
+/// **Exit-code decision (reserved runner band `100`–`119`).** When `with_options`
+/// cannot apply a requested cap it returns [`PkError::ResourceLimit`], and it does
+/// so **pre-spawn** — the child never started, so no child code is ever at risk.
+/// Because the CLI parsers (`src/cli.rs`) already reject every nonsensical value as
+/// a `USAGE` (100) form error *before* we reach here, the only reasons that survive
+/// to this point are the "could not be applied" ones — `Unsupported` (macOS/BSD and
+/// the Linux process-group fallback have no whole-tree container at all) and
+/// `Unenforceable` (a Linux cgroup v2 whose controllers can't be enabled — under
+/// systemd, an ordinary container, or typical CI). That is the **same class** of
+/// failure as the existing `ProcessGroup::new()` container-creation error ("a
+/// whole-tree container capable of what was asked could not be established here"),
+/// so the caller **deliberately reuses** the existing [`exit::BACKEND`] (102) code
+/// and the `container_error` `runner_exit` `source` rather than minting a new code
+/// in the free `112`–`119` slots. The distinguishing signal is the dedicated
+/// `limit_hit` event emitted immediately before the shared tail — the authoritative,
+/// machine-readable channel (`docs/exit-codes.md`, "Why a band is not enough on its
+/// own"; the numeric exit code is only a best-effort hint). Codes `112`–`119` stay
+/// reserved.
+fn create_group(args: &RunArgs) -> processkit::Result<ProcessGroup> {
+    match build_limit_options(args) {
+        Some(options) => ProcessGroup::with_options(options),
+        None => ProcessGroup::new(),
+    }
+}
+
+/// Assemble ProcessKit's [`ProcessGroupOptions`] from the run's resource-limit
+/// flags, or `None` when the operator set none — the signal [`create_group`] uses
+/// to keep the plain, unchanged `ProcessGroup::new()` path. Each flag maps straight
+/// onto the matching `ProcessGroupOptions` builder; the values were already
+/// validated for form by the CLI parsers (`src/cli.rs` is the single source of
+/// truth for that), so nothing is re-validated here.
+fn build_limit_options(args: &RunArgs) -> Option<ProcessGroupOptions> {
+    if args.max_memory.is_none() && args.max_processes.is_none() && args.cpu_quota.is_none() {
+        return None;
+    }
+    let mut options = ProcessGroupOptions::default();
+    if let Some(bytes) = args.max_memory {
+        options = options.max_memory(bytes);
+    }
+    if let Some(n) = args.max_processes {
+        options = options.max_processes(n);
+    }
+    if let Some(cores) = args.cpu_quota {
+        options = options.cpu_quota(cores);
+    }
+    Some(options)
+}
+
+/// The stable `limit_hit.limit` schema string for a [`LimitKind`]. `LimitKind` is
+/// `#[non_exhaustive]`, so a future kind this build predates maps to `"unknown"`
+/// rather than a guess — mirroring [`events::mechanism_str`]'s treatment of an
+/// unrecognized `Mechanism`. The three known strings match the golden fixture and
+/// `docs/schema.md` (`"memory"` / `"processes"` / `"cpu"`).
+fn limit_kind_str(kind: LimitKind) -> &'static str {
+    match kind {
+        LimitKind::Memory => "memory",
+        LimitKind::Processes => "processes",
+        LimitKind::Cpu => "cpu",
+        _ => "unknown",
+    }
 }
 
 /// Drive the child to its exit, returning the raw wait result the race resolves
@@ -1472,6 +1566,55 @@ mod tests {
         assert_eq!(format_duration(Duration::from_millis(500)), "500ms");
         assert_eq!(format_duration(Duration::from_millis(1500)), "1500ms");
         assert_eq!(format_duration(Duration::ZERO), "0ms");
+    }
+
+    /// The `limit_hit.limit` string for each `LimitKind` matches the schema and the
+    /// golden fixture (`"memory"`/`"processes"`/`"cpu"`). Cross-platform and
+    /// container-free: it proves the mapping the `limit_hit` emission uses without
+    /// depending on Job Object / cgroup availability (the enforcement itself is
+    /// platform-specific and is exercised, honestly per platform, through the
+    /// binary in `tests/run.rs`).
+    #[test]
+    fn limit_kind_maps_to_the_documented_schema_strings() {
+        assert_eq!(limit_kind_str(LimitKind::Memory), "memory");
+        assert_eq!(limit_kind_str(LimitKind::Processes), "processes");
+        assert_eq!(limit_kind_str(LimitKind::Cpu), "cpu");
+    }
+
+    /// A run with no `--max-*`/`--cpu-quota` flag requests no options, so
+    /// `create_group` keeps the plain `ProcessGroup::new()` path unchanged; any one
+    /// flag flips it to `with_options`.
+    #[test]
+    fn build_limit_options_is_none_without_flags_and_some_with_any() {
+        use clap::Parser;
+
+        let base = |argv: &[&str]| -> RunArgs {
+            let mut full = vec!["processkit-cli", "run", "--jsonl", "events.jsonl"];
+            full.extend_from_slice(argv);
+            full.extend_from_slice(&["--", "true"]);
+            match crate::cli::Cli::try_parse_from(full)
+                .expect("valid run")
+                .command
+            {
+                crate::cli::Command::Run(args) => *args,
+                _ => panic!("expected run"),
+            }
+        };
+
+        assert!(
+            build_limit_options(&base(&[])).is_none(),
+            "no limit flag ⇒ the unchanged ProcessGroup::new() path"
+        );
+        for flag in [
+            vec!["--max-memory", "256m"],
+            vec!["--max-processes", "8"],
+            vec!["--cpu-quota", "1.5"],
+        ] {
+            assert!(
+                build_limit_options(&base(&flag)).is_some(),
+                "the {flag:?} flag must request ProcessGroupOptions"
+            );
+        }
     }
 
     /// Forcing a real wait *failure* through the child's actual OS-level wait

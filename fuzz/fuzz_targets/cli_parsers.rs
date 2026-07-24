@@ -1,18 +1,24 @@
-//! Fuzz the three defensive CLI value parsers (`src/cli.rs`), each fed the same
-//! raw text independently — they never interact, and each is expected to
-//! reject anything outside its own strict grammar rather than panic or
-//! silently reinterpret it (see each function's own doc comment for its
-//! grammar: `--timeout`/`--grace` duration, `--require-exit-code-band`,
-//! `--env`).
+//! Fuzz the defensive CLI value parsers (`src/cli.rs`), each fed the same raw
+//! text independently — they never interact, and each is expected to reject
+//! anything outside its own strict grammar rather than panic or silently
+//! reinterpret it (see each function's own doc comment for its grammar:
+//! `--timeout`/`--grace` duration, `--require-exit-code-band`, `--env`,
+//! `--max-memory` size, `--max-processes` count, `--cpu-quota` core fraction).
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use processkit_cli::cli::{parse_duration, parse_env_kv, parse_exit_code_band};
+use processkit_cli::cli::{
+    parse_cpu_quota, parse_duration, parse_env_kv, parse_exit_code_band, parse_max_processes,
+    parse_size,
+};
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(text) = std::str::from_utf8(data) {
         let _ = parse_duration(text);
         let _ = parse_exit_code_band(text);
         let _ = parse_env_kv(text);
+        let _ = parse_size(text);
+        let _ = parse_max_processes(text);
+        let _ = parse_cpu_quota(text);
     }
 });

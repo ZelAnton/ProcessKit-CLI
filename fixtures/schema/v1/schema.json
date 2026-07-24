@@ -201,12 +201,12 @@
     },
     "limitHit": {
       "type": "object",
-      "description": "A configured ProcessKit resource limit was exceeded or could not be applied. Reserved for v1 shape-pinning; not emitted at runtime in this version.",
+      "description": "A requested ProcessKit resource limit (--max-memory/--max-processes/--cpu-quota) could not be applied. Emitted pre-spawn, only for the 'could not be applied' branch (Unsupported/Unenforceable), immediately before the container_failed(create) -> runner_exit(container_error) tail; nonsense values are rejected earlier as USAGE. docs/schema.md ('limit_hit') is the source of truth.",
       "properties": {
         "schema_version": { "$ref": "#/$defs/schemaVersion" },
         "time": { "$ref": "#/$defs/time" },
         "event": { "const": "limit_hit" },
-        "limit": { "type": "string", "description": "Which limit, e.g. processes, memory, cpu." },
+        "limit": { "type": "string", "description": "Which limit could not be applied: memory, processes, or cpu." },
         "detail": { "type": ["string", "null"], "description": "Human-readable detail; null if none." }
       },
       "required": ["schema_version", "time", "event", "limit", "detail"],

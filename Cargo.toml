@@ -61,7 +61,16 @@ serde_json = "1"
 # this runner is built on (the single source of truth for lifecycle semantics).
 # `run` owns a `ProcessGroup` and streams the child through it; the control-plane
 # paths that also call it land in later tasks (docs/ROADMAP.md).
-processkit = "2"
+#
+# `features = ["limits"]` opts into the whole-tree resource caps
+# (`ProcessGroupOptions`/`ResourceLimits`, `ProcessGroup::with_options`, and
+# `Error::ResourceLimit`) that back `run`'s `--max-memory`/`--max-processes`/
+# `--cpu-quota` flags — the enforcement primitive is a Windows Job Object or a
+# Linux cgroup v2, and the crate hides it behind this opt-in feature (it also
+# implies the crate's `stats` feature). Without a limit flag `run` still creates
+# the group through the plain `ProcessGroup::new()`, so a default run pulls none
+# of this at runtime.
+processkit = { version = "2", features = ["limits"] }
 # Async runtime that drives the tokio-based `processkit` API. A small
 # current-thread runtime hosts the run; `io-std` provides the async stdout/stderr
 # sinks the child's output is teed to. `time` arms the `--timeout` deadline timer

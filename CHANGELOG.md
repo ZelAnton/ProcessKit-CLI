@@ -12,6 +12,20 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- `run` resource-limit flags `--max-memory <size>`, `--max-processes <n>`, and
+  `--cpu-quota <cores>`, mapping onto ProcessKit's whole-tree `ProcessGroupOptions`
+  caps (the `processkit` dependency now enables its `limits` feature). Enforcement
+  needs a real container — a Windows Job Object or a Linux cgroup v2 at the real
+  hierarchy root — so where a cap cannot be applied (macOS/BSD and the Linux
+  process-group fallback; a cgroup v2 that is unenforceable under
+  systemd/containers/typical CI) the run fails fast **before** the child is spawned:
+  it now emits the previously reserved **`limit_hit`** JSONL event (naming
+  `memory`/`processes`/`cpu`) and exits with `BACKEND` (102), rather than running
+  silently unbounded. A nonsensical value (`--max-memory 0`, a non-positive/non-finite
+  `--cpu-quota`) is a `USAGE` (100) parse-time error. The new flags appear in the
+  `probe` surface tokens automatically; `schema_version` is unchanged (the
+  `limit_hit` shape was already fixed in v1). See README.md, "Resource limits", and
+  docs/schema.md / docs/exit-codes.md.
 - Shell completions (bash/zsh/fish/PowerShell/Elvish) and man pages, generated
   from the live `clap` CLI definition by a new `build.rs` at build time and
   attached to every release archive under `completions/` and `man/man1/` (see

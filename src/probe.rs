@@ -298,6 +298,11 @@ mod tests {
             "run:--inherit-stdin",
             "run:--stdin-file",
             "run:--timeout",
+            // The resource-limit flags (T-180) appear in the surface automatically —
+            // they are derived from the live clap tree, not a hand-maintained list.
+            "run:--max-memory",
+            "run:--max-processes",
+            "run:--cpu-quota",
             "inspect:--json",
             "cancel:--run-id",
             "probe:--json",

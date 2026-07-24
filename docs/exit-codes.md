@@ -30,7 +30,7 @@ failure is not mistaken for a child result.
 |------|-------------------|---------------------------------------------------------------------------------------------|
 | 100  | `USAGE`           | Invalid command line: unknown flag, missing required option, malformed value (including a bad `--timeout`/`--grace` duration), or bad subcommand form. |
 | 101  | `SPAWN`           | The target program could not be started (not found, not executable, bad `--cwd`, permission denied). |
-| 102  | `BACKEND`         | ProcessKit backend/containment failure: kernel container, job object, IPC endpoint, or run registry could not be established. |
+| 102  | `BACKEND`         | ProcessKit backend/containment failure: kernel container, job object, IPC endpoint, or run registry could not be established — including a requested resource limit (`--max-memory` / `--max-processes` / `--cpu-quota`) the active mechanism could not apply (the machine-readable `limit_hit` event names which one; see "Resource limits" below). |
 | 103  | `CONTROL`         | An `inspect` / `cancel` / `kill` command could not reach its target run: no such run id, a stale/dead registry entry, an ambiguous run id (more than one live run registered under it), or an IPC failure. |
 | 104  | `INTERNAL`        | Unexpected runner fault: the runner reached a state its own logic rules out, or lost a trustworthy view of the run (a `wait` on the child failed and its fate is unknown; the backend returned an outcome this build cannot render). Reported with this code instead of panicking. **A genuine runner bug** — an ordinary setup failure is `SETUP` (111), not this. |
 | 105  | `NOT_IMPLEMENTED` | **Retired.** Formerly minted for a defined-but-not-yet-built code path; every subcommand is now implemented, so no active path mints it. The number stays permanently reserved (see "Stability" below) — it is never reused for a different meaning. |
@@ -117,6 +117,29 @@ caller which one happened:
 
 The distinction is which side failed: an environment/resource condition the caller can fix
 (`SETUP`) versus the runner's own logic being wrong (`INTERNAL`).
+
+## Resource limits reuse `BACKEND` (102)
+
+When `run` is given a whole-tree resource cap (`--max-memory`, `--max-processes`,
+or `--cpu-quota`) that the active containment mechanism cannot apply, the run ends
+with **`BACKEND` (102)** and a `runner_exit` `source` of `container_error` — the
+same code as any other container-creation failure — **not** a new code from the
+reserved `112`–`119` slots. This is a deliberate choice: the failure is genuinely
+that a *whole-tree container capable of the requested cap could not be established*
+here (macOS/BSD and the Linux process-group fallback have no such container at all;
+a Linux cgroup v2 whose controllers can't be enabled — under systemd, an ordinary
+container, or typical CI — can't carry it either), which is the same class as the
+existing container-creation error. The failure is always **pre-spawn**, so no child
+code is ever at stake.
+
+What makes a limit ending *distinguishable* is not the exit code but the dedicated
+**`limit_hit`** JSONL event that precedes the `container_failed`/`runner_exit` tail
+and names which limit (`memory` / `processes` / `cpu`) — the authoritative,
+machine-readable channel, exactly as this document's core principle holds the exit
+code to be only a best-effort hint (see "Why a band is not enough on its own"
+below). A nonsensical value (`--max-memory 0`, a non-positive/non-finite
+`--cpu-quota`) is instead a `USAGE` (100) argument error, rejected at parse time
+before any container is touched. Codes `112`–`119` therefore stay reserved.
 
 ## Why a band is not enough on its own
 

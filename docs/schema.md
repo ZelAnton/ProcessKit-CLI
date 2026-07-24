@@ -148,18 +148,39 @@ is reaped. `soft_terminate` is one of:
 
 ### `limit_hit`
 
-A configured ProcessKit resource limit (process count, memory, CPU) was exceeded
-or could not be applied.
+A requested ProcessKit resource limit (`--max-memory`, `--max-processes`, or
+`--cpu-quota`) could not be applied.
 
 | Field    | Type             | Notes                                            |
 |----------|------------------|--------------------------------------------------|
-| `limit`  | string           | Which limit, e.g. `processes`, `memory`, `cpu`.  |
+| `limit`  | string           | Which limit could not be applied: `memory`, `processes`, or `cpu`. |
 | `detail` | string, nullable | Human-readable detail; `null` if none.           |
 
-**Status in v1.** This event's shape is fixed now so adapters can pin it, but the
-runner exposes no resource-limit configuration yet, so it is not emitted at
-runtime in this version. It is reserved for when limit flags land, at which point
-the runner emits it without changing the shape above.
+**When it is emitted.** Enforcement of a whole-tree cap needs a real container — a
+Windows Job Object or a Linux cgroup v2. Where none can carry the request, the run
+fails **fast** rather than running silently unbounded, and this event records it.
+The emission is deliberately narrow:
+
+- **Only the "could not be applied" branch.** ProcessKit signals a limit failure
+  only at group creation (pre-spawn — the child never started); it exposes no
+  separate "the tree was killed mid-run for exceeding a cap" runtime signal (the OS
+  reaps an offender itself — a Job Object/cgroup OOM or CPU throttle — without the
+  crate translating that into an event). So `limit_hit` covers the *unenforceable /
+  unsupported* case, not a live overrun: `memory`/`cpu`/`processes` where the
+  platform has no whole-tree container at all (macOS/the BSDs, the Linux
+  process-group fallback), or a Linux cgroup v2 whose controllers can't be enabled
+  (not the real hierarchy root — under systemd, an ordinary container, or typical
+  CI; see `README.md`, "Resource limits").
+- **Nonsense values never reach it.** A degenerate value (`--max-memory 0`, a
+  non-positive/non-finite `--cpu-quota`) is a `USAGE` (100) form error rejected at
+  argument-parse time, so `limit_hit` never carries an "invalid value" reason.
+- **Ordering.** `limit_hit` is emitted **first**, then the same
+  `container_failed` (`phase: "create"`) → `runner_exit` (`source:
+  "container_error"`, code `BACKEND` = 102) tail every other group-creation failure
+  takes. The dedicated `limit_hit` event — not the exit code — is the authoritative
+  signal that the ending was a resource limit (`docs/exit-codes.md`, "Why a band is
+  not enough on its own"). A run whose caps *were* applied emits no `limit_hit` at
+  all and proceeds normally.
 
 ### `timeout`
 
@@ -308,7 +329,11 @@ is absent.
 
 A failure before the child is spawned emits its error event (`container_failed`
 with `phase` `create` or `attach`, or `spawn_failed`) and then `runner_exit`, with
-no `run_started` (and no `output_captured` — the child never produced output). A
+no `run_started` (and no `output_captured` — the child never produced output). When
+that pre-spawn failure is a resource limit that could not be applied, a `limit_hit`
+is emitted **first**, immediately before the `container_failed` (`phase` `create`) →
+`runner_exit` (`source` `container_error`) pair — the resource-specific record of
+why the container could not be created (see `limit_hit`). A
 `container_failed` with `phase` `foreground` comes later: the child had already
 spawned, so `cleanup_started`/`cleanup_finished` tear the container down before the
 terminal `runner_exit`. `run_started` is still never written (the handoff fails

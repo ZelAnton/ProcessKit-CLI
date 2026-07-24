@@ -101,6 +101,16 @@ processkit-cli run \
   clear, then remove, then set — regardless of flag order on the command line,
   so an explicit `--env` always wins on a duplicated key. See `README.md`,
   "Environment", for the full precedence rule.
+- **`--max-memory <size>` / `--max-processes <n>` / `--cpu-quota <cores>`** cap
+  the run's whole process tree. Enforcement needs a real container (Windows Job
+  Object or Linux cgroup v2 at the real hierarchy root); where the platform or
+  environment can't apply a cap the run fails **fast** with a `limit_hit` event
+  (§3) and `BACKEND` (102) rather than running silently unbounded — so an adapter
+  that *depends* on a cap must treat a `limit_hit` as a hard failure, not a
+  warning. See `README.md`, "Resource limits", for the platform matrix (macOS/BSD
+  and the Linux process-group fallback are unsupported; cgroup v2 is often
+  unenforceable under systemd/containers/typical CI) and the Linux
+  `--max-processes` caveat.
 - **Command-line redaction.** `run_started`'s `command` field is redacted by
   default: the raw argv is *not* recorded, only a one-way SHA-256
   fingerprint (`argv_sha256`) and a classified worker-shape `hint` (both
@@ -166,7 +176,7 @@ check, no parsing needed) and the terminal `runner_exit` event's `source` and
 | `control_cancel` | `108` | A control-plane `cancel` (§4) cancelled the run. |
 | `control_kill` | `109` | A control-plane `kill` (§4) force-killed the run. |
 | `spawn_error` | `101` | The child never started (`spawn_failed` precedes it). |
-| `container_error` | `102` | The container could not be created or joined (`container_failed` precedes it). |
+| `container_error` | `102` | The container could not be created or joined (`container_failed` precedes it) — including a requested resource limit (`--max-memory`/`--max-processes`/`--cpu-quota`) the platform could not apply, in which case a `limit_hit` naming the limit precedes the `container_failed` (see [`docs/schema.md`](schema.md#limit_hit)). |
 | `internal` | `104` | A genuine runner bug — the runner's own logic hit a state it rules out. |
 | `setup` | `111` | An ordinary fail-closed setup failure (an unwritable `--jsonl`/`--capture-dir`, an unreadable `--stdin-file`) — distinct from `internal`, and the caller can usually act on it (bad path, permissions, resources). |
 

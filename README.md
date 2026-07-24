@@ -158,7 +158,9 @@ owned container's ordinary teardown path on every supported platform.
 ```text
 processkit-cli run     [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl>
                        [--create-no-window] [--timeout <duration>]
-                       [--grace <duration>] [--capture-dir <dir>] [--argv-raw]
+                       [--grace <duration>] [--max-memory <size>]
+                       [--max-processes <n>] [--cpu-quota <cores>]
+                       [--capture-dir <dir>] [--argv-raw]
                        [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
                        [--env-clear] [--env-remove <KEY>]... [--env <KEY=VALUE>]...
                        -- <program> <args...>
@@ -386,6 +388,48 @@ JSONL event (see [the schema](docs/schema.md)):
 Without `--capture-dir`, nothing changes: no capture files, no `output_captured`
 event, and the event stream is byte-for-byte identical to a plain run.
 
+## Resource limits
+
+Three optional flags cap the run's **whole process tree** — not a single process —
+mapping straight onto ProcessKit's own `ProcessGroupOptions` resource caps (the
+runner never reimplements the OS-level enforcement):
+
+- `--max-memory <size>` — total tree memory. A byte count with an optional binary
+  unit: `1048576`, `512k`, `256m`, `2g` (`k`/`m`/`g` are KiB/MiB/GiB, 1024-based).
+- `--max-processes <n>` — number of live processes in the tree (`n` > 0).
+- `--cpu-quota <cores>` — CPU as a fraction of a **single** core: `0.5` is half a
+  core, `2` is two cores' worth (a finite value > 0).
+
+Omit a flag to leave that resource unbounded; a bare `run` requests no caps at all
+and behaves exactly as before. A nonsensical value (`--max-memory 0`, a
+non-positive or non-finite `--cpu-quota`, `--max-processes 0`) is a usage error
+(exit `100`) rejected at parse time, not a surprise at runtime.
+
+**Enforcement is platform-specific, and honestly fail-fast — never a silent
+no-op.** A whole-tree cap needs a real container:
+
+| Platform / mechanism | Resource limits |
+| --- | --- |
+| Windows — Job Object | **Enforced** (memory, CPU, and active-process count). |
+| Linux — cgroup v2 **at the real hierarchy root** | **Enforced.** Requires the runner to be a direct member of the real cgroup-v2 root (a minimal, non-systemd init). **Not** under a systemd session/scope/service, and **not** in an ordinary container (incl. Docker/Kubernetes and **typical CI such as GitHub Actions**) — there the controllers can't be enabled and the request is *unenforceable*. |
+| macOS, the BSDs, Linux process-group fallback | **Unsupported** — no whole-tree container exists, so any cap request fails fast. |
+
+Where a cap **cannot** be applied, the run does not silently continue unbounded:
+it fails fast **before the child is spawned**, emits a `limit_hit` JSONL event
+naming which limit (`memory` / `processes` / `cpu`), and exits with `BACKEND`
+(`102`) — the `limit_hit` event, not the exit code, is the authoritative signal
+that the ending was a resource limit (see [the exit-code
+contract](docs/exit-codes.md)). An adapter that *depends* on a cap should treat a
+`limit_hit` as a hard failure rather than a warning.
+
+**Linux `--max-processes` caveat.** On Linux the kernel checks the process-count
+cap only when a process forks *inside* the cgroup, so `--max-processes` reliably
+bounds the **descendants** a contained child spawns (its own fork bomb), but does
+**not** reject additional top-level launches into the group. Treat it as a bound on
+a tree's own growth, not an exact admission count. (Memory and CPU caps are
+whole-cgroup and have no such asymmetry; on Windows the Job Object's
+active-process limit does cap every launch into the job.)
+
 ## JSONL event schema
 
 `run` writes a versioned stream of **JSONL lifecycle events** to the file named by
@@ -398,10 +442,11 @@ golden-tested.
 The stream covers the run lifecycle: `run_started` (run id, root PID, containment
 mechanism, working directory), `members_snapshot`, `root_exited`, the
 `cleanup_started` / `cleanup_finished` teardown pair, `timeout` / `cancelled`,
-launch and container errors, an `output_captured` event when `--capture-dir` is
-set (see "Bounded output capture"), and a terminal `runner_exit` that preserves the
-child's own code even when the runner itself fails — so a child's code is never
-lost or aliased.
+launch and container errors (including a `limit_hit` when a `--max-memory` /
+`--max-processes` / `--cpu-quota` cap could not be applied — see "Resource
+limits"), an `output_captured` event when `--capture-dir` is set (see "Bounded
+output capture"), and a terminal `runner_exit` that preserves the child's own code
+even when the runner itself fails — so a child's code is never lost or aliased.
 
 The command line is **redacted by default** (`argv` is recorded only under
 `--argv-raw`); in its place a one-way SHA-256 fingerprint of argv (`argv_sha256`)
