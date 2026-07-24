@@ -66,6 +66,38 @@ fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) {
     }
 }
 
+/// Set `path`'s mtime `age` in the past, without a real sleep — used to age an
+/// orphaned-lock fixture past `Registry`'s `ORPHAN_LOCK_MIN_AGE` (`src/registry.rs`,
+/// [R-01]) so `prune`'s orphan-lock pass actually treats it as a candidate, rather
+/// than the fixture racing that floor purely by test timing. Keep the age passed by
+/// callers comfortably above that constant's value.
+#[cfg(unix)]
+fn backdate(path: &Path, age: Duration) {
+    use std::fs::File;
+    use std::time::SystemTime;
+
+    let file = File::open(path).expect("open the fixture to backdate its mtime");
+    file.set_modified(SystemTime::now() - age)
+        .expect("backdate the fixture's mtime");
+}
+
+#[cfg(windows)]
+fn backdate(path: &Path, age: Duration) {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::time::SystemTime;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .expect("open the fixture to backdate its mtime");
+    file.set_modified(SystemTime::now() - age)
+        .expect("backdate the fixture's mtime");
+}
+
 /// A child that stays alive for ~2s — long enough to observe the live entry.
 fn slow_child() -> Vec<String> {
     if cfg!(windows) {
@@ -867,9 +899,13 @@ fn prune_reaps_an_orphaned_lock_file_alongside_a_stale_pair_and_a_live_run() {
     // A hand-written, confirmed-stale entry (record + unlocked lock file).
     write_stale_entry(&registry, "run-stale-0000");
 
-    // A lone, unlocked `.lock` file with no `.json` sibling at all.
+    // A lone, unlocked `.lock` file with no `.json` sibling at all. Backdated well
+    // past `Registry`'s `ORPHAN_LOCK_MIN_AGE` ([R-01]) so it reads as a confirmed,
+    // long-sitting orphan rather than the brief, legitimate pre-lock window a
+    // just-starting `reserve_entry` would otherwise leave the same shape in.
     let orphan_lock = registry.join("orphan-0000.lock");
     fs::write(&orphan_lock, b"").expect("write the orphaned lock file");
+    backdate(&orphan_lock, Duration::from_secs(30));
     assert!(
         orphan_lock.exists() && !registry.join("orphan-0000.json").exists(),
         "the orphaned lock fixture has no paired record"

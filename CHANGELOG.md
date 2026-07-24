@@ -155,9 +155,11 @@ to a dated version section.
   or a `Registration::remove` whose `.json` delete succeeded while its `.lock`
   delete did not), with the same confirm-before-delete safety as the existing
   paired-record reap (a live lock is never touched; an unprobeable one is left in
-  place). Its `--json` tally gained an additive `orphaned_locks` field alongside the
-  existing `pruned`/`live`/`unprobed`. See README.md and
-  [`docs/registry.md`](docs/registry.md), "Reaping — `prune`".
+  place), plus a minimum-age floor so a lock file `Registry::register` has only just
+  reserved — created, but not yet locked — is never mistaken for a long-dead orphan
+  by a concurrently running `prune`. Its `--json` tally gained an additive
+  `orphaned_locks` field alongside the existing `pruned`/`live`/`unprobed`. See
+  README.md and [`docs/registry.md`](docs/registry.md), "Reaping — `prune`".
 
 ## [0.2.2] - 2026-07-24
 

@@ -235,6 +235,22 @@ leaves the file in place, only a confirmed-stale lock is deleted) and reports it
 reaps under the separate `orphaned_locks` tally below — kept distinct from `pruned`
 because it deletes one file, not a `.json`/`.lock` pair.
 
+A record-less lock file needs one more guard the paired-record pass does not: a
+freshly `create_new`-d `.lock` file that a **just-starting** `Registry::register` has
+not yet locked is, for a moment, indistinguishable from a genuine, long-dead orphan —
+both are simply an unlocked `.lock` with no `.json` next to them. The second pass
+therefore only ever considers a candidate whose mtime is already at least a few
+seconds old (`ORPHAN_LOCK_MIN_AGE` in `src/registry.rs`); a genuine orphan never ages
+out of that check, so the extra latency costs nothing, while the two-syscall
+reservation window reliably falls inside it. `Registry::reserve_entry` closes the
+same window from its own side: after taking its lock it re-checks that `lock_path`
+still resolves to the identical file it is holding open (device/inode on Unix, file
+index + volume serial number on Windows) before trusting it enough to publish a
+record naming it, and retries with a fresh stem — never a hard error — both when the
+lock is denied and when that identity check fails. Together these close the race a
+lock-probe-only guarantee would otherwise leave open (see "The reaping safety
+invariant" below).
+
 ### The reaping safety invariant
 
 Pruning deletes files, so it is deliberately conservative: an entry is reaped **only**
@@ -265,6 +281,15 @@ Two further guarantees hold, mirroring the rest of the registry:
   still holds its exclusive lock** — the "keep the lock to reclaim" behavior noted
   under "Staleness" above — so a second concurrent prune sees the entry as live and
   skips it instead of racing on the same files.
+
+A `.lock` file with no `.json` sibling carries one further precondition **before**
+any of the three probe outcomes above even apply: it must already be at least
+`ORPHAN_LOCK_MIN_AGE` old (by mtime). A confirmed-stale-*or*-live-*or*-unprobed
+verdict on a lock-probe alone is not enough to call a record-less lock file safe to
+touch, because a freshly reserved-but-not-yet-locked file would otherwise read as
+"probe succeeded, no live holder" — indistinguishable from a genuine orphan purely by
+scheduling luck. A too-young candidate (or one whose age could not be confirmed at
+all) is simply left alone this round, to be reconsidered once it has aged.
 
 Corrupt records the scan already skips (unreadable, unparsable JSON, a malformed
 `started_at`, or a `lock_file` that is not a simple in-directory name) are **not**
