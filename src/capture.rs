@@ -59,7 +59,15 @@ pub const CAPTURE_INFLIGHT_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// so the [`CaptureTee`] on ProcessKit's pump task and the runner reading the final
 /// metadata share one state; the lock is only ever held for a synchronous file
 /// write, never across an `.await`.
-struct StreamCapture {
+///
+/// `pub` (and likewise [`new`](Self::new)/[`absorb`](Self::absorb) below) so the
+/// `benches/capture_bench.rs` microbenchmark (T-187) can drive the counting/
+/// write/hash path directly, without an async runtime or the tee's `AsyncWrite`
+/// plumbing in the timed loop — matching the crate's documented "future
+/// benchmarks reach internal primitives directly" design (`docs/architecture.md`,
+/// "Target structure"). Not a stability signal: this module stays
+/// `#[doc(hidden)]` and the library carries no semver guarantee (`src/lib.rs`).
+pub struct StreamCapture {
     file: std::fs::File,
     path: PathBuf,
     /// Every decoded byte the stream produced — the "full byte counter", which
@@ -80,7 +88,7 @@ struct StreamCapture {
 }
 
 impl StreamCapture {
-    fn new(path: PathBuf) -> std::io::Result<Self> {
+    pub fn new(path: PathBuf) -> std::io::Result<Self> {
         let file = std::fs::File::create(&path)?;
         Ok(Self {
             file,
@@ -96,7 +104,7 @@ impl StreamCapture {
     /// Fold `bytes` (already echoed live) into the capture: count them, write the
     /// portion that fits under the ceiling, hash exactly what was written, and flag
     /// truncation once the stream outruns the ceiling.
-    fn absorb(&mut self, bytes: &[u8]) {
+    pub fn absorb(&mut self, bytes: &[u8]) {
         self.seen = self.seen.saturating_add(bytes.len() as u64);
         if !self.write_error && self.written < CAPTURE_MAX_BYTES {
             let room = (CAPTURE_MAX_BYTES - self.written) as usize;

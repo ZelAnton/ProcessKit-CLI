@@ -47,13 +47,17 @@ reusable dependency. Keeping the runner's internals in a `[lib]` target lets:
   run as the library's `--lib` tier under a plain `cargo test`, reaching
   module-private helpers directly — retiring the `cargo test --bin` workaround the
   old bin-only layout required;
-- **future fuzz targets** (`cargo-fuzz`, planned as T-186) link the library and
-  drive internal primitives such as the argv-redaction `HINT_RULES` classifier
-  (`src/events.rs`), the hand-rolled SHA-256 hasher (`src/hash.rs`), and the CLI
-  duration grammar (`src/cli.rs`) — a `[lib]` target is a hard prerequisite
-  `cargo-fuzz` cannot work without;
-- **future benchmarks** (criterion, planned as T-187) reach those same internal
-  primitives to measure them in isolation.
+- **fuzz targets** (`cargo-fuzz`, `fuzz/`, T-186) link the library and drive
+  parsers of untrusted/semi-trusted input — the registry's bytes → parse/
+  validate path, the control plane's request-line classifier and
+  response-line decode, and the CLI's `--timeout`/`--grace`/
+  `--require-exit-code-band`/`--env` value parsers — a `[lib]` target is a
+  hard prerequisite `cargo-fuzz` cannot work without (see `CONTRIBUTING.md`,
+  "Fuzzing");
+- **benchmarks** (criterion, `benches/`, T-187) reach internal primitives —
+  the hand-rolled SHA-256 hasher (`src/hash.rs`), bounded-capture `absorb`
+  (`src/capture.rs`), and the argv-redaction hint classifier (`src/events.rs`)
+  — directly, to measure them in isolation (see `README.md`, "Benchmarks").
 
 Because the crate is published to crates.io, the library surface is deliberately
 **not** a stable public Rust API: every module is `#[doc(hidden)]`, the crate-root
@@ -62,8 +66,9 @@ supported compatibility surface stays the *binary's* contract — the CLI flags
 (`src/cli.rs`), the reserved exit-code band (`src/exit.rs`,
 [`docs/exit-codes.md`](exit-codes.md)), and the JSONL `schema_version`
 (`src/events.rs`, [`docs/schema.md`](schema.md)) — exactly as before this split.
-This document records only the target structure; it does not implement the
-fuzz/bench tiers themselves (T-186/T-187), which build on it.
+This document records only the target structure; the fuzz and benchmark tiers
+themselves (T-186, T-187) are documented in `CONTRIBUTING.md` ("Fuzzing") and
+`README.md` ("Benchmarks") respectively.
 
 ## Data flow of one `run`
 

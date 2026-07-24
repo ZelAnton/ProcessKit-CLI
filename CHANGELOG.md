@@ -23,6 +23,19 @@ to a dated version section.
   the JSONL event stream, control-plane supervision (`inspect`/`cancel`/
   `kill`), registry housekeeping (`list`/`prune`), and typical error modes —
   linking the existing normative documents rather than duplicating them.
+- A [criterion](https://github.com/bheisler/criterion.rs)-based benchmark tier
+  (`benches/`, `bench` Cargo feature) covering incremental SHA-256
+  (`src/hash.rs`), bounded-capture `absorb` (`src/capture.rs`), the argv hint
+  classifier (`src/events.rs`), and two through-the-binary scenarios — echo
+  overhead (direct vs. under `run`, with and without `--capture-dir`) and
+  startup latency (call to `run_started`) — plus a non-gating CI `perf` job
+  that publishes results to the step summary (see README.md, "Benchmarks").
+  Dev-only tooling: off by default, like the `e2e` tier, so it never affects a
+  plain `cargo build`/`cargo test`/`cargo publish`. `StreamCapture` and
+  `classify_hint` are now `pub` (still `#[doc(hidden)]`, no semver guarantee)
+  so the new tier can reach them directly, matching this crate's documented
+  "future benchmarks reach internal primitives directly" design
+  (`docs/architecture.md`, "Target structure").
 
 ### Changed
 - The crate is now a thin binary over an internal library target (`src/lib.rs`,

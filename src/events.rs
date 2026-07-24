@@ -363,7 +363,14 @@ static HINT_RULES: &[HintRule] = &[HintRule {
 /// found whether it is a whole argument or embedded in one (e.g. a full
 /// `…/MSBuild.dll` path). The hint is a fixed category label — never argv content —
 /// so emitting it does not weaken redaction.
-fn classify_hint(argv: &[String]) -> Option<&'static str> {
+///
+/// `pub` so `benches/hint_classifier_bench.rs` (T-187) can measure the classifier
+/// in isolation, without the argv-fingerprint SHA-256 that its only other caller,
+/// [`CommandInfo::for_argv`], always computes alongside it — matching the crate's
+/// documented "future benchmarks reach internal primitives directly" design
+/// (`docs/architecture.md`, "Target structure"). Not a stability signal: this
+/// module stays `#[doc(hidden)]` and the library carries no semver guarantee.
+pub fn classify_hint(argv: &[String]) -> Option<&'static str> {
     let haystack = argv.join(" ").to_ascii_lowercase();
     HINT_RULES
         .iter()

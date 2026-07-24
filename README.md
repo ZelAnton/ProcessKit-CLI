@@ -448,6 +448,66 @@ cargo fmt --all --check
 cargo run --bin processkit-cli -- --help
 ```
 
+## Benchmarks
+
+A [criterion]-based regression lane lives under `benches/`, gated behind the
+`bench` Cargo feature so a plain `cargo build`/`cargo test`/`cargo publish`
+never builds it — like the `e2e` end-to-end tier, this is dev-only tooling. It
+covers two things:
+
+- **Internal primitives**, in isolation: incremental SHA-256
+  (`src/hash.rs`, `benches/hash_bench.rs`), bounded-capture `absorb`
+  (`src/capture.rs`, `benches/capture_bench.rs`), and the argv worker-shape
+  hint classifier (`src/events.rs`, `benches/hint_classifier_bench.rs`). Each
+  reaches the primitive directly rather than through its caller (see each
+  module's doc comment on why a given item is `pub`) — the library is not a
+  stable API (see "Target structure: library and binary" in
+  [`docs/architecture.md`](docs/architecture.md)), and reaching internals
+  directly for exactly this purpose is part of its documented design.
+- **Through-the-binary scenarios**, driving the built binary like the
+  integration tests do: `benches/echo_overhead_bench.rs` compares a direct
+  invocation of a child that writes an exact byte count against the same child
+  run under `run` (plain echo, and echo plus `--capture-dir`) at a couple of
+  payload sizes; `benches/startup_latency_bench.rs` measures the latency from
+  just before `run` is invoked to the `time` the runner itself stamps on its
+  `run_started` JSONL event, over a short series of invocations.
+
+Run the whole lane locally with:
+
+```sh
+cargo bench --features bench
+```
+
+CI publishes results to the `perf` job's step summary on every push/PR — a
+data source, not a gate: the job never fails the pipeline and is not a
+required check (same non-gating pattern as the `coverage` job; see
+`CONTRIBUTING.md`, "Code coverage"). Absolute numbers are noisy on shared CI
+hardware; treat the summary as a trend over time, not a single-run verdict.
+
+The table below is one informal, single-run snapshot from a Windows
+development host (not tuned, not a target) — a sanity baseline for a reader
+skimming this document, not the authoritative source; run the lane yourself
+for numbers on your own hardware, or read the CI step summary for the
+tracked trend.
+
+| Benchmark | Result |
+| --- | --- |
+| Incremental SHA-256, 64KiB chunks (256KiB total) | ~116 MiB/s |
+| `StreamCapture::absorb`, 64KiB chunks (256KiB total) | ~98 MiB/s |
+| Hint classifier, no match / MSBuild match | ~520 ns / ~830 ns |
+| Echo overhead, 4MiB payload: direct vs. under `run` (no capture) | ~16 ms vs. ~3.8 s |
+| Echo overhead, 4MiB payload: under `run` with `--capture-dir` | ~3.3 s |
+| Startup latency, call to `run_started` | ~430 ms (median) |
+
+The echo-overhead and startup-latency figures are dominated by this run's own
+per-invocation costs (container creation, the registry record, the control-
+plane endpoint, and the async pump/echo path) rather than by the child's own
+payload size — a multi-hundred-millisecond-to-low-seconds cost per `run`
+invocation on this host, worth keeping an eye on as the regression lane
+accumulates history, but not (yet) a claim about where the time goes.
+
+[criterion]: https://github.com/bheisler/criterion.rs
+
 ## Safety boundaries
 
 - No reimplementation of ProcessKit containment or lifecycle behavior.

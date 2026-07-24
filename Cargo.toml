@@ -93,6 +93,14 @@ tokio = { version = "1", features = [
 # `required-features` below).
 e2e = []
 
+# Opt-in criterion benchmark tier (`benches/`) plus its `bench_emit` worker. Off
+# by default so a plain `cargo build`/`cargo test`/`cargo publish` never builds
+# it — benchmarks are dev-only tooling, never shipped. The dedicated,
+# non-gating CI `perf` job enables it (`cargo bench --features bench`). Empty
+# feature set, same pattern as `e2e` above — it only gates which targets build
+# (see the `[[bench]]` / `[[bin]]` `required-features` below).
+bench = []
+
 # Unix-only: the run registry (src/registry.rs) restricts its directory to `0700`
 # via std, but the per-run liveness lock — a BSD `flock` whose OS-released-on-death
 # semantics make an orphaned entry detectably stale — has no std wrapper, so it
@@ -163,6 +171,21 @@ proptest = "1"
 # well-tested, unrelated implementation (rather than against itself).
 sha2 = "0.11"
 
+# Statistics-driven microbenchmark harness for the `bench`-gated tier
+# (`benches/`, T-187): incremental SHA-256 (`src/hash.rs`), bounded-capture
+# absorb (`src/capture.rs`), and the argv hint classifier (`src/events.rs`), plus
+# the two through-the-binary scenarios (echo overhead, startup latency). Default
+# features disabled to skip the `plotters`/`rayon` chart-rendering machinery this
+# project never renders (CI publishes plain text to the step summary, not HTML
+# plots); `cargo_bench_support` is the one default feature actually needed — it
+# is what makes a plain `cargo bench` (rather than only `cargo criterion`) work.
+# In the top-level `[dev-dependencies]` (not the `cfg(unix)` table below) since
+# every bench target — including the cross-platform through-the-binary ones —
+# needs it, on every platform.
+criterion = { version = "0.8", default-features = false, features = [
+    "cargo_bench_support",
+] }
+
 # Unix-only: the cancel integration test needs to deliver a real SIGINT (the
 # `Ctrl-C` the runner listens for) to the spawned runner process, which the std
 # library cannot do. Also backs the e2e tier's external PID-liveness probe
@@ -186,3 +209,41 @@ required-features = ["e2e"]
 name = "e2e"
 path = "tests/e2e.rs"
 required-features = ["e2e"]
+
+# Test-support worker for the `bench`-gated through-the-binary scenarios
+# (benches/echo_overhead_bench.rs, benches/startup_latency_bench.rs): writes an
+# exact, caller-chosen byte count to stdout, so those benchmarks measure the
+# runner's own echo/capture overhead against a precisely-sized, otherwise
+# minimal child rather than an OS shell builtin (whose own startup cost would
+# be conflated with the runner's).
+[[bin]]
+name = "bench_emit"
+path = "src/bin/bench_emit.rs"
+required-features = ["bench"]
+
+# `harness = false` on every bench below: criterion supplies its own `main` via
+# `criterion_main!`, which would collide with the default libtest bench harness.
+[[bench]]
+name = "hash_bench"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "capture_bench"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "hint_classifier_bench"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "echo_overhead_bench"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "startup_latency_bench"
+harness = false
+required-features = ["bench"]

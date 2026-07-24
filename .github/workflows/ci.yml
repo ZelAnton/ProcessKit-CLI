@@ -128,6 +128,44 @@ jobs:
           name: coverage-report-${{ matrix.os }}
           path: coverage-report
 
+  perf:
+    name: perf (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Regression-timeline data source, not a gate: continue-on-error absorbs
+    # any step failure and no threshold is enforced below, so this job never
+    # turns red and never blocks a merge — it is not a required check, and
+    # the `test`/`clippy`/`fmt`/other jobs above are unaffected either way
+    # (same non-gating pattern as the `coverage` job above; see K-029).
+    #
+    # Shared CI hardware is noisy, so the absolute numbers this job publishes
+    # are indicative, not authoritative — track the trend across runs, not a
+    # single-run delta. ubuntu-latest + windows-latest mirrors `coverage`'s
+    # matrix, covering both the `cfg(unix)` and `cfg(windows)` halves of the
+    # through-the-binary scenarios (echo overhead, startup latency).
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@stable # rolling toolchain selector — intentionally unpinned
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # The `bench`-gated tier (benches/, src/bin/bench_emit.rs): criterion
+      # microbenchmarks of the hash/capture/hint-classifier internals, plus
+      # the through-the-binary echo-overhead and startup-latency scenarios
+      # (see README.md, "Benchmarks"). Off by default (like `e2e`), so this is
+      # the one place in CI that opts in.
+      - name: Run benchmarks
+        shell: bash
+        run: |
+          {
+            echo "### Benchmark results (${{ matrix.os }})"
+            echo '```text'
+            cargo bench --features bench
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   e2e:
     name: e2e (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
