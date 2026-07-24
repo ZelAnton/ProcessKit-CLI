@@ -759,11 +759,12 @@ mod tests {
     }
 
     // Property-based tier (T-167). Placed in this same `#[cfg(test)]` module
-    // rather than a new `tests/properties.rs`: `parse_duration` is private to
-    // this module, so an integration test under `tests/` — which links only
-    // against the crate's public surface — cannot reach it; only an in-crate
-    // unit test can. These run under the library unit-test tier (a plain
-    // `cargo test`, i.e. `--lib`).
+    // rather than a new `tests/properties.rs`: `parse_duration` is `pub` +
+    // `#[doc(hidden)]` (T-186, for the `cli_parsers` fuzz target), but that is
+    // not a stable, exported clap surface — the module is still not public
+    // API — so proptests stay in-crate rather than moving to an integration
+    // test under `tests/`. These run under the library unit-test tier (a
+    // plain `cargo test`, i.e. `--lib`).
     mod proptests {
         use super::*;
         use proptest::prelude::*;

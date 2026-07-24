@@ -951,11 +951,12 @@ mod tests {
     }
 
     // Property-based tier (T-167). Placed in this same `#[cfg(test)]` module
-    // rather than a new `tests/properties.rs`: `classify_hint`/`HINT_RULES` are
-    // private to this module, so an integration test under `tests/` — which links
-    // only against the crate's public surface — cannot reach them; only an
-    // in-crate unit test can. These run under the library unit-test tier (a plain
-    // `cargo test`, i.e. `--lib`).
+    // rather than a new `tests/properties.rs`: `classify_hint` is `pub` +
+    // `#[doc(hidden)]` (T-187, for a benchmark), but `HINT_RULES` stays
+    // private, and neither is a stable, exported clap surface — the module is
+    // still not public API — so proptests stay in-crate rather than moving to
+    // an integration test under `tests/`. These run under the library
+    // unit-test tier (a plain `cargo test`, i.e. `--lib`).
     //
     // The generator is deliberately *not* fully random bytes: `classify_hint` is
     // a documented, rule-driven substring matcher (`HINT_RULES`), so a

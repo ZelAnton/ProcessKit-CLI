@@ -135,23 +135,66 @@ fn print_json(rows: &[ListEntry]) -> Result<(), RunnerError> {
     Ok(())
 }
 
-/// Print a simple, aligned, human-readable table. An empty registry prints a
+/// Print a column-aligned, human-readable table: every column is padded to
+/// the width of its widest value (header included), so rows line up under
+/// the header regardless of value length. An empty registry prints a
 /// one-line notice rather than a bare header with no rows.
 fn print_table(rows: &[ListEntry]) {
+    for line in render_table_lines(rows) {
+        println!("{line}");
+    }
+}
+
+/// Build the lines `print_table` would print, without touching stdout —
+/// split out so alignment can be asserted directly in tests.
+fn render_table_lines(rows: &[ListEntry]) -> Vec<String> {
     if rows.is_empty() {
-        println!("no runs registered");
-        return;
+        return vec!["no runs registered".to_string()];
     }
-    println!("RUN_ID  HEALTH  STARTED_AT  ENDPOINT");
-    for row in rows {
-        println!(
-            "{}  {}  {}  {}",
-            row.run_id,
-            row.health,
-            row.started_at,
-            row.endpoint.as_deref().unwrap_or("-")
-        );
+    const HEADERS: [&str; 4] = ["RUN_ID", "HEALTH", "STARTED_AT", "ENDPOINT"];
+    let cells: Vec<[String; 4]> = rows
+        .iter()
+        .map(|row| {
+            [
+                row.run_id.clone(),
+                row.health.to_string(),
+                row.started_at.clone(),
+                row.endpoint.as_deref().unwrap_or("-").to_string(),
+            ]
+        })
+        .collect();
+    let mut widths = HEADERS.map(str::len);
+    for row in &cells {
+        for (width, cell) in widths.iter_mut().zip(row.iter()) {
+            *width = (*width).max(cell.len());
+        }
     }
+    // The last column is left-aligned but not padded, so trailing whitespace
+    // is never printed after the final value.
+    let mut lines = Vec::with_capacity(cells.len() + 1);
+    lines.push(format!(
+        "{:w0$}  {:w1$}  {:w2$}  {}",
+        HEADERS[0],
+        HEADERS[1],
+        HEADERS[2],
+        HEADERS[3],
+        w0 = widths[0],
+        w1 = widths[1],
+        w2 = widths[2],
+    ));
+    for row in &cells {
+        lines.push(format!(
+            "{:w0$}  {:w1$}  {:w2$}  {}",
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            w0 = widths[0],
+            w1 = widths[1],
+            w2 = widths[2],
+        ));
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -240,5 +283,47 @@ mod tests {
         let json = serde_json::to_string(&entry).expect("a list entry serializes");
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert!(value["endpoint"].is_null());
+    }
+
+    /// An empty registry renders as the one-line notice, not a bare header.
+    #[test]
+    fn render_table_lines_reports_an_empty_registry_with_a_notice() {
+        assert_eq!(render_table_lines(&[]), vec!["no runs registered"]);
+    }
+
+    /// Every column is padded to its widest value (header included), so a
+    /// short `run_id` in one row and a long one in another still line up
+    /// under the header — matching the docstring's "column-aligned" claim.
+    #[test]
+    fn render_table_lines_pads_every_column_to_its_widest_value() {
+        let rows = vec![
+            ListEntry {
+                run_id: "r1".to_string(),
+                health: "live",
+                started_at: "2026-07-22T00:00:00.000Z".to_string(),
+                endpoint: Some("/tmp/pkc-a.sock".to_string()),
+            },
+            ListEntry {
+                run_id: "much-longer-run-id".to_string(),
+                health: "stale",
+                started_at: "2026-07-22T00:00:00.000Z".to_string(),
+                endpoint: None,
+            },
+        ];
+        let lines = render_table_lines(&rows);
+        assert_eq!(
+            lines,
+            vec![
+                "RUN_ID              HEALTH  STARTED_AT                ENDPOINT",
+                "r1                  live    2026-07-22T00:00:00.000Z  /tmp/pkc-a.sock",
+                "much-longer-run-id  stale   2026-07-22T00:00:00.000Z  -",
+            ]
+        );
+        // The actual alignment property: the HEALTH value starts at the same
+        // column in every row as the "HEALTH" header does, regardless of how
+        // long that row's `run_id` is.
+        let health_col = lines[0].find("HEALTH").unwrap();
+        assert_eq!(lines[1][health_col..].find("live"), Some(0));
+        assert_eq!(lines[2][health_col..].find("stale"), Some(0));
     }
 }
