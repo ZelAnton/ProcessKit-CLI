@@ -51,6 +51,19 @@ to a dated version section.
   "future benchmarks reach internal primitives directly" design
   (`docs/architecture.md`, "Target structure").
 
+- `run` gained `--capture-max-bytes <size>`, a per-stream ceiling for
+  `--capture-dir`'s bounded transcript files, replacing the previously
+  hard-coded 8 MiB constant with a configurable one (same grammar as
+  `--max-memory`: a byte count with an optional binary unit — `1048576`,
+  `512k`, `256m`, `2g`; a malformed value is a `USAGE` (100) parse-time error).
+  Omitting the flag keeps the prior 8 MiB default, so a bare `run`/`run
+  --capture-dir` is byte-for-byte unchanged; the `output_captured` event's
+  shape and its `truncated` flag's meaning are unaffected. The pump's
+  separate in-flight line-assembly ceiling (`CAPTURE_INFLIGHT_MAX_BYTES`)
+  stays an independent constant, not derived from this flag (see
+  `src/capture.rs`). Appears in the `probe` surface tokens automatically. See
+  README.md, "Bounded output capture".
+
 ### Changed
 - The JSONL `members_snapshot` event and the control-plane `inspect` snapshot now
   populate the enriched per-member fields (`ppid`, executable `name`,

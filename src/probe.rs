@@ -294,6 +294,9 @@ mod tests {
             "probe",
             "run:--jsonl",
             "run:--capture-dir",
+            // The `--capture-max-bytes` flag (T-181) appears in the surface
+            // automatically too — same derivation as the resource-limit flags below.
+            "run:--capture-max-bytes",
             "run:--inherit-stdio",
             "run:--inherit-stdin",
             "run:--stdin-file",

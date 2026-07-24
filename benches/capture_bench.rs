@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 
-use processkit_cli::capture::StreamCapture;
+use processkit_cli::capture::{CAPTURE_MAX_BYTES, StreamCapture};
 
 #[path = "support/mod.rs"]
 mod support;
@@ -36,7 +36,10 @@ fn bench_absorb(c: &mut Criterion) {
             // reusing one across iterations would silently benchmark an
             // ever-growing byte count instead of a steady-state per-run cost.
             b.iter_batched(
-                || StreamCapture::new(path.clone()).expect("open bench capture file"),
+                || {
+                    StreamCapture::new(path.clone(), CAPTURE_MAX_BYTES)
+                        .expect("open bench capture file")
+                },
                 |mut cap| {
                     for piece in data.chunks(chunk) {
                         cap.absorb(black_box(piece));

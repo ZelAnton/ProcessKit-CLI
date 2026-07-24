@@ -39,13 +39,15 @@ use tokio::io::AsyncWrite;
 use crate::events::CaptureInfo;
 use crate::hash::Sha256;
 
-/// Per-stream ceiling on bytes written to a capture file. Output past it is
-/// counted (so the full byte counter stays honest) but not written, and the
-/// stream's `truncated` flag is set. Bounds the on-disk transcript so a runaway
-/// child cannot fill the disk through the capture files; the live echo is never
-/// bounded. Not currently configurable — a `--capture-max-bytes` knob is a
-/// possible future addition.
-const CAPTURE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Default per-stream ceiling on bytes written to a capture file, used when
+/// `run`'s `--capture-max-bytes` is not given. Output past the (possibly
+/// user-configured) ceiling is counted (so the full byte counter stays honest)
+/// but not written, and the stream's `truncated` flag is set. Bounds the on-disk
+/// transcript so a runaway child cannot fill the disk through the capture files;
+/// the live echo is never bounded. `pub` so `src/cli.rs`'s `--capture-max-bytes`
+/// docstring and `src/run.rs`'s default-resolution call site can both cite this
+/// single constant instead of duplicating the value (T-181).
+pub const CAPTURE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The byte ceiling handed to ProcessKit's [`OutputBufferPolicy`] for the pump's
 /// **in-flight** line assembly. Deliberately far larger than [`CAPTURE_MAX_BYTES`]
@@ -53,6 +55,19 @@ const CAPTURE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// file and the live echo); it only bounds the pathological single never-terminated
 /// line the kernel would otherwise assemble whole. This is the memory bound the
 /// task requires be taken from the kernel policy rather than hand-rolled.
+///
+/// **Deliberately independent of `--capture-max-bytes` (T-181), not derived from
+/// it.** The two ceilings bound different things: this one bounds the pump's
+/// *in-memory* assembly of one still-unterminated line (a pathological-input
+/// concern, sized once for the whole binary), while `--capture-max-bytes` bounds
+/// the *on-disk* per-stream transcript size (an operator's disk-budget choice,
+/// per invocation). Deriving this from `--capture-max-bytes` would tie the
+/// in-flight memory ceiling to an unrelated on-disk budget — e.g. an operator
+/// asking for a deliberately small `--capture-max-bytes` (a stricter disk cap)
+/// would have no reason to also want a smaller in-flight line-assembly buffer,
+/// and the reverse (a large `--capture-max-bytes` for a long build log) would
+/// otherwise inflate the in-flight buffer far past what any real line needs. Kept
+/// as its own constant instead.
 pub const CAPTURE_INFLIGHT_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// One stream's capture file plus its running metadata. Behind an `Arc<Mutex<…>>`
@@ -70,11 +85,14 @@ pub const CAPTURE_INFLIGHT_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub struct StreamCapture {
     file: std::fs::File,
     path: PathBuf,
+    /// This stream's per-stream ceiling — `CAPTURE_MAX_BYTES` unless
+    /// `--capture-max-bytes` overrode it (see [`Capture::create`]).
+    max_bytes: u64,
     /// Every decoded byte the stream produced — the "full byte counter", which
     /// exceeds the file size once the stream is truncated.
     seen: u64,
-    /// Bytes actually written to the file (`= min(seen, CAPTURE_MAX_BYTES)` while
-    /// writes succeed) — the length the SHA-256 covers.
+    /// Bytes actually written to the file (`= min(seen, max_bytes)` while writes
+    /// succeed) — the length the SHA-256 covers.
     written: u64,
     /// Running digest of the bytes written to the file.
     hasher: Sha256,
@@ -88,11 +106,14 @@ pub struct StreamCapture {
 }
 
 impl StreamCapture {
-    pub fn new(path: PathBuf) -> std::io::Result<Self> {
+    /// `max_bytes` is this stream's per-stream ceiling — `CAPTURE_MAX_BYTES`
+    /// unless `--capture-max-bytes` (T-181) overrode it.
+    pub fn new(path: PathBuf, max_bytes: u64) -> std::io::Result<Self> {
         let file = std::fs::File::create(&path)?;
         Ok(Self {
             file,
             path,
+            max_bytes,
             seen: 0,
             written: 0,
             hasher: Sha256::new(),
@@ -106,8 +127,8 @@ impl StreamCapture {
     /// truncation once the stream outruns the ceiling.
     pub fn absorb(&mut self, bytes: &[u8]) {
         self.seen = self.seen.saturating_add(bytes.len() as u64);
-        if !self.write_error && self.written < CAPTURE_MAX_BYTES {
-            let room = (CAPTURE_MAX_BYTES - self.written) as usize;
+        if !self.write_error && self.written < self.max_bytes {
+            let room = (self.max_bytes - self.written) as usize;
             let take = room.min(bytes.len());
             match self.file.write_all(&bytes[..take]) {
                 Ok(()) => {
@@ -120,7 +141,7 @@ impl StreamCapture {
                 Err(_) => self.write_error = true,
             }
         }
-        if self.seen > CAPTURE_MAX_BYTES {
+        if self.seen > self.max_bytes {
             self.truncated = true;
         }
     }
@@ -152,13 +173,24 @@ pub struct Capture {
 
 impl Capture {
     /// Open (creating the directory and truncating the two files) the capture for
-    /// `dir`. Fails closed — like the `--jsonl` file, a capture the operator asked
-    /// for but that cannot be created is reported *before* the child is spawned,
-    /// never silently dropped.
-    pub fn create(dir: &Path) -> std::io::Result<Self> {
+    /// `dir`, applying `max_bytes` as **both** streams' per-stream ceiling.
+    /// Fails closed — like the `--jsonl` file, a capture the operator asked for
+    /// but that cannot be created is reported *before* the child is spawned, never
+    /// silently dropped.
+    ///
+    /// Callers pass [`CAPTURE_MAX_BYTES`] unless `run`'s `--capture-max-bytes`
+    /// overrode it (see `src/run.rs`), so a bare `run --capture-dir` (no
+    /// `--capture-max-bytes`) is byte-for-byte the same ceiling as before T-181.
+    pub fn create(dir: &Path, max_bytes: u64) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
-        let stdout = Arc::new(Mutex::new(StreamCapture::new(dir.join("stdout.log"))?));
-        let stderr = Arc::new(Mutex::new(StreamCapture::new(dir.join("stderr.log"))?));
+        let stdout = Arc::new(Mutex::new(StreamCapture::new(
+            dir.join("stdout.log"),
+            max_bytes,
+        )?));
+        let stderr = Arc::new(Mutex::new(StreamCapture::new(
+            dir.join("stderr.log"),
+            max_bytes,
+        )?));
         Ok(Self { stdout, stderr })
     }
 
@@ -302,9 +334,16 @@ mod tests {
     use super::*;
 
     /// Drive a stream's capture directly (bypassing the async tee) to exercise the
-    /// counting / ceiling / hashing logic without a live process.
+    /// counting / ceiling / hashing logic without a live process, at the default
+    /// (`CAPTURE_MAX_BYTES`) ceiling.
     fn drive(path: PathBuf, chunks: &[&[u8]]) -> StreamCapture {
-        let mut cap = StreamCapture::new(path).expect("create capture file");
+        drive_with_ceiling(path, CAPTURE_MAX_BYTES, chunks)
+    }
+
+    /// Like [`drive`], but at an explicit per-stream ceiling — exercises the
+    /// `--capture-max-bytes`-configured path (T-181).
+    fn drive_with_ceiling(path: PathBuf, max_bytes: u64, chunks: &[&[u8]]) -> StreamCapture {
+        let mut cap = StreamCapture::new(path, max_bytes).expect("create capture file");
         for chunk in chunks {
             cap.absorb(chunk);
         }
@@ -377,6 +416,38 @@ mod tests {
     }
 
     #[test]
+    fn a_custom_ceiling_truncates_at_the_configured_value_not_the_default() {
+        // `--capture-max-bytes` (T-181): a ceiling well below `CAPTURE_MAX_BYTES`
+        // must clip there, not at the default 8 MiB.
+        let custom_ceiling = 16u64;
+        assert!(
+            custom_ceiling < CAPTURE_MAX_BYTES,
+            "the custom ceiling must be smaller than the default to prove it, not the \
+             default, governs the clip"
+        );
+        let path = temp_path("custom-ceiling");
+        let head = vec![b'a'; custom_ceiling as usize];
+        let mut cap = drive_with_ceiling(path.clone(), custom_ceiling, &[&head, b"overflow"]);
+        let info = cap.info();
+        assert_eq!(
+            info.bytes(),
+            custom_ceiling + "overflow".len() as u64,
+            "the full byte counter still sums every produced byte"
+        );
+        assert!(
+            info.truncated(),
+            "crossing the configured (not the default) ceiling sets the flag"
+        );
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(
+            on_disk.len() as u64,
+            custom_ceiling,
+            "the file holds exactly the configured ceiling's worth, not the default's"
+        );
+        assert_eq!(info.sha256(), crate::hash::sha256_hex(&head));
+    }
+
+    #[test]
     fn empty_stream_is_the_empty_hash_and_untruncated() {
         let path = temp_path("empty");
         let mut cap = drive(path, &[]);
@@ -390,7 +461,8 @@ mod tests {
     #[test]
     fn a_write_error_is_surfaced_and_is_not_a_ceiling_truncation() {
         let path = temp_path("write-error");
-        let mut cap = StreamCapture::new(path.clone()).expect("create capture file");
+        let mut cap =
+            StreamCapture::new(path.clone(), CAPTURE_MAX_BYTES).expect("create capture file");
         // Force a deterministic write failure on every platform: swap the writable
         // handle for a read-only one on the same file, so the next `write_all`
         // returns `Err` (EBADF / ERROR_ACCESS_DENIED) without depending on an

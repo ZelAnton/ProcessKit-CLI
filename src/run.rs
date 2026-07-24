@@ -52,7 +52,7 @@ use processkit::{
     ProcessGroup, ProcessGroupOptions, RunningProcess, Signal, Stdin, StdioMode,
 };
 
-use crate::capture::{CAPTURE_INFLIGHT_MAX_BYTES, Capture};
+use crate::capture::{CAPTURE_INFLIGHT_MAX_BYTES, CAPTURE_MAX_BYTES, Capture};
 use crate::cli::RunArgs;
 use crate::control::{self, SnapshotSource};
 use crate::events::{self, Emitter, Event, Member};
@@ -171,9 +171,13 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     // created is a fail-closed setup error reported here — no child code is at risk
     // yet — rather than a silently-dropped diagnostic. Left `None` when the flag is
     // absent, so a run without capture is byte-for-byte unchanged (no policy, no
-    // extra event, no capture files).
+    // extra event, no capture files). `--capture-max-bytes` (T-181) only resolves
+    // here, applied as both streams' per-stream ceiling — omitted, it falls back to
+    // `CAPTURE_MAX_BYTES` (the prior hard-coded 8 MiB), so a bare
+    // `--capture-dir` without `--capture-max-bytes` is byte-for-byte unchanged too.
+    let capture_max_bytes = args.capture_max_bytes.unwrap_or(CAPTURE_MAX_BYTES);
     let capture = match args.capture_dir.as_deref() {
-        Some(dir) => match Capture::create(dir) {
+        Some(dir) => match Capture::create(dir, capture_max_bytes) {
             Ok(capture) => Some(capture),
             Err(err) => {
                 let error = RunnerError::new(
@@ -1662,7 +1666,10 @@ mod tests {
         let mut emitter = Emitter::create(&jsonl).expect("create the events file");
         // A real `Capture` (not `None`) so `output_captured` actually fires too —
         // proving all three events, not just the two cleanup ones.
-        let capture = Some(Capture::create(&dir.join("capture")).expect("create the capture dir"));
+        let capture = Some(
+            Capture::create(&dir.join("capture"), CAPTURE_MAX_BYTES)
+                .expect("create the capture dir"),
+        );
 
         emit_hard_teardown(&mut emitter, &group, &capture, &None);
 

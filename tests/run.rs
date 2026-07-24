@@ -491,6 +491,86 @@ fn capture_records_streams_without_hanging_on_a_leaked_descendant() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `--capture-max-bytes <size>` (T-181) overrides the default 8 MiB per-stream
+/// ceiling: a small custom ceiling actually clips the captured file at exactly
+/// that value — not the default — while the full byte counter and the explicit
+/// `truncated` flag still report the whole (unclipped) truth, exactly as they do
+/// at the default ceiling.
+#[test]
+fn custom_capture_max_bytes_clips_the_stream_at_the_configured_ceiling() {
+    let dir = scratch("capture-max-bytes");
+    let capture_dir = dir.join("capture");
+    let ceiling: u64 = 50;
+    let script = write_overflow_stdout_script(&dir);
+    let program_and_args: Vec<String> = if cfg!(windows) {
+        vec!["cmd".into(), "/c".into(), path_arg(&script)]
+    } else {
+        vec!["/bin/sh".into(), path_arg(&script)]
+    };
+
+    let capture_flag = path_arg(&capture_dir);
+    let out = run_with_flags(
+        &dir,
+        &[],
+        &[
+            "--capture-dir",
+            &capture_flag,
+            "--capture-max-bytes",
+            &ceiling.to_string(),
+        ],
+        program_and_args,
+    );
+    assert_eq!(out.status.code(), Some(0), "the child exits cleanly");
+
+    // The file on disk holds exactly the *configured* ceiling's worth, not the
+    // default 8 MiB one.
+    let on_disk_len = file_len(&capture_dir.join("stdout.log"));
+    assert_eq!(
+        on_disk_len, ceiling,
+        "the capture file must be clipped at the configured ceiling"
+    );
+
+    let events = read_run_events(&dir);
+    let captured = events
+        .iter()
+        .find(|e| e["event"] == "output_captured")
+        .expect("an output_captured event when --capture-dir is set");
+    let stdout_meta = &captured["stdout"];
+    assert_eq!(
+        stdout_meta["truncated"], true,
+        "the stream outran the configured ceiling: {captured}"
+    );
+    assert!(
+        stdout_meta["bytes"].as_u64().is_some_and(|b| b > ceiling),
+        "the full byte counter must exceed the configured ceiling: {captured}"
+    );
+}
+
+/// A script that writes well over 50 bytes to stdout (repeated fixed-width
+/// lines), so any small `--capture-max-bytes` ceiling well below that is
+/// guaranteed to clip it. The exact per-platform byte count is not load-bearing
+/// (line endings differ), only that it comfortably exceeds the small ceiling the
+/// test configures.
+fn write_overflow_stdout_script(dir: &Path) -> std::path::PathBuf {
+    if cfg!(windows) {
+        let path = dir.join("overflow_stdout.bat");
+        let body = "@echo off\r\n\
+             for /L %%i in (1,1,50) do echo 0123456789ABCDEF\r\n";
+        std::fs::write(&path, body).expect("write overflow_stdout.bat");
+        path
+    } else {
+        let path = dir.join("overflow_stdout.sh");
+        let body = "#!/bin/sh\n\
+             i=0\n\
+             while [ \"$i\" -lt 50 ]; do\n\
+             \x20 printf '0123456789ABCDEF\\n'\n\
+             \x20 i=$((i + 1))\n\
+             done\n";
+        std::fs::write(&path, body).expect("write overflow_stdout.sh");
+        path
+    }
+}
+
 /// Parse the emitted JSONL event stream for `dir`, one object per non-empty line.
 fn read_run_events(dir: &Path) -> Vec<Value> {
     let path = events_path(dir);

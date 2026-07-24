@@ -46,15 +46,16 @@ pub enum Command {
 
 /// `run [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl> [--create-no-window]
 /// [--timeout <duration>] [--grace <duration>] [--max-memory <size>]
-/// [--max-processes <n>] [--cpu-quota <cores>] [--capture-dir <dir>] [--argv-raw]
+/// [--max-processes <n>] [--cpu-quota <cores>] [--capture-dir <dir>]
+/// [--capture-max-bytes <size>] [--argv-raw]
 /// [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
 /// -- <program> <args...>`
 //
 // `run` consumes every field: `cwd`, `create_no_window`, `timeout`, `grace`,
 // `max_memory`, `max_processes`, `cpu_quota` — the whole-tree ProcessKit
 // resource caps (see `src/run.rs`) — `command`, `jsonl`, `run_id`, `argv_raw`,
-// `capture_dir` — bounded stdout/stderr capture to files (see `src/capture.rs`)
-// — `env_clear`, `env_remove`, `env`, and
+// `capture_dir`/`capture_max_bytes` — bounded stdout/stderr capture to files
+// (see `src/capture.rs`) — `env_clear`, `env_remove`, `env`, and
 // `inherit_stdio`/`inherit_stdin`/`stdin_file`.
 #[derive(Debug, Args)]
 pub struct RunArgs {
@@ -121,6 +122,19 @@ pub struct RunArgs {
     /// truncation flag are reported in the `output_captured` JSONL event.
     #[arg(long, value_name = "dir")]
     pub capture_dir: Option<PathBuf>,
+
+    /// Per-**stream** ceiling on bytes written to a `--capture-dir` file — the
+    /// same value that otherwise defaults to `crate::capture::CAPTURE_MAX_BYTES`
+    /// (8 MiB). Same grammar as `--max-memory` (see [`parse_size`]): a byte count
+    /// with an optional binary unit — `1048576`, `512k`, `256m`, `2g`. Only takes
+    /// effect together with `--capture-dir`; omitting it leaves the default
+    /// ceiling in place, so a bare `run` (with or without `--capture-dir`) stays
+    /// byte-for-byte unchanged. Does not change the `output_captured` event's
+    /// shape or the meaning of its `truncated` flag, which still just means "the
+    /// stream outran whatever per-stream ceiling was in effect" (see
+    /// `src/capture.rs` and `README.md`, "Bounded output capture").
+    #[arg(long, value_name = "size", value_parser = parse_size)]
+    pub capture_max_bytes: Option<u64>,
 
     /// Give the child the runner's stdin, stdout, and stderr handles directly.
     /// This preserves terminal status and cannot be combined with mediated I/O
@@ -1087,6 +1101,67 @@ mod tests {
         assert!(args.max_memory.is_none());
         assert!(args.max_processes.is_none());
         assert!(args.cpu_quota.is_none());
+    }
+
+    #[test]
+    fn run_parses_capture_max_bytes_and_defaults_to_absent() {
+        let cli = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--capture-dir",
+            "cap",
+            "--capture-max-bytes",
+            "64k",
+            "--",
+            "true",
+        ])
+        .expect("a valid run invocation with a custom capture ceiling");
+        let Command::Run(args) = cli.command else {
+            panic!("expected the run subcommand");
+        };
+        assert_eq!(args.capture_max_bytes, Some(64 * 1024));
+
+        let cli = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--",
+            "true",
+        ])
+        .expect("a valid run invocation");
+        let Command::Run(args) = cli.command else {
+            panic!("expected the run subcommand");
+        };
+        assert!(
+            args.capture_max_bytes.is_none(),
+            "omitting --capture-max-bytes leaves it absent so the default ceiling applies"
+        );
+    }
+
+    #[test]
+    fn run_rejects_a_malformed_capture_max_bytes() {
+        // Same grammar (and rejection) as `--max-memory` (`parse_size`), so a
+        // malformed value fails loudly at parse time (mapped to USAGE) rather than
+        // silently falling back to the default ceiling.
+        for bad in ["0", "lots", "-5", "1.5m"] {
+            assert!(
+                Cli::try_parse_from([
+                    "processkit-cli",
+                    "run",
+                    "--jsonl",
+                    "events.jsonl",
+                    "--capture-max-bytes",
+                    bad,
+                    "--",
+                    "true",
+                ])
+                .is_err(),
+                "a malformed `--capture-max-bytes {bad}` must fail at parse time"
+            );
+        }
     }
 
     #[test]

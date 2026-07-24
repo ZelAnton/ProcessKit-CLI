@@ -160,7 +160,8 @@ processkit-cli run     [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl>
                        [--create-no-window] [--timeout <duration>]
                        [--grace <duration>] [--max-memory <size>]
                        [--max-processes <n>] [--cpu-quota <cores>]
-                       [--capture-dir <dir>] [--argv-raw]
+                       [--capture-dir <dir>] [--capture-max-bytes <size>]
+                       [--argv-raw]
                        [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
                        [--env-clear] [--env-remove <KEY>]... [--env <KEY=VALUE>]...
                        -- <program> <args...>
@@ -387,6 +388,24 @@ JSONL event (see [the schema](docs/schema.md)):
 
 Without `--capture-dir`, nothing changes: no capture files, no `output_captured`
 event, and the event stream is byte-for-byte identical to a plain run.
+
+The per-stream ceiling defaults to 8 MiB and is configurable with
+`--capture-max-bytes <size>`, only meaningful together with `--capture-dir`.
+Same grammar as `--max-memory`: a byte count with an optional binary unit —
+`1048576`, `512k`, `256m`, `2g` (`k`/`m`/`g` are KiB/MiB/GiB, 1024-based). A
+malformed value is a usage error (exit `100`) rejected at parse time, not a
+silent fallback to the default. Omitting the flag leaves the default 8 MiB
+ceiling in place, so a bare `run --capture-dir` (no `--capture-max-bytes`)
+stays byte-for-byte unchanged; `output_captured`'s shape and its `truncated`
+flag's meaning are unaffected — `truncated` still just means "the stream
+outran whichever per-stream ceiling was in effect," regardless of its size.
+`--capture-max-bytes` is independent of the pump's separate in-flight
+line-assembly ceiling (64 MiB, not user-configurable): that one bounds a
+single still-unterminated line's in-memory assembly, a pathological-input
+concern sized once for the whole binary, while `--capture-max-bytes` bounds
+the on-disk per-stream transcript size, an operator's disk-budget choice per
+invocation — the two are deliberately kept separate rather than one deriving
+from the other.
 
 ## Resource limits
 
