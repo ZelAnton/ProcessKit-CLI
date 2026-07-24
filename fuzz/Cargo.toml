@@ -10,8 +10,8 @@ cargo-fuzz = true
 [dependencies]
 # libFuzzer harness glue (the `fuzz_target!` macro and the `main` it generates).
 libfuzzer-sys = "0.4"
-# Deserializes the control-plane wire replies (`Snapshot`/`ControlAck`) the same
-# way the real client does, in the `control_wire` target.
+# Deserializes the control-plane wire replies (`Snapshot`/`ControlAck`/
+# `ErrorReply`) the same way the real client does, in the `control_wire` target.
 serde_json = "1"
 
 [dependencies.processkit-cli]

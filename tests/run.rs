@@ -1,6 +1,7 @@
 //! Through-the-binary tests for the `run` subcommand: exit-code fidelity, live
 //! stream pass-through with strict separation, the spawn-failure code, timeout
-//! and Ctrl-C cancel as distinguishable runner-imposed endings, the `--grace`
+//! and stop-signal cancel (`Ctrl-C`, and on Unix `SIGTERM`/`SIGHUP`) as
+//! distinguishable runner-imposed endings, the `--grace`
 //! pause, and kernel-backed teardown of a leaked descendant. These prove behavior
 //! the library-level ProcessKit-rs suite cannot: the *binary's* own contracts
 //! (`AGENTS.md`, "Testing tiers"). The full end-to-end scenario matrix is a
@@ -1014,8 +1015,203 @@ fn cancel_via_ctrl_c_reports_the_cancel_code_and_tears_down_the_tree() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A `SIGTERM` mid-run — the *standard external stop* (`kill <pid>`, `systemctl
+/// stop`, a cancelled CI job, a supervisor's shutdown timeout) — must be a
+/// **first-class cancel**, not an abrupt death of the runner: the same reserved
+/// `CANCELLED` code (107), the same complete terminal JSONL sequence, and the same
+/// full teardown of the tree. Before the runner caught this signal its default
+/// disposition killed the runner outright, so none of that happened — no terminal
+/// events, and no explicit kill of the container, whose abrupt-owner-death reap
+/// covers only the direct child on Linux (`PDEATHSIG`) and nothing on macOS/BSD
+/// (K-005). The detached grandchild here is exactly the descendant that reap would
+/// miss, which is what makes the bystander check load-bearing rather than decorative.
+///
+/// Unix-only: it delivers a real `SIGTERM` to the runner process alone (its pid, not
+/// a process group), so only the runner sees it — the child must be reaped by the
+/// runner's teardown, not by the signal itself.
+#[cfg(unix)]
+#[test]
+fn cancel_via_sigterm_reports_the_cancel_code_and_tears_down_the_tree() {
+    use std::process::Stdio;
+
+    let dir = scratch("sigterm");
+    let heartbeat = dir.join("heartbeat.txt");
+    let grandchild = write_grandchild_script(&dir);
+    let root = write_sleeping_root_script(&dir);
+
+    let child = common::command_with_flags(
+        &dir,
+        &[
+            ("HB", heartbeat.as_path()),
+            ("GRANDCHILD", grandchild.as_path()),
+        ],
+        &["--grace", "1s"],
+        vec!["/bin/sh".to_string(), path_arg(&root)],
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("spawn the runner");
+
+    // Let the grandchild start heartbeating so the SIGTERM lands mid-run, with a
+    // live descendant to tear down.
+    wait_until(|| file_len(&heartbeat) > 0, Duration::from_secs(10));
+
+    // The external stop: SIGTERM to the runner alone (its pid), not a process group.
+    let rc = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(rc, 0, "failed to deliver SIGTERM to the runner");
+
+    let out = child.wait_with_output().expect("runner did not exit");
+    assert_eq!(
+        out.status.code(),
+        Some(107),
+        "a SIGTERM must exit with the reserved CANCELLED code, like any other cancel"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("run cancelled (SIGTERM)"),
+        "the stderr line must name the signal that actually stopped the run, not a \
+         Ctrl-C that never happened: {stderr:?}"
+    );
+
+    // The full terminal sequence must be present and in order — this is what a plain
+    // `kill` used to skip entirely.
+    let events = read_run_events(&dir);
+    let tags: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event["event"].as_str())
+        .collect();
+    let cancelled = events
+        .iter()
+        .find(|event| event["event"] == "cancelled")
+        .unwrap_or_else(|| panic!("a SIGTERM must write a `cancelled` event: {tags:?}"));
+    assert_eq!(
+        cancelled["source"], "sigterm",
+        "the cancel must be attributed to the signal that arrived: {cancelled}"
+    );
+    let position = |tag: &str| {
+        tags.iter()
+            .position(|found| *found == tag)
+            .unwrap_or_else(|| panic!("the stream must contain a `{tag}` event: {tags:?}"))
+    };
+    let (cancel_at, started_at, finished_at) = (
+        position("cancelled"),
+        position("cleanup_started"),
+        position("cleanup_finished"),
+    );
+    assert!(
+        cancel_at < started_at && started_at < finished_at,
+        "the reason event must bracket the teardown pair: {tags:?}"
+    );
+    let terminal = events.last().expect("a terminal event");
+    assert_eq!(
+        terminal["event"], "runner_exit",
+        "`runner_exit` is always the last line: {tags:?}"
+    );
+    assert_eq!(terminal["source"], "cancelled");
+    assert_eq!(terminal["code"], 107);
+    assert_eq!(
+        terminal["child_code"],
+        Value::Null,
+        "a runner-imposed ending forwards no child code"
+    );
+
+    // And the headline guarantee: the whole tree is gone. The detached grandchild
+    // cannot grow its heartbeat after the runner returned. Baseline is read *after*
+    // the runner exited, so a stale pre-teardown value cannot mask a survivor (K-012).
+    let size_at_return = file_len(&heartbeat);
+    assert!(
+        size_at_return > 0,
+        "the grandchild must have heartbeat before the SIGTERM"
+    );
+    sleep(Duration::from_secs(3));
+    let size_later = file_len(&heartbeat);
+    assert_eq!(
+        size_later, size_at_return,
+        "a descendant survived the SIGTERM teardown (grew from {size_at_return} to \
+         {size_later})"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `SIGHUP` — the controlling terminal went away (a closed terminal, a dropped SSH
+/// session) — is the sibling of the `SIGTERM` case above and takes the very same
+/// path, distinguished only by the `cancelled` event's `source`. Kept as its own
+/// (lighter) test rather than folded into the one above so a regression that wires
+/// only one of the two signals cannot hide.
+#[cfg(unix)]
+#[test]
+fn cancel_via_sighup_is_reported_as_its_own_source() {
+    use std::process::Stdio;
+
+    let dir = scratch("sighup");
+    let heartbeat = dir.join("heartbeat.txt");
+    let grandchild = write_grandchild_script(&dir);
+    let root = write_sleeping_root_script(&dir);
+
+    let child = common::command_with_flags(
+        &dir,
+        &[
+            ("HB", heartbeat.as_path()),
+            ("GRANDCHILD", grandchild.as_path()),
+        ],
+        &["--grace", "1s"],
+        vec!["/bin/sh".to_string(), path_arg(&root)],
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("spawn the runner");
+
+    wait_until(|| file_len(&heartbeat) > 0, Duration::from_secs(10));
+
+    let rc = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGHUP) };
+    assert_eq!(rc, 0, "failed to deliver SIGHUP to the runner");
+
+    let out = child.wait_with_output().expect("runner did not exit");
+    assert_eq!(
+        out.status.code(),
+        Some(107),
+        "a SIGHUP shares the reserved CANCELLED code with the other stop signals"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("run cancelled (SIGHUP)"),
+        "the stderr line must name SIGHUP: {stderr:?}"
+    );
+
+    let events = read_run_events(&dir);
+    let cancelled = events
+        .iter()
+        .find(|event| event["event"] == "cancelled")
+        .expect("a SIGHUP must write a `cancelled` event");
+    assert_eq!(
+        cancelled["source"], "sighup",
+        "a SIGHUP is neither a Ctrl-C nor a SIGTERM: {cancelled}"
+    );
+    let terminal = events.last().expect("a terminal event");
+    assert_eq!(terminal["event"], "runner_exit");
+    assert_eq!(terminal["source"], "cancelled");
+    assert_eq!(terminal["code"], 107);
+
+    let size_at_return = file_len(&heartbeat);
+    assert!(
+        size_at_return > 0,
+        "the grandchild must have heartbeat before the SIGHUP"
+    );
+    sleep(Duration::from_secs(3));
+    assert_eq!(
+        file_len(&heartbeat),
+        size_at_return,
+        "a descendant survived the SIGHUP teardown"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Poll `cond` until it holds or `timeout` elapses (then panic). A tiny spin used
-/// by the cancel test to wait for the grandchild to come alive.
+/// by the cancel tests to wait for the grandchild to come alive.
 #[cfg(unix)]
 fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) {
     let start = std::time::Instant::now();
