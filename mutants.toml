@@ -1,0 +1,35 @@
+# Configuration for cargo-mutants (https://mutants.rs), consumed by the
+# non-gating `.github/workflows/mutants.yml` weekly/manual CI tier — see
+# CONTRIBUTING.md, "Mutation testing".
+#
+# Root-level `mutants.toml` (over the other documented location,
+# `.cargo/mutants.toml`) matches this repo's convention of keeping tool config
+# at the repository root (`deny.toml`, `cliff.toml`) rather than nested under
+# `.cargo/`.
+
+# Scope mutation to the crate's own library modules.
+examine_globs = ["src/**/*.rs"]
+
+exclude_globs = [
+    # Thin binary entry point (`src/main.rs`): parses argv and dispatches into
+    # the library, no independently testable logic of its own — a mutant here
+    # would only ever be "missed" against tests that already exercise the
+    # library the binary calls through, never a real gap in the suite.
+    "src/main.rs",
+    # Feature-gated helper binaries: `e2e_helper` (the e2e tier's worker,
+    # required-features = ["e2e"]) and `bench_emit` (the bench tier's worker,
+    # required-features = ["bench"]). Test/bench harnesses, not library logic;
+    # neither builds under this workflow's plain `cargo mutants` (no
+    # `--features e2e,bench`), so cargo-mutants could not build a mutant for
+    # them anyway — excluded explicitly so that is documented, not incidental.
+    "src/bin/*.rs",
+    # Windows-only module (`#[cfg(windows)]` in src/lib.rs): the Job Object
+    # security-descriptor helpers backing the registry's protected-DACL
+    # directory and the e2e tier's nested-Job-Object scenario. The CI job
+    # below runs on `ubuntu-latest` only (a single, cheaper runner given how
+    # expensive a full per-mutant test run already is — see the workflow's own
+    # comment), so this module never compiles into that build and
+    # cargo-mutants could not construct a viable mutant for it there either;
+    # listed explicitly rather than relying on that being incidental.
+    "src/win_security.rs",
+]

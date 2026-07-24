@@ -166,6 +166,55 @@ a plain terminal summary instead.
 
 [`cargo-llvm-cov`]: https://github.com/taiki-e/cargo-llvm-cov
 
+## Mutation testing
+
+CI runs a scheduled, non-gating [`cargo-mutants`] tier
+(`.github/workflows/mutants.yml`) that reruns the crate's default `cargo test`
+tier once per artificially introduced defect ("mutant") across `src/`. A
+mutant the suite doesn't catch — a *survivor* — is a direct pointer to a gap
+the coverage numbers above cannot see: a line executing only proves it ran,
+not that a test would notice if its behavior changed.
+
+Configuration lives in [`mutants.toml`](mutants.toml) (repository root,
+matching this project's other tool configs — `deny.toml`, `cliff.toml` — over
+`.cargo/mutants.toml`, cargo-mutants' other documented config location). It
+scopes mutation to `src/**/*.rs`, excluding the thin `src/main.rs` entry
+point, the feature-gated helper binaries under `src/bin/` (the `e2e` and
+`bench` tiers' worker binaries — test/bench harnesses, not library logic),
+and the Windows-only `src/win_security.rs` (the CI job runs on `ubuntu-latest`
+only, so that module never compiles into the build it mutates); see the
+file's own comments for the reasoning behind each exclusion.
+
+This is by far the most expensive tier in this repo — a full run reruns the
+whole test suite once per mutant — so, like `fuzz.yml`, it is scheduled
+weekly and manual-dispatch only, never on push/pull request.
+
+Install it once:
+
+```sh
+cargo install cargo-mutants --locked
+```
+
+Run the full scoped tree (expect anywhere from tens of minutes to a few hours
+depending on hardware — this is not a `cargo test`-speed command):
+
+```sh
+cargo mutants
+```
+
+Or scope a single file while iterating on its tests:
+
+```sh
+cargo mutants --file src/hash.rs
+```
+
+Results land under `mutants.out/`: `missed.txt` lists survivors, `caught.txt`/
+`timeout.txt`/`unviable.txt` the other outcomes, and `logs/` the per-mutant
+build/test output. CI publishes the same summary to the job's step summary
+and uploads the whole directory as the `mutants-out` artifact.
+
+[`cargo-mutants`]: https://mutants.rs
+
 ## Conventions
 
 - **Formatting** is governed by `rustfmt` (run `cargo fmt`); non-Rust files

@@ -1,0 +1,109 @@
+name: Mutants
+
+# Non-gating mutation-testing tier (cargo-mutants, T-202) over `src/`: each
+# surviving mutant is a location where an artificially introduced defect
+# changed the compiled behavior but no test in the suite noticed — a direct
+# pointer to a gap the `coverage` job's line-coverage numbers in ci.yml cannot
+# see (a line executing is not the same as a test checking its behavior). See
+# mutants.toml (scope/exclusions) and CONTRIBUTING.md, "Mutation testing".
+#
+# Deliberately scheduled + manual-only (no `push:`/`pull_request:` trigger):
+# cargo-mutants reruns the *entire* test suite once per generated mutant, so a
+# full pass is far more expensive than a single `cargo test` — by far the
+# priciest tier in this repo. Every step that can fail on a genuine surviving
+# mutant uses `continue-on-error`, so a run with survivors is reported (job
+# summary + an uploaded `mutants-out` artifact) but never turns this workflow
+# red in a way that blocks an unrelated PR — this is a discovery tier, not a
+# required check. CI-only addition (no application/library code touched, same
+# reasoning as the `coverage`/`fuzz` tiers), so it carries no CHANGELOG.md
+# entry — see K-029.
+
+on:
+  schedule:
+    # Weekly, off-peak UTC — offset from fuzz.yml's Monday slot so the two
+    # expensive scheduled tiers don't compete for the same runner window.
+    - cron: '23 5 * * 3'
+  workflow_dispatch:
+    inputs:
+      file:
+        description: >-
+          Restrict the run to mutants in one source file (cargo-mutants'
+          --file), e.g. src/hash.rs. Leave blank for the full scoped tree
+          (see mutants.toml).
+        required: false
+        default: ''
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  mutants:
+    name: mutants
+    runs-on: ubuntu-latest
+    # A full run mutates every eligible line across `src/` and reruns the
+    # whole test suite per mutant. Single-OS (unlike coverage/perf's
+    # ubuntu+windows matrix): mutation outcomes are about test *logic*
+    # coverage, not platform-specific runtime behavior, so doubling the
+    # (already expensive) run for a second OS buys little — see mutants.toml
+    # for how the Windows-only `src/win_security.rs` module is handled given
+    # that choice. The timeout below is generous headroom over a full run,
+    # not an expected duration.
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@stable # rolling toolchain selector — intentionally unpinned
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+
+      # A surviving or timed-out mutant is a real, reportable result of this
+      # step, not an infrastructure failure — continue past it so the summary
+      # and artifact-upload steps below still run instead of the job aborting
+      # mid-way (same reasoning as the "Fuzz" step in fuzz.yml).
+      - name: Run cargo-mutants
+        id: mutants
+        continue-on-error: true
+        shell: bash
+        run: |
+          args=()
+          if [ -n "${{ github.event.inputs.file }}" ]; then
+            args+=(--file "${{ github.event.inputs.file }}")
+          fi
+          cargo mutants "${args[@]}"
+
+      - name: Report outcome
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### cargo-mutants: ${{ steps.mutants.outcome }}"
+            echo
+            if [ -d mutants.out ]; then
+              echo '```text'
+              echo "caught:   $(wc -l < mutants.out/caught.txt 2>/dev/null || echo 0)"
+              echo "missed:   $(wc -l < mutants.out/missed.txt 2>/dev/null || echo 0)"
+              echo "timeout:  $(wc -l < mutants.out/timeout.txt 2>/dev/null || echo 0)"
+              echo "unviable: $(wc -l < mutants.out/unviable.txt 2>/dev/null || echo 0)"
+              echo '```'
+              if [ -s mutants.out/missed.txt ]; then
+                echo
+                echo "Surviving mutants (full per-mutant log in the \`mutants-out\` artifact):"
+                echo '```text'
+                cat mutants.out/missed.txt
+                echo '```'
+              fi
+            else
+              echo "cargo-mutants produced no \`mutants.out/\` directory — see the" \
+                   "\"Run cargo-mutants\" step log above."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutants-out
+          path: mutants.out
+          if-no-files-found: ignore
