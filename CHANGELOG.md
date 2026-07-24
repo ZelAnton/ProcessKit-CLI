@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [0.2.2] - 2026-07-24
+
+### Added
 - `run --inherit-stdio` for interactive commands that need the runner's stdin,
   stdout, and stderr handles directly. It preserves an existing terminal while
   retaining containment, JSONL lifecycle events, cleanup, control-plane access,
@@ -229,7 +240,8 @@ to a dated version section.
   inheriting the registry's full path, so deeply nested macOS CI/workspace paths
   cannot exceed `sockaddr_un::sun_path` and silently disable `inspect`.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ZelAnton/ProcessKit-CLI/releases/tag/v0.1.0

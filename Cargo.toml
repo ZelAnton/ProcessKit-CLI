@@ -1,6 +1,6 @@
 [package]
 name = "processkit-cli"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Standalone CLI runner for ProcessKit process-tree containment and lifecycle diagnostics"
 license = "MIT"
