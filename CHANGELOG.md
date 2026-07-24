@@ -12,6 +12,19 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- `run` gained `--idle-timeout <duration>`, a deadline on child **silence** for the
+  stuck-worker case (a child that is alive but has long stopped producing output).
+  The deadline is re-armed on every chunk of the child's output, so a child that
+  keeps talking is never reaped no matter how long it runs — only one that goes quiet
+  past the window is. An idle expiry reuses the existing `TIMEOUT` (106) exit and the
+  same soft-stop → grace → hard-kill teardown as `--timeout`; the two are told apart
+  by a new always-present `reason` field on the `timeout` JSONL event (`overall` vs
+  `idle`), so `schema_version` is unchanged (additive field). Same duration grammar
+  as `--timeout`/`--grace`; a malformed value is a `USAGE` (100) parse-time error. It
+  needs the runner's output pump, so it conflicts with `--inherit-stdio` at parse
+  time (like `--capture-dir`) but composes with `--capture-dir`. The new flag appears
+  in the `probe` surface tokens automatically. See README.md, "Timeouts, cancel, and
+  grace", and docs/schema.md / docs/exit-codes.md.
 - `run` resource-limit flags `--max-memory <size>`, `--max-processes <n>`, and
   `--cpu-quota <cores>`, mapping onto ProcessKit's whole-tree `ProcessGroupOptions`
   caps (the `processkit` dependency now enables its `limits` feature). Enforcement

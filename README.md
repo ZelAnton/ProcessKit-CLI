@@ -158,6 +158,7 @@ owned container's ordinary teardown path on every supported platform.
 ```text
 processkit-cli run     [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl>
                        [--create-no-window] [--timeout <duration>]
+                       [--idle-timeout <duration>]
                        [--grace <duration>] [--max-memory <size>]
                        [--max-processes <n>] [--cpu-quota <cores>]
                        [--capture-dir <dir>] [--capture-max-bytes <size>]
@@ -288,12 +289,24 @@ candidate.
 
 ## Timeouts, cancel, and grace
 
-In the default and input-only I/O modes, `run` bounds a run two ways, and both end
-in the **same** teardown path:
+In the default and input-only I/O modes, `run` bounds a run three ways — a
+whole-run deadline, an idle (no-output) deadline, and an interactive cancel — and
+all of them end in the **same** teardown path:
 
 - `--timeout <duration>` is a hard deadline for the whole run. When it elapses the
   runner ends the run and exits with the reserved `TIMEOUT` code (`106`) — never
   the child's own code, because the child did not choose to stop.
+- `--idle-timeout <duration>` is a deadline on child **silence**, for the classic
+  stuck-worker case (a build worker that is alive but has long stopped making
+  progress). Its deadline is *re-armed* on every chunk of the child's output, so a
+  child that keeps talking is never reaped no matter how long it runs — only one
+  that goes quiet past the window is. An idle expiry reuses the **same** `TIMEOUT`
+  code (`106`) and the same teardown as `--timeout`; the two are told apart by the
+  `timeout` event's `reason` field (`overall` vs `idle`) in the JSONL stream, not by
+  a distinct exit code. Because it needs the runner's output pump to observe the
+  child, it cannot be combined with `--inherit-stdio` (a parse-time error, like
+  `--capture-dir`); it does compose with `--capture-dir`, which re-arms the same one
+  timer through its tee.
 - **`Ctrl-C`** cancels a run in progress. The runner ends it and exits with the
   reserved `CANCELLED` code (`107`), distinct from a timeout and from any child
   code, so "I interrupted it" is never confused with "it ran too long" or with a

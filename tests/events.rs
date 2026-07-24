@@ -568,10 +568,85 @@ fn timeout_emits_timeout_cleanup_and_runner_exit() {
         .find(|e| e["event"] == "timeout")
         .expect("a timeout event");
     assert_eq!(timeout["timeout_ms"], 1000);
+    assert_eq!(
+        timeout["reason"], "overall",
+        "a whole-run --timeout is reported with reason=overall: {timeout}"
+    );
 
     let runner_exit = events.last().expect("a terminal event");
     assert_eq!(runner_exit["event"], "runner_exit");
     assert_eq!(runner_exit["source"], "timeout");
+    assert_eq!(runner_exit["code"], 106);
+    assert!(
+        runner_exit["child_code"].is_null(),
+        "a runner-imposed ending forwards no child code: {runner_exit}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `--idle-timeout` that elapses on a **silent** child reuses the whole `--timeout`
+/// machinery — the same reserved `TIMEOUT` (106) code, the same `timeout` runner-exit
+/// `source`, and the same cleanup pair — distinguished only by the `timeout` event's
+/// `reason: "idle"`. A long-lived child that produces no output is the silence the
+/// idle deadline is for. Cross-platform via a runtime `cfg!`.
+#[test]
+fn idle_timeout_emits_timeout_with_idle_reason() {
+    let dir = scratch("idle-timeout-events");
+    // A long sleeper that writes nothing to stdout: the runner observes no output, so
+    // the idle window elapses and ends the run.
+    let long_silent = if cfg!(windows) {
+        shell_inline("ping -n 300 127.0.0.1 >nul")
+    } else {
+        shell_inline("sleep 300")
+    };
+    let out = run_with_flags(
+        &dir,
+        &[],
+        &["--idle-timeout", "1s", "--grace", "500ms"],
+        long_silent,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(106),
+        "an idle timeout reuses the reserved TIMEOUT code, not a new one"
+    );
+
+    let events = read_events(&dir);
+    assert_events_match_schema(&events);
+    let types = event_types(&events);
+    for expected in [
+        "run_started",
+        "timeout",
+        "cleanup_started",
+        "cleanup_finished",
+        "runner_exit",
+    ] {
+        assert!(
+            types.iter().any(|t| t == expected),
+            "the idle-timeout stream must contain `{expected}`: {types:?}"
+        );
+    }
+
+    let timeout = events
+        .iter()
+        .find(|e| e["event"] == "timeout")
+        .expect("a timeout event");
+    assert_eq!(
+        timeout["reason"], "idle",
+        "the --idle-timeout trigger is reported with reason=idle: {timeout}"
+    );
+    assert_eq!(
+        timeout["timeout_ms"], 1000,
+        "timeout_ms echoes the idle window that elapsed"
+    );
+
+    let runner_exit = events.last().expect("a terminal event");
+    assert_eq!(runner_exit["event"], "runner_exit");
+    assert_eq!(
+        runner_exit["source"], "timeout",
+        "an idle expiry reuses the `timeout` source, not a new one"
+    );
     assert_eq!(runner_exit["code"], 106);
     assert!(
         runner_exit["child_code"].is_null(),

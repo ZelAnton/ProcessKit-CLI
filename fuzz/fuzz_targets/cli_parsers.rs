@@ -2,7 +2,7 @@
 //! text independently — they never interact, and each is expected to reject
 //! anything outside its own strict grammar rather than panic or silently
 //! reinterpret it (see each function's own doc comment for its grammar:
-//! `--timeout`/`--grace` duration, `--require-exit-code-band`, `--env`,
+//! `--timeout`/`--idle-timeout`/`--grace` duration, `--require-exit-code-band`, `--env`,
 //! `--max-memory` size, `--max-processes` count, `--cpu-quota` core fraction).
 #![no_main]
 

@@ -1473,3 +1473,64 @@ fn env_clear_wipes_inherited_env_except_explicit_env() {
         "an explicit --env still sets its variable on top of the cleared slate: {stdout:?}"
     );
 }
+
+/// The `--idle-timeout` contract, proven through the built binary at two ends: a
+/// child that goes silent past the idle window is torn down (the stuck-worker case),
+/// while a child that keeps emitting output — every silence shorter than the window —
+/// is left to run even though its *total* lifetime far exceeds the window. The
+/// silent one exits with the reserved `TIMEOUT` code and its `timeout` event names
+/// `reason: "idle"`; the chatty one exits `0` on its own with no `timeout` event at
+/// all, so the idle timer proves it can tell "alive but stuck" from "alive and busy".
+#[test]
+fn idle_timeout_reaps_a_silent_child_but_spares_a_chatty_one() {
+    // Silent child: a long-lived worker that writes nothing to stdout. With a 1s idle
+    // window it must be reaped well before its own 120s bound.
+    let silent = Scenario::new("e2e-idle-silent");
+    let out = run_with_flags(
+        &silent.dir,
+        &[],
+        &["--idle-timeout", "1s", "--grace", "500ms"],
+        helper("spin", &["--sleep-secs", "120"]),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(106),
+        "a child silent past the idle window is torn down with the reserved TIMEOUT code; \
+         stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let silent_events = read_events(&events_path(&silent.dir));
+    let timeout = silent_events
+        .iter()
+        .find(|e| e["event"] == "timeout")
+        .expect("the silent child produced a timeout event");
+    assert_eq!(
+        timeout["reason"], "idle",
+        "an idle teardown names reason=idle: {timeout}"
+    );
+
+    // Chatty child: prints a line every 100ms for 3s. Every silence (100ms) is far
+    // under the 1s idle window, so the idle timer never fires even though the run's
+    // total life (3s) exceeds the window. It exits on its own with code 0 and the
+    // stream carries no timeout event.
+    let chatty = Scenario::new("e2e-idle-chatty");
+    let out = run_with_flags(
+        &chatty.dir,
+        &[],
+        &["--idle-timeout", "1s"],
+        helper("chatter", &["--duration-secs", "3", "--interval-ms", "100"]),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a continuously-chattering child outlives the idle window without being reaped; \
+         stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let chatty_events = read_events(&events_path(&chatty.dir));
+    assert!(
+        chatty_events.iter().all(|e| e["event"] != "timeout"),
+        "a chatty child (silences shorter than the idle window) must not trigger an idle \
+         timeout: {chatty_events:?}"
+    );
+}

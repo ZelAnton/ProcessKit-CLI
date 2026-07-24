@@ -214,15 +214,20 @@
     },
     "timeout": {
       "type": "object",
-      "description": "The --timeout deadline elapsed while the child was still running.",
+      "description": "A runner deadline elapsed while the child was still running: the whole-run --timeout or the --idle-timeout (no child output for the idle window). Both share this event and the reserved TIMEOUT (106) code; `reason` tells them apart.",
       "properties": {
         "schema_version": { "$ref": "#/$defs/schemaVersion" },
         "time": { "$ref": "#/$defs/time" },
         "event": { "const": "timeout" },
-        "timeout_ms": { "$ref": "#/$defs/nonNegativeInt", "description": "The deadline that elapsed, milliseconds." },
-        "grace_ms": { "$ref": "#/$defs/u64OrNull", "description": "The --grace window, ms; null if unset." }
+        "timeout_ms": { "$ref": "#/$defs/nonNegativeInt", "description": "The deadline that elapsed, milliseconds (the whole-run window for overall, the idle window for idle)." },
+        "grace_ms": { "$ref": "#/$defs/u64OrNull", "description": "The --grace window, ms; null if unset." },
+        "reason": {
+          "type": "string",
+          "enum": ["overall", "idle"],
+          "description": "Which deadline fired: overall (--timeout) or idle (--idle-timeout)."
+        }
       },
-      "required": ["schema_version", "time", "event", "timeout_ms", "grace_ms"],
+      "required": ["schema_version", "time", "event", "timeout_ms", "grace_ms", "reason"],
       "additionalProperties": false
     },
     "cancelled": {

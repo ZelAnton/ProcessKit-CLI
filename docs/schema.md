@@ -184,15 +184,28 @@ The emission is deliberately narrow:
 
 ### `timeout`
 
-The `--timeout` deadline elapsed while the child was still running. The teardown
-it triggers is described by the following `cleanup_started` / `cleanup_finished`
-events; the run's terminal code is the reserved `TIMEOUT` (106) — see
-`docs/exit-codes.md`.
+A runner deadline elapsed while the child was still running: either the whole-run
+`--timeout`, or the `--idle-timeout` (the child produced no output for the idle
+window). Both share this event, the reserved `TIMEOUT` (106) terminal code, and the
+soft-stop → grace → hard-kill teardown described by the following `cleanup_started` /
+`cleanup_finished` events (see `docs/exit-codes.md`); the always-present `reason`
+field tells them apart.
 
 | Field        | Type              | Notes                                     |
 |--------------|-------------------|-------------------------------------------|
-| `timeout_ms` | integer           | The deadline that elapsed, milliseconds.  |
+| `timeout_ms` | integer           | The deadline that elapsed, milliseconds — the whole-run window for `overall`, the idle window for `idle`. |
 | `grace_ms`   | integer, nullable | The `--grace` window, ms; `null` if unset. |
+| `reason`     | string            | Which deadline fired: `overall` (`--timeout`) or `idle` (`--idle-timeout`). |
+
+`--idle-timeout` re-arms its deadline on every chunk of the child's output, so a
+child that keeps producing output is never reaped no matter how long it runs — only
+one that goes silent past the window is. It reuses `TIMEOUT` (106) rather than
+minting a new exit code (the same class of ending — a deadline the runner enforced —
+distinguished by the more specific `reason` on this earlier event) and its terminal
+`runner_exit` `source` stays `timeout`, exactly as for `--timeout`. It requires the
+runner's output pump, so it conflicts with `--inherit-stdio` at parse time (like
+`--capture-dir`); it does compose with `--capture-dir`, whose tee re-arms the same
+one timer.
 
 ### `cancelled`
 
@@ -318,9 +331,10 @@ A normal run emits, in order: `run_started`, `members_snapshot`, then either
 - **runner-imposed ending** — the reason event (`timeout`, `cancelled`, or `killed`),
   `cleanup_started`, `cleanup_finished`, `runner_exit`.
 
-The reason event names *which* ending it was: `timeout` for a `--timeout`, `cancelled`
-(with `source` `ctrl_c` or `control_cancel`) for a Ctrl-C or a control-plane cancel,
-and `killed` (`source` `control_kill`) for a control-plane kill.
+The reason event names *which* ending it was: `timeout` (with `reason` `overall` or
+`idle`) for a `--timeout` or a `--idle-timeout`, `cancelled` (with `source` `ctrl_c`
+or `control_cancel`) for a Ctrl-C or a control-plane cancel, and `killed` (`source`
+`control_kill`) for a control-plane kill.
 
 When `--capture-dir` is set, an `output_captured` event is inserted after
 `cleanup_finished` and before the terminal `runner_exit`, on every ending that ran
@@ -428,7 +442,9 @@ consumer that pins the events it knows simply ignores one it does not. Adding a 
 field** to an existing event — always present, and leaving every other field's name,
 type, and meaning intact — is additive in the same way: a consumer that reads the
 fields it knows is unaffected and simply ignores the new one. The `output_captured`
-per-stream `write_error` flag was added this way within v1. Filling a
+per-stream `write_error` flag was added this way within v1, as was the `timeout`
+event's `reason` field (when `--idle-timeout` joined `--timeout` on that event).
+Filling a
 field that was reserved-as-`null` is **not** a breaking change: the field already
 exists and its type is unchanged. The `argv_sha256` and
 `hint` fields were filled this way — they now carry values on every run instead of

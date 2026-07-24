@@ -171,7 +171,7 @@ check, no parsing needed) and the terminal `runner_exit` event's `source` and
 | `runner_exit.source` | Exit code | Meaning |
 | --- | --- | --- |
 | `child_exit` | the child's own code (`child_code`, echoed in `code` too) | The child ran to completion on its own. |
-| `timeout` | `106` | `--timeout` elapsed; the runner tore the tree down. |
+| `timeout` | `106` | A runner deadline elapsed and the runner tore the tree down — the whole-run `--timeout` or the `--idle-timeout` (child silent past the idle window). The preceding `timeout` event's `reason` (`overall` / `idle`) says which; both reuse this one source and code. |
 | `cancelled` | `107` | A local `Ctrl-C` cancelled the run. |
 | `control_cancel` | `108` | A control-plane `cancel` (§4) cancelled the run. |
 | `control_kill` | `109` | A control-plane `kill` (§4) force-killed the run. |

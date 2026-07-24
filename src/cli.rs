@@ -45,17 +45,17 @@ pub enum Command {
 }
 
 /// `run [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl> [--create-no-window]
-/// [--timeout <duration>] [--grace <duration>] [--max-memory <size>]
-/// [--max-processes <n>] [--cpu-quota <cores>] [--capture-dir <dir>]
-/// [--capture-max-bytes <size>] [--argv-raw]
+/// [--timeout <duration>] [--idle-timeout <duration>] [--grace <duration>]
+/// [--max-memory <size>] [--max-processes <n>] [--cpu-quota <cores>]
+/// [--capture-dir <dir>] [--capture-max-bytes <size>] [--argv-raw]
 /// [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
 /// -- <program> <args...>`
 //
-// `run` consumes every field: `cwd`, `create_no_window`, `timeout`, `grace`,
-// `max_memory`, `max_processes`, `cpu_quota` — the whole-tree ProcessKit
-// resource caps (see `src/run.rs`) — `command`, `jsonl`, `run_id`, `argv_raw`,
-// `capture_dir`/`capture_max_bytes` — bounded stdout/stderr capture to files
-// (see `src/capture.rs`) — `env_clear`, `env_remove`, `env`, and
+// `run` consumes every field: `cwd`, `create_no_window`, `timeout`,
+// `idle_timeout`, `grace`, `max_memory`, `max_processes`, `cpu_quota` — the
+// whole-tree ProcessKit resource caps (see `src/run.rs`) — `command`, `jsonl`,
+// `run_id`, `argv_raw`, `capture_dir`/`capture_max_bytes` — bounded stdout/stderr
+// capture to files (see `src/capture.rs`) — `env_clear`, `env_remove`, `env`, and
 // `inherit_stdio`/`inherit_stdin`/`stdin_file`.
 #[derive(Debug, Args)]
 pub struct RunArgs {
@@ -84,6 +84,21 @@ pub struct RunArgs {
     // [`parse_duration`] for the accepted grammar.
     #[arg(long, value_name = "duration", value_parser = parse_duration)]
     pub timeout: Option<Duration>,
+
+    /// Deadline on child **silence**: the tree is torn down when the child produces
+    /// no observed output for this long. Unlike `--timeout` (a ceiling on the whole
+    /// run), this deadline is *re-armed* on every chunk of the child's output, so a
+    /// child that keeps talking is never reaped no matter how long it runs — only
+    /// one that goes quiet past the window is (the classic "stuck build worker").
+    /// An idle expiry reuses the same reserved `TIMEOUT` (106) exit and the same
+    /// soft-stop → grace → hard-kill teardown as `--timeout`, told apart only by the
+    /// `timeout` event's `reason` field (`idle` vs `overall`; see `docs/schema.md`).
+    /// Same grammar and parse-time validation as `--timeout` (see [`parse_duration`]).
+    /// Cannot be combined with `--inherit-stdio`: under direct inheritance the runner
+    /// runs no output pump, so there is no point at which to observe the child and
+    /// re-arm the deadline — the flags conflict at parse time, like `--capture-dir`.
+    #[arg(long, value_name = "duration", value_parser = parse_duration)]
+    pub idle_timeout: Option<Duration>,
 
     /// Grace period between a cancel/timeout and the hard kill. Same grammar and
     /// parse-time validation as `--timeout` (see [`parse_duration`]).
@@ -144,6 +159,7 @@ pub struct RunArgs {
         conflicts_with_all = [
             "capture_dir",
             "create_no_window",
+            "idle_timeout",
             "inherit_stdin",
             "stdin_file"
         ]
@@ -727,6 +743,45 @@ mod tests {
     }
 
     #[test]
+    fn run_parses_idle_timeout_into_a_duration_and_defaults_to_absent() {
+        // `--idle-timeout` reuses `parse_duration`, so it accepts the same grammar
+        // as `--timeout`/`--grace` and lands as a ready `Duration`.
+        let cli = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--idle-timeout",
+            "2m",
+            "--",
+            "true",
+        ])
+        .expect("a valid run invocation with --idle-timeout");
+        let Command::Run(args) = cli.command else {
+            panic!("expected the run subcommand");
+        };
+        assert_eq!(args.idle_timeout, Some(Duration::from_secs(120)));
+
+        // Omitting it leaves it absent, so no idle deadline is armed.
+        let cli = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--",
+            "true",
+        ])
+        .expect("a valid run invocation");
+        let Command::Run(args) = cli.command else {
+            panic!("expected the run subcommand");
+        };
+        assert!(
+            args.idle_timeout.is_none(),
+            "omitting --idle-timeout arms no idle deadline"
+        );
+    }
+
+    #[test]
     fn run_parses_each_stdio_mode_and_rejects_incompatible_combinations() {
         let inherited_stdio = Cli::try_parse_from([
             "processkit-cli",
@@ -796,7 +851,12 @@ mod tests {
             "the two stdin modes are contradictory and must fail at parse time"
         );
 
-        for incompatible in ["--inherit-stdin", "--stdin-file", "--capture-dir"] {
+        for incompatible in [
+            "--inherit-stdin",
+            "--stdin-file",
+            "--capture-dir",
+            "--idle-timeout",
+        ] {
             let mut argv = vec![
                 "processkit-cli",
                 "run",
@@ -805,8 +865,13 @@ mod tests {
                 "--inherit-stdio",
                 incompatible,
             ];
+            // Give the value-taking flags a *valid* value so the only reason parsing
+            // fails is the conflict itself, not a malformed value: a path for the
+            // file/dir flags, a well-formed duration for `--idle-timeout`.
             if matches!(incompatible, "--stdin-file" | "--capture-dir") {
                 argv.push("path");
+            } else if incompatible == "--idle-timeout" {
+                argv.push("5s");
             }
             argv.extend(["--", "true"]);
             assert!(
@@ -993,6 +1058,28 @@ mod tests {
             .is_err(),
             "a malformed --timeout must fail at parse time"
         );
+    }
+
+    #[test]
+    fn run_rejects_a_malformed_idle_timeout() {
+        // `--idle-timeout` shares `--timeout`'s parser, so a malformed value is the
+        // same `USAGE` form error, rejected at parse time rather than mid-run.
+        for bad in ["soon", "-5", "1.5s", "5x"] {
+            assert!(
+                Cli::try_parse_from([
+                    "processkit-cli",
+                    "run",
+                    "--jsonl",
+                    "events.jsonl",
+                    "--idle-timeout",
+                    bad,
+                    "--",
+                    "true",
+                ])
+                .is_err(),
+                "a malformed `--idle-timeout {bad}` must fail at parse time"
+            );
+        }
     }
 
     #[test]

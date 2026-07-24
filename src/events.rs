@@ -127,11 +127,19 @@ pub enum Event {
         limit: String,
         detail: Option<String>,
     },
-    /// The `--timeout` deadline elapsed while the child was still running. The
-    /// teardown it triggers is described by the following cleanup events.
+    /// A runner deadline elapsed while the child was still running: either the
+    /// whole-run `--timeout`, or the `--idle-timeout` (the child produced no output
+    /// for the idle window). Both share this event, the reserved `TIMEOUT` (106)
+    /// terminal code, and the soft-stop → grace → hard-kill teardown described by the
+    /// following cleanup events; the always-present `reason` field tells them apart —
+    /// `overall` for `--timeout`, `idle` for `--idle-timeout`. `timeout_ms` is the
+    /// deadline that actually elapsed (the whole-run window for `overall`, the idle
+    /// window for `idle`).
     Timeout {
         timeout_ms: u64,
         grace_ms: Option<u64>,
+        /// Which deadline fired: `overall` (`--timeout`) or `idle` (`--idle-timeout`).
+        reason: &'static str,
     },
     /// The run was cancelled and torn down through the shared soft-stop → grace →
     /// hard-kill path. `source` names the trigger: `ctrl_c` for a local `Ctrl-C`, or
@@ -691,6 +699,7 @@ mod tests {
             Event::Timeout {
                 timeout_ms: 5_000,
                 grace_ms: Some(2_000),
+                reason: "overall",
             },
             Event::Cancelled {
                 source: "ctrl_c",
@@ -1087,6 +1096,27 @@ mod tests {
             serde_json::from_str(&serialize_record(&timeout, fixed_time()).unwrap()).unwrap();
         assert_eq!(value["code"], 106);
         assert!(value["child_code"].is_null());
+    }
+
+    /// The `timeout` event's always-present `reason` distinguishes the two deadlines
+    /// that share it: `overall` for `--timeout`, `idle` for `--idle-timeout`. Both
+    /// serialize the same shape (only the `reason` value differs), and `timeout_ms`
+    /// carries whichever window elapsed.
+    #[test]
+    fn timeout_reason_distinguishes_overall_from_idle() {
+        for (reason, timeout_ms) in [("overall", 5_000u64), ("idle", 1_000u64)] {
+            let event = Event::Timeout {
+                timeout_ms,
+                grace_ms: Some(2_000),
+                reason,
+            };
+            let value: serde_json::Value =
+                serde_json::from_str(&serialize_record(&event, fixed_time()).unwrap()).unwrap();
+            assert_eq!(value["event"], "timeout");
+            assert_eq!(value["reason"], reason, "the trigger is named by `reason`");
+            assert_eq!(value["timeout_ms"], timeout_ms);
+            assert_eq!(value["grace_ms"], 2_000);
+        }
     }
 
     /// The control-plane endings are distinguishable in the stream. A control-plane

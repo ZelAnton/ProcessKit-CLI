@@ -29,6 +29,7 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("root") => root(&args[1..]),
         Some("spin") => spin(&args[1..]),
+        Some("chatter") => chatter(&args[1..]),
         Some("exit") => leaf_exit(&args[1..]),
         Some("job-parent") => job_parent(&args[1..]),
         Some("stdio-report") => stdio_report(&args[1..]),
@@ -37,7 +38,7 @@ fn main() -> ExitCode {
         other => {
             eprintln!(
                 "e2e-helper: expected a mode \
-                 (root|spin|exit|job-parent|stdio-report|console-parent|pty-parent), \
+                 (root|spin|chatter|exit|job-parent|stdio-report|console-parent|pty-parent), \
                  got {other:?}"
             );
             ExitCode::from(2)
@@ -106,6 +107,28 @@ fn spin(args: &[String]) -> ExitCode {
             append_heartbeat(path);
         }
         sleep(Duration::from_millis(100));
+    }
+    ExitCode::SUCCESS
+}
+
+/// A talkative worker: print a line to **stdout** every `--interval-ms` for
+/// `--duration-secs`, then exit `0`. Unlike [`spin`]'s file heartbeat, this output
+/// flows to the runner's own output pump, so the runner sees continuous activity —
+/// the shape the `--idle-timeout` e2e proof needs for the "chatty child is *not*
+/// reaped" half: with an idle window longer than the interval, every silence stays
+/// under the window even though the run's total life exceeds it. Bounded by
+/// `--duration-secs` so it self-terminates if the test aborts.
+fn chatter(args: &[String]) -> ExitCode {
+    let duration = u64_flag(args, "--duration-secs", 5);
+    let interval = u64_flag(args, "--interval-ms", 100);
+    let deadline = Instant::now() + Duration::from_secs(duration);
+    let mut stdout = std::io::stdout();
+    while Instant::now() < deadline {
+        // Best-effort: a broken pipe never turns this worker into a failure — the
+        // scenario asserts on the run's outcome, not on this write.
+        let _ = writeln!(stdout, "chatter tick");
+        let _ = stdout.flush();
+        sleep(Duration::from_millis(interval));
     }
     ExitCode::SUCCESS
 }

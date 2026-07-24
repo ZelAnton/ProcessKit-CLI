@@ -34,7 +34,7 @@ failure is not mistaken for a child result.
 | 103  | `CONTROL`         | An `inspect` / `cancel` / `kill` command could not reach its target run: no such run id, a stale/dead registry entry, an ambiguous run id (more than one live run registered under it), or an IPC failure. |
 | 104  | `INTERNAL`        | Unexpected runner fault: the runner reached a state its own logic rules out, or lost a trustworthy view of the run (a `wait` on the child failed and its fate is unknown; the backend returned an outcome this build cannot render). Reported with this code instead of panicking. **A genuine runner bug** — an ordinary setup failure is `SETUP` (111), not this. |
 | 105  | `NOT_IMPLEMENTED` | **Retired.** Formerly minted for a defined-but-not-yet-built code path; every subcommand is now implemented, so no active path mints it. The number stays permanently reserved (see "Stability" below) — it is never reused for a different meaning. |
-| 106  | `TIMEOUT`         | The run exceeded its `--timeout`: the runner enforced the deadline and tore the process tree down. A runner-*imposed outcome*, not a child exit. |
+| 106  | `TIMEOUT`         | The run exceeded a runner deadline — the whole-run `--timeout`, or the `--idle-timeout` (the child went silent past the idle window) — and the runner tore the process tree down. A runner-*imposed outcome*, not a child exit. The two are told apart by the `timeout` event's `reason` (`overall` / `idle`), not by the code; both reuse `106` (see "Timeout, cancel, and kill" below). |
 | 107  | `CANCELLED`       | The run was cancelled interactively (`Ctrl-C`): the runner tore the process tree down. Distinct from `TIMEOUT` and from any child result. |
 | 108  | `CONTROL_CANCELLED` | The run was cancelled by a control-plane `cancel` command (over the local control channel): the runner ran the same soft-stop → grace → hard-kill teardown as a Ctrl-C. Distinct from `CANCELLED` so "a control client cancelled it" is told from "the operator pressed Ctrl-C". |
 | 109  | `CONTROL_KILLED`  | The run was killed by a control-plane `kill` command: the runner hard-killed the whole tree immediately (no soft stop, no grace). Distinct from every other runner-imposed ending. |
@@ -53,7 +53,9 @@ child did not choose to exit, so forwarding "its" code would be a lie; instead e
 takes a distinct reserved-band code so a caller can tell them apart:
 
 - the child exited by itself (its exact code, forwarded — possibly `0`),
-- the runner ended it because the `--timeout` deadline elapsed (`106`),
+- the runner ended it because a deadline elapsed — the whole-run `--timeout`, or the
+  `--idle-timeout` (no child output for the idle window) — both `106`, told apart by
+  the `timeout` event's `reason` (`overall` / `idle`) rather than by a distinct code,
 - the runner ended it because the operator pressed `Ctrl-C` (`107`),
 - a control-plane `cancel` command ended it — the same graceful teardown as a Ctrl-C,
   but triggered over the network (`108`), and

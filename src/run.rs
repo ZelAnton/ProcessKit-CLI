@@ -52,7 +52,7 @@ use processkit::{
     ProcessGroup, ProcessGroupOptions, RunningProcess, Signal, Stdin, StdioMode,
 };
 
-use crate::capture::{CAPTURE_INFLIGHT_MAX_BYTES, CAPTURE_MAX_BYTES, Capture};
+use crate::capture::{CAPTURE_INFLIGHT_MAX_BYTES, CAPTURE_MAX_BYTES, Capture, IdleClock};
 use crate::cli::RunArgs;
 use crate::control::{self, SnapshotSource};
 use crate::events::{self, Emitter, Event, Member};
@@ -95,12 +95,35 @@ fn run_inner(args: RunArgs) -> Result<i32, RunnerError> {
     runtime.block_on(run_async(args))
 }
 
+/// Which runner deadline fired, for the shared timeout ending — the two share the
+/// reserved `TIMEOUT` (106) code and the same teardown, told apart only by this tag
+/// (surfaced as the `timeout` event's `reason` field, `docs/schema.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutTrigger {
+    /// The whole-run `--timeout` deadline elapsed.
+    Overall,
+    /// The `--idle-timeout` elapsed: the child produced no output for the idle window.
+    Idle,
+}
+
+impl TimeoutTrigger {
+    /// The `timeout` event's always-present `reason` value for this trigger.
+    fn reason(self) -> &'static str {
+        match self {
+            TimeoutTrigger::Overall => "overall",
+            TimeoutTrigger::Idle => "idle",
+        }
+    }
+}
+
 /// How a run ended — the decision the race in [`run_async`] resolves to.
 enum Ending {
     /// The child exited on its own; carries the raw wait result.
     Exited(processkit::Result<Outcome>),
-    /// The `--timeout` deadline elapsed while the child was still running.
-    TimedOut,
+    /// A runner deadline elapsed while the child was still running: the whole-run
+    /// `--timeout` ([`TimeoutTrigger::Overall`]) or the `--idle-timeout`
+    /// ([`TimeoutTrigger::Idle`]). Both take the same teardown and terminal code.
+    TimedOut(TimeoutTrigger),
     /// The operator pressed `Ctrl-C`.
     Cancelled,
     /// A control-plane `cancel` command reached the live runner: the same soft-stop →
@@ -114,8 +137,12 @@ enum Ending {
 /// A runner-imposed ending that shares the soft-stop → grace → hard-kill teardown
 /// (the `kill` verb is *not* one — it hard-kills immediately, handled separately).
 enum Termination {
-    /// The `--timeout` deadline (the elapsed limit) was exceeded.
-    Timeout(Duration),
+    /// A runner deadline (the elapsed `limit`) was exceeded: `trigger` names which —
+    /// the whole-run `--timeout` or the `--idle-timeout`.
+    Timeout {
+        limit: Duration,
+        trigger: TimeoutTrigger,
+    },
     /// The run was cancelled interactively (`Ctrl-C`).
     Cancelled,
     /// The run was cancelled by a control-plane `cancel` command.
@@ -329,30 +356,53 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     } else if let Some(path) = args.stdin_file.as_deref() {
         command = command.stdin(Stdin::from_file(path));
     }
+    // The shared idle-timeout clock. Every chunk of the child's output the runner
+    // sees re-arms it (below), and the idle-deadline arm of the race reads it. There
+    // is exactly one, so both output paths (default echo and the `--capture-dir` tee)
+    // re-arm the *same* timer. It is only wired in — and only ever touched — when
+    // `--idle-timeout` is set, so a run without the flag is byte-for-byte unchanged
+    // (no wrapper on the sinks, no clock reads); the clone is otherwise inert.
+    let idle_clock = IdleClock::new();
+    let idle_timeout = args.idle_timeout;
+
     // `--inherit-stdio` gives the child the runner's actual output handles. No
     // pump, decoding, or tee sits between a terminal and the child, so terminal
-    // status and full-screen behavior are preserved. Capture conflicts at parse
-    // time because it fundamentally requires replacing these handles with pipes.
+    // status and full-screen behavior are preserved. Capture — and `--idle-timeout`,
+    // which has no output pump to observe under inheritance — both conflict with it
+    // at parse time.
     //
     // Otherwise pipe + echo remains the compatibility default: ProcessKit's pump
     // reads each stream and tees it to the corresponding runner stream. With
-    // `--capture-dir` that same tee also mirrors into bounded files.
+    // `--capture-dir` that same tee also mirrors into bounded files. When
+    // `--idle-timeout` is armed, an [`IdleClock`] tee wraps the *outermost* sink on
+    // whichever of those two paths is active, so every observed chunk re-arms the
+    // idle window regardless of capture mode; without it the sinks are exactly as
+    // before.
     command = if args.inherit_stdio {
         command
             .stdout(StdioMode::Inherit)
             .stderr(StdioMode::Inherit)
-    } else {
-        match &capture {
-            Some(capture) => command
-                .output_buffer(
-                    OutputBufferPolicy::bounded(0).with_max_bytes(CAPTURE_INFLIGHT_MAX_BYTES),
-                )
+    } else if let Some(capture) = &capture {
+        let command = command.output_buffer(
+            OutputBufferPolicy::bounded(0).with_max_bytes(CAPTURE_INFLIGHT_MAX_BYTES),
+        );
+        if idle_timeout.is_some() {
+            command
+                .stdout_tee(idle_clock.tee(capture.stdout_tee(tokio::io::stdout())))
+                .stderr_tee(idle_clock.tee(capture.stderr_tee(tokio::io::stderr())))
+        } else {
+            command
                 .stdout_tee(capture.stdout_tee(tokio::io::stdout()))
-                .stderr_tee(capture.stderr_tee(tokio::io::stderr())),
-            None => command
-                .stdout_tee(tokio::io::stdout())
-                .stderr_tee(tokio::io::stderr()),
+                .stderr_tee(capture.stderr_tee(tokio::io::stderr()))
         }
+    } else if idle_timeout.is_some() {
+        command
+            .stdout_tee(idle_clock.tee(tokio::io::stdout()))
+            .stderr_tee(idle_clock.tee(tokio::io::stderr()))
+    } else {
+        command
+            .stdout_tee(tokio::io::stdout())
+            .stderr_tee(tokio::io::stderr())
     };
 
     // `ProcessGroup::start` joins the child to the group *we* own and hands back a
@@ -461,23 +511,35 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     let timeout = args.timeout;
     let grace = args.grace;
 
-    // Race the child's own exit against the two runner-imposed endings. Whichever
-    // fires first *decides* the outcome; only then does teardown begin, so the
-    // owning group is never dropped before the outcome is known.
+    // Arm the idle window from *here* — the moment the race begins, right after the
+    // child is spawned and `run_started` is written — rather than from whenever the
+    // clock was constructed, so a child's first idle window is measured from the run
+    // starting, not from the runner's own pre-spawn setup. A no-op read/write when
+    // `--idle-timeout` is unset (the clock is never consulted then).
+    idle_clock.reset();
+
+    // Race the child's own exit against the runner-imposed endings. Whichever fires
+    // first *decides* the outcome; only then does teardown begin, so the owning group
+    // is never dropped before the outcome is known.
     //
-    // `biased` order — Ctrl-C, natural exit, control command, deadline, then the
-    // control server — makes the tie-breaks deliberate: a `Ctrl-C` always wins, and a
-    // child that exits in the very poll a deadline or a control command fires is
-    // reported as its own exit rather than a runner-imposed ending (natural exit is
-    // polled before both). When a cancel/kill/deadline branch wins, `running` (moved
-    // into `wait()`) is dropped; because this is a shared-group handle that does not
-    // kill on drop, the child stays alive for the teardown path below, and its output
-    // pumps stop (teardown is underway). The `command_rx` branch resolves when the
-    // control server routes a `cancel`/`kill` verb (having already acked the client);
-    // the control-server branch itself **never resolves** (its output is `Infallible`)
-    // — it serves clients concurrently with the output pump, so it neither delays the
-    // child's exit nor blocks teardown, and is dropped (tearing the transport down)
-    // when another branch wins.
+    // `biased` order — Ctrl-C, natural exit, control command, overall deadline, idle
+    // deadline, then the control server — makes the tie-breaks deliberate: a `Ctrl-C`
+    // always wins, and a child that exits in the very poll a deadline or a control
+    // command fires is reported as its own exit rather than a runner-imposed ending
+    // (natural exit is polled before all of them). The new `--idle-timeout` arm sits
+    // right after the overall `--timeout` arm: both are runner-imposed deadlines, so
+    // they share the same low tie-break priority (behind the child's own exit and a
+    // cancel), and between the two the overall deadline is polled first — an
+    // arbitrary but fixed order, since a run can only cross one deadline "first" in
+    // wall-clock terms anyway. When a cancel/kill/deadline branch wins, `running`
+    // (moved into `wait()`) is dropped; because this is a shared-group handle that
+    // does not kill on drop, the child stays alive for the teardown path below, and
+    // its output pumps stop (teardown is underway). The `command_rx` branch resolves
+    // when the control server routes a `cancel`/`kill` verb (having already acked the
+    // client); the control-server branch itself **never resolves** (its output is
+    // `Infallible`) — it serves clients concurrently with the output pump, so it
+    // neither delays the child's exit nor blocks teardown, and is dropped (tearing the
+    // transport down) when another branch wins.
     let capturing = capture.is_some();
     let ending = tokio::select! {
         biased;
@@ -491,7 +553,8 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             // did rather than misreport an ending.
             None => std::future::pending().await,
         },
-        () = deadline(timeout) => Ending::TimedOut,
+        () = deadline(timeout) => Ending::TimedOut(TimeoutTrigger::Overall),
+        () = idle_deadline(idle_timeout, &idle_clock) => Ending::TimedOut(TimeoutTrigger::Idle),
         never = control::serve(control_server, &snapshot_source, &command_tx) => match never {},
     };
 
@@ -549,11 +612,24 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             Ok(child_code)
             // `group` drops here (a no-op after the explicit kill above).
         }
-        Ending::TimedOut => {
-            let limit = timeout.expect("the deadline arm only fires when --timeout is set");
+        Ending::TimedOut(trigger) => {
+            // Both `--timeout` (overall) and `--idle-timeout` (idle) resolve here and
+            // share everything but the `reason`: the reserved `TIMEOUT` (106) code,
+            // the `timeout` runner-exit `source`, and the soft-stop → grace →
+            // hard-kill teardown. `limit` is the deadline that actually elapsed — the
+            // whole-run window for `overall`, the idle window for `idle` — so the
+            // event's `timeout_ms` and the stderr message both echo the right duration.
+            let limit = match trigger {
+                TimeoutTrigger::Overall => {
+                    timeout.expect("the overall-deadline arm only fires when --timeout is set")
+                }
+                TimeoutTrigger::Idle => idle_timeout
+                    .expect("the idle-deadline arm only fires when --idle-timeout is set"),
+            };
             emitter.emit(&Event::Timeout {
                 timeout_ms: duration_ms(limit),
                 grace_ms: grace.map(duration_ms),
+                reason: trigger.reason(),
             });
             // `cleanup_started` brackets the whole teardown — soft stop, grace, and
             // hard kill — so `members_before` is the full tree, not a post-soft remnant.
@@ -565,7 +641,7 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             // The registry entry is removed on every decided ending, not just the
             // happy path: a timeout tears the run down cleanly too.
             clear_registration(&registration);
-            let error = termination_error(Termination::Timeout(limit), soft, grace);
+            let error = termination_error(Termination::Timeout { limit, trigger }, soft, grace);
             Err(finish(&mut emitter, "timeout", None, error))
         }
         Ending::Cancelled => {
@@ -1158,12 +1234,40 @@ fn launch_failure_source(error: &RunnerError) -> &'static str {
     }
 }
 
-/// The runner-imposed deadline: sleep `limit`, or (with no `--timeout`) never
-/// resolve, so the race falls through to the other arms.
+/// The runner-imposed whole-run deadline: sleep `limit`, or (with no `--timeout`)
+/// never resolve, so the race falls through to the other arms.
 async fn deadline(limit: Option<Duration>) {
     match limit {
         Some(limit) => tokio::time::sleep(limit).await,
         None => std::future::pending::<()>().await,
+    }
+}
+
+/// The runner-imposed **idle** deadline: resolve once the child has produced no
+/// observed output for a full `idle` window. Unlike [`deadline`] this timer is
+/// *re-armed* on every chunk of the child's output (the output sinks touch `clock`;
+/// see [`IdleClock`]/[`crate::capture::IdleActivityTee`]) — it repeatedly sleeps the
+/// idle time still remaining, and only resolves when that remaining reaches zero
+/// with no fresh output having pushed it back out. With no `--idle-timeout` it never
+/// resolves, so the race falls through to the other arms.
+///
+/// The loop is not a busy-poll: each iteration sleeps the *whole* remaining window
+/// (`clock.remaining`), so a quiet run wakes exactly once, at the deadline; only a
+/// run that keeps producing output loops, and then only once per output-driven
+/// re-arm, never faster than the child speaks.
+async fn idle_deadline(idle: Option<Duration>, clock: &IdleClock) {
+    let Some(idle) = idle else {
+        // No idle deadline armed: park forever so this arm never wins the race.
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        let remaining = clock.remaining(idle);
+        if remaining.is_zero() {
+            // A full idle window has elapsed with no output since the last re-arm.
+            return;
+        }
+        tokio::time::sleep(remaining).await;
     }
 }
 
@@ -1256,9 +1360,24 @@ fn termination_error(
     grace: Option<Duration>,
 ) -> RunnerError {
     let (code, headline) = match kind {
-        Termination::Timeout(limit) => (
+        // Both timeout triggers surface the same reserved code; only the headline
+        // differs, naming which deadline elapsed so the stderr line is honest.
+        Termination::Timeout {
+            limit,
+            trigger: TimeoutTrigger::Overall,
+        } => (
             exit::TIMEOUT,
             format!("run timed out after {}", format_duration(limit)),
+        ),
+        Termination::Timeout {
+            limit,
+            trigger: TimeoutTrigger::Idle,
+        } => (
+            exit::TIMEOUT,
+            format!(
+                "run idle-timed out after {} with no output",
+                format_duration(limit)
+            ),
         ),
         Termination::Cancelled => (exit::CANCELLED, "run cancelled (Ctrl-C)".to_string()),
         Termination::ControlCancelled => (
@@ -1415,7 +1534,10 @@ mod tests {
     #[test]
     fn timeout_and_cancel_carry_distinct_reserved_codes() {
         let timed_out = termination_error(
-            Termination::Timeout(Duration::from_secs(5)),
+            Termination::Timeout {
+                limit: Duration::from_secs(5),
+                trigger: TimeoutTrigger::Overall,
+            },
             SoftTerminate::Signalled,
             Some(Duration::from_secs(2)),
         );
@@ -1432,7 +1554,10 @@ mod tests {
     #[test]
     fn timeout_message_names_the_ending_and_the_limit() {
         let err = termination_error(
-            Termination::Timeout(Duration::from_secs(5)),
+            Termination::Timeout {
+                limit: Duration::from_secs(5),
+                trigger: TimeoutTrigger::Overall,
+            },
             SoftTerminate::Signalled,
             Some(Duration::from_secs(2)),
         );
@@ -1442,6 +1567,57 @@ mod tests {
             "message should name the timeout: {msg}"
         );
         assert!(msg.contains("5s"), "message should echo the limit: {msg}");
+    }
+
+    /// Both timeout triggers surface the reserved `TIMEOUT` code (an idle expiry is
+    /// the *same class* of ending as an overall one — a deadline the runner enforced,
+    /// per K-047/the task's exit-code decision), but their stderr headlines differ so
+    /// an operator can tell "ran too long overall" from "went silent". `reason` on
+    /// the JSONL `timeout` event is the machine-readable counterpart.
+    #[test]
+    fn idle_timeout_reuses_the_timeout_code_with_its_own_message() {
+        let idle = termination_error(
+            Termination::Timeout {
+                limit: Duration::from_secs(3),
+                trigger: TimeoutTrigger::Idle,
+            },
+            SoftTerminate::Signalled,
+            Some(Duration::from_secs(2)),
+        );
+        let overall = termination_error(
+            Termination::Timeout {
+                limit: Duration::from_secs(3),
+                trigger: TimeoutTrigger::Overall,
+            },
+            SoftTerminate::Signalled,
+            Some(Duration::from_secs(2)),
+        );
+        // Same reserved class of ending, same code.
+        assert_eq!(idle.code(), exit::TIMEOUT);
+        assert_eq!(overall.code(), exit::TIMEOUT);
+
+        let idle_msg = idle.to_string();
+        assert!(
+            idle_msg.contains("idle-timed out"),
+            "an idle expiry names itself as an idle timeout: {idle_msg}"
+        );
+        assert!(
+            idle_msg.contains("no output"),
+            "the idle message states why (no output): {idle_msg}"
+        );
+        assert!(
+            idle_msg.contains("3s"),
+            "the idle window is echoed: {idle_msg}"
+        );
+        assert_ne!(
+            idle_msg,
+            overall.to_string(),
+            "the idle and overall headlines must read differently"
+        );
+
+        // And the reason strings the JSONL event carries stay distinct.
+        assert_eq!(TimeoutTrigger::Overall.reason(), "overall");
+        assert_eq!(TimeoutTrigger::Idle.reason(), "idle");
     }
 
     #[test]
@@ -1460,7 +1636,10 @@ mod tests {
         // Every runner-imposed ending must be tellable apart by exit code: a timeout,
         // a Ctrl-C, a control-plane cancel, and a control-plane kill.
         let timeout = termination_error(
-            Termination::Timeout(Duration::from_secs(5)),
+            Termination::Timeout {
+                limit: Duration::from_secs(5),
+                trigger: TimeoutTrigger::Overall,
+            },
             SoftTerminate::Signalled,
             None,
         );

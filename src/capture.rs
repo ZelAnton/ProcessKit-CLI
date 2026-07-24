@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWrite;
 
@@ -329,6 +330,128 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CaptureTee<W> {
     }
 }
 
+/// The shared "last observed output" timestamp backing `run`'s `--idle-timeout`
+/// deadline.
+///
+/// Every output chunk the runner sees a child produce re-arms the idle window by
+/// stamping this clock with the current instant (see [`IdleActivityTee`]); the
+/// idle-deadline future in `src/run.rs` reads it to decide whether a *full* idle
+/// window has elapsed with **no** output. There is exactly one clock per run, so
+/// both output paths — the default echo and the `--capture-dir` tee — re-arm the
+/// same timer rather than two independent ones (a requirement of T-182: an idle
+/// expiry must mean the same thing in either mode).
+///
+/// Cheap to [`clone`](Clone) (an `Arc`), so the output sink(s) and the deadline
+/// future all share one timestamp. The lock is only ever held for a single
+/// timestamp read or write, never across an `.await`, so a poisoned lock (which a
+/// panicking holder cannot produce here, as no user code runs under it) is
+/// tolerated by reading through it rather than propagating.
+#[derive(Clone)]
+pub(crate) struct IdleClock {
+    last_activity: Arc<Mutex<Instant>>,
+}
+
+impl Default for IdleClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IdleClock {
+    /// A fresh clock whose window starts now.
+    pub(crate) fn new() -> Self {
+        Self {
+            last_activity: Arc::new(Mutex::new(Instant::now())),
+        }
+    }
+
+    /// Record output activity now, re-arming the idle window. Called on every
+    /// non-empty write the child's output passes through (see [`IdleActivityTee`]).
+    pub(crate) fn touch(&self) {
+        let now = Instant::now();
+        match self.last_activity.lock() {
+            Ok(mut guard) => *guard = now,
+            Err(poisoned) => *poisoned.into_inner() = now,
+        }
+    }
+
+    /// Re-arm the window's start to now. A semantic alias for [`touch`](Self::touch),
+    /// called once at the start of the run's race so the first idle window is
+    /// measured from there rather than from whenever the clock was constructed.
+    pub(crate) fn reset(&self) {
+        self.touch();
+    }
+
+    /// The idle time still left before the window elapses, given `idle` as the full
+    /// window: `idle - (now - last_activity)`, saturating at zero once the window
+    /// has been exceeded. Saturating throughout (no `Instant` arithmetic that could
+    /// overflow), so an astronomically large `--idle-timeout` is handled the same
+    /// way `tokio::time::sleep` caps one, never by panicking.
+    pub(crate) fn remaining(&self, idle: Duration) -> Duration {
+        let last = match self.last_activity.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        };
+        idle.saturating_sub(last.elapsed())
+    }
+
+    /// Wrap `inner` so every chunk written through it re-arms this clock. Used to
+    /// wrap the outermost output sink on both the default-echo and `--capture-dir`
+    /// tee paths (see `src/run.rs`).
+    pub(crate) fn tee<W>(&self, inner: W) -> IdleActivityTee<W> {
+        IdleActivityTee {
+            inner,
+            clock: self.clone(),
+        }
+    }
+}
+
+/// An output sink wrapper that re-arms the `--idle-timeout` window on every chunk
+/// of the child's output it forwards.
+///
+/// It sits **outermost** on the runner's output tee — ProcessKit's pump writes into
+/// it first — so it observes every byte in *both* output paths (the default echo and
+/// the `--capture-dir` tee it may wrap) and re-arms one shared [`IdleClock`], never
+/// two independent timers. It only forwards to the inner sink and stamps the clock:
+/// it changes no byte, buffers nothing, and swallows no error, so the live echo and
+/// any capture transcript are exactly what they would be without it. Activity is
+/// recorded for the bytes the inner sink *accepted* (a partial write re-offers its
+/// tail on the next poll, re-arming then too), so a re-arm always reflects real
+/// forward progress of the child's output.
+pub(crate) struct IdleActivityTee<W> {
+    inner: W,
+    clock: IdleClock,
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for IdleActivityTee<W> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_write(cx, buf);
+        // Re-arm on observed forward progress: a chunk the inner sink actually
+        // accepted is a chunk of the child's output the runner just saw.
+        if let Poll::Ready(Ok(n)) = &poll
+            && *n > 0
+        {
+            this.clock.touch();
+        }
+        poll
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,5 +611,38 @@ mod tests {
         // written, and `bytes` (5) exceeds the file's size (0) as the flag warns.
         assert_eq!(info.sha256(), crate::hash::sha256_hex(b""));
         assert_eq!(std::fs::read(&path).unwrap(), b"");
+    }
+
+    /// A fresh `touch` re-arms (nearly) the whole idle window: right after it, the
+    /// remaining time is close to the full window. Generous tolerance (a 10s window,
+    /// asserting >9s remains) keeps this robust against scheduling jitter.
+    #[test]
+    fn idle_clock_touch_rearms_the_window() {
+        let clock = IdleClock::new();
+        let idle = Duration::from_secs(10);
+        std::thread::sleep(Duration::from_millis(20));
+        clock.touch();
+        let remaining = clock.remaining(idle);
+        assert!(
+            remaining > Duration::from_secs(9),
+            "a fresh touch re-arms nearly the full window: {remaining:?}"
+        );
+        assert!(
+            remaining <= idle,
+            "the remaining window never exceeds the configured idle: {remaining:?}"
+        );
+    }
+
+    /// Once the idle window has been exceeded with no touch, `remaining` saturates at
+    /// zero — the signal the idle-deadline future in `run` uses to fire.
+    #[test]
+    fn idle_clock_remaining_saturates_to_zero_past_the_window() {
+        let clock = IdleClock::new();
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            clock.remaining(Duration::from_millis(1)),
+            Duration::ZERO,
+            "an elapsed window leaves no remaining idle time"
+        );
     }
 }
