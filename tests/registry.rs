@@ -851,3 +851,80 @@ fn prune_reaps_a_stale_entry_and_keeps_a_live_one() {
     let _ = child.wait();
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// The orphan-lock counterpart to `prune_reaps_a_stale_entry_and_keeps_a_live_one`:
+/// alongside the same confirmed-stale `.json`/`.lock` pair and live run, a lone
+/// `.lock` file with **no `.json` sibling** is reaped too — the leftover
+/// `Registry::register`'s Drop guard now backstops at the source, but which
+/// `Registry::prune`'s separate orphan-lock pass must still clean up wherever else
+/// it arises (a hand-edited directory, or a `Registration::remove` whose `.json`
+/// delete succeeded but whose `.lock` delete did not).
+#[test]
+fn prune_reaps_an_orphaned_lock_file_alongside_a_stale_pair_and_a_live_run() {
+    let dir = scratch("prune-orphan-lock-mixed");
+    let registry = registry_dir(&dir);
+
+    // A hand-written, confirmed-stale entry (record + unlocked lock file).
+    write_stale_entry(&registry, "run-stale-0000");
+
+    // A lone, unlocked `.lock` file with no `.json` sibling at all.
+    let orphan_lock = registry.join("orphan-0000.lock");
+    fs::write(&orphan_lock, b"").expect("write the orphaned lock file");
+    assert!(
+        orphan_lock.exists() && !registry.join("orphan-0000.json").exists(),
+        "the orphaned lock fixture has no paired record"
+    );
+
+    // A real, live run alongside them both.
+    let mut child = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "live-run"],
+        long_child(),
+    )
+    .spawn()
+    .expect("spawn the runner");
+
+    wait_until(|| record_count(&registry) == 2, Duration::from_secs(10));
+
+    let out = prune(&registry, true);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "prune succeeds; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("prune --json prints one JSON object");
+    assert_eq!(
+        report["pruned"], 1,
+        "the confirmed-stale pair is reaped: {report}"
+    );
+    assert_eq!(
+        report["live"], 1,
+        "the live entry is counted as kept, not reaped: {report}"
+    );
+    assert_eq!(
+        report["orphaned_locks"], 1,
+        "the lone orphaned lock file is reaped too: {report}"
+    );
+
+    assert!(
+        !registry.join("run-stale-0000.json").exists()
+            && !registry.join("run-stale-0000.lock").exists(),
+        "the stale pair's files are both reaped"
+    );
+    assert!(
+        !orphan_lock.exists(),
+        "the orphaned lock file is reaped alongside the stale pair"
+    );
+    assert_eq!(
+        record_count(&registry),
+        1,
+        "only the live entry's record remains"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_dir_all(&dir);
+}

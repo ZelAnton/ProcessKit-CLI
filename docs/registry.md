@@ -219,6 +219,22 @@ nothing to prune — scans it with the same shared scan `list` uses, and for eac
 scanned record deletes **both** its files (`<stem>.json` then `<stem>.lock`, the same
 order [`Registration::remove`] uses) only when it can *confirm* the record is stale.
 
+It then makes a second pass over any **orphaned lock files** — a `.lock` with no
+`.json` sibling at all. Such a `.lock` is invisible to the shared scan (which only
+ever walks `.json` records), so however long it has sat there the paired-record pass
+above can never find it. An orphan can still arise two ways: `Registry::register`
+reserves and locks the `.lock` file *before* it writes the `.json` record, so a
+`fs::write` failure in between would otherwise leave the fresh lock file behind
+forever — this is now closed at the source by a Drop-backstop guard on the
+reservation, armed until the record is published and disarmed right after, so a
+failed `register` deletes its own lock file instead of leaking it; or
+`Registration::remove`'s best-effort `.json` delete can succeed while its `.lock`
+delete does not, which is not similarly guarded. The second pass reuses the exact
+same lock-probe safety as the first (a `Live` lock is never touched, a probe failure
+leaves the file in place, only a confirmed-stale lock is deleted) and reports its
+reaps under the separate `orphaned_locks` tally below — kept distinct from `pruned`
+because it deletes one file, not a `.json`/`.lock` pair.
+
 ### The reaping safety invariant
 
 Pruning deletes files, so it is deliberately conservative: an entry is reaped **only**
@@ -253,16 +269,20 @@ Two further guarantees hold, mirroring the rest of the registry:
 Corrupt records the scan already skips (unreadable, unparsable JSON, a malformed
 `started_at`, or a `lock_file` that is not a simple in-directory name) are **not**
 prune candidates: they are never probed and never deleted, exactly as `list` leaves
-them alone. Every deletion is best-effort and per-entry — an OS error reaping one
-entry never aborts the reaping of the others (the leftover just reads as stale again
-next time) — and pruning an already-clean, empty, or missing registry is a no-op that
-exits `0`.
+them alone — and a `.lock` file that *does* have a `.json` sibling, however corrupt,
+is likewise left to that first pass (or to neither pass, for a corrupt record),
+never treated as orphaned. Every deletion is best-effort and per-entry — an OS error
+reaping one entry never aborts the reaping of the others (the leftover just reads as
+stale again next time) — and pruning an already-clean, empty, or missing registry is
+a no-op that exits `0`.
 
 - **No `--json`** prints a one-line summary (`no stale entries to prune` when there
   was nothing to reap).
-- **`--json`** prints a single JSON object with the tally: `pruned` (entries reaped),
-  `live` (live entries left untouched), and `unprobed` (entries whose probe failed and
-  were left in place).
+- **`--json`** prints a single JSON object with the tally: `pruned` (paired entries
+  reaped), `live` (live entries left untouched, paired or orphaned lock alike),
+  `unprobed` (entries whose probe failed and were left in place, paired or orphaned
+  lock alike), and `orphaned_locks` (lone `.lock` files with no `.json` sibling that
+  were reaped).
 
 ## Lifecycle
 

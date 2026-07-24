@@ -143,13 +143,26 @@ struct ScannedRecord {
 /// corrupt/unreadable record is never a prune candidate and is not counted here.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PruneOutcome {
-    /// Confirmed-stale entries whose `.json`/`.lock` files were reaped.
+    /// Confirmed-stale entries (`.json`/`.lock` pairs) whose files were reaped.
     pub pruned: usize,
-    /// Live entries left untouched (a live runner holds the lock).
+    /// Live entries left untouched (a live runner holds the lock) — counts both
+    /// paired records and lone orphaned `.lock` files a live holder still holds.
     pub live: usize,
     /// Entries whose liveness could not be probed (the lock file would not open, or
-    /// the lock call errored) and were therefore left in place rather than risked.
+    /// the lock call errored) and were therefore left in place rather than risked —
+    /// counts both paired records and lone orphaned `.lock` files.
     pub unprobed: usize,
+    /// Confirmed-stale **orphaned** `.lock` files — ones with no paired `.json` —
+    /// that were reaped. Kept as its own field rather than folded into `pruned`
+    /// because a pruned entry deletes *two* files (`.json` + `.lock`) while an
+    /// orphaned-lock reap deletes only the one `.lock` file: collapsing the two
+    /// would make `pruned` an inconsistent unit (sometimes "pairs", sometimes
+    /// "files"). An orphan arises when a record's `.json` write never lands (now
+    /// backstopped for the fresh-registration case by
+    /// [`ReservedEntry`]'s Drop guard, but still possible for, say, a hand-edited or
+    /// partially-cleaned-up directory) or when [`Registration::remove`]'s best-effort
+    /// `.json` delete succeeds while its `.lock` delete does not.
+    pub orphaned_locks: usize,
 }
 
 /// A handle onto the per-user run registry directory.
@@ -205,6 +218,13 @@ impl Registry {
     /// run's lifetime; dropping it (or calling [`Registration::remove`]) tears the
     /// entry down.
     ///
+    /// If the record is never actually published — the `fs::write` of the JSON call
+    /// itself fails, or an earlier `?` returns first — the reserved lock file does
+    /// not leak: [`ReservedEntry`]'s [`LockCleanupGuard`] backstop deletes it when the
+    /// unpublished reservation drops (see [`Registry::reserve_entry`]), so a failed
+    /// `register` never leaves an orphaned `.lock` file with no `.json` for
+    /// `Registry::prune`'s orphan-lock pass to have to clean up later.
+    ///
     /// `endpoint` is the local transport address the runner published (a unix socket
     /// path / Windows pipe name), or `None` when no transport could be stood up.
     /// `started` is the run's start time.
@@ -232,6 +252,11 @@ impl Registry {
         // The record is written only after the lock is held, so an entry is never
         // visible to a scanner in a state where it looks live but no lock exists.
         fs::write(&reserved.json_path, json)?;
+        // The record is now published: disarm the Drop backstop so it does not
+        // delete the very lock file the just-written record names. Every earlier
+        // return above (the `?` on `fs::write` failing) leaves the guard armed, so
+        // `reserved` drops with it still active and the lock file is reclaimed.
+        reserved.cleanup.disarm();
 
         Ok(Registration {
             json_path: reserved.json_path,
@@ -328,6 +353,23 @@ impl Registry {
     /// error on one entry never aborts the reaping of the others (a leftover just reads
     /// as stale again next time). Running prune over an already-clean registry is a
     /// no-op, not an error.
+    ///
+    /// A second pass, after the paired-record pass above, reaps **orphaned lock
+    /// files**: `.lock` files with no sibling `.json` at all, invisible to
+    /// [`Registry::scan`] (which only ever walks `.json` records) and therefore never
+    /// reachable by the pass above, however long it has sat there. Such an orphan
+    /// arises when a record's `.json` write never lands (the fresh-registration case
+    /// is now backstopped by [`ReservedEntry`]'s Drop guard, but a hand-edited or
+    /// partially-cleaned-up directory can still produce one) or when
+    /// [`Registration::remove`]'s best-effort `.json` delete succeeds while its
+    /// `.lock` delete does not. This second pass reuses the exact same
+    /// [`probe_for_prune`] lock-probe safety as the paired-record pass — a `Live` lock
+    /// is never touched, a probe `Err` leaves the file in place, and only a confirmed-
+    /// stale lock is deleted — tallied into [`PruneOutcome::orphaned_locks`] (kept
+    /// distinct from `pruned` because it deletes one file, not a `.json`/`.lock` pair)
+    /// while sharing the `live`/`unprobed` counters with the paired-record pass, since
+    /// those two verdicts mean exactly the same thing whether or not the lock has a
+    /// `.json` sibling.
     pub fn prune(&self) -> io::Result<PruneOutcome> {
         let mut outcome = PruneOutcome::default();
         for ScannedRecord {
@@ -353,7 +395,62 @@ impl Registry {
                 Err(_) => outcome.unprobed += 1,
             }
         }
+
+        for lock_path in self.orphaned_lock_paths()? {
+            match probe_for_prune(&lock_path) {
+                // Confirmed stale: there is no `.json` sibling to delete, only the
+                // lock file itself.
+                Ok(PruneProbe::Reapable(_held_lock)) => {
+                    let _ = fs::remove_file(&lock_path);
+                    outcome.orphaned_locks += 1;
+                }
+                Ok(PruneProbe::Live) => outcome.live += 1,
+                Err(_) => outcome.unprobed += 1,
+            }
+        }
+
         Ok(outcome)
+    }
+
+    /// The `.lock` files in the registry directory that have no sibling `.json`
+    /// record — the candidates [`Registry::prune`]'s second pass probes. Unlike
+    /// [`Registry::scan`]'s `.json` records, there is no per-file corruption guard to
+    /// apply here: a `.lock` file name is never deserialized untrusted data (it is
+    /// either a filesystem-provided directory-listing name here, or, for a paired
+    /// record, the already-validated `lock_file` field [`Registry::scan`] resolves) —
+    /// pairing is decided purely by whether `<stem>.json` exists next to it, matching
+    /// exactly the on-disk convention [`Registry::reserve_entry`]/[`next_stem`]
+    /// establish. A missing directory yields no candidates, exactly as
+    /// [`Registry::scan`] treats it as an empty registry.
+    fn orphaned_lock_paths(&self) -> io::Result<Vec<PathBuf>> {
+        let read_dir = match fs::read_dir(&self.dir) {
+            Ok(read_dir) => read_dir,
+            // A missing directory is simply an empty registry.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+
+        let mut orphans = Vec::new();
+        for dir_entry in read_dir {
+            // Per-item iteration noise is skipped here exactly as in `scan` — a
+            // transient error on one entry must not abort the whole listing.
+            let Ok(dir_entry) = dir_entry else {
+                continue;
+            };
+            let path = dir_entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("lock") {
+                continue;
+            }
+            if path.with_extension("json").exists() {
+                // A `.json` sibling exists (whether or not it is itself a valid,
+                // parsable record) — this lock is not an orphan, so leave it to the
+                // paired-record pass above (or, for a corrupt `.json`, to neither
+                // pass, exactly as `scan` already leaves a corrupt record untouched).
+                continue;
+            }
+            orphans.push(path);
+        }
+        Ok(orphans)
     }
 
     /// Scan the registry directory into the records that pass every corruption guard,
@@ -430,6 +527,12 @@ impl Registry {
     /// Reserve a unique entry by atomically creating its lock file (`create_new`) and
     /// taking the exclusive lock on it. The stem is a time+counter token with no PID;
     /// uniqueness is guaranteed by the filesystem, so a collision just retries.
+    ///
+    /// The returned [`ReservedEntry`] carries an armed [`LockCleanupGuard`]: if it is
+    /// dropped before [`Registry::register`] publishes the record and disarms it, the
+    /// guard deletes the fresh lock file this call just created — the reservation is
+    /// then indistinguishable from never having happened, rather than leaking an
+    /// orphaned `.lock` with no `.json`.
     fn reserve_entry(&self) -> io::Result<ReservedEntry> {
         const MAX_TRIES: u32 = 128;
         for _ in 0..MAX_TRIES {
@@ -452,6 +555,7 @@ impl Registry {
                     let json_path = self.dir.join(format!("{stem}.json"));
                     return Ok(ReservedEntry {
                         json_path,
+                        cleanup: LockCleanupGuard::new(lock_path.clone()),
                         lock_path,
                         lock,
                     });
@@ -466,11 +570,72 @@ impl Registry {
     }
 }
 
-/// A reserved-but-not-yet-published entry: its paths and the held lock.
+/// A reserved-but-not-yet-published entry: its paths, the held lock, and the
+/// [`LockCleanupGuard`] backstop that deletes the fresh lock file if the entry is
+/// dropped before [`Registry::register`] finishes publishing its record.
 struct ReservedEntry {
     json_path: PathBuf,
     lock_path: PathBuf,
     lock: File,
+    /// Armed until [`Registry::register`] successfully writes the record and
+    /// disarms it; see [`LockCleanupGuard`].
+    cleanup: LockCleanupGuard,
+}
+
+/// Drop-backstop for a freshly reserved lock file: deletes it if dropped while still
+/// armed, i.e. the entry it belongs to was never published.
+///
+/// [`Registry::reserve_entry`] atomically creates and locks `<stem>.lock` *before*
+/// [`Registry::register`] writes `<stem>.json`. If that write never happens — the
+/// `fs::write` call itself fails, or `register` returns early for any other reason —
+/// the [`ReservedEntry`] simply drops with no record ever written, and without this
+/// guard the freshly created lock file would be left on disk forever: invisible to
+/// [`Registry::scan`] (which only walks `.json` files), so neither `list` nor the old
+/// `prune` could ever see or reap it. This guard closes that leak: it stays armed
+/// from creation until `register` explicitly [`disarm`](Self::disarm)s it right after
+/// the record write succeeds, and a still-armed guard's `Drop` deletes the lock file.
+///
+/// The lock is still held by *this very process* at drop time — `reserve_entry`'s
+/// `create_new` guarantees no other caller could ever have opened this exact path —
+/// so deleting it here races with no concurrent holder; it is exactly the "reserved
+/// but never checked out" case, not the "abruptly killed while live" case `prune`
+/// otherwise reaps.
+///
+/// Carved out as its own type, rather than an `impl Drop` directly on
+/// [`ReservedEntry`], because [`Registry::register`] constructs [`Registration`] by
+/// moving `reserved.json_path` / `reserved.lock_path` / `reserved.lock` out
+/// field-by-field — a partial move Rust forbids from any type that itself
+/// implements `Drop`. Only this narrow guard type implements `Drop`; `ReservedEntry`
+/// does not, so that partial move keeps compiling.
+struct LockCleanupGuard {
+    lock_path: PathBuf,
+    active: bool,
+}
+
+impl LockCleanupGuard {
+    /// A freshly armed guard for `lock_path`.
+    fn new(lock_path: PathBuf) -> Self {
+        Self {
+            lock_path,
+            active: true,
+        }
+    }
+
+    /// Disarm the guard: the entry was successfully published, so its lock file must
+    /// survive as `<stem>.json`'s sibling, not be deleted when this guard drops.
+    /// Consumes `self` — once disarmed there is no path back to "armed" — so its own
+    /// `Drop` still runs when this returns, but as a no-op.
+    fn disarm(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for LockCleanupGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = fs::remove_file(&self.lock_path);
+        }
+    }
 }
 
 /// A live registry entry owned by the running `run` process. Holding it keeps the
@@ -1490,6 +1655,36 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The Drop-backstop this task adds: a [`ReservedEntry`] that is dropped before
+    /// its record is ever published (here simulated directly, the same shape
+    /// `Registry::register` hits when its `fs::write` of the JSON record fails and
+    /// returns early with `?`, before it ever calls `disarm`) must delete its
+    /// freshly created `.lock` file — never leave it as an orphan invisible to
+    /// `scan()` (which only walks `.json` files).
+    #[test]
+    fn reserved_entry_drop_backstop_removes_the_lock_file_when_never_published() {
+        let dir = scratch("reserve-drop-backstop");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+
+        let reserved = registry.reserve_entry().expect("reserve an entry");
+        let lock_path = reserved.lock_path.clone();
+        assert!(
+            lock_path.exists(),
+            "reserve_entry creates the lock file up front"
+        );
+
+        // Never publish the record (no `fs::write` of the `.json`, no `disarm`) —
+        // just drop the reservation, exactly as an early `?` return in `register`
+        // would.
+        drop(reserved);
+
+        assert!(
+            !lock_path.exists(),
+            "dropping an unpublished reservation must remove its lock file"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// A clean exit removes the entry: files gone, and the scan sees nothing.
     #[test]
     fn clean_removal_deletes_the_entry() {
@@ -1963,6 +2158,7 @@ mod tests {
                 pruned: 1,
                 live: 0,
                 unprobed: 0,
+                orphaned_locks: 0,
             },
             "an orphaned stale record is reaped"
         );
@@ -1999,6 +2195,7 @@ mod tests {
                 pruned: 1,
                 live: 0,
                 unprobed: 0,
+                orphaned_locks: 0,
             },
             "the confirmed-stale entry is reaped"
         );
@@ -2048,6 +2245,7 @@ mod tests {
                 pruned: 1,
                 live: 1,
                 unprobed: 0,
+                orphaned_locks: 0,
             },
             "exactly the stale entry is reaped and the live one is counted, not touched"
         );
@@ -2101,6 +2299,7 @@ mod tests {
                 pruned: 1,
                 live: 0,
                 unprobed: 1,
+                orphaned_locks: 0,
             },
             "the unprobeable entry is kept and the stale sibling is still reaped"
         );
@@ -2124,12 +2323,112 @@ mod tests {
                 pruned: 0,
                 live: 0,
                 unprobed: 1,
+                orphaned_locks: 0,
             },
             "the unprobeable entry is still kept on a repeat pass"
         );
         assert!(
             dir.join("broken.json").exists(),
             "the unprobeable record survives every prune"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The orphan-lock counterpart to `prune_reaps_a_confirmed_stale_orphan_record`:
+    /// a lone `.lock` file with **no `.json` sibling at all** — invisible to `scan()`
+    /// and so unreachable by the paired-record pass no matter how long it sits there
+    /// — is reaped by `prune`'s second, orphan-lock pass. An unlocked file confirms
+    /// stale exactly as `probe_for_prune` documents.
+    #[test]
+    fn prune_reaps_a_lone_orphaned_lock_file() {
+        let dir = scratch("prune-orphan-lock");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+
+        let lock_path = dir.join("orphan.lock");
+        fs::write(&lock_path, b"").expect("write the orphaned lock file");
+
+        let outcome = registry.prune().expect("prune must not fail");
+        assert_eq!(
+            outcome,
+            PruneOutcome {
+                pruned: 0,
+                live: 0,
+                unprobed: 0,
+                orphaned_locks: 1,
+            },
+            "a lone, unlocked .lock file with no .json sibling is reaped as an orphan"
+        );
+        assert!(!lock_path.exists(), "the orphaned lock file is deleted");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A `.lock` file **held by a live holder** is never reaped, orphan or not —
+    /// the same "Live ⇒ never touch" rule the paired-record pass follows.
+    #[test]
+    fn prune_never_reaps_a_live_orphaned_lock_file() {
+        let dir = scratch("prune-orphan-live");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+
+        let lock_path = dir.join("orphan.lock");
+        let held = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .expect("create the orphaned lock file");
+        assert!(
+            platform::try_lock_exclusive(&held).expect("take the lock"),
+            "a fresh file must not already be locked"
+        );
+
+        let outcome = registry.prune().expect("prune must not fail");
+        assert_eq!(
+            outcome,
+            PruneOutcome {
+                pruned: 0,
+                live: 1,
+                unprobed: 0,
+                orphaned_locks: 0,
+            },
+            "a lock held by a live holder must never be reaped, orphan or not"
+        );
+        assert!(
+            lock_path.exists(),
+            "the live-held orphaned lock file survives prune"
+        );
+
+        drop(held);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An orphaned `.lock` whose probe **fails** — here the name resolves to a
+    /// directory rather than a regular file, the same cross-platform [K-014] trick
+    /// used for the paired-record probe-error tests — is left in place, not deleted:
+    /// liveness is unknown, not confirmed stale.
+    #[test]
+    fn prune_leaves_an_unprobeable_orphaned_lock_file_in_place() {
+        let dir = scratch("prune-orphan-unprobeable");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+
+        let broken = dir.join("broken.lock");
+        fs::create_dir(&broken).expect("create the directory the lock name resolves to");
+
+        let outcome = registry.prune().expect("prune must not fail");
+        assert_eq!(
+            outcome,
+            PruneOutcome {
+                pruned: 0,
+                live: 0,
+                unprobed: 1,
+                orphaned_locks: 0,
+            },
+            "an unprobeable orphaned lock is kept in place, not deleted"
+        );
+        assert!(
+            broken.exists(),
+            "the unprobeable orphaned lock's target is left alone"
         );
 
         let _ = fs::remove_dir_all(&dir);
