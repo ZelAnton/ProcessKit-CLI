@@ -30,6 +30,11 @@ to a dated version section.
   stderr and the "a `container_error` exit is always preceded by `container_failed`"
   invariant holds on these paths too. `foreground` is an additive value in the v1
   `container_failed.phase` enum (no `schema_version` bump).
+- `inspect`/`cancel`/`kill` now open the run registry read-only, like `list`/
+  `prune` already did, instead of the mutating open `run` uses: a simple query or
+  control command against a run no longer creates the registry directory or
+  re-asserts its owner-only permissions as a side effect when the directory does
+  not yet exist.
 
 ## [0.2.2] - 2026-07-24
 
