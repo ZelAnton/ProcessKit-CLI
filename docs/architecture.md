@@ -98,7 +98,9 @@ implemented in `run::execute`/`run::run_async` (`src/run.rs`):
    POSIX process-group containment and stdin is a terminal, `run` temporarily
    assigns the terminal's foreground group to the child and restores the original
    group during cleanup. A `members_snapshot` event records the container's
-   PID-only member list in either path.
+   member list — enriched with `ppid`/executable `name`/`start_time` via
+   ProcessKit's `members_info()` wherever the platform can report them
+   (`docs/schema.md`, "Enriched member fields") — in either path.
 3. **Capture and hash.** `src/capture.rs`'s `CaptureTee` mirrors every echoed
    byte into a bounded capture file per stream, hashing what actually reached
    disk with `src/hash.rs`'s incremental SHA-256 and recording an explicit

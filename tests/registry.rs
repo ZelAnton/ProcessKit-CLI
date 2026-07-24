@@ -235,13 +235,31 @@ fn inspect_reports_a_live_run() {
         snapshot["started_at"].is_string(),
         "the snapshot carries a start time: {snapshot}"
     );
+    let members = snapshot["members"]
+        .as_array()
+        .expect("the snapshot carries a members array");
+    let root_pid = snapshot["root_pid"]
+        .as_u64()
+        .expect("the snapshot carries a root_pid");
+    let root = members
+        .iter()
+        .find(|m| m["pid"].as_u64() == Some(root_pid))
+        .unwrap_or_else(|| panic!("the snapshot must list the root child: {snapshot}"));
+    // `inspect`'s members are enriched the same way as the JSONL `members_snapshot`
+    // (`docs/schema.md`, "Enriched member fields") — populated on every platform
+    // this crate's CI runs (only the "bare" BSDs, outside the CI matrix, report
+    // `null`).
     assert!(
-        snapshot["members"].is_array(),
-        "the snapshot carries a members array: {snapshot}"
+        root["ppid"].as_u64().is_some(),
+        "ppid is populated on this platform: {root}"
     );
     assert!(
-        snapshot.get("root_pid").is_some(),
-        "the snapshot carries a root_pid field (possibly null): {snapshot}"
+        root["name"].as_str().is_some(),
+        "the executable name is populated on this platform: {root}"
+    );
+    assert!(
+        root["start_time"].as_str().is_some(),
+        "the start-time token is populated on this platform: {root}"
     );
     assert_eq!(
         snapshot["snapshot_version"], 1,

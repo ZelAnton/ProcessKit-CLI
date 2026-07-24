@@ -58,12 +58,12 @@
     },
     "member": {
       "type": "object",
-      "description": "One entry of a members_snapshot. Only `pid` is populated today; the enriched fields are always present but explicitly null until ProcessKit ships members_info() (docs/schema.md, 'Enriched member fields').",
+      "description": "One entry of a members_snapshot. `ppid`/`name`/`start_time` are filled from ProcessKit's members_info() wherever the platform can report them; each stays independently null where it can't (docs/schema.md, 'Enriched member fields').",
       "properties": {
         "pid": { "$ref": "#/$defs/u32", "description": "The process id." },
-        "ppid": { "$ref": "#/$defs/u32OrNull", "description": "Parent pid; null until the enriched member fields ship." },
-        "name": { "type": ["string", "null"], "description": "Executable name; null until the enriched member fields ship." },
-        "start_time": { "type": ["string", "null"], "description": "Process start time; null until the enriched member fields ship." }
+        "ppid": { "$ref": "#/$defs/u32OrNull", "description": "Parent pid; null where the platform can't report it." },
+        "name": { "type": ["string", "null"], "description": "Executable name; null where the platform can't report it." },
+        "start_time": { "type": ["string", "null"], "description": "Opaque, platform-specific start-time token as a decimal string (not a timestamp); null where the platform can't report it." }
       },
       "required": ["pid", "ppid", "name", "start_time"],
       "additionalProperties": false

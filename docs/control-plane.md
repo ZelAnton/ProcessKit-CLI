@@ -131,12 +131,12 @@ from the JSONL event `schema_version` and the `registry_version`.
 | `mechanism`        | string            | Containment mechanism: `job_object`, `cgroup_v2`, or `process_group` (same vocabulary as the JSONL `run_started`). |
 | `root_pid`         | integer, nullable | The root child's PID; `null` if the backend exposed none.             |
 | `started_at`       | string            | Run start time, RFC 3339 UTC, millisecond precision.                  |
-| `members`          | array of member   | The container's members, **PID-only** — the scope the public `processkit` API exposes today, the same shape as the JSONL `members_snapshot` (the enriched `ppid`/`name`/`start_time` fields are present but `null`). Queried **at request time**, so it reflects the container's composition *when inspected*, not at start. |
+| `members`          | array of member   | The container's members, enriched with `ppid`/executable `name`/`start_time` wherever ProcessKit's `members_info()` can report them — the same shape as the JSONL `members_snapshot` (`docs/schema.md`, "Enriched member fields"), and read through the same call, so the two views never drift. Fields stay `null` on platforms/members that can't report them (e.g. the "bare" BSDs). Queried **at request time**, so it reflects the container's composition *when inspected*, not at start. |
 
 Example:
 
 ```json
-{"snapshot_version":1,"run_id":"build-42","mechanism":"job_object","root_pid":4242,"started_at":"2026-07-20T21:00:00.000Z","members":[{"pid":4242,"ppid":null,"name":null,"start_time":null}]}
+{"snapshot_version":1,"run_id":"build-42","mechanism":"job_object","root_pid":4242,"started_at":"2026-07-20T21:00:00.000Z","members":[{"pid":4242,"ppid":4200,"name":"build.exe","start_time":"133456789000000000"}]}
 ```
 
 ## `cancel` and `kill`

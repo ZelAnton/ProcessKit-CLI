@@ -102,7 +102,7 @@ A **member** object:
 | `pid`        | integer           | The process id.                                          |
 | `ppid`       | integer, nullable | Parent pid — see "Enriched member fields".               |
 | `name`       | string, nullable  | Executable name — see "Enriched member fields".          |
-| `start_time` | string, nullable  | Process start time — see "Enriched member fields".       |
+| `start_time` | string, nullable  | Opaque, platform-specific start-time token, as a decimal string — see "Enriched member fields". |
 
 ### `root_exited`
 
@@ -366,13 +366,28 @@ breaking change — see "Versioning").
 
 ## Enriched member fields
 
-ProcessKit's public API returns bare PIDs today; the richer per-member snapshot
-(`ppid`, executable `name`, `start_time`) is a filed-but-unshipped ProcessKit-rs
-capability (`ProcessGroup::members_info()`). Rather than reimplement process
-enumeration locally (`AGENTS.md`, "Build strictly on the public `processkit`
-API"), v1 declares those fields as nullable and fills them from bare PIDs alone —
-so today they are always explicitly `null`. When the core capability ships, the
-runner populates them without reshaping the event.
+`ppid`, executable `name`, and `start_time` are filled from ProcessKit's
+`ProcessGroup::members_info()` — built strictly on the public `processkit` API
+rather than a local process-enumeration path (`AGENTS.md`, "Build strictly on the
+public `processkit` API"). Each field stays independently nullable because
+`members_info()` itself reports a field `null` wherever the platform can't read
+it: on Windows, Linux (cgroup or the process-group fallback), and macOS every
+field is populated; on the "bare" BSDs (no wired-up per-process reader) every
+enriching field is `null` while `pid` is still reported — a correct result, not
+an error. A member that exits between enumeration and metadata read is omitted
+from `members` entirely rather than reported with fabricated fields.
+
+`start_time` is **not** a wall-clock timestamp — it is an opaque, platform- and
+unit-specific token (Windows: 100 ns since 1601-01-01 UTC; Linux: clock ticks
+since boot; macOS: microseconds since the Unix epoch) whose only documented
+purpose is telling a recycled `pid` apart from the process that previously held
+it. It is rendered as its decimal string, matching the field's `string, nullable`
+type, and must never be parsed as a timestamp or compared across platforms.
+
+The same enrichment backs the control-plane `inspect` snapshot (see
+[`docs/control-plane.md`](control-plane.md)): both `members_snapshot` and
+`inspect`'s `members` are queried through `members_info()`, so the two "container
+member" views never drift.
 
 ## Versioning
 
@@ -392,8 +407,8 @@ per-stream `write_error` flag was added this way within v1. Filling a
 field that was reserved-as-`null` is **not** a breaking change: the field already
 exists and its type is unchanged. The `argv_sha256` and
 `hint` fields were filled this way — they now carry values on every run instead of
-always `null`; the enriched member fields remain reserved and `null` until
-ProcessKit ships `members_info()`. Adding a new `hint` label to the classifier
+always `null`; the enriched member fields (see "Enriched member fields" above) were
+filled the same way once ProcessKit shipped `members_info()`. Adding a new `hint` label to the classifier
 catalog is likewise additive, but renaming or removing an existing `hint` label, or
 changing the fingerprint's canonical encoding, changes the meaning of a value and
 so is a breaking change.

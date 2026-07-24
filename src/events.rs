@@ -12,14 +12,20 @@
 //!
 //! Two field groups are shaped to keep the wire form stable as capabilities grow:
 //!
-//! - **Enriched member fields (still reserved).** ProcessKit's public API returns
-//!   bare PIDs today; the richer per-member snapshot (`ppid` / executable `name` /
-//!   `start_time`) is a filed-but-unshipped ProcessKit-rs capability
-//!   (`ProcessGroup::members_info()`). So [`Member`] declares those fields as
-//!   optional and the emitter fills them from bare PIDs alone, marking every
-//!   richer field explicitly **absent** (JSON `null`) rather than inventing a
-//!   local process-enumeration path (`AGENTS.md`, "Build strictly on the public
-//!   `processkit` API").
+//! - **Enriched member fields.** Beyond the bare PID, [`Member`] carries `ppid`,
+//!   executable `name`, and `start_time`, filled from ProcessKit's
+//!   `ProcessGroup::members_info()` (`AGENTS.md`, "Build strictly on the public
+//!   `processkit` API") rather than a local process-enumeration path. Each field
+//!   stays declared `Option`: `members_info()` itself reports an enriching field
+//!   `None` wherever the platform can't read it (the "bare" BSDs report none of
+//!   them) or a member vanished between enumeration and metadata read, so a
+//!   `null` here is an honest per-field/per-platform gap, never a placeholder for
+//!   unimplemented enrichment (`docs/schema.md`, "Enriched member fields").
+//!   `start_time` is `members_info()`'s opaque, platform-specific start-time
+//!   *token* — not a wall-clock timestamp, and not comparable across platforms
+//!   (see [`processkit::MemberInfo::start_time`]) — carried here as its decimal
+//!   string rather than a number, so the wire shape never implies it is safe to
+//!   treat as an epoch time or to do arithmetic on.
 //! - **Command line / argv redaction (shipped in T-005).** Command lines carry
 //!   secrets, so argv is redacted by default (`AGENTS.md`, "Argv is redacted by
 //!   default"): a redacted `command` omits the raw `argv` and instead carries a
@@ -35,7 +41,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use processkit::{Command as PkCommand, Mechanism, Outcome, ParentDeathCleanup};
+use processkit::{Command as PkCommand, Mechanism, MemberInfo, Outcome, ParentDeathCleanup};
 
 /// The schema version stamped on every event. Part of the compatibility surface:
 /// any breaking change to an event's shape is a **major** bump of this number
@@ -78,8 +84,9 @@ pub enum Event {
         cwd: Option<String>,
         command: CommandInfo,
     },
-    /// A point-in-time snapshot of the container's members. PID-only today; the
-    /// richer fields are declared but absent (see module docs and [`Member`]).
+    /// A point-in-time snapshot of the container's members, including the enriched
+    /// per-member fields ProcessKit's `members_info()` reports (see module docs
+    /// and [`Member`]).
     MembersSnapshot { members: Vec<Member> },
     /// The root child exited on its own. `code` is set for a normal exit; `signal`
     /// for a Unix signal death; both `null` only for an outcome without either.
@@ -179,14 +186,16 @@ pub enum Event {
     },
 }
 
-/// One entry of a [`Event::MembersSnapshot`]. Only `pid` is populated today; the
-/// enriched fields are declared for the schema but filled `null` until ProcessKit
-/// ships `members_info()` (module docs).
+/// One entry of a [`Event::MembersSnapshot`]: a PID plus the enriched fields
+/// (`ppid`, executable `name`, `start_time`) [`Member::from_info`] fills from
+/// ProcessKit's `members_info()` (module docs, "Enriched member fields"). Each
+/// enriched field is independently `Option` and `None` wherever the platform (or
+/// a process that vanished mid-read) could not report it — never a fabricated
+/// value.
 ///
-/// `Deserialize` as well as `Serialize`: the same PID-only member shape is reused
-/// by the control-plane `inspect` snapshot ([`crate::control::Snapshot`]), whose
-/// client parses the response back — so the two "container member" views never
-/// drift.
+/// `Deserialize` as well as `Serialize`: the same member shape is reused by the
+/// control-plane `inspect` snapshot ([`crate::control::Snapshot`]), whose client
+/// parses the response back — so the two "container member" views never drift.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Member {
     pub pid: u32,
@@ -197,12 +206,31 @@ pub struct Member {
 
 impl Member {
     /// A member built from a bare PID: every enriched field is explicitly absent.
+    /// Used where only a PID is known (hand-built test/fixture data); production
+    /// snapshotting goes through [`Member::from_info`].
     pub fn from_pid(pid: u32) -> Self {
         Self {
             pid,
             ppid: None,
             name: None,
             start_time: None,
+        }
+    }
+
+    /// A member built from ProcessKit's enriched [`MemberInfo`]
+    /// (`ProcessGroup::members_info()`): `ppid` and the executable `name` carry
+    /// over directly (each already `None` wherever the platform can't report it —
+    /// see [`MemberInfo`]'s per-field platform matrix); `start_time` is
+    /// `members_info()`'s opaque, platform-specific start-time *token* — not a
+    /// wall-clock timestamp, not comparable across platforms — rendered as its
+    /// decimal string, matching the schema's `string, nullable` type for exactly
+    /// that reason (`docs/schema.md`, "Enriched member fields").
+    pub fn from_info(info: MemberInfo) -> Self {
+        Self {
+            pid: info.pid(),
+            ppid: info.ppid(),
+            name: info.exe_name().map(str::to_string),
+            start_time: info.start_time().map(|token| token.to_string()),
         }
     }
 }
@@ -606,8 +634,20 @@ mod tests {
                 cwd: Some("/work/project".to_string()),
                 command: CommandInfo::for_argv(msbuild_argv, true),
             },
+            // Two members: one fully enriched (a live `members_info()` read on a
+            // platform that reports everything), one with every enriched field
+            // absent (a platform gap, e.g. the "bare" BSDs, or a member that
+            // vanished mid-read) — the fixture pins both shapes side by side.
             Event::MembersSnapshot {
-                members: vec![Member::from_pid(4242), Member::from_pid(4243)],
+                members: vec![
+                    Member {
+                        pid: 4242,
+                        ppid: Some(4200),
+                        name: Some("worker.exe".to_string()),
+                        start_time: Some("133456789000000000".to_string()),
+                    },
+                    Member::from_pid(4243),
+                ],
             },
             Event::RootExited {
                 outcome: "exited",
@@ -771,6 +811,40 @@ mod tests {
                 "enriched field `{field}` must be present and null: {line}"
             );
         }
+    }
+
+    /// An enriched member (the shape [`Member::from_info`] produces from a live
+    /// `members_info()` read) serializes `ppid`/`name` as their values and
+    /// `start_time` as its **decimal-string** rendering of the opaque token — a
+    /// string, not a JSON number, matching the schema's `string, nullable` type
+    /// (`docs/schema.md`, "Enriched member fields"). `Member::from_info` itself
+    /// cannot be exercised directly here: `processkit::MemberInfo` has no public
+    /// constructor (only the platform backends inside `processkit` build one), so
+    /// this pins the wire shape the mapping must produce instead.
+    #[test]
+    fn members_enriched_fields_serialize_as_documented_when_populated() {
+        let member = Member {
+            pid: 4242,
+            ppid: Some(4200),
+            name: Some("worker.exe".to_string()),
+            start_time: Some(133_456_789_000_000_000u64.to_string()),
+        };
+        let line = serialize_record(
+            &Event::MembersSnapshot {
+                members: vec![member],
+            },
+            fixed_time(),
+        )
+        .expect("serializes");
+        let value: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
+        let member = &value["members"][0];
+        assert_eq!(member["pid"], 4242);
+        assert_eq!(member["ppid"], 4200);
+        assert_eq!(member["name"], "worker.exe");
+        assert_eq!(
+            member["start_time"], "133456789000000000",
+            "start_time is the opaque token's decimal string, not a JSON number: {line}"
+        );
     }
 
     /// Whether `s` is a 64-character lowercase-hex string — the shape of an

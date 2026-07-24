@@ -472,6 +472,58 @@ fn an_uncreatable_capture_dir_is_a_setup_failure_with_a_null_child_code() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `members_snapshot` reports the enriched per-member fields (`ppid`, `name`,
+/// `start_time`) ProcessKit's `members_info()` fills, on every platform this
+/// crate's CI runs (Windows, Linux, macOS all report them per the platform matrix
+/// in `docs/schema.md`, "Enriched member fields" — only the "bare" BSDs, outside
+/// the CI matrix, report `null`). The child sleeps briefly so it is still present
+/// when the snapshot is taken right after `run_started`.
+#[test]
+fn members_snapshot_reports_enriched_fields() {
+    let dir = scratch("members-snapshot-enriched");
+    let brief_sleep = if cfg!(windows) {
+        shell_inline("ping -n 2 127.0.0.1 >nul")
+    } else {
+        shell_inline("sleep 1")
+    };
+    let out = run(&dir, &[], brief_sleep);
+    assert_eq!(out.status.code(), Some(0));
+
+    let events = read_events(&dir);
+    assert_events_match_schema(&events);
+
+    let started = events
+        .iter()
+        .find(|e| e["event"] == "run_started")
+        .expect("a run_started event");
+    let root_pid = started["root_pid"].as_u64().expect("root_pid is present");
+
+    let snapshot = events
+        .iter()
+        .find(|e| e["event"] == "members_snapshot")
+        .expect("a members_snapshot event");
+    let members = snapshot["members"].as_array().expect("members is an array");
+    let root = members
+        .iter()
+        .find(|m| m["pid"].as_u64() == Some(root_pid))
+        .unwrap_or_else(|| panic!("the snapshot must list the root child: {snapshot}"));
+
+    assert!(
+        root["ppid"].as_u64().is_some(),
+        "ppid is populated on this platform: {root}"
+    );
+    assert!(
+        root["name"].as_str().is_some(),
+        "the executable name is populated on this platform: {root}"
+    );
+    assert!(
+        root["start_time"].as_str().is_some(),
+        "the start-time token is populated on this platform: {root}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A `--timeout` that elapses emits a `timeout` event and the cleanup pair, then a
 /// terminal `runner_exit` in the reserved band with a null child code. Kept
 /// cross-platform via a runtime `cfg!` so both OSes compile and lint this test.

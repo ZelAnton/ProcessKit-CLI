@@ -15,8 +15,9 @@
 //! - **Client side (`inspect`).** [`inspect`] finds the live runner through the
 //!   registry (matching `run_id`, never a PID), connects to its endpoint, and prints
 //!   a machine-readable [`Snapshot`] of the run: its id, containment mechanism, root
-//!   PID, container members (PID-only, the scope the public `processkit` API exposes
-//!   today — the same shape as the JSONL `members_snapshot`), and start time.
+//!   PID, container members (enriched with `ppid`/executable `name`/`start_time`
+//!   wherever the platform can report them — the same shape as the JSONL
+//!   `members_snapshot`), and start time.
 //!
 //! ## Owner-only transport
 //!
@@ -243,7 +244,7 @@ const CONNECTION_DEADLINE: Duration = Duration::from_secs(5);
 /// request verb ([`serve_one`]) and the JSON reply ([`converse`]). The protocol is
 /// deliberately tiny (module doc, "Wire protocol") — a request line is `inspect` /
 /// `cancel` / `kill` / empty plus `\n` (a handful of bytes), and a reply line is a
-/// [`Snapshot`] (JSON of a handful of scalar fields plus a PID-only `members` array),
+/// [`Snapshot`] (JSON of a handful of scalar fields plus an enriched `members` array),
 /// a [`ControlAck`], or an error object. `64 KiB` sits comfortably above even a
 /// generously large `members` list — the sole field with unbounded real-world size —
 /// while staying nowhere near "unbounded": a peer that never sends a `\n` (an
@@ -273,10 +274,11 @@ pub struct Snapshot {
     /// Run start time, RFC 3339 UTC with millisecond precision (same formatter as the
     /// JSONL events and the registry record).
     pub started_at: String,
-    /// A point-in-time snapshot of the container's members, PID-only — the scope the
-    /// public `processkit` API exposes today, mirroring the JSONL `members_snapshot`
-    /// (the enriched fields stay reserved-`null`). Queried at request time, so it
-    /// reflects the container's composition *when inspected*, not at start.
+    /// A point-in-time snapshot of the container's members, enriched with
+    /// `ppid`/executable `name`/`start_time` wherever `members_info()` can report
+    /// them, mirroring the JSONL `members_snapshot` (`docs/schema.md`, "Enriched
+    /// member fields"). Queried at request time, so it reflects the container's
+    /// composition *when inspected*, not at start.
     pub members: Vec<Member>,
 }
 
@@ -296,7 +298,7 @@ pub struct SnapshotSource<'a> {
     mechanism: &'static str,
     root_pid: Option<u32>,
     started: SystemTime,
-    /// Produces the current PID-only member list on demand. Kept as a borrowed
+    /// Produces the current enriched member list on demand. Kept as a borrowed
     /// closure so this module never has to depend on `processkit` directly — `run`
     /// supplies one that queries the owning `ProcessGroup`.
     members: &'a (dyn Fn() -> Vec<Member> + 'a),
@@ -1199,7 +1201,9 @@ mod tests {
     use super::*;
 
     /// A snapshot round-trips through JSON: the client parses exactly what the server
-    /// serialized, members included. This is the wire contract `inspect` depends on.
+    /// serialized, members included — both a fully enriched member and a bare-PID one
+    /// (a platform gap or a vanished-mid-read member), the same two shapes the JSONL
+    /// `members_snapshot` fixture pins. This is the wire contract `inspect` depends on.
     #[test]
     fn snapshot_round_trips_through_json() {
         let snapshot = Snapshot {
@@ -1208,7 +1212,15 @@ mod tests {
             mechanism: "job_object".to_string(),
             root_pid: Some(4242),
             started_at: "2026-07-21T00:00:00.000Z".to_string(),
-            members: vec![Member::from_pid(4242), Member::from_pid(4243)],
+            members: vec![
+                Member {
+                    pid: 4242,
+                    ppid: Some(4200),
+                    name: Some("worker.exe".to_string()),
+                    start_time: Some("133456789000000000".to_string()),
+                },
+                Member::from_pid(4243),
+            ],
         };
         let line = serialize_snapshot(&snapshot);
         let parsed: Snapshot = serde_json::from_str(&line).expect("a snapshot line parses back");
@@ -1218,8 +1230,16 @@ mod tests {
         assert_eq!(parsed.root_pid, Some(4242));
         assert_eq!(parsed.members.len(), 2);
         assert_eq!(parsed.members[0].pid, 4242);
-        // The enriched member fields stay reserved (null), like the JSONL snapshot.
-        assert!(parsed.members[0].ppid.is_none());
+        assert_eq!(parsed.members[0].ppid, Some(4200));
+        assert_eq!(parsed.members[0].name.as_deref(), Some("worker.exe"));
+        assert_eq!(
+            parsed.members[0].start_time.as_deref(),
+            Some("133456789000000000")
+        );
+        // A member built from a bare pid still round-trips with the enriched fields
+        // explicitly null, not omitted.
+        assert_eq!(parsed.members[1].pid, 4243);
+        assert!(parsed.members[1].ppid.is_none());
     }
 
     /// The source builds a snapshot from its facts and queries members live each time.

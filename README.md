@@ -406,8 +406,9 @@ lost or aliased.
 The command line is **redacted by default** (`argv` is recorded only under
 `--argv-raw`); in its place a one-way SHA-256 fingerprint of argv (`argv_sha256`)
 and, for recognized worker shapes, a categorical `hint` are recorded on every run —
-neither can reveal the command line. Member snapshots are PID-only today, with the
-richer per-member fields declared but absent until ProcessKit-rs ships them.
+neither can reveal the command line. Member snapshots carry each member's `ppid`,
+executable `name`, and start-time token wherever ProcessKit's `members_info()` can
+report them (nullable per-field on platforms/members it can't).
 
 - Normative field reference: [`docs/schema.md`](docs/schema.md).
 - Golden sample stream for adapters:
