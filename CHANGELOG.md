@@ -12,6 +12,12 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- Shell completions (bash/zsh/fish/PowerShell/Elvish) and man pages, generated
+  from the live `clap` CLI definition by a new `build.rs` at build time and
+  attached to every release archive under `completions/` and `man/man1/` (see
+  README.md, "Shell completions and man pages"). Build-time generation, not a
+  CLI subcommand, so the binary's own runtime surface — and the `probe`
+  compatibility report a consumer's preflight checks — are unchanged.
 - `docs/integration.md`: a consumer/adapter integration guide walking through
   the fail-closed `probe` preflight, the recommended `run` invocation, reading
   the JSONL event stream, control-plane supervision (`inspect`/`cancel`/
