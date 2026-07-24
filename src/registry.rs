@@ -249,8 +249,12 @@ impl Registry {
     /// non-`NotFound` error opening it, or a lock/unlock error) is different: the
     /// record itself is trustworthy, only its liveness is unknowable, so the entry is
     /// still returned — classified [`Health::Stale`] ("could not confirm liveness ⇒
-    /// treat as not live") — rather than dropped. Either way one bad entry never
-    /// aborts the whole scan or blinds a client to the healthy ones. This is the read
+    /// treat as not live") — rather than dropped. A failure to even iterate one
+    /// directory entry (a transient filesystem error or a removal race on that one
+    /// item, distinct from `fs::read_dir` itself failing on the directory as a whole —
+    /// see [`Registry::scan`]) is the same kind of per-item noise and is likewise
+    /// skipped, not fatal. Either way one bad entry never aborts the whole scan or
+    /// blinds a client to the healthy ones. This is the read
     /// side the control-plane client (`inspect`, T-008; `cancel`/`kill`, T-009) builds
     /// on: find the run whose `record.run_id` matches, then act only if it is live —
     /// which a probe-failed entry, being `Stale`, never is.
@@ -359,6 +363,30 @@ impl Registry {
     /// step guarantees the two paths agree exactly on which records are corrupt-and-
     /// skipped versus real-and-probed, so prune can never act on a record `entries`
     /// would have dropped. A missing directory is simply an empty registry.
+    ///
+    /// Two distinct levels of read failure are handled differently. `fs::read_dir`
+    /// itself failing (the registry directory as a whole is unreadable — permissions,
+    /// or a non-`NotFound` I/O error) is fatal and returned as `Err`, exactly as
+    /// before. A failure to iterate a *single* `DirEntry` within an otherwise-readable
+    /// directory (a transient filesystem error, or a race with something removing that
+    /// one entry between the directory read and this step) is different: it is
+    /// per-item noise, the same class of failure as a corrupt record below, and is
+    /// skipped so the scan continues over the remaining entries rather than aborting
+    /// and discarding every other, healthy one.
+    ///
+    /// Untested by design, not by oversight: std's `ReadDir::next()` on both target
+    /// platforms only ever produces `Err` from the underlying `readdir`/
+    /// `FindNextFileW` call failing outright (e.g. `EIO`, a yanked or disconnected
+    /// volume, a corrupted directory index) — failure modes with no reliable,
+    /// deterministic, cross-platform trigger from a unit test running as an ordinary
+    /// user (unlike the sibling per-record probe failures this task's other tests
+    /// force via a lock-file-that-is-really-a-directory, see [K-014]/[K-024]: there is
+    /// no file to redirect here, only the directory-iteration syscall itself). The
+    /// `let Ok(dir_entry) = dir_entry else { continue };` line above is exercised by
+    /// every other test in this module through its `Ok` arm; only the `Err` arm goes
+    /// unexercised, and is covered by inspection instead: it is a direct structural
+    /// mirror of the corrupt-record `let Ok(text) = ... else { continue }` guard two
+    /// lines below, which *is* covered.
     fn scan(&self) -> io::Result<Vec<ScannedRecord>> {
         let read_dir = match fs::read_dir(&self.dir) {
             Ok(read_dir) => read_dir,
@@ -369,7 +397,17 @@ impl Registry {
 
         let mut scanned = Vec::new();
         for dir_entry in read_dir {
-            let path = dir_entry?.path();
+            // A single `DirEntry` iteration failure (a transient filesystem error, or a
+            // race with something removing the entry between the directory read and
+            // this step) is the same class of per-item noise as a corrupt record
+            // below: skip it and keep scanning the rest of the directory rather than
+            // aborting the whole scan and returning `Err` for every other, healthy
+            // entry. Only `fs::read_dir` itself failing (the directory is wholesale
+            // unreadable, handled above) is fatal.
+            let Ok(dir_entry) = dir_entry else {
+                continue;
+            };
+            let path = dir_entry.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }

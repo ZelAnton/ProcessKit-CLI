@@ -1,6 +1,7 @@
 //! The `run` subcommand: launch one shell-free program inside a ProcessKit
 //! container, route its output live, forward its exit code faithfully, and bound
-//! the run with a hard `--timeout` and an interactive `Ctrl-C` cancel.
+//! the run with a hard `--timeout` and a local stop-signal cancel (`Ctrl-C`, and on
+//! Unix `SIGTERM`/`SIGHUP`).
 //!
 //! This is the first executable path of the runner (see `docs/ROADMAP.md`,
 //! "Runnable containment shell"). It builds strictly on the public `processkit`
@@ -23,7 +24,8 @@
 //! - **Exit-code fidelity, with distinguishable runner-imposed endings.** On a
 //!   completed run the process exits with the child's *exact* code (full width,
 //!   never clamped). When the runner instead *ends* the run — the `--timeout`
-//!   deadline elapsed, the operator pressed `Ctrl-C`, or a control-plane
+//!   deadline elapsed, a local stop signal arrived (`Ctrl-C`, or on Unix `SIGTERM` /
+//!   `SIGHUP`), or a control-plane
 //!   `cancel`/`kill` command reached the live runner — the child did not choose to
 //!   stop, so its code is not forwarded: the run reports a reserved-band code
 //!   ([`exit::TIMEOUT`] / [`exit::CANCELLED`] / [`exit::CONTROL_CANCELLED`] /
@@ -86,7 +88,8 @@ pub fn execute(args: RunArgs) -> ExitCode {
 /// may hard-exit with the child's code.
 fn run_inner(args: RunArgs) -> Result<i32, RunnerError> {
     // A small current-thread runtime is enough: the run is one child plus its
-    // output pumps, a deadline timer, and a Ctrl-C listener. The shared helper's
+    // output pumps, a deadline timer, and the stop-signal listeners (`Ctrl-C`, plus
+    // `SIGTERM`/`SIGHUP` on Unix). The shared helper's
     // `enable_all` arms the I/O, time, and signal drivers those need — the
     // child-pipe I/O driver is compiled in through `processkit`'s own tokio
     // `process`/`net` features, and the `time`/`signal` features this crate now
@@ -116,6 +119,67 @@ impl TimeoutTrigger {
     }
 }
 
+/// Which **local stop signal** asked the runner to end the run — the honest
+/// `source` of the `cancelled` JSONL event and the trigger the stderr line names.
+///
+/// **Decision (T-188): SIGTERM and SIGHUP get their own additive `source` values**
+/// (`sigterm` / `sighup`) rather than reusing `ctrl_c`. Reusing `ctrl_c` for a
+/// `systemd stop`, a cancelled CI job, or a plain `kill <pid>` would report a
+/// keyboard interrupt that never happened — the same lie the runner refuses to tell
+/// about a soft stop it could not deliver (see [`SoftTerminate`]/[`describe_teardown`]),
+/// and consumers do act on the difference: "the operator interrupted me" and "my
+/// supervisor is shutting me down" call for different handling. Adding values to an
+/// existing string field is an **additive** schema change (no `schema_version` bump,
+/// see `docs/schema.md`, "Versioning"), so the cost is one enum entry per echo site.
+///
+/// The exit code is *not* split the same way: every local-signal cancel keeps
+/// [`exit::CANCELLED`] (107) and the `cancelled` terminal `runner_exit` source,
+/// because it is the same class of ending (a local signal ended the run) and the more
+/// specific `cancelled.source` already disambiguates it one event earlier — the same
+/// reasoning that kept `--idle-timeout` on `TIMEOUT` (106) rather than minting a code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelSignal {
+    /// The operator pressed `Ctrl-C` (`SIGINT` on Unix, the console handler on
+    /// Windows).
+    CtrlC,
+    /// Unix `SIGTERM`: the standard *external* stop — `kill <pid>`, `systemctl stop`,
+    /// a cancelled CI job, a supervisor's shutdown timeout. Not an interactive
+    /// interrupt, and the most common way a runner is asked to go away.
+    #[cfg(unix)]
+    Term,
+    /// Unix `SIGHUP`: the controlling terminal went away (a closed terminal, a dropped
+    /// SSH session). Treated as a stop, not as the daemon "reload your config"
+    /// convention — this runner supervises exactly one child and has nothing to reload,
+    /// and the default disposition would kill it outright anyway.
+    #[cfg(unix)]
+    Hup,
+}
+
+impl CancelSignal {
+    /// The `cancelled` event's `source` value for this trigger (`docs/schema.md`,
+    /// "cancelled").
+    fn source(self) -> &'static str {
+        match self {
+            CancelSignal::CtrlC => "ctrl_c",
+            #[cfg(unix)]
+            CancelSignal::Term => "sigterm",
+            #[cfg(unix)]
+            CancelSignal::Hup => "sighup",
+        }
+    }
+
+    /// How the stderr line names this trigger to a human.
+    fn phrase(self) -> &'static str {
+        match self {
+            CancelSignal::CtrlC => "Ctrl-C",
+            #[cfg(unix)]
+            CancelSignal::Term => "SIGTERM",
+            #[cfg(unix)]
+            CancelSignal::Hup => "SIGHUP",
+        }
+    }
+}
+
 /// How a run ended — the decision the race in [`run_async`] resolves to.
 enum Ending {
     /// The child exited on its own; carries the raw wait result.
@@ -124,8 +188,10 @@ enum Ending {
     /// `--timeout` ([`TimeoutTrigger::Overall`]) or the `--idle-timeout`
     /// ([`TimeoutTrigger::Idle`]). Both take the same teardown and terminal code.
     TimedOut(TimeoutTrigger),
-    /// The operator pressed `Ctrl-C`.
-    Cancelled,
+    /// A local stop signal reached the runner — `Ctrl-C`, or (Unix) `SIGTERM` /
+    /// `SIGHUP`. All take the same teardown and terminal code; the carried
+    /// [`CancelSignal`] is what tells them apart on the wire.
+    Cancelled(CancelSignal),
     /// A control-plane `cancel` command reached the live runner: the same soft-stop →
     /// grace → hard-kill teardown as `Ctrl-C`, only triggered over the network.
     ControlCancelled,
@@ -143,8 +209,9 @@ enum Termination {
         limit: Duration,
         trigger: TimeoutTrigger,
     },
-    /// The run was cancelled interactively (`Ctrl-C`).
-    Cancelled,
+    /// The run was cancelled by a local stop signal: `Ctrl-C`, or (Unix) `SIGTERM` /
+    /// `SIGHUP`. The carried [`CancelSignal`] names which, so the message stays honest.
+    Cancelled(CancelSignal),
     /// The run was cancelled by a control-plane `cancel` command.
     ControlCancelled,
 }
@@ -522,8 +589,9 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     // first *decides* the outcome; only then does teardown begin, so the owning group
     // is never dropped before the outcome is known.
     //
-    // `biased` order — Ctrl-C, natural exit, control command, overall deadline, idle
-    // deadline, then the control server — makes the tie-breaks deliberate: a `Ctrl-C`
+    // `biased` order — local stop signal, natural exit, control command, overall
+    // deadline, idle deadline, then the control server — makes the tie-breaks
+    // deliberate: a cancel signal (`Ctrl-C`, or Unix `SIGTERM`/`SIGHUP`)
     // always wins, and a child that exits in the very poll a deadline or a control
     // command fires is reported as its own exit rather than a runner-imposed ending
     // (natural exit is polled before all of them). The new `--idle-timeout` arm sits
@@ -543,7 +611,7 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     let capturing = capture.is_some();
     let ending = tokio::select! {
         biased;
-        () = wait_for_ctrl_c() => Ending::Cancelled,
+        signal = wait_for_cancel_signal() => Ending::Cancelled(signal),
         outcome = drive_to_outcome(running, capturing) => Ending::Exited(outcome),
         command = command_rx.recv() => match command {
             Some(control::ControlCommand::Cancel) => Ending::ControlCancelled,
@@ -644,9 +712,14 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             let error = termination_error(Termination::Timeout { limit, trigger }, soft, grace);
             Err(finish(&mut emitter, "timeout", None, error))
         }
-        Ending::Cancelled => {
+        Ending::Cancelled(signal) => {
+            // Every local stop signal — `Ctrl-C`, and on Unix `SIGTERM`/`SIGHUP` —
+            // resolves here and shares everything but the `source`: the reserved
+            // `CANCELLED` (107) code, the `cancelled` runner-exit source, and the
+            // soft-stop → grace → hard-kill teardown. Which signal it was is recorded
+            // honestly rather than flattened onto `ctrl_c` (see `CancelSignal`).
             emitter.emit(&Event::Cancelled {
-                source: "ctrl_c",
+                source: signal.source(),
                 grace_ms: grace.map(duration_ms),
             });
             emit_cleanup_started(&mut emitter, &group);
@@ -654,9 +727,9 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             emit_cleanup_finished(&mut emitter, &group, Some(soft_terminate_label(soft)));
             // A forced ending still reports whatever was captured before teardown.
             emit_output_captured(&mut emitter, &capture);
-            // A Ctrl-C cancel tears the run down cleanly too — its entry goes with it.
+            // A signal cancel tears the run down cleanly too — its entry goes with it.
             clear_registration(&registration);
-            let error = termination_error(Termination::Cancelled, soft, grace);
+            let error = termination_error(Termination::Cancelled(signal), soft, grace);
             Err(finish(&mut emitter, "cancelled", None, error))
         }
         Ending::ControlCancelled => {
@@ -1271,6 +1344,56 @@ async fn idle_deadline(idle: Option<Duration>, clock: &IdleClock) {
     }
 }
 
+/// Resolve when a **local stop signal** asks the runner to end the run, naming which
+/// one arrived. This is the single cancel arm of [`run_async`]'s race, so every signal
+/// it listens for takes the very same teardown (soft stop → `--grace` → hard kill) and
+/// the same reserved [`exit::CANCELLED`] code.
+///
+/// On Unix that is three signals, not one: `SIGINT` (the interactive `Ctrl-C`),
+/// `SIGTERM` (the standard external stop — `kill`, `systemctl stop`, a cancelled CI
+/// job), and `SIGHUP` (the controlling terminal went away). Their **default**
+/// dispositions all terminate the runner outright, which would skip teardown entirely:
+/// no terminal JSONL events, a registry entry left behind, and — the guarantee that
+/// actually matters — no explicit kill of the container, whose abrupt-owner-death reap
+/// covers only the direct child on Linux and nothing at all on macOS/BSD (see
+/// [`crate::events::abrupt_cleanup_str`], K-005). Catching them turns the most common
+/// way a supervisor stops this runner into the same clean, fully-reported teardown a
+/// `Ctrl-C` already got.
+///
+/// Windows keeps the single `Ctrl-C` listener: its console-close/logoff/shutdown
+/// half is a separate, differently-shaped problem (a console control handler with an
+/// OS-imposed deadline) and is deliberately out of scope here.
+///
+/// A handler that cannot be installed degrades to "this signal is not handled" — that
+/// arm never resolves, after an honest warning — rather than aborting an otherwise
+/// healthy run; the remaining arms keep working. A signal the environment has already
+/// neutralized (`SIG_IGN`, as `nohup` does for `SIGHUP`) is left alone rather than
+/// un-ignored behind the operator's back — see [`wait_for_unix_signal`].
+async fn wait_for_cancel_signal() -> CancelSignal {
+    #[cfg(unix)]
+    {
+        // The handlers are installed on first poll of this future — i.e. once the race
+        // begins — and stay installed for the rest of the process: tokio never restores
+        // a default disposition, so a *second* signal arriving mid-teardown is absorbed
+        // rather than killing the runner half-way through the cleanup it is running.
+        // That is deliberate and already the behavior of the existing `Ctrl-C` arm:
+        // teardown is bounded (`--grace` is an upper bound, cut short by
+        // `wait_grace_or_empty`), and finishing it is the whole point of catching the
+        // signal.
+        tokio::select! {
+            biased;
+            () = wait_for_ctrl_c() => CancelSignal::CtrlC,
+            () = wait_for_unix_signal(libc::SIGTERM, "SIGTERM") => CancelSignal::Term,
+            () = wait_for_unix_signal(libc::SIGHUP, "SIGHUP") => CancelSignal::Hup,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        wait_for_ctrl_c().await;
+        CancelSignal::CtrlC
+    }
+}
+
 /// Resolve when the operator presses `Ctrl-C`. If the signal handler cannot be
 /// installed we degrade to "no cancel" (never resolving) after an honest warning,
 /// rather than aborting an otherwise-healthy run.
@@ -1281,6 +1404,65 @@ async fn wait_for_ctrl_c() {
             eprintln!("processkit-cli: warning: Ctrl-C handling is unavailable: {err}");
             std::future::pending::<()>().await;
         }
+    }
+}
+
+/// Resolve when one delivery of the Unix signal `number` arrives. Degrades exactly
+/// like [`wait_for_ctrl_c`]: a handler that cannot be installed warns once and then
+/// parks forever, so this arm simply never wins the race and the run continues
+/// unaffected.
+///
+/// **Never overrides an inherited `SIG_IGN`.** Installing a handler replaces the
+/// disposition unconditionally, including a deliberate "ignore this signal" the
+/// environment set before exec'ing us — `nohup` does exactly that for `SIGHUP`, and a
+/// supervisor may do it for `SIGTERM`. Silently un-ignoring the signal would turn
+/// `nohup processkit-cli run …` from "survives the hangup" into "stops on it", so the
+/// disposition is checked first ([`signal_is_ignored`]) and this arm simply parks
+/// instead. Nothing is lost by doing so: an ignored signal would not have terminated
+/// the runner either, so there is no teardown to rescue — the run continues exactly
+/// as it did before this listener existed. No warning is printed, because this is a
+/// policy the environment chose, not a failure.
+#[cfg(unix)]
+async fn wait_for_unix_signal(number: libc::c_int, name: &str) {
+    if signal_is_ignored(number) {
+        return std::future::pending().await;
+    }
+    let kind = tokio::signal::unix::SignalKind::from_raw(number);
+    let mut signal = match tokio::signal::unix::signal(kind) {
+        Ok(signal) => signal,
+        Err(err) => {
+            eprintln!("processkit-cli: warning: {name} handling is unavailable: {err}");
+            return std::future::pending().await;
+        }
+    };
+    // `recv()` yields `None` only once the underlying handler is torn down, which
+    // cannot happen while this future owns the stream. Park rather than report a
+    // cancel that no signal actually triggered.
+    if signal.recv().await.is_none() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Is this signal's current disposition `SIG_IGN` — i.e. did whoever launched the
+/// runner deliberately neutralize it (the classic case being `nohup`, which ignores
+/// `SIGHUP` before exec)? A disposition *query* only: nothing is installed or
+/// changed here. A failed query reads as "not ignored", so the caller falls back to
+/// its ordinary listener rather than silently dropping a signal it could have caught.
+///
+/// Applied to the **new** `SIGTERM`/`SIGHUP` listeners only, not to the pre-existing
+/// `Ctrl-C` one: this guard exists to avoid *changing* how an already-neutralized
+/// signal behaves, and `Ctrl-C` has always installed its handler unconditionally.
+/// Reworking that would be a behavior change of its own, not part of this addition.
+#[cfg(unix)]
+fn signal_is_ignored(number: libc::c_int) -> bool {
+    // SAFETY: `sigaction` with a null `act` only reads the current disposition and
+    // leaves it untouched; `current` is a valid, writable, zero-initialized value for
+    // the duration of the call (the same plain-C-value pattern as
+    // `ScopedSignalIgnore::acquire`).
+    unsafe {
+        let mut current: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(number, std::ptr::null(), &mut current) == 0
+            && current.sa_sigaction == libc::SIG_IGN
     }
 }
 
@@ -1379,7 +1561,13 @@ fn termination_error(
                 format_duration(limit)
             ),
         ),
-        Termination::Cancelled => (exit::CANCELLED, "run cancelled (Ctrl-C)".to_string()),
+        // Every local-signal cancel surfaces the same reserved code; only the headline
+        // differs, naming the signal that actually arrived (`Ctrl-C`, `SIGTERM`,
+        // `SIGHUP`) so the stderr line is honest about who stopped the run.
+        Termination::Cancelled(signal) => (
+            exit::CANCELLED,
+            format!("run cancelled ({})", signal.phrase()),
+        ),
         Termination::ControlCancelled => (
             exit::CONTROL_CANCELLED,
             "run cancelled by a control-plane command".to_string(),
@@ -1542,7 +1730,7 @@ mod tests {
             Some(Duration::from_secs(2)),
         );
         let cancelled = termination_error(
-            Termination::Cancelled,
+            Termination::Cancelled(CancelSignal::CtrlC),
             SoftTerminate::Signalled,
             Some(Duration::from_secs(2)),
         );
@@ -1622,13 +1810,66 @@ mod tests {
 
     #[test]
     fn cancel_message_names_ctrl_c() {
-        let err = termination_error(Termination::Cancelled, SoftTerminate::Signalled, None);
+        let err = termination_error(
+            Termination::Cancelled(CancelSignal::CtrlC),
+            SoftTerminate::Signalled,
+            None,
+        );
         let msg = err.to_string();
         assert!(
             msg.contains("cancelled"),
             "message should say cancelled: {msg}"
         );
         assert!(msg.contains("Ctrl-C"), "message should name Ctrl-C: {msg}");
+    }
+
+    /// Every local stop signal is the *same class* of ending — a signal ended the run —
+    /// so all of them keep the reserved `CANCELLED` code (K-047: an earlier, more
+    /// specific record already disambiguates, here the `cancelled` event's `source`).
+    /// What must **not** collapse is the reporting: the stderr headline names the
+    /// signal that actually arrived, and the wire `source` values stay distinct, so a
+    /// `systemctl stop` is never reported as a keyboard interrupt.
+    #[cfg(unix)]
+    #[test]
+    fn unix_stop_signals_share_the_cancel_code_but_report_themselves_honestly() {
+        let for_signal = |signal| {
+            termination_error(
+                Termination::Cancelled(signal),
+                SoftTerminate::Signalled,
+                Some(Duration::from_secs(2)),
+            )
+        };
+        let ctrl_c = for_signal(CancelSignal::CtrlC);
+        let sigterm = for_signal(CancelSignal::Term);
+        let sighup = for_signal(CancelSignal::Hup);
+
+        // One class of ending, one reserved code.
+        for err in [&ctrl_c, &sigterm, &sighup] {
+            assert_eq!(err.code(), exit::CANCELLED);
+        }
+
+        // Distinct, honest headlines.
+        let sigterm_msg = sigterm.to_string();
+        assert!(
+            sigterm_msg.contains("run cancelled (SIGTERM)"),
+            "a SIGTERM cancel must name SIGTERM: {sigterm_msg}"
+        );
+        assert!(
+            !sigterm_msg.contains("Ctrl-C"),
+            "a SIGTERM is not a Ctrl-C: {sigterm_msg}"
+        );
+        let sighup_msg = sighup.to_string();
+        assert!(
+            sighup_msg.contains("run cancelled (SIGHUP)"),
+            "a SIGHUP cancel must name SIGHUP: {sighup_msg}"
+        );
+        assert_ne!(ctrl_c.to_string(), sigterm_msg);
+        assert_ne!(sigterm_msg, sighup_msg);
+
+        // And the machine-readable `source` values a consumer switches on.
+        assert_eq!(CancelSignal::CtrlC.source(), "ctrl_c");
+        assert_eq!(CancelSignal::Term.source(), "sigterm");
+        assert_eq!(CancelSignal::Hup.source(), "sighup");
     }
 
     #[test]
@@ -1643,7 +1884,11 @@ mod tests {
             SoftTerminate::Signalled,
             None,
         );
-        let ctrl_c = termination_error(Termination::Cancelled, SoftTerminate::Signalled, None);
+        let ctrl_c = termination_error(
+            Termination::Cancelled(CancelSignal::CtrlC),
+            SoftTerminate::Signalled,
+            None,
+        );
         let control_cancel = termination_error(
             Termination::ControlCancelled,
             SoftTerminate::Signalled,
