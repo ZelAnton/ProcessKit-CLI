@@ -26,8 +26,11 @@ with the `processkit` crate.
   `yaml-lint` (`yamllint .`), `msrv` (`cargo check --all-targets` on the
   toolchain the `msrv` job pins, with `rust-toolchain.toml` removed first —
   see the job for why), and `target-check` (`cargo check --all-targets
-  --target <triplet>` for three release triplets, most of which need a cross
-  toolchain this machine likely lacks) — so a clean run of every `just`
+  --target <triplet>`, now covering only the one release triplet with no
+  native GitHub-hosted runner — `x86_64-unknown-linux-musl`, needing a cross
+  toolchain this machine likely lacks; the two aarch64 triplets it used to
+  cross-compile-check are now covered by real, executed runs of the `test`
+  job below instead — see that job's comment) — so a clean run of every `just`
   target does not by itself guarantee a green CI run; run those three
   directly, or rely on CI, before merging or publishing. `cargo test <name>`,
   the various `cargo install …`/`rustup …` setup commands below, and
@@ -57,6 +60,20 @@ Run a single test (substring match on the test name) with:
 ```sh
 cargo test <name>
 ```
+
+The `test` job's matrix runs on `ubuntu-latest`, `windows-latest`,
+`macos-latest` (already aarch64 — Apple Silicon), and the GitHub-hosted
+arm64 runners `ubuntu-24.04-arm` and `windows-11-arm`, so every aarch64
+release target (see README.md's [platform
+matrix](README.md#platform-matrix)) gets real, executed test coverage, not
+just the compile-only check `target-check` still runs for the one release
+triplet with no native runner (`x86_64-unknown-linux-musl`). The two arm64
+entries are **required** checks from the start, same as the three
+pre-existing entries in this matrix — there is no non-gating grace period
+for them (unlike the informational `coverage`/`perf` jobs, which use
+`continue-on-error` deliberately); if you administer branch protection,
+add `test (ubuntu-24.04-arm)` and `test (windows-11-arm)` to the required
+status checks list alongside the existing `test (*)` entries.
 
 Before opening a pull request or publishing directly to `main`, make sure the
 same gates CI enforces pass locally — CI treats clippy warnings as errors, so a
@@ -159,7 +176,11 @@ just e2e
 platform primitive is unavailable. A scenario that would leak a worker on
 failure is self-healing: the helper workers self-terminate on a bounded timer,
 and the harness never kills by (recyclable) PID. CI runs this tier as a separate
-`e2e` job on Linux, Windows, and macOS.
+`e2e` job with the same OS matrix as `test` above — `ubuntu-latest`,
+`windows-latest`, `macos-latest`, `ubuntu-24.04-arm`, and `windows-11-arm` —
+so this is the tier that most directly exercises each platform's containment
+mechanism (Job Object / cgroup v2 / process group) on real aarch64 hardware,
+not just x86_64.
 
 [`tests/e2e.rs`]: tests/e2e.rs
 

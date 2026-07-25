@@ -68,8 +68,27 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # ubuntu-24.04-arm and windows-11-arm are GitHub-hosted arm64 runners
+      # (free for public repos, same as the x86_64 runners above): they make
+      # this job actually execute the test suite on the same
+      # aarch64-unknown-linux-gnu / aarch64-pc-windows-msvc triplets the
+      # release matrix ships (see release.yml), rather than only
+      # cross-compile-checking them (target-check below). macos-latest is
+      # already aarch64 (Apple Silicon), so with these two additions every
+      # aarch64 release target has real, executed test coverage. These two
+      # entries are required checks from the start, same as the three
+      # existing entries in this matrix (no continue-on-error here, unlike
+      # the informational `coverage`/`perf` jobs) — see CONTRIBUTING.md,
+      # "Build and test".
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os:
+          [
+            ubuntu-latest,
+            windows-latest,
+            macos-latest,
+            ubuntu-24.04-arm,
+            windows-11-arm,
+          ]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@stable # rolling toolchain selector — intentionally unpinned
@@ -178,8 +197,24 @@ jobs:
     timeout-minutes: 20
     strategy:
       fail-fast: false
+      # Same arm64 additions and rationale as the `test` job above: real
+      # execution on the aarch64-unknown-linux-gnu / aarch64-pc-windows-msvc
+      # triplets instead of only target-check's cross-compile check. The e2e
+      # tier's real process trees make it heavier than `test`, but GitHub's
+      # arm64 runners are free for public repos like the x86_64 ones, so the
+      # added cost here is wall-clock time, not billing — acceptable given
+      # this tier is exactly the containment-mechanism-sensitive one (Job
+      # Object / cgroup v2 / process group) the platform matrix exists to
+      # cover.
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os:
+          [
+            ubuntu-latest,
+            windows-latest,
+            macos-latest,
+            ubuntu-24.04-arm,
+            windows-11-arm,
+          ]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@stable # rolling toolchain selector — intentionally unpinned
@@ -198,16 +233,21 @@ jobs:
       # each platform skip (e.g. the `dotnet`-absent skip).
       - run: cargo test --features e2e --test e2e -- --nocapture
 
-  # release.yml's build-artifacts matrix ships six target triplets; the
-  # `test` job above only exercises each runner's host triplet (x86_64 on
-  # ubuntu-latest/windows-latest, aarch64 on macos-latest — the default
-  # macos-latest image is Apple Silicon). This job cross-checks the three
-  # remaining release targets with `cargo check --all-targets` (no test run,
-  # just a compile check) so a platform regression surfaces here instead of on
-  # release day. musl and aarch64-linux use the same apt cross toolchains as
-  # release.yml's build-artifacts job; aarch64-pc-windows-msvc cross-compiles
-  # from windows-latest (the ARM64 MSVC tools are present on the hosted
-  # image, same as release.yml).
+  # release.yml's build-artifacts matrix ships six target triplets. With the
+  # `test`/`e2e` jobs above now running natively on ubuntu-24.04-arm and
+  # windows-11-arm (in addition to macos-latest, already Apple Silicon),
+  # five of those six triplets get real, executed test coverage — not just a
+  # compile check. This job now cross-checks only the one release target
+  # that still has no native runner to execute on:
+  # x86_64-unknown-linux-musl (GitHub does not host a musl-libc runner).
+  # `cargo check --all-targets` (no test run, just a compile check) surfaces
+  # a build regression here instead of on release day; musl uses the same
+  # apt cross toolchain as release.yml's build-artifacts job. The two
+  # aarch64 entries this job used to cross-compile-check
+  # (aarch64-pc-windows-msvc, aarch64-unknown-linux-gnu) were dropped: they
+  # would now duplicate the compilation half of the `test` job's native
+  # aarch64 runs, and native execution is a strictly stronger check than a
+  # cross-compiled `cargo check`.
   target-check:
     name: target-check (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
@@ -215,11 +255,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: aarch64-pc-windows-msvc
-            os: windows-latest
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            apt: gcc-aarch64-linux-gnu
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             apt: musl-tools
@@ -231,19 +266,15 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: ${{ matrix.target }}
-      # Cross toolchain for the Linux targets that need one: the aarch64 glibc
-      # linker, or musl's libc for the static build. Native ubuntu-latest
-      # matrix entries skip this (no `apt` set).
+      # musl's libc for the static build (the only remaining entry in this
+      # matrix; see the job comment above for why the aarch64 entries and
+      # their cross toolchains were dropped).
       - name: Install Linux cross toolchain
         if: ${{ matrix.apt != '' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.apt }}
-      # The aarch64 glibc linker override only applies to that exact triple;
-      # cargo ignores it for every other target in this matrix.
       - name: cargo check --all-targets
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo check --all-targets --target ${{ matrix.target }}
 
   audit:
