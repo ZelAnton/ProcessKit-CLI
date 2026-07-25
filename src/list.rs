@@ -3,7 +3,7 @@
 //! The by-`run_id` commands (`inspect`/`cancel`/`kill`) all require an operator or
 //! orchestrator to already know which run to target; `list` is the discovery
 //! counterpart — it scans the registry ([`registry::Registry::entries`]) and prints
-//! every entry it finds, live or stale, so a caller that lost (or never had) a
+//! every entry it finds, whatever its health, so a caller that lost (or never had) a
 //! `run_id` can find one. It is read-only: it never connects to a runner's control
 //! transport and never mutates the registry, so it carries none of the
 //! reach-a-live-runner failure modes `inspect`/`cancel`/`kill` do (see
@@ -17,6 +17,17 @@
 //! corrupt/unreadable record never blinds the command to the healthy entries: that
 //! degradation already lives in [`registry::Registry::entries`], so this module
 //! does not need to (and does not) duplicate it.
+//!
+//! **Health vocabulary (T-206).** [`registry::Health`] has three values, not two:
+//! [`registry::Health::Live`], [`registry::Health::Stale`] (**confirmed** dead — the
+//! probe succeeded and found no holder), and [`registry::Health::Unprobed`] (the
+//! probe itself could not run — e.g. permission denied, or the lock file replaced by
+//! something the probe refuses to open — so liveness is genuinely unknown). Printing
+//! an unprobed entry as `"stale"` would assert a confirmed death the probe never
+//! established; [`health_str`] renders it as its own `"unprobed"` value instead, the
+//! same vocabulary `prune --json`'s tallies and `wait`'s `RunStatus::Unprobed`
+//! already use for the identical case (`docs/registry.md`). This is additive to
+//! `list --json`'s existing `"live"`/`"stale"` contract.
 
 use std::path::PathBuf;
 
@@ -35,9 +46,18 @@ struct ListEntry {
     /// The run's identifier — the value a caller passes as `--run-id` to
     /// `inspect`/`cancel`/`kill`.
     run_id: String,
-    /// `"live"` or `"stale"`, the same vocabulary [`registry::Health`] documents:
-    /// a live runner still holds its liveness lock; a stale entry is a leftover
-    /// record from a runner that died abruptly without cleaning up.
+    /// `"live"`, `"stale"`, or `"unprobed"` — the same three-value vocabulary
+    /// [`registry::Health`] documents, and the one `prune --json`'s tallies and
+    /// `wait`'s `RunStatus` already use for the same distinction (see
+    /// `docs/registry.md`): a live runner still holds its liveness lock; a stale
+    /// entry is a **confirmed** leftover record from a runner that died abruptly
+    /// without cleaning up; an unprobed entry is one whose liveness lock could not
+    /// even be opened (e.g. permission denied, or an unexpected non-regular file in
+    /// its place) — its fate is genuinely unknown, never a positive "the runner is
+    /// dead" claim. New, additive value as of the value's introduction — a consumer
+    /// that already handles `"live"`/`"stale"` and treats any other string as
+    /// "not live" needs no change; one that matched exhaustively on exactly those two
+    /// strings must be updated to accept `"unprobed"` too.
     health: &'static str,
     /// Run start time, RFC 3339 UTC with millisecond precision (the same
     /// formatter every other timestamp in this binary uses).
@@ -115,11 +135,15 @@ fn sort_rows(rows: &mut [(PathBuf, ListEntry)]) {
 
 /// `health` rendered in the vocabulary `list` prints and serializes — never the
 /// `Debug` form, so the output is a stable, documented contract independent of how
-/// [`registry::Health`]'s derive happens to render.
+/// [`registry::Health`]'s derive happens to render. Deliberately no wildcard arm: a
+/// future [`registry::Health`] variant fails this module's build until `list`'s
+/// vocabulary is extended for it too, rather than silently omitting it from the
+/// operator-facing output.
 fn health_str(health: Health) -> &'static str {
     match health {
         Health::Live => "live",
         Health::Stale => "stale",
+        Health::Unprobed => "unprobed",
     }
 }
 
@@ -205,6 +229,7 @@ mod tests {
     fn health_str_uses_the_documented_vocabulary() {
         assert_eq!(health_str(Health::Live), "live");
         assert_eq!(health_str(Health::Stale), "stale");
+        assert_eq!(health_str(Health::Unprobed), "unprobed");
     }
 
     /// A `ListEntry` round-trips through JSON with the exact field names a

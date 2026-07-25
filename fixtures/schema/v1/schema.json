@@ -172,9 +172,10 @@
         "schema_version": { "$ref": "#/$defs/schemaVersion" },
         "time": { "$ref": "#/$defs/time" },
         "event": { "const": "cleanup_started" },
-        "members_before": { "$ref": "#/$defs/nonNegativeInt", "description": "The tree size (member count) about to be reaped." }
+        "members_before": { "$ref": "#/$defs/nonNegativeInt", "description": "The tree size (member count) about to be reaped." },
+        "read_error": { "type": "boolean", "description": "true when the pre-cleanup member read itself failed, in which case members_before is a 0 fallback, not a confirmed empty tree." }
       },
-      "required": ["schema_version", "time", "event", "members_before"],
+      "required": ["schema_version", "time", "event", "members_before", "read_error"],
       "additionalProperties": false
     },
     "cleanupFinished": {
@@ -194,9 +195,10 @@
           "type": ["string", "null"],
           "enum": ["signalled", "unsupported", "failed", null],
           "description": "The soft-stop tier for a runner-imposed ending; null on the natural-exit path."
-        }
+        },
+        "read_error": { "type": "boolean", "description": "true when the post-kill member read itself failed, in which case remaining/remaining_pids fall back to an empty snapshot, not a confirmed-clean teardown." }
       },
-      "required": ["schema_version", "time", "event", "remaining", "remaining_pids", "soft_terminate"],
+      "required": ["schema_version", "time", "event", "remaining", "remaining_pids", "soft_terminate", "read_error"],
       "additionalProperties": false
     },
     "limitHit": {

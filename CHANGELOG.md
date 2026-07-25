@@ -29,12 +29,31 @@ to a dated version section.
   publish`; CI runs it as a separate, non-gating scheduled `stress.yml`
   workflow (see CONTRIBUTING.md, "Stress tests"). No runtime behavior, CLI
   surface, exit code, or event-schema change.
+- `cleanup_started`/`cleanup_finished` gained an additive `read_error` field: `true`
+  when the underlying container-member read itself failed, so a `0`/empty fallback
+  is never indistinguishable from a confirmed empty tree or a confirmed-clean
+  teardown (mirrors `output_captured`'s `write_error`). See "Fixed" below.
 
 ### Changed
 -
 
 ### Fixed
--
+- **`cleanup_started`/`cleanup_finished` no longer fabricate a confirmed `0` on a
+  member-read failure.** Both emitters previously turned a `ProcessGroup::members()`
+  read error into a silent `members_before: 0` / `remaining: 0, remaining_pids: []` —
+  indistinguishable from a genuinely empty tree, and inconsistent with the sibling
+  `emit_members_snapshot`'s honest degradation and `wait_grace_or_empty`'s "a read
+  failure is not a confirmed empty tree" policy. Both now warn on stderr on a read
+  failure and set the new `read_error: true` flag instead of letting the fallback
+  stand as an observation; the success path is unaffected.
+- `list` (`--json` and the human-readable table) no longer prints a registry entry
+  whose liveness lock could not even be *probed* (permission denied, a rejected
+  symlink/reparse point, an unexpected non-regular file in its place) as `"stale"` —
+  a positive, unconfirmed claim that the runner is dead. It now reports a distinct
+  `"unprobed"` health value, matching the three-way vocabulary `prune --json`'s
+  `unprobed` tally and `wait` already use for the identical case. Additive change to
+  `list --json`'s `health` field; `inspect`/`cancel`/`kill`, which act only on a
+  confirmed-live entry, are unaffected.
 
 ## [0.3.0] - 2026-07-25
 

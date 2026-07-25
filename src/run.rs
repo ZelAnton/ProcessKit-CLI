@@ -1798,13 +1798,59 @@ fn emit_members_snapshot(emitter: &mut Emitter, group: &ProcessGroup) {
     }
 }
 
+/// The shared honest-degradation policy behind [`emit_cleanup_started`]'s
+/// `members_before`/`read_error`: `Ok` reports the confirmed count, `Err` falls
+/// back to the pre-existing `0` but flags it `read_error: true` instead of
+/// letting it stand as a confirmed empty tree (see [`Event::CleanupStarted`]).
+/// Pulled out as a pure function over a synthetic `Result` — like its
+/// `emit_cleanup_finished`-side sibling [`remaining_pids_or_unknown`] — because
+/// the real `Err` path is backend-internal plumbing not reliably forceable from a
+/// spawned test child (see `hard_teardown_tail_emits_the_shared_sequence_in_order`'s
+/// doc comment), so the honest-degradation branch is exercised here directly
+/// instead of only through an always-`Ok` integration test (K-059: a real
+/// injected failure, not a vacuous happy-path-only assertion).
+fn members_len_or_unknown(members: Result<Vec<u32>, PkError>) -> (usize, bool) {
+    match members {
+        Ok(pids) => (pids.len(), false),
+        Err(_) => (0, true),
+    }
+}
+
 /// Mark the start of container teardown with the full tree size about to be
 /// reaped. Emitted before any termination action (including the soft stop on a
 /// runner-imposed ending), so `members_before` is the whole tree, not a post-soft
 /// remnant.
+///
+/// A `group.members()` read failure is not silently fabricated as "0 members
+/// before cleanup": it warns on stderr — the same honest-degradation convention
+/// as the sibling [`emit_members_snapshot`] — and [`members_len_or_unknown`]'s
+/// `read_error` flag tells a JSONL consumer the `0` fallback is not a confirmed
+/// empty tree.
 fn emit_cleanup_started(emitter: &mut Emitter, group: &ProcessGroup) {
-    let members_before = group.members().map(|pids| pids.len()).unwrap_or(0);
-    emitter.emit(&Event::CleanupStarted { members_before });
+    let members = group.members();
+    if let Err(err) = &members {
+        eprintln!(
+            "processkit-cli: warning: could not read container members before cleanup: {err}"
+        );
+    }
+    let (members_before, read_error) = members_len_or_unknown(members);
+    emitter.emit(&Event::CleanupStarted {
+        members_before,
+        read_error,
+    });
+}
+
+/// The shared honest-degradation policy behind [`emit_cleanup_finished`]'s
+/// `remaining`/`remaining_pids`/`read_error`: `Ok` reports the confirmed post-kill
+/// snapshot, `Err` falls back to the pre-existing empty list but flags it
+/// `read_error: true` instead of letting it stand as a confirmed-clean teardown
+/// (see [`Event::CleanupFinished`], and [`members_len_or_unknown`] for why this is
+/// a pure function unit-tested against a synthetic `Result`).
+fn remaining_pids_or_unknown(members: Result<Vec<u32>, PkError>) -> (Vec<u32>, bool) {
+    match members {
+        Ok(pids) => (pids, false),
+        Err(_) => (Vec::new(), true),
+    }
 }
 
 /// Hard-kill the container and mark teardown finished with a post-kill member
@@ -1814,13 +1860,25 @@ fn emit_cleanup_started(emitter: &mut Emitter, group: &ProcessGroup) {
 /// kill error is best-effort: the group's drop is still a backstop. `soft` labels
 /// the soft-stop tier of a runner-imposed ending, or `None` on the natural-exit
 /// path where no soft stop was attempted.
+///
+/// A post-kill `group.members()` read failure is not silently fabricated as "0
+/// remaining, confirmed clean": it warns on stderr, matching the honest
+/// degradation [`wait_grace_or_empty`] already applies to the same read (a
+/// failure there is treated as "not yet empty", never as a confirmed-empty
+/// tree — see its doc comment), and [`remaining_pids_or_unknown`]'s `read_error`
+/// flag carries that same "not confirmed" verdict onto the wire.
 fn emit_cleanup_finished(emitter: &mut Emitter, group: &ProcessGroup, soft: Option<&'static str>) {
     let _ = group.kill_all();
-    let remaining_pids = group.members().unwrap_or_default();
+    let members = group.members();
+    if let Err(err) = &members {
+        eprintln!("processkit-cli: warning: could not read container members after cleanup: {err}");
+    }
+    let (remaining_pids, read_error) = remaining_pids_or_unknown(members);
     emitter.emit(&Event::CleanupFinished {
         remaining: remaining_pids.len(),
         remaining_pids,
         soft_terminate: soft,
+        read_error,
     });
 }
 
@@ -3416,5 +3474,59 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `emit_cleanup_started`'s real `Err` path (a `group.members()` read
+    /// failure) is not reliably forceable from a spawned test child — like the
+    /// sibling `Err` arms this module already documents as untestable through the
+    /// real backend (see `hard_teardown_tail_emits_the_shared_sequence_in_order`'s
+    /// doc comment) — so the honest-degradation policy is proven directly against
+    /// the pure [`members_len_or_unknown`] with a real injected `Err`, not just an
+    /// always-`Ok` happy path (K-059).
+    #[test]
+    fn members_len_or_unknown_flags_a_read_failure_instead_of_a_confirmed_zero() {
+        assert_eq!(
+            members_len_or_unknown(Ok(vec![4242, 4243])),
+            (2, false),
+            "a successful read reports the real count, unflagged"
+        );
+        assert_eq!(
+            members_len_or_unknown(Ok(Vec::new())),
+            (0, false),
+            "a successful read of an empty tree is a confirmed zero, unflagged — \
+             distinct from the failure fallback below despite the same count"
+        );
+        let simulated = PkError::Io(std::io::Error::other("simulated members() failure"));
+        assert_eq!(
+            members_len_or_unknown(Err(simulated)),
+            (0, true),
+            "a read failure must not be indistinguishable from a confirmed-empty tree"
+        );
+    }
+
+    /// The `emit_cleanup_finished` twin of the test above, over the pure
+    /// [`remaining_pids_or_unknown`] — same K-059 rationale (the real `Err` path
+    /// is backend-internal plumbing, not deterministically triggerable from a
+    /// spawned test child).
+    #[test]
+    fn remaining_pids_or_unknown_flags_a_read_failure_instead_of_a_confirmed_clean_teardown() {
+        assert_eq!(
+            remaining_pids_or_unknown(Ok(vec![4242])),
+            (vec![4242], false),
+            "a successful read reports the real snapshot, unflagged"
+        );
+        assert_eq!(
+            remaining_pids_or_unknown(Ok(Vec::new())),
+            (Vec::new(), false),
+            "a successful read of an empty tree is a confirmed-clean teardown, \
+             unflagged — distinct from the failure fallback below despite the \
+             same empty snapshot"
+        );
+        let simulated = PkError::Io(std::io::Error::other("simulated members() failure"));
+        assert_eq!(
+            remaining_pids_or_unknown(Err(simulated)),
+            (Vec::new(), true),
+            "a read failure must not be indistinguishable from a confirmed-clean teardown"
+        );
     }
 }

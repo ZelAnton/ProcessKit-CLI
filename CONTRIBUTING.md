@@ -18,12 +18,38 @@ with the `processkit` crate.
   verified by the `msrv` CI job. `stable` is normally newer than the floor, so
   this only matters if you adopt a newer language or `std` feature — bump
   `rust-version` and the `msrv` job's toolchain together if you do.
+- Optionally, [`just`](https://github.com/casey/just#installation) — the repo
+  ships a [`justfile`](justfile) covering the main dev-lanes (`just test`,
+  `just lint`, …); each target mirrors the exact command its CI counterpart
+  runs, so it never drifts from what CI actually does. Coverage is not
+  complete, though: three **gating** `ci.yml` jobs have no `just` equivalent —
+  `yaml-lint` (`yamllint .`), `msrv` (`cargo check --all-targets` on the
+  toolchain the `msrv` job pins, with `rust-toolchain.toml` removed first —
+  see the job for why), and `target-check` (`cargo check --all-targets
+  --target <triplet>` for three release triplets, most of which need a cross
+  toolchain this machine likely lacks) — so a clean run of every `just`
+  target does not by itself guarantee a green CI run; run those three
+  directly, or rely on CI, before merging or publishing. `cargo test <name>`,
+  the various `cargo install …`/`rustup …` setup commands below, and
+  `cargo +nightly fuzz build` also have no dedicated target. Both the `just`
+  and plain-`cargo` forms are documented in the sections below; where a `just`
+  target exists, `just <target>` is the shorter path. Before any of the
+  above, `just check-env` (or `bash scripts/check-env.sh` /
+  `pwsh scripts/check-env.ps1` directly) confirms a stable Rust toolchain is
+  on `PATH`.
 
 ## Build and test
 
 ```sh
 cargo build
 cargo test
+```
+
+Or, mirroring CI's `test` job exactly (`cargo build --all-targets` before
+`cargo test`):
+
+```sh
+just test
 ```
 
 Run a single test (substring match on the test name) with:
@@ -38,8 +64,16 @@ clean run is required:
 
 ```sh
 cargo clippy --all-targets --all-features -- -D warnings
-cargo fmt --check
+cargo fmt --all --check
 cargo deny check advisories bans licenses sources
+```
+
+or, one target per gate:
+
+```sh
+just lint
+just fmt-check
+just deny
 ```
 
 ## Documentation quality
@@ -59,6 +93,13 @@ Run the same checks locally before opening a pull request:
 ```sh
 typos .
 lychee --offline --config .lychee.toml README.md CONTRIBUTING.md SECURITY.md CHANGELOG.md 'docs/**/*.md'
+```
+
+or, as one target (`just docs-checks`, running both commands above in
+sequence):
+
+```sh
+just docs-checks
 ```
 
 Install both once:
@@ -106,6 +147,12 @@ trees and run longer. Run it explicitly:
 
 ```sh
 cargo test --features e2e --test e2e -- --nocapture
+```
+
+or:
+
+```sh
+just e2e
 ```
 
 `--nocapture` surfaces the explicit `SKIP …` line a scenario prints when its
@@ -212,6 +259,15 @@ cd fuzz
 cargo +nightly fuzz run registry_record -- -max_total_time=60
 ```
 
+or, a short bounded smoke run of any target from the repo root (defaults to
+`registry_record` for 10 seconds; both are overridable — `just fuzz-smoke
+control_wire 30`), useful as a quick local sanity check rather than a real
+fuzzing session:
+
+```sh
+just fuzz-smoke
+```
+
 A crash minimizes to a reproducing input under `fuzz/artifacts/<target>/`; feed
 it back to `cargo +nightly fuzz run <target> <path-to-input>` to reproduce.
 `cargo +nightly fuzz build` alone (no `run`) is enough to confirm the fuzz crate
@@ -257,10 +313,36 @@ feature-gated `e2e` tier:
 cargo llvm-cov --open
 ```
 
-`--open` builds an HTML report and opens it in your browser; drop the flag for
-a plain terminal summary instead.
+or:
+
+```sh
+just coverage
+```
+
+`--open` builds an HTML report and opens it in your browser; drop the flag (or
+edit the `coverage` target) for a plain terminal summary instead.
 
 [`cargo-llvm-cov`]: https://github.com/taiki-e/cargo-llvm-cov
+
+## Benchmarks
+
+CI publishes a [criterion]-based regression lane to the non-gating `perf`
+job's step summary on every push/PR — see [README.md, "Benchmarks"] for what
+it covers (internal primitives plus through-the-binary scenarios) and how to
+read the results. Run the same command locally:
+
+```sh
+cargo bench --features bench
+```
+
+or:
+
+```sh
+just bench
+```
+
+[criterion]: https://github.com/bheisler/criterion.rs
+[README.md, "Benchmarks"]: README.md#benchmarks
 
 ## Mutation testing
 
@@ -310,6 +392,14 @@ all of it:
 
 ```sh
 cargo mutants --shard 0/8
+```
+
+The `just mutants` target forwards any arguments straight to `cargo mutants`,
+so both look like:
+
+```sh
+just mutants --file src/hash.rs
+just mutants --shard 0/8
 ```
 
 Results land under `mutants.out/`: `missed.txt` lists survivors, `caught.txt`/

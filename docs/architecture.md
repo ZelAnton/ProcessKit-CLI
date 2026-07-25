@@ -28,7 +28,7 @@ Responsibilities, in the order data flows through a `run`:
 | [`src/hash.rs`](../src/hash.rs) | The one hand-rolled incremental/one-shot SHA-256 (FIPS 180-4) both `events` (argv fingerprint) and `capture` (streamed transcript hashing) build on, so the project has a single digest primitive and rendering style. |
 | [`src/registry.rs`](../src/registry.rs) | The per-user run registry: one record per in-flight run in an owner-only-restricted directory, found by scanning and matching `run_id` (never a PID), with staleness detected via an OS advisory lock the live runner holds (see [`docs/registry.md`](registry.md)). The first brick of the control plane. |
 | [`src/control.rs`](../src/control.rs) | The live-run control plane: the per-run local IPC transport (unix domain socket / Windows named pipe, owner-restricted) stood up inside `run`, its line-oriented `inspect`/`cancel`/`kill` wire protocol, and the three clients that speak it (see [`docs/control-plane.md`](control-plane.md)). |
-| [`src/list.rs`](../src/list.rs) | The `list` subcommand: a thin, read-only CLI wrapper over `Registry::entries` that renders every registry entry — live and stale — as a table or JSON Lines, for a caller that has lost (or never had) a `run_id`. |
+| [`src/list.rs`](../src/list.rs) | The `list` subcommand: a thin, read-only CLI wrapper over `Registry::entries` that renders every registry entry — whatever its health (live/stale/unprobed) — as a table or JSON Lines, for a caller that has lost (or never had) a `run_id`. |
 | [`src/prune.rs`](../src/prune.rs) | The `prune` subcommand: an equally thin wrapper over `Registry::prune`, which owns the whole confirm-before-delete reaping safety rule; this module only opens the registry and reports the tally. |
 | [`src/wait.rs`](../src/wait.rs) | The `wait` subcommand: blocks until a run is no longer live, for a supervisor that is not the runner's parent. Registry-only — it polls `Registry::probe_run` and never contacts the runner — so its three outcomes (finished, its own `--timeout` elapsing, an ambiguous `run_id`) are decided entirely from the registry (see [`docs/registry.md`](registry.md), "Waiting — `wait`"). |
 | [`src/probe.rs`](../src/probe.rs) | The side-effect-free `probe` subcommand: reports (and, with `--require-*`, verifies) this binary's version/`schema_version`/exit-code band/CLI surface as one JSON line. |
@@ -160,10 +160,14 @@ implemented in `run::execute`/`run::run_async` (`src/run.rs`):
 by PID; they resolve it through the run registry (`src/registry.rs`):
 
 1. **Registry scan.** `registry::Registry::entries` lists every record in the
-   per-user registry directory and classifies each as live or
-   [`registry::Health::Stale`] by probing the record's advisory liveness
-   lock — a dead runner's leftover record is detected this way, not by mere
-   file existence (see [`docs/registry.md`](registry.md)).
+   per-user registry directory and classifies each by probing the record's
+   advisory liveness lock — a dead runner's leftover record is detected this
+   way, not by mere file existence — as [`registry::Health::Live`],
+   confirmed-dead [`registry::Health::Stale`], or (when the probe itself could
+   not run, e.g. permission denied) [`registry::Health::Unprobed`]; this
+   control-plane contour only ever acts on `Live`, so `Stale` and `Unprobed`
+   are equivalent here (see [`docs/registry.md`](registry.md); `list` is the
+   consumer that tells the latter two apart).
 2. **Endpoint resolution.** `control::resolve_live_endpoint` matches the
    requested `run_id` against the live entries only. More than one live match
    is an **ambiguous run id** — a hard `CONTROL` (103) failure for every verb,

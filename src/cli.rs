@@ -36,7 +36,8 @@ pub enum Command {
     Kill(TargetArgs),
     /// Block until a run recorded in the per-user registry has finished.
     Wait(WaitArgs),
-    /// List every run recorded in the per-user registry, live and stale alike.
+    /// List every run recorded in the per-user registry, whatever its health
+    /// (live/stale/unprobed).
     List(ListArgs),
     /// Reap the registry's confirmed-stale entries — the leftover records of runners
     /// that died abruptly — while never touching a live run's entry.
@@ -50,7 +51,8 @@ pub enum Command {
 /// [--timeout <duration>] [--idle-timeout <duration>] [--grace <duration>]
 /// [--max-memory <size>] [--max-processes <n>] [--cpu-quota <cores>]
 /// [--capture-dir <dir>] [--capture-max-bytes <size>] [--no-echo] [--detach]
-/// [--argv-raw] [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
+/// [--argv-raw] [--env-clear] [--env-remove <KEY>] [--env <KEY=VALUE>]
+/// [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
 /// -- <program> <args...>`
 //
 // `run` consumes every field: `cwd`, `create_no_window`, `timeout`,
@@ -317,7 +319,7 @@ pub struct WaitArgs {
 /// `list [--json]`
 ///
 /// Scans the per-user registry ([`crate::registry::Registry::entries`]) and prints
-/// every entry it finds, live or stale — the discovery counterpart to the
+/// every entry it finds, whatever its health (live/stale/unprobed) — the discovery counterpart to the
 /// by-`run-id` commands above, for an operator or orchestrator that has lost (or
 /// never had) a `run_id`. An empty registry is not an error: it prints an empty
 /// result and exits `0`, and a single unreadable/corrupt record never blinds the

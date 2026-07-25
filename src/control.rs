@@ -235,9 +235,54 @@ const CONNECT_DEADLINE: Duration = Duration::from_secs(5);
 /// A live-but-wedged runner is bounded by this instead of hanging the client.
 const CONVERSATION_DEADLINE: Duration = Duration::from_secs(5);
 
-/// How long the *server* spends on a single client exchange before dropping it, so a
-/// client that connects and then stalls cannot wedge the accept loop for other
-/// inspect clients (the run's own path is already independent of this).
+/// How long the *server* spends on a single client exchange before dropping it.
+/// Both platform accept loops ([`ControlServer::serve`], unix and Windows alike)
+/// serve connections strictly **sequentially**: one [`handle_connection`] call is
+/// awaited to completion (or this timeout) before the loop accepts or services the
+/// next, so a client that connects and then stalls blocks every client queued behind
+/// it, with no bound on how long a queue of stalled clients can grow (the run's own
+/// path is already independent of this and never waits on a control client). This is
+/// not merely an added-latency bound for the client stuck behind the stall: behind
+/// exactly **one** stalled peer, a client usually still gets served on both
+/// platforms, just later — with added latency up to roughly this deadline (the
+/// margin is how much later it connected than the stalled peer; if the two connect
+/// almost simultaneously, it is a race). Where the threshold at which a queued
+/// client actually fails *without* ever being served sits, and which deadline fires,
+/// differ by platform, because unix and Windows queue waiting clients differently:
+///
+/// - **unix:** the kernel backlog admits a connecting client's `accept()`
+///   immediately no matter how deep the queue is, so every queued client's
+///   [`CONVERSATION_DEADLINE`] window starts at roughly the same time as its peers',
+///   independent of how far the server has gotten through the queue. Starting from a
+///   **second** stalled peer already queued ahead, the accumulated wait before the
+///   server reaches this client exceeds its own 5 seconds, and it is dropped without
+///   ever being serviced. This surfaces as [`CONVERSATION_DEADLINE`] firing
+///   ([`CONNECT_DEADLINE`] never triggers on unix in this scenario, since the connect
+///   itself never blocks).
+/// - **Windows:** only one pipe instance is ever free at a time, and the next
+///   instance is created exactly when the server starts servicing the current one
+///   (`server.connect().await` immediately followed by `create_instance` in
+///   [`ControlServer::serve`]'s Windows impl), so a client at queue position *k+1*
+///   cannot even connect until the server begins servicing position *k*. Its
+///   [`CONVERSATION_DEADLINE`] window therefore only starts once it connects, and
+///   that window covers the ≤5-second service of just the *one* peer immediately
+///   ahead of it — so, unlike unix, a client behind even a second stalled peer is
+///   normally still serviced once it does connect. Windows' actual failure mode is
+///   on the *connect* side instead: a client that cannot yet reach a free instance
+///   retries against `ERROR_PIPE_BUSY`, bounded by its own [`CONNECT_DEADLINE`]
+///   (`connect`, this module's Windows impl) — and because each queue position's
+///   connect window only opens roughly this deadline later than the position ahead
+///   of it, that failure starts at a materially deeper queue position than unix's
+///   two, not at the same numeric threshold.
+///
+/// Either way the failure surfaces as the reserved [`exit::CONTROL`] (103) exit
+/// code; for `cancel`/`kill` that means the command was never delivered
+/// (fail-closed, but a real failure, not a delay). The channel is owner-only, not
+/// exposed to an untrusted network peer, so this is not a network-facing
+/// vulnerability: what this deadline guarantees is only that *one* stalled client
+/// cannot wedge the loop forever, not that other clients are served concurrently or
+/// reliably reach the server once a deep-enough queue of stalled clients is ahead of
+/// them.
 const CONNECTION_DEADLINE: Duration = Duration::from_secs(5);
 
 /// The byte ceiling on the *one* line either side of the wire protocol reads: the
@@ -406,9 +451,13 @@ pub async fn serve(
 }
 
 /// Handle one accepted connection: read the request verb, write the JSON response,
-/// close. Bounded by [`CONNECTION_DEADLINE`] so a client that connects and stalls
-/// cannot wedge the accept loop. Errors are swallowed — a broken client connection is
-/// never the run's problem.
+/// close. Bounded by [`CONNECTION_DEADLINE`], so a stalled client cannot wedge the
+/// accept loop *forever* — but every caller (both platform `serve` loops) awaits this
+/// inline, one connection at a time, so a stalled client still blocks the *next*
+/// client's accept and service (see [`CONNECTION_DEADLINE`]'s doc comment for the
+/// exact, platform-dependent threshold at which a queued client fails outright with
+/// [`exit::CONTROL`] before ever being serviced — it differs between unix and
+/// Windows and which deadline fires differs too).
 async fn handle_connection<S>(stream: S, source: &SnapshotSource<'_>, commands: &ControlCommandSink)
 where
     S: AsyncRead + AsyncWrite + Unpin,

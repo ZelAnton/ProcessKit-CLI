@@ -122,8 +122,22 @@ pub enum Health {
     /// A live runner holds the entry's advisory lock: the run is running.
     Live,
     /// No process holds the lock (the runner exited abruptly without cleaning up, or
-    /// the lock file is gone): the entry is stale and must not be treated as live.
+    /// the lock file is gone): the entry is **confirmed** stale and must not be
+    /// treated as live.
     Stale,
+    /// The liveness probe itself could not be performed — the lock file would not
+    /// open (EISDIR, permission denied, a rejected symlink/reparse point) or the
+    /// lock call errored. Liveness is **unknown**, not confirmed stale: this is the
+    /// same "probe failed" case [`Registry::prune`]'s own [`probe_for_prune`] and
+    /// [`Registry::probe_run`]'s own [`probe_health`] call already keep apart from a
+    /// confirmed-dead entry (see [K-024]) — [`Registry::entries`] now keeps it apart
+    /// too, instead of folding it into [`Health::Stale`]. Every control client
+    /// (`inspect`/`cancel`/`kill`) that matches only on [`Health::Live`] treats this
+    /// exactly like `Stale` — refusing to act — so their behavior is unchanged; only
+    /// `list`, the operator-facing discovery surface, prints it as a distinct value
+    /// rather than the misleadingly positive claim "stale" (the runner is confirmed
+    /// dead), which the probe never actually established.
+    Unprobed,
 }
 
 /// A scanned registry entry: its parsed [`Record`], its probed [`Health`], and the
@@ -358,15 +372,16 @@ impl Registry {
         })
     }
 
-    /// Scan every entry, classifying each as [`Health::Live`] or [`Health::Stale`]
-    /// by probing its lock file. A malformed *record* (unparsable JSON, or one whose
-    /// `started_at`/`lock_file` field is not the shape a well-behaved runner writes)
-    /// is corrupt-record noise and is skipped outright — there is no lock path worth
-    /// probing. A well-formed record whose lock file *cannot be probed* (any
-    /// non-`NotFound` error opening it, or a lock/unlock error) is different: the
-    /// record itself is trustworthy, only its liveness is unknowable, so the entry is
-    /// still returned — classified [`Health::Stale`] ("could not confirm liveness ⇒
-    /// treat as not live") — rather than dropped. A failure to even iterate one
+    /// Scan every entry, classifying each as [`Health::Live`], [`Health::Stale`], or
+    /// [`Health::Unprobed`] by probing its lock file. A malformed *record*
+    /// (unparsable JSON, or one whose `started_at`/`lock_file` field is not the shape
+    /// a well-behaved runner writes) is corrupt-record noise and is skipped outright
+    /// — there is no lock path worth probing. A well-formed record whose lock file
+    /// *cannot be probed* (any non-`NotFound` error opening it, or a lock/unlock
+    /// error) is different: the record itself is trustworthy, only its liveness is
+    /// unknowable, so the entry is still returned — classified [`Health::Unprobed`]
+    /// ("could not confirm liveness — neither live nor confirmed stale") — rather
+    /// than dropped or misreported as confirmed-dead. A failure to even iterate one
     /// directory entry (a transient filesystem error or a removal race on that one
     /// item, distinct from `fs::read_dir` itself failing on the directory as a whole —
     /// see [`Registry::scan`]) is the same kind of per-item noise and is likewise
@@ -374,7 +389,12 @@ impl Registry {
     /// blinds a client to the healthy ones. This is the read
     /// side the control-plane client (`inspect`, T-008; `cancel`/`kill`, T-009) builds
     /// on: find the run whose `record.run_id` matches, then act only if it is live —
-    /// which a probe-failed entry, being `Stale`, never is.
+    /// which a probe-failed entry, being [`Health::Unprobed`] (not [`Health::Live`]),
+    /// never is, so those clients behave exactly as they did when this case was
+    /// folded into `Stale` (see [K-024]). `list` (the operator-facing discovery
+    /// surface, T-206) is the one consumer that must tell the two apart: printing a
+    /// probe-failed entry as `"stale"` is a positive, unconfirmed claim that the
+    /// runner is dead, distinct from what the probe actually established.
     pub fn entries(&self) -> io::Result<Vec<Entry>> {
         let mut entries = Vec::new();
         for ScannedRecord {
@@ -386,17 +406,22 @@ impl Registry {
             // A per-record probe failure (an unreadable target, one rejected as a
             // symlink/reparse point at open time, or a lock/unlock error — see
             // [`probe_health`]) does not discredit the record itself: only its
-            // liveness could not be confirmed. Degrade to `Stale` rather than
-            // dropping the entry or aborting the scan — "could not confirm liveness ⇒
-            // treat as not live" is the least-surprising verdict, it keeps the entry
-            // visible for the `prune` reaper (T-164), and it is exactly what fixes the
-            // misrouting bug this task exists for: `inspect`/`cancel`/`kill` act only
-            // on `Live` entries, so a record whose probe failed can no longer fail
-            // the whole scan and take down an operation on an unrelated, healthy
-            // run_id. **Prune must not reuse this collapsed value** — it cannot tell a
-            // genuinely stale entry from a probe-failed one — and so probes on its own
-            // path (see [`Registry::prune`] / [`probe_for_prune`]).
-            let health = probe_health(&lock_path).unwrap_or(Health::Stale);
+            // liveness could not be confirmed. Classify it `Unprobed` rather than
+            // dropping the entry, aborting the scan, or fabricating a confirmed
+            // `Stale` verdict the probe never actually reached — this keeps the entry
+            // visible for the `prune` reaper (T-164) and preserves the misrouting fix
+            // this method exists for: `inspect`/`cancel`/`kill` act only on `Live`
+            // entries, so a record whose probe failed can no longer fail the whole
+            // scan and take down an operation on an unrelated, healthy run_id.
+            // **Prune must not reuse this value** — it needs the acquired lock held
+            // across its deletions, which a pure liveness query like this one already
+            // released — and so probes on its own path (see [`Registry::prune`] /
+            // [`probe_for_prune`]).
+            let health = match probe_health(&lock_path) {
+                Ok(LivenessProbe::Live) => Health::Live,
+                Ok(LivenessProbe::Stale) => Health::Stale,
+                Err(_) => Health::Unprobed,
+            };
             entries.push(Entry {
                 record,
                 health,
@@ -423,11 +448,13 @@ impl Registry {
     ///   file would not open — EISDIR, permission-denied, a rejected reparse point — or
     ///   the lock call itself errored). Liveness is *unknown*, not confirmed stale, so
     ///   the entry is kept, on every repeated prune, rather than risk deleting a record
-    ///   that may belong to a live run. This is exactly the distinction
-    ///   [`Registry::entries`] deliberately throws away (its `.unwrap_or(Health::Stale)`
-    ///   folds `Err` into `Stale` — see [K-024]); prune therefore probes on its **own**
-    ///   path ([`probe_for_prune`]), which keeps the three cases apart, and never reads
-    ///   the collapsed [`Entry::health`].
+    ///   that may belong to a live run — the same [`Health::Unprobed`] verdict
+    ///   [`Registry::entries`] now reports for this case (see [K-024]), but prune
+    ///   cannot simply read [`Entry::health`] here: it needs the probe's acquired
+    ///   lock held across the two deletions below, and a pure liveness query like
+    ///   `entries` already released it. So prune probes on its **own** path
+    ///   ([`probe_for_prune`]), which keeps the three cases apart *and* keeps the
+    ///   lock, rather than reading [`Entry::health`].
     ///
     /// Corrupt records the scan already skips (unreadable, unparsable JSON, a malformed
     /// `started_at`, or a `lock_file` that is not a simple in-directory name) are
@@ -574,17 +601,20 @@ impl Registry {
     /// the read step [`crate::wait`] polls, and the third consumer of [`Registry::scan`]
     /// alongside [`Registry::entries`] and [`Registry::prune`].
     ///
-    /// **Why this does not read [`Entry::health`].** `entries()` folds a probe *error*
-    /// into [`Health::Stale`] (`"could not confirm liveness ⇒ treat as not live"`), which
-    /// is right for `inspect`/`cancel`/`kill`, whose worst case is refusing to act. It is
-    /// wrong here: `wait` returning "finished" is a positive claim about a run's lifetime,
-    /// and minting it from a probe that never actually ran would report a live run as
-    /// over. So this probes on its own path through [`probe_health`], whose
-    /// `Ok(Live)` / `Ok(Stale)` / `Err` triple keeps the failure distinct — the same
-    /// discipline [`Registry::prune`] applies with [`probe_for_prune`] for the same
-    /// reason (see [K-024]), differing only in what it does with the acquired lock:
-    /// prune *reclaims* the entry and keeps the lock held across its deletions, while
-    /// this is a pure query and releases it immediately, exactly as `list` does.
+    /// **Why this does not build on [`Registry::entries`].** This method needs to
+    /// count *matching* (by `run_id`) live and unprobed records separately —
+    /// `entries()` returns every record with no such filtering or counting — so it
+    /// shares only the underlying [`Registry::scan`] step and probes each matching
+    /// record on its own path through [`probe_health`], whose `Ok(Live)` / `Ok(Stale)`
+    /// / `Err` triple keeps a probe failure distinct from a confirmed-stale record —
+    /// the same discipline [`Registry::prune`] applies with [`probe_for_prune`] for
+    /// the analogous reason (see [K-024]: minting `Finished` from a probe that never
+    /// actually ran would report a live run as over, exactly as reaping one would
+    /// delete a live run's record), differing only in what it does with the acquired
+    /// lock: prune *reclaims* the entry and keeps the lock held across its deletions,
+    /// while this is a pure query and releases it immediately, exactly as `list` does
+    /// (whose `entries()` now reports the identical [`Health::Unprobed`] verdict for
+    /// this same case, since T-206).
     ///
     /// **Counting.** Matching records are selected by the identity predicate — the
     /// `run_id` field — **first**, and only then classified by health; folding both into
@@ -622,10 +652,10 @@ impl Registry {
                 continue;
             }
             match probe_health(&lock_path) {
-                Ok(Health::Live) => live += 1,
+                Ok(LivenessProbe::Live) => live += 1,
                 // Confirmed stale: this record is a leftover, not a running run, and
                 // contributes nothing to either count.
-                Ok(Health::Stale) => {}
+                Ok(LivenessProbe::Stale) => {}
                 Err(_) => unprobed += 1,
             }
         }
@@ -988,32 +1018,47 @@ impl Drop for Registration {
     }
 }
 
+/// The two-way verdict a *successful* liveness probe reaches — deliberately not
+/// [`Health`] itself: [`Health::Unprobed`] is what a caller reports when
+/// [`probe_health`] returns `Err`, never a value this function constructs, so a
+/// separate, genuinely two-variant type lets every match on `Ok(_)` at the call
+/// sites stay exhaustive without an `unreachable!()` arm for a case that cannot
+/// occur here.
+enum LivenessProbe {
+    /// No process holds the lock (or the lock file is gone): confirmed stale.
+    Stale,
+    /// A live runner holds the lock.
+    Live,
+}
+
 /// Probe an entry's liveness through its lock file, without trusting file existence.
 ///
 /// Trying a non-blocking exclusive lock is the whole test: acquiring it means no
-/// live runner holds it, so the entry is [`Health::Stale`]; being denied means a
-/// live runner holds it, so it is [`Health::Live`]. A missing lock file is stale by
-/// definition. When the probe acquires the lock it drops it immediately (the entry
-/// is stale, not being claimed) — a client that means to *reclaim* a stale entry
-/// would instead keep the lock held.
+/// live runner holds it, so the entry is stale; being denied means a live runner
+/// holds it, so it is live. A missing lock file is stale by definition. When the
+/// probe acquires the lock it drops it immediately (the entry is stale, not being
+/// claimed) — a client that means to *reclaim* a stale entry would instead keep the
+/// lock held. An `Err` means the probe itself could not run at all (see the call
+/// sites, which report that as [`Health::Unprobed`] / [`RunStatus::Unprobed`], never
+/// as a confirmed verdict this function did not actually reach).
 ///
 /// The lock file is opened *without following a symlink* at its final component
 /// ([`platform::open_lock_file`]: `O_NOFOLLOW` on unix, reparse-point rejection on
 /// Windows), closing the open-time TOCTOU window that a symlink swapped in after the
 /// name check would otherwise open — the probe can only ever touch a regular file
 /// inside the registry directory, never a link redirecting elsewhere.
-fn probe_health(lock_path: &Path) -> io::Result<Health> {
+fn probe_health(lock_path: &Path) -> io::Result<LivenessProbe> {
     let lock = match platform::open_lock_file(lock_path) {
         Ok(lock) => lock,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Health::Stale),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(LivenessProbe::Stale),
         Err(err) => return Err(err),
     };
     if platform::try_lock_exclusive(&lock)? {
         // Acquired: no live holder. Drop the handle here to release it at once.
         drop(lock);
-        Ok(Health::Stale)
+        Ok(LivenessProbe::Stale)
     } else {
-        Ok(Health::Live)
+        Ok(LivenessProbe::Live)
     }
 }
 
@@ -1031,10 +1076,12 @@ enum PruneProbe {
     Live,
 }
 
-/// Probe an entry's lock file **for pruning**, keeping apart the three cases
-/// [`Registry::entries`] deliberately folds together (its `.unwrap_or(Health::Stale)`
-/// collapses a probe *error* into `Stale`, so a probe-failed record is indistinguishable
-/// there from a genuinely dead one — see [K-024]). Here they stay distinct, because
+/// Probe an entry's lock file **for pruning**, keeping the same three cases
+/// [`Registry::entries`] now keeps apart via [`Health::Unprobed`] (see [K-024]) —
+/// but returning the acquired lock alongside the confirmed-stale verdict, which
+/// `Entry::health` alone cannot carry. Prune cannot simply read `Entry::health`
+/// here: it needs that lock held across its deletions, and a pure liveness query
+/// like `entries()` already released it. So this probes on its own path, because
 /// prune deletes files and must never act on a record it did not actually confirm dead:
 ///
 /// - lock file **absent** (`NotFound`) ⇒ [`PruneProbe::Reapable`]`(None)` — stale by
@@ -2413,9 +2460,10 @@ mod tests {
     /// Unix: a lock file that is a *symlink* is refused at open time (`O_NOFOLLOW`),
     /// even though its name passes the simple-name check — so a record pointing a
     /// valid-looking lock name at a symlink still shows up in the scan (the record
-    /// itself is well-formed), but degrades to `Stale`: the probe error must never
-    /// let the link be followed onto an off-target file, and must never abort the
-    /// whole scan either.
+    /// itself is well-formed), but classifies as `Unprobed`: the probe error must
+    /// never let the link be followed onto an off-target file, must never be
+    /// misreported as a confirmed-dead `Stale` verdict the probe never reached, and
+    /// must never abort the whole scan either.
     #[cfg(unix)]
     #[test]
     fn symlink_lock_target_is_refused_at_open_time() {
@@ -2437,8 +2485,9 @@ mod tests {
         write_record(&dir, "run-symlink-0000", "linked", "run-symlink-0000.lock");
 
         // The open refuses to follow the symlink, so the probe errors — the entry is
-        // still returned (its record is well-formed) but degrades to `Stale` rather
-        // than ever being reported `Live` off a link it never actually locked.
+        // still returned (its record is well-formed) but classifies `Unprobed`
+        // rather than ever being reported `Live` off a link it never actually
+        // locked, or `Stale` (a confirmed-dead claim the probe never established).
         let entries = registry.entries().expect("scan");
         let linked = entries
             .iter()
@@ -2446,8 +2495,8 @@ mod tests {
             .expect("a probe-failed entry is still returned, not dropped");
         assert_eq!(
             linked.health,
-            Health::Stale,
-            "an unprobeable lock file (symlink) must degrade to Stale, not abort the scan"
+            Health::Unprobed,
+            "an unprobeable lock file (symlink) must classify Unprobed, not abort the scan"
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -2461,12 +2510,14 @@ mod tests {
     /// privileged or `CAP_DAC_OVERRIDE` CI runner simply ignores, making that
     /// approach a false-green trap. `entries()` must not abort the whole scan over
     /// this one unprobeable record: the healthy sibling stays `Live`, and the
-    /// broken one degrades to `Stale` rather than disappearing or taking the scan
-    /// down with it — the exact bug this task fixes (a stale/broken record no
-    /// longer fails `inspect`/`cancel`/`kill` routing to a *different*, healthy
-    /// run_id).
+    /// broken one classifies `Unprobed` rather than disappearing, being
+    /// misreported as the confirmed-dead `Stale` (the T-206 fix), or taking the
+    /// scan down with it — the exact misrouting bug T-007 fixed by returning
+    /// (rather than dropping/aborting on) a probe-failed record in the first place
+    /// (a stale/broken record no longer fails `inspect`/`cancel`/`kill` routing to a
+    /// *different*, healthy run_id).
     #[test]
-    fn entries_degrades_an_unprobeable_lock_directory_to_stale_without_aborting_the_scan() {
+    fn entries_classifies_an_unprobeable_lock_directory_as_unprobed_without_aborting_the_scan() {
         let dir = scratch("dir-lock");
         let registry = Registry::open_in(dir.clone()).expect("open registry");
 
@@ -2505,8 +2556,8 @@ mod tests {
             .expect("the unprobeable entry is present, not dropped");
         assert_eq!(
             broken_entry.health,
-            Health::Stale,
-            "a record whose lock probe cannot even open must degrade to Stale"
+            Health::Unprobed,
+            "a record whose lock probe cannot even open must classify Unprobed, never the confirmed-dead Stale"
         );
 
         good.remove();
@@ -2593,7 +2644,7 @@ mod tests {
     /// A live entry is **never** reaped, even sitting right beside a confirmed-stale
     /// one: the live runner still holds its lock, so the probe reports it live and
     /// prune leaves its files alone while reaping the dead sibling. Modelled on
-    /// [`entries_degrades_an_unprobeable_lock_directory_to_stale_without_aborting_the_scan`].
+    /// [`entries_classifies_an_unprobeable_lock_directory_as_unprobed_without_aborting_the_scan`].
     #[test]
     fn prune_never_reaps_a_live_entry() {
         let dir = scratch("prune-live");
@@ -3276,9 +3327,8 @@ mod tests {
     /// **cannot be probed** (its lock name resolves to a *directory*, so the
     /// write-open fails with a semantic error for any user — the cross-platform trick
     /// from [K-014], never `chmod 0o000`) must read as [`RunStatus::Unprobed`], never
-    /// as [`RunStatus::Finished`]. Folding the probe error into "stale" the way
-    /// [`Registry::entries`] does would have `wait` announce a run finished on the
-    /// strength of a probe that never ran.
+    /// as [`RunStatus::Finished`]. Fabricating "finished" from a probe that never
+    /// actually ran would have `wait` announce a live run as over.
     #[test]
     fn probe_run_reports_an_unprobeable_record_as_unprobed_not_finished() {
         let dir = scratch("probe-run-unprobeable");
@@ -3293,14 +3343,15 @@ mod tests {
             RunStatus::Unprobed,
             "an unprobeable record leaves the run's fate unknown, not confirmed over"
         );
-        // Contrast: `entries()` collapses the same probe failure into `Stale`, which
-        // is exactly the collapsed value this method must not be built on.
+        // `entries()` reaches the same "not confirmed" verdict independently, via
+        // `Health::Unprobed` (T-206) — the two methods agree on this record's health
+        // even though neither is built on the other's scan.
         let entries = registry.entries().expect("scan");
         assert_eq!(entries.len(), 1);
         assert_eq!(
             entries[0].health,
-            Health::Stale,
-            "entries() still degrades an unprobeable entry to stale, as documented"
+            Health::Unprobed,
+            "entries() classifies an unprobeable entry Unprobed, agreeing with probe_run"
         );
 
         // A confirmed-live record under the same id outranks the unknown one: there
