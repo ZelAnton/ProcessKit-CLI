@@ -17,7 +17,10 @@ For a map of the modules below, the data flow of one run, and the
 control-plane contour, see [the architecture overview](docs/architecture.md).
 For a consumer/adapter walkthrough — preflight, launching a run, reading the
 JSONL stream, supervision, and housekeeping — see
-[the integration guide](docs/integration.md).
+[the integration guide](docs/integration.md). For symptom-to-cause diagnosis
+of common operator issues (CI resource-limit failures, a stray Windows
+console window, ambiguous run ids, and more), see
+[the troubleshooting guide](docs/troubleshooting.md).
 
 ## Installation
 

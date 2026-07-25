@@ -51,7 +51,8 @@ pub enum Command {
 /// [--timeout <duration>] [--idle-timeout <duration>] [--grace <duration>]
 /// [--max-memory <size>] [--max-processes <n>] [--cpu-quota <cores>]
 /// [--capture-dir <dir>] [--capture-max-bytes <size>] [--no-echo] [--detach]
-/// [--argv-raw] [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
+/// [--argv-raw] [--env-clear] [--env-remove <KEY>] [--env <KEY=VALUE>]
+/// [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
 /// -- <program> <args...>`
 //
 // `run` consumes every field: `cwd`, `create_no_window`, `timeout`,
