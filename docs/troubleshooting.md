@@ -109,7 +109,11 @@ point — or the lock call itself errored). `"unprobed"` is a deliberately
 distinct, conservative verdict — "could not confirm liveness" is not the same
 claim as "confirmed dead" — and `prune` (and its non-destructive
 `prune --dry-run` preview) never reap an entry in this state, on every
-repeated run, until the probe itself can succeed.
+repeated run, until the probe itself can succeed. A control client
+(`inspect`/`cancel`/`kill`) aimed at such an entry refuses with `CONTROL`
+(103), since it acts only on a **confirmed-live** entry — but its message,
+too, reports that liveness could not be probed rather than that the runner is
+gone (see the `CONTROL` (103) entry below).
 
 A non-zero `unprobed` count in `prune --json`/`prune --dry-run --json` is not
 always the same set of things `list` shows you as `unprobed`, though: the
@@ -135,17 +139,23 @@ issue or a path collision) rather than deleting registry files by hand.
 **Symptom.** `inspect` / `cancel` / `kill` exits `103` and prints an
 explanatory line on stderr instead of doing anything.
 
-**Diagnose.** stderr names which of two reasons applied — a **stale registry
+**Diagnose.** stderr names which of three reasons applied — a **stale registry
 entry** (the runner died abruptly, so the entry's record is left behind but
-its liveness lock has been released, detected *before* connecting) or **died
+its liveness lock has been released, detected *before* connecting), an
+**unprobeable registry entry** (the liveness lock could not be probed at all,
+so the runner is *not* confirmed gone — the message says liveness could not be
+probed and calls the entry `unprobed`, never "the runner is gone"), or **died
 mid-conversation** (the entry read live, but the runner exited between the
 liveness probe and the reply, or the connection closed before a complete
-response arrived). Both are bounded — no client hangs waiting for a runner
-that is not going to answer. `list` will show a stale entry as `stale`, which
-is the fastest way to confirm the first case without retrying the failing
-command. See [`docs/control-plane.md`](control-plane.md), "When the runner is
-gone: a distinguishable result, never a hang", and the `CONTROL` (103) row of
-the reserved-band table in [`docs/exit-codes.md`](exit-codes.md).
+response arrived). All three are bounded — no client hangs waiting for a
+runner that is not going to answer. `list` is the fastest cross-check for the
+first two without retrying the failing command, and it reports the same
+verdict the refusal did: a stale entry shows as `stale`, an unprobeable one as
+`unprobed` (see "`list` shows an entry as `unprobed`" above for what to do
+with that one — in short, do not hand-delete it). See
+[`docs/control-plane.md`](control-plane.md), "When the runner cannot be
+reached: a distinguishable result, never a hang", and the `CONTROL` (103) row
+of the reserved-band table in [`docs/exit-codes.md`](exit-codes.md).
 
 **`wait` does not share this code.** The registry-only `wait --run-id <id>`
 never connects to a run's control transport, so "died mid-conversation" is

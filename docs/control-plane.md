@@ -10,7 +10,7 @@ mistake.
 
 This document is the normative description of the **local transport**, the **wire
 protocol**, and the three clients — **`inspect`** (read-only) and the mutating
-**`cancel`** / **`kill`** — including their behavior when the runner is gone.
+**`cancel`** / **`kill`** — including their behavior when the runner cannot be reached.
 Discovery — how a client *finds* a live runner — is the run registry, described in
 [`docs/registry.md`](registry.md). The in-code source of truth is `src/control.rs`.
 
@@ -202,17 +202,27 @@ file — not the control client — still sees that the run ended by an outside 
 
 See [`docs/schema.md`](schema.md) for these events.
 
-### When the runner is gone: a distinguishable result, never a hang
+### When the runner cannot be reached: a distinguishable result, never a hang
 
-Every client — `inspect`, `cancel`, and `kill` — can lose the runner the same two
-ways. Both are reported as the reserved **`CONTROL` exit code (103)** — "could not
-reach the target run" (see [`docs/exit-codes.md`](exit-codes.md)) — with an
+Every client — `inspect`, `cancel`, and `kill` — can lose the runner the same three
+ways. All of them are reported as the reserved **`CONTROL` exit code (103)** — "could
+not reach the target run" (see [`docs/exit-codes.md`](exit-codes.md)) — with an
 explanatory message on **stderr** (naming the action and the run) and nothing on
-stdout. Neither is a generic error, and neither hangs:
+stdout. None is a generic error, and none hangs:
 
 - **Stale registry entry.** The runner died abruptly, leaving its record behind; the
   released liveness lock makes the entry stale. The client detects this *before*
   connecting and reports the run as gone (its registry entry is stale).
+- **Unprobeable registry entry.** The liveness probe could not be performed at all —
+  the entry's lock file would not open (a directory in its place, a permission error,
+  a rejected symlink/reparse point), the same case `list` prints as `unprobed` and
+  `prune` refuses to reap (see [`docs/registry.md`](registry.md#the-reaping-safety-invariant)).
+  The client refuses just as it does for a stale entry — it acts only on a
+  **confirmed-live** match, and this is not one — but it says so differently: the
+  message reports that liveness could not be probed and names the entry `unprobed`,
+  never that the runner is gone, which is a confirmed death nothing established. So a
+  refusal you cross-check against `list` will always agree with what `list` shows for
+  that record.
 - **Died mid-conversation.** The entry read live, but the runner exited between the
   liveness probe and the reply — so the connect fails, or the connection closes before
   a complete response arrives. The client reports that the runner could not be reached

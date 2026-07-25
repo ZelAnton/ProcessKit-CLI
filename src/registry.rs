@@ -132,11 +132,14 @@ pub enum Health {
     /// [`Registry::probe_run`]'s own [`probe_health`] call already keep apart from a
     /// confirmed-dead entry (see [K-024]) — [`Registry::entries`] now keeps it apart
     /// too, instead of folding it into [`Health::Stale`]. Every control client
-    /// (`inspect`/`cancel`/`kill`) that matches only on [`Health::Live`] treats this
-    /// exactly like `Stale` — refusing to act — so their behavior is unchanged; only
-    /// `list`, the operator-facing discovery surface, prints it as a distinct value
-    /// rather than the misleadingly positive claim "stale" (the runner is confirmed
-    /// dead), which the probe never actually established.
+    /// (`inspect`/`cancel`/`kill`) that matches only on [`Health::Live`] *acts* on
+    /// this exactly as it does on `Stale` — refusing — so their behavior is
+    /// unchanged; what they no longer share is the *wording* of that refusal, which
+    /// names an unprobeable entry `unprobed` instead of claiming the runner is gone
+    /// (see [`crate::control`], "Dead runner / unreachable entry"). Neither the
+    /// discovery surface `list` nor a refusing control client makes the misleadingly
+    /// positive claim "stale" (the runner is confirmed dead) about a record the probe
+    /// never actually reached.
     Unprobed,
 }
 

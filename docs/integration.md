@@ -334,6 +334,14 @@ carries the "could not reach the target run" failure modes of §4.
   the cleanup pair, `runner_exit` `cancelled`/`107`, and removal of the registry
   entry), so stopping a run with `kill <pid>` (Unix) or a closed console
   (Windows) leaves neither a stale entry nor a surviving descendant.
+- **Unprobeable registry entry.** The entry's liveness lock could not be probed
+  at all (permission denied, a rejected symlink/reparse point, a non-regular
+  file in its place), so nothing about the run is confirmed either way. This is
+  the same `CONTROL` (103) refusal — `inspect`/`cancel`/`kill` act only on a
+  **confirmed-live** entry — but it is reported honestly as `unprobed`, not as
+  a gone runner; `list` shows the same entry as `unprobed` and `prune` leaves
+  it in place. Investigate the registry directory rather than deleting the
+  record by hand (see [`docs/troubleshooting.md`](troubleshooting.md)).
 - **Died mid-conversation.** The registry entry read as live, but the runner
   exited between the liveness check and the reply reaching the client — the
   connect fails, or the connection closes before a complete response. Also a

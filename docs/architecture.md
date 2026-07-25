@@ -165,9 +165,11 @@ by PID; they resolve it through the run registry (`src/registry.rs`):
    way, not by mere file existence — as [`registry::Health::Live`],
    confirmed-dead [`registry::Health::Stale`], or (when the probe itself could
    not run, e.g. permission denied) [`registry::Health::Unprobed`]; this
-   control-plane contour only ever acts on `Live`, so `Stale` and `Unprobed`
-   are equivalent here (see [`docs/registry.md`](registry.md); `list` is the
-   consumer that tells the latter two apart).
+   control-plane contour only ever *acts* on `Live`, so `Stale` and `Unprobed`
+   are equally unactionable here — but not equally reportable: the refusal
+   names a stale entry as a gone runner and an unprobeable one as `unprobed`
+   (liveness unknown), the same distinction `list`/`prune`/`wait` draw (see
+   [`docs/registry.md`](registry.md)).
 2. **Endpoint resolution.** `control::resolve_live_endpoint` matches the
    requested `run_id` against the live entries only. More than one live match
    is an **ambiguous run id** — a hard `CONTROL` (103) failure for every verb,
@@ -188,8 +190,8 @@ by PID; they resolve it through the run registry (`src/registry.rs`):
 
 See [`docs/registry.md`](registry.md) for the registry's location, record
 format, and staleness signal, and [`docs/control-plane.md`](control-plane.md)
-for the full wire protocol and both dead-runner cases (stale entry vs. died
-mid-conversation).
+for the full wire protocol and all three unreachable-runner cases (stale entry
+vs. unprobeable entry vs. died mid-conversation).
 
 ## Boundary with `processkit`
 

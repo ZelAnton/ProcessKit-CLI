@@ -52,8 +52,17 @@ to a dated version section.
   a positive, unconfirmed claim that the runner is dead. It now reports a distinct
   `"unprobed"` health value, matching the three-way vocabulary `prune --json`'s
   `unprobed` tally and `wait` already use for the identical case. Additive change to
-  `list --json`'s `health` field; `inspect`/`cancel`/`kill`, which act only on a
-  confirmed-live entry, are unaffected.
+  `list --json`'s `health` field.
+- **`inspect`/`cancel`/`kill` no longer report an unprobeable registry entry as a
+  runner that is gone.** All three act only on a confirmed-live entry, so *what they
+  do* is unchanged — they still refuse with `CONTROL` (103) — but the refusal used to
+  say "its registry entry is stale — the runner is gone (it exited without cleaning
+  up)" for an entry whose liveness lock could not be probed at all, asserting a death
+  nothing had established and contradicting the `unprobed` verdict `list`/`prune`/
+  `wait` report for that same record. The message now distinguishes the two cases and
+  names the unprobeable one `unprobed`, so cross-checking a refusal against `list`
+  (as `docs/troubleshooting.md` advises) agrees instead of conflicting. Only
+  free-text stderr changed; no exit code, event, or CLI surface did.
 
 ## [0.3.0] - 2026-07-25
 

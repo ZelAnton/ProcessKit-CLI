@@ -287,9 +287,12 @@ kept strictly apart — and this is the load-bearing distinction:
   same case `Registry::entries` reports as [`Health::Unprobed`] (T-206) — never
   folded into `Stale` — so the read path `list`/`inspect` share already keeps it
   apart from a confirmed-dead entry too, at the `Health` level; `inspect`/`cancel`/
-  `kill` still treat it exactly like `Stale` because they act only on
-  [`Health::Live`] (a probe-failed record is not that, whichever of the two
-  non-live values it carries). Prune, though, cannot simply reuse `Entry::health`
+  `kill` still *act* on it exactly as they do on `Stale` (they refuse, because they
+  act only on [`Health::Live`], and a probe-failed record is not that whichever of
+  the two non-live values it carries) — but they no longer *word* the refusal the
+  same way: an unprobeable entry is reported as `unprobed`, liveness unknown, not as
+  a runner confirmed gone (see [`docs/control-plane.md`](control-plane.md), "When
+  the runner cannot be reached"). Prune, though, cannot simply reuse `Entry::health`
   here even now that it distinguishes the case: reaping needs the probe's acquired
   lock held across the two deletions below, and a pure liveness query like
   `entries()` already released it — so prune probes on its **own** path that keeps
@@ -455,11 +458,13 @@ the same "probe failed" case "The reaping safety invariant" above keeps apart fr
 "confirmed stale"). `Registry::entries` reports that case as its own
 [`Health::Unprobed`] value (T-206), never folded into `Stale` — right for `list`,
 whose whole purpose is showing the operator exactly what was and was not confirmed,
-and functionally unchanged for `inspect`/`cancel`/`kill`, which act only on
-[`Health::Live`] and so treat `Unprobed` exactly as they treated the old collapsed
-`Stale`. Minting a *positive* "finished" from that same unconfirmed case would still
-be wrong for `wait`, whose `0` is a positive claim about a run's lifetime — so `wait`
-does not read `Entry::health` at all here, live or otherwise.
+and behaviorally unchanged for `inspect`/`cancel`/`kill`, which act only on
+[`Health::Live`] and so refuse on `Unprobed` exactly as they refused on the old
+collapsed `Stale` (their *message* now tells the two apart, so no client asserts a
+death this case never established). Minting a *positive* "finished" from that same
+unconfirmed case would still be wrong for `wait`, whose `0` is a positive claim about
+a run's lifetime — so `wait` does not read `Entry::health` at all here, live or
+otherwise.
 
 So `wait` probes on its own path and **keeps waiting** on an unconfirmable entry rather
 than announcing a completion it never observed. A bounded caller still gets a definite

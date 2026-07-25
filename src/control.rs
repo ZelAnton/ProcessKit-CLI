@@ -34,10 +34,10 @@
 //!   same SID the registry restricts to — see
 //!   [`registry::current_user_sid_string`]), and rejects remote clients.
 //!
-//! ## Dead runner / stale entry — a distinguishable result, never a hang
+//! ## Dead runner / unreachable entry — a distinguishable result, never a hang
 //!
-//! A client can lose the runner two ways, and both are reported as the reserved
-//! [`exit::CONTROL`] code (103, "could not reach the target run" — see
+//! A client can lose the runner three ways, and every one of them is reported as the
+//! reserved [`exit::CONTROL`] code (103, "could not reach the target run" — see
 //! `docs/exit-codes.md`) with an explanatory message, **never** a generic error and
 //! **never** a hang:
 //!
@@ -45,6 +45,16 @@
 //!   the released liveness lock makes the entry [`registry::Health::Stale`]
 //!   ([`registry::Registry::entries`], T-007). The client detects this *before*
 //!   connecting and reports the run as gone.
+//! - **Unprobeable registry entry.** The liveness probe could not run at all — the
+//!   lock file would not open (a directory in its place, a permission error, a
+//!   rejected symlink/reparse point) or the lock call itself errored — so the entry
+//!   is [`registry::Health::Unprobed`] (T-206) and liveness is *unknown*. The client
+//!   refuses exactly as it does for a stale entry (it acts only on a confirmed
+//!   [`registry::Health::Live`] match, and this is not one), but it deliberately does
+//!   **not** report the runner as gone: that is a confirmed death the probe never
+//!   established, and asserting it here would contradict what `list`, `prune`, and
+//!   `wait` say about the very same record. The refusal names the entry `unprobed`
+//!   instead — the vocabulary those three already share for this case.
 //! - **Died mid-conversation.** The entry read live, but the runner exited between
 //!   the liveness probe and the reply: the connect fails, or the connection closes
 //!   before a complete response arrives. Every socket/pipe wait is bounded by a
@@ -607,7 +617,8 @@ pub fn current_thread_runtime() -> Result<tokio::runtime::Runtime, RunnerError> 
 /// Client entry for `inspect --run-id <id> --json`: find the live runner through the
 /// registry, ask it for a snapshot, and print it. Runs on its own small current-thread
 /// runtime (the transport client is async). A run that cannot be reached — no such id,
-/// a stale entry, a dead-mid-conversation runner — returns a [`exit::CONTROL`] error.
+/// a stale entry, an unprobeable one, a dead-mid-conversation runner — returns a
+/// [`exit::CONTROL`] error naming which of those applied (see `no_live_entry`).
 pub fn inspect(run_id: &str) -> Result<(), RunnerError> {
     let runtime = current_thread_runtime()?;
     runtime.block_on(inspect_async(run_id))
@@ -789,15 +800,11 @@ fn resolve_in_registry(
     }
 
     // Exactly one live entry (or none) — now it's safe to look at its endpoint.
-    // Say *why* it's unreachable — the run is gone (stale) or predates the
-    // transport (live, no endpoint) — rather than a generic failure.
+    // Say *why* it's unreachable — the run is gone (stale), its liveness could not be
+    // probed at all (unprobed), or it predates the transport (live, no endpoint) —
+    // rather than a generic failure.
     let Some(entry) = live.into_iter().next() else {
-        return Err(unreachable_run(
-            action,
-            run_id,
-            "its registry entry is stale — the runner is gone (it exited without cleaning up)"
-                .to_string(),
-        ));
+        return Err(no_live_entry(action, run_id, &matches));
     };
     if entry.record.endpoint.is_none() {
         return Err(unreachable_run(
@@ -948,6 +955,46 @@ fn unreachable_run(action: &str, run_id: &str, detail: String) -> RunnerError {
     RunnerError::new(
         exit::CONTROL,
         format!("cannot {action} run `{run_id}`: {detail}"),
+    )
+}
+
+/// The "no confirmed-live entry matches `run_id`" verdict, worded by *which* non-live
+/// health the matching records actually carry — the single place the control clients
+/// choose between "the runner is gone" and "liveness is unknown".
+///
+/// [`registry::Registry::entries`] keeps a **confirmed**-stale record
+/// ([`registry::Health::Stale`] — the probe ran and found no holder) apart from one
+/// whose probe could not run at all ([`registry::Health::Unprobed`], T-206), and the
+/// distinction is load-bearing for the operator even though it changes nothing about
+/// what the client *does*: every verb here still refuses, because it acts only on
+/// [`registry::Health::Live`]. What it must not do is *assert* the runner exited when
+/// nothing established that. Saying "the runner is gone" for an unprobeable entry
+/// would be the very unconfirmed positive claim `list` stopped making (see
+/// `docs/registry.md`, "Discovery — `list`"), and would send an operator following
+/// `docs/troubleshooting.md`'s "cross-check with `list`" advice to a record `list`
+/// prints as `unprobed` — two surfaces contradicting each other about one record.
+///
+/// A single unprobeable record among the matches is enough to withhold the stronger
+/// claim, mirroring [`registry::Registry::probe_run`], which reports
+/// [`registry::RunStatus::Unprobed`] rather than `Finished` whenever any matching
+/// record could not be probed: an unprobeable entry is not evidence of anything, so it
+/// cannot be outvoted by a confirmed-stale sibling.
+fn no_live_entry(action: &str, run_id: &str, matches: &[registry::Entry]) -> RunnerError {
+    if matches.iter().any(|entry| entry.health == Health::Unprobed) {
+        return unreachable_run(
+            action,
+            run_id,
+            "its liveness could not be probed — the entry's lock file would not open, or the \
+             lock call itself failed — so the runner is not confirmed gone; `list` reports \
+             this entry as `unprobed`"
+                .to_string(),
+        );
+    }
+    unreachable_run(
+        action,
+        run_id,
+        "its registry entry is stale — the runner is gone (it exited without cleaning up)"
+            .to_string(),
     )
 }
 
@@ -1822,6 +1869,115 @@ mod tests {
 
         drop(with_endpoint);
         drop(without_endpoint);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Hand-write a registry record whose `lock_file` is the sibling `<stem>.lock`,
+    /// the exact shape a live runner writes — `register` only ever mints opaque stems
+    /// and always takes the lock, so a test that needs a *non*-live entry fabricates
+    /// the record directly, the same way `registry`'s own unit tests and
+    /// `tests/registry.rs` do.
+    fn write_record(dir: &std::path::Path, stem: &str, run_id: &str) {
+        std::fs::create_dir_all(dir).expect("create the registry directory");
+        let record = format!(
+            "{{\"registry_version\":1,\"run_id\":\"{run_id}\",\"endpoint\":null,\
+             \"started_at\":\"2026-07-25T00:00:00.000Z\",\
+             \"liveness\":{{\"kind\":\"advisory_lock\",\"lock_file\":\"{stem}.lock\"}}}}"
+        );
+        std::fs::write(dir.join(format!("{stem}.json")), record).expect("write the record");
+    }
+
+    /// A **confirmed-stale** entry: the record above plus an *unlocked* sibling lock
+    /// file — what an abruptly-killed runner leaves behind. The probe opens it, takes
+    /// the free lock, and confirms nobody is holding it: `Health::Stale`.
+    fn write_stale_entry(dir: &std::path::Path, stem: &str, run_id: &str) {
+        write_record(dir, stem, run_id);
+        std::fs::write(dir.join(format!("{stem}.lock")), b"")
+            .expect("write the unlocked lock file");
+    }
+
+    /// An **unprobeable** entry (T-206): the record above plus a *directory* where its
+    /// lock file should be. The probe's write-open then fails with a semantic "is a
+    /// directory" error for any user, including root — the cross-platform trick from
+    /// [K-014], never `chmod 0o000`, which a privileged CI runner ignores — so the
+    /// entry is `Health::Unprobed`: neither confirmed live nor confirmed stale.
+    fn write_unprobeable_entry(dir: &std::path::Path, stem: &str, run_id: &str) {
+        write_record(dir, stem, run_id);
+        std::fs::create_dir(dir.join(format!("{stem}.lock")))
+            .expect("create the directory the lock name resolves to");
+    }
+
+    /// (F-01) The control clients refuse on anything that is not a confirmed-live
+    /// match — but *what they say* must not outrun what the registry established.
+    /// A confirmed-stale entry is reported as a gone runner; an entry whose liveness
+    /// probe could not run at all must not be, because that is exactly the
+    /// unconfirmed positive claim `Health::Unprobed` (T-206) exists to stop
+    /// `list`/`prune`/`wait` from making about the same record — and an operator
+    /// cross-checking a "the runner is gone" refusal with `list` (as
+    /// `docs/troubleshooting.md` prescribes) would be shown `unprobed` there.
+    /// Both wordings are still the same reserved `CONTROL` (103) refusal.
+    #[test]
+    fn resolve_in_registry_does_not_call_an_unprobeable_entry_a_gone_runner() {
+        let dir = scratch_registry_dir("unprobed-vs-stale");
+        let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
+
+        write_stale_entry(&dir, "gone", "gone-run");
+        write_unprobeable_entry(&dir, "opaque", "opaque-run");
+
+        // The confirmed-dead case is unchanged: the probe ran and found no holder, so
+        // naming the runner gone is a fact the registry actually established.
+        let stale = resolve_in_registry(&registry, "cancel", "gone-run")
+            .expect_err("a stale entry is not a live target");
+        assert_eq!(stale.code(), exit::CONTROL);
+        let stale_message = stale.to_string();
+        assert!(
+            stale_message.contains("stale") && stale_message.contains("the runner is gone"),
+            "a confirmed-stale entry still reports the runner as gone: {stale_message}"
+        );
+
+        // The unconfirmed case: same refusal, same code — different claim.
+        for action in ["inspect", "cancel", "kill"] {
+            let err = resolve_in_registry(&registry, action, "opaque-run")
+                .expect_err("an unprobeable entry is not a live target either");
+            assert_eq!(err.code(), exit::CONTROL);
+            let message = err.to_string();
+            assert!(
+                message.contains(action) && message.contains("opaque-run"),
+                "still names the action and the run: {message}"
+            );
+            assert!(
+                message.contains("unprobed"),
+                "carries the same vocabulary `list`/`prune`/`wait` use for this case: {message}"
+            );
+            assert!(
+                !message.contains("the runner is gone") && !message.contains("is stale"),
+                "must not assert a death the probe never established: {message}"
+            );
+        }
+
+        // The mutating verbs' pre-dispatch re-check drives the same resolver, so it
+        // cannot reintroduce the claim on its own path either.
+        let reconfirm = reconfirm_target(&registry, "kill", "opaque-run", "endpoint-whatever")
+            .expect_err("the re-check refuses an unprobeable target too");
+        assert_eq!(reconfirm.code(), exit::CONTROL);
+        assert!(
+            !reconfirm.to_string().contains("the runner is gone"),
+            "the pre-dispatch re-check words it the same way: {reconfirm}"
+        );
+
+        // One unprobeable record is enough to withhold the stronger claim, even
+        // beside a confirmed-stale sibling under the *same* run id — the same
+        // precedence `Registry::probe_run` gives `Unprobed` over `Finished`.
+        write_stale_entry(&dir, "mixed-gone", "mixed-run");
+        write_unprobeable_entry(&dir, "mixed-opaque", "mixed-run");
+        let mixed = resolve_in_registry(&registry, "kill", "mixed-run")
+            .expect_err("neither matching record is live");
+        let mixed_message = mixed.to_string();
+        assert!(
+            mixed_message.contains("unprobed") && !mixed_message.contains("the runner is gone"),
+            "an unprobeable record is not outvoted by a confirmed-stale sibling: {mixed_message}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
