@@ -220,36 +220,46 @@ reserved code:
 - `sighup` — **Unix only**: the runner received `SIGHUP` — its controlling terminal
   went away (a closed terminal, a dropped SSH session); terminal code `CANCELLED`
   (107).
+- `ctrl_break` — **Windows only**: the runner caught `CTRL_BREAK_EVENT`; terminal
+  code `CANCELLED` (107).
+- `ctrl_close` — **Windows only**: the runner caught `CTRL_CLOSE_EVENT` (the console
+  window is being closed); terminal code `CANCELLED` (107). Windows gives the
+  handler only a short window (about 5 seconds) before terminating the process
+  regardless — see "Timeouts, cancel, and grace" in `README.md` for how the
+  effective `--grace` is bounded so this event's own teardown can fit inside it.
+- `ctrl_logoff` — **Windows only**: the runner caught `CTRL_LOGOFF_EVENT` (the user
+  is logging off); terminal code `CANCELLED` (107).
+- `ctrl_shutdown` — **Windows only**: the runner caught `CTRL_SHUTDOWN_EVENT` (the
+  system is shutting down); terminal code `CANCELLED` (107).
 - `control_cancel` — a `cancel` command that reached the live runner over its control
   plane (see [`docs/control-plane.md`](control-plane.md)); terminal code
   `CONTROL_CANCELLED` (108).
 
 They all share this event because they share the teardown; the `source` and the
-terminal code tell them apart. The three local signals deliberately share the one
+terminal code tell them apart. The local signals/events deliberately share the one
 `CANCELLED` code — they are the same class of ending (a local signal stopped the run) —
-so a consumer that needs to know *which* signal arrived reads this `source`, one event
-before the terminal `runner_exit`. The Unix signal values are **additive**: a run that
-is never signalled emits exactly the stream it did before, and a consumer that only
-knows `ctrl_c`/`control_cancel` still sees a well-formed `cancelled` event with the
-same fields.
+so a consumer that needs to know *which* one arrived reads this `source`, one event
+before the terminal `runner_exit`. The Unix signal and Windows console-control-event
+values are **additive**: a run that is never signalled emits exactly the stream it did
+before, and a consumer that only knows `ctrl_c`/`control_cancel` still sees a
+well-formed `cancelled` event with the same fields.
 
-Catching `SIGTERM`/`SIGHUP` is what makes this teardown happen at all on those paths:
+Catching `SIGTERM`/`SIGHUP` (Unix) and `CTRL_BREAK`/`CTRL_CLOSE`/`CTRL_LOGOFF`/
+`CTRL_SHUTDOWN` (Windows) is what makes this teardown happen at all on those paths:
 their default disposition terminates the runner outright, which would skip the
 `cancelled` / `cleanup_started` / `cleanup_finished` / `runner_exit` events, leave the
 run's registry entry behind, and — the guarantee that matters — never explicitly kill
 the container, whose abrupt-owner-death reap covers only the direct child on Linux and
-nothing on macOS/BSD (see `cleanup_finished` and `docs/registry.md`). One exception,
-deliberate: a signal whose disposition is already `SIG_IGN` when the runner starts
-(what `nohup` does to `SIGHUP`) is left ignored rather than un-ignored behind the
-operator's back, so no `cancelled` event is produced for it — and none is owed, since
-an ignored signal would not have ended the run either. Windows keeps the
-`Ctrl-C` listener only; its console-close/logoff/shutdown half is a separate mechanism
-and is not covered by this event yet.
+nothing at all on Windows/macOS/BSD (see `cleanup_finished` and `docs/registry.md`).
+One exception, deliberate: a Unix signal whose disposition is already `SIG_IGN` when
+the runner starts (what `nohup` does to `SIGHUP`) is left ignored rather than
+un-ignored behind the operator's back, so no `cancelled` event is produced for it —
+and none is owed, since an ignored signal would not have ended the run either.
 
 | Field      | Type              | Notes                                                        |
 |------------|-------------------|--------------------------------------------------------------|
-| `source`   | string            | `ctrl_c`, `sigterm` (Unix), `sighup` (Unix), or `control_cancel`. |
-| `grace_ms` | integer, nullable | The `--grace` window, ms; `null` if unset.                   |
+| `source`   | string            | `ctrl_c`, `sigterm` (Unix), `sighup` (Unix), `ctrl_break` (Windows), `ctrl_close` (Windows), `ctrl_logoff` (Windows), `ctrl_shutdown` (Windows), or `control_cancel`. |
+| `grace_ms` | integer, nullable | The **effective** `--grace` window, ms; `null` if unset. For a Windows `ctrl_close` this may be less than the requested `--grace` (capped to fit the OS's own termination window — see `README.md`, "Timeouts, cancel, and grace"); every other trigger echoes the request unchanged. |
 
 ### `killed`
 
@@ -358,8 +368,9 @@ A normal run emits, in order: `run_started`, `members_snapshot`, then either
 
 The reason event names *which* ending it was: `timeout` (with `reason` `overall` or
 `idle`) for a `--timeout` or a `--idle-timeout`, `cancelled` (with `source` `ctrl_c`,
-`sigterm`, `sighup`, or `control_cancel`) for a local stop signal or a control-plane
-cancel, and `killed` (`source` `control_kill`) for a control-plane kill.
+`sigterm`/`sighup` (Unix), `ctrl_break`/`ctrl_close`/`ctrl_logoff`/`ctrl_shutdown`
+(Windows), or `control_cancel`) for a local stop signal or a control-plane cancel, and
+`killed` (`source` `control_kill`) for a control-plane kill.
 
 When `--capture-dir` is set, an `output_captured` event is inserted after
 `cleanup_finished` and before the terminal `runner_exit`, on every ending that ran

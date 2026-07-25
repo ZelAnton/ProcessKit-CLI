@@ -326,15 +326,30 @@ or external) — and all of them end in the **same** teardown path:
   would skip teardown entirely — no terminal JSONL events, a registry entry left
   behind, and no explicit kill of the container, whose abrupt-owner-death reap
   covers only the direct child on Linux and nothing on macOS (the `abrupt_cleanup`
-  tri-state under [Platform matrix](#platform-matrix)). All three signals share the
-  `CANCELLED` code (`107`); which one arrived is recorded in the JSONL `cancelled`
-  event's `source` field (`ctrl_c` / `sigterm` / `sighup`). A signal your environment
+  tri-state under [Platform matrix](#platform-matrix)). A signal your environment
   has deliberately neutralized before launching the runner (`SIG_IGN` — which is
   exactly what `nohup` does to `SIGHUP`) is **left alone**: the runner does not
   un-ignore it behind your back, and nothing is lost by that, since an ignored signal
-  would not have stopped the runner either. Windows keeps the
-  `Ctrl-C` listener only — its console-close/logoff/shutdown handler is a separate
-  mechanism and is not covered yet.
+  would not have stopped the runner either.
+- **`Ctrl-Break`, console close, logoff, and system shutdown (Windows)** are caught
+  too, through the same console-control-handler mechanism `Ctrl-C` already used, and
+  take the *same* path. Uncaught, their default handling would likewise skip
+  teardown entirely — and on Windows the abrupt-owner-death reap covers *nothing*
+  (unlike Linux, where it at least reaps the direct child), so an uncaught console
+  close would orphan the whole tree behind it. The console-close event carries an
+  OS-imposed deadline: Windows gives the handler only about 5 seconds before
+  terminating the process regardless, so the runner caps the *effective* `--grace`
+  for that one trigger to a budget comfortably under that window — a longer request
+  degrades to the shorter, honest wait rather than risking the OS killing the runner
+  before it even finishes reporting the teardown. Logoff and shutdown are left
+  uncapped, since their real deadline is a system-wide policy this runner cannot
+  reliably discover (see the `wait_for_cancel_signal`/`effective_grace_for` doc
+  comments in `src/run.rs` for the full reasoning).
+
+All of the signals/events above share the `CANCELLED` code (`107`); which one
+arrived is recorded in the JSONL `cancelled` event's `source` field (`ctrl_c` /
+`sigterm` / `sighup` (Unix) / `ctrl_break` / `ctrl_close` / `ctrl_logoff` /
+`ctrl_shutdown` (Windows)).
 
 With `--inherit-stdio`, native terminal delivery takes precedence; see
 [Standard I/O](#standard-io) for the platform-dependent reporting contract.

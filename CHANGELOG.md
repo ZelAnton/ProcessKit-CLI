@@ -12,6 +12,34 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- **Windows: `Ctrl-Break`, console close, logoff, and system shutdown now end a run
+  through the full cancel teardown** instead of the OS's default handling silently
+  ending the runner. The console-control events `CTRL_BREAK_EVENT`,
+  `CTRL_CLOSE_EVENT`, `CTRL_LOGOFF_EVENT`, and `CTRL_SHUTDOWN_EVENT` (caught via
+  `tokio::signal::windows`, the same `SetConsoleCtrlHandler` mechanism `Ctrl-C`
+  already used) join `Ctrl-C` in the same race, so they get the same soft-stop →
+  `--grace` → hard-kill teardown, the same terminal JSONL events (`cancelled`,
+  `cleanup_started`, `cleanup_finished`, `runner_exit`), the same registry-entry
+  removal, and the same reserved `CANCELLED` (107) exit. Previously the OS's default
+  handling terminated the runner outright on all four: the events were never
+  written, the registry entry was left behind stale, and — the guarantee that
+  matters — the container was never explicitly killed, so on Windows *nothing* of
+  the tree was reaped by the abrupt-owner-death path (unlike Linux, where the direct
+  child at least gets `PDEATHSIG`). Which event arrived is reported honestly rather
+  than flattened onto a keyboard interrupt: the `cancelled` event's `source` gained
+  the additive values **`ctrl_break`**, **`ctrl_close`**, **`ctrl_logoff`**, and
+  **`ctrl_shutdown`** alongside `ctrl_c` (`schema_version` unchanged — a new value
+  of an existing string field), and the stderr line names the event
+  (`Ctrl-Break`/`console close`/`logoff`/`system shutdown`). All four keep the one
+  `CANCELLED` (107) code, the same class of ending. `CTRL_CLOSE_EVENT` carries an
+  OS-imposed termination deadline (about 5 seconds): the runner caps the
+  *effective* `--grace` for that trigger alone to a budget comfortably inside that
+  window (a longer request degrades to the shorter, honest wait — and the
+  `cancelled` event's `grace_ms` reports this effective value, not the raw request
+  — rather than risk the OS killing the runner mid-teardown, before the terminal
+  events are even written); `Ctrl-Break`/logoff/shutdown carry no such matching
+  deadline this runner can honestly bound, so they are left uncapped. See
+  README.md, "Timeouts, cancel, and grace", and docs/schema.md / docs/exit-codes.md.
 - **Unix: `SIGTERM` and `SIGHUP` now end a run through the full cancel teardown**
   instead of killing the runner where it stands. The standard external stop — a plain
   `kill <pid>`, a `systemctl stop`, a cancelled CI job, a supervisor's shutdown

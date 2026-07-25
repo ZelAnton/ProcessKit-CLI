@@ -14,7 +14,8 @@ variants — `run_started` redacted vs `--argv-raw`, and the `cancelled` event's
 extension never rewrites an existing shipped line. It is a catalog of event
 **types**, not an exhaustive enumeration of every value an event's string fields can
 take: `docs/schema.md` and `schema.json` remain the complete list (the `cancelled`
-event's Unix `sigterm`/`sighup` sources, for instance, are documented and validated
+event's Unix `sigterm`/`sighup` sources and Windows `ctrl_break`/`ctrl_close`/
+`ctrl_logoff`/`ctrl_shutdown` sources, for instance, are documented and validated
 there without a line of their own here). Adapters (for example the
 processkit-py CLI) that pin `schema_version` can use it as the reference material to
 build and test their readers against.

@@ -1,7 +1,7 @@
 //! Through-the-binary tests for the `run` subcommand: exit-code fidelity, live
 //! stream pass-through with strict separation, the spawn-failure code, timeout
-//! and stop-signal cancel (`Ctrl-C`, and on Unix `SIGTERM`/`SIGHUP`) as
-//! distinguishable runner-imposed endings, the `--grace`
+//! and stop-signal cancel (`Ctrl-C`; on Unix `SIGTERM`/`SIGHUP`; on Windows
+//! `Ctrl-Break`) as distinguishable runner-imposed endings, the `--grace`
 //! pause, and kernel-backed teardown of a leaked descendant. These prove behavior
 //! the library-level ProcessKit-rs suite cannot: the *binary's* own contracts
 //! (`AGENTS.md`, "Testing tiers"). The full end-to-end scenario matrix is a
@@ -1210,9 +1210,114 @@ fn cancel_via_sighup_is_reported_as_its_own_source() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A real `CTRL_BREAK_EVENT` — generated for the runner's own console process
+/// group via `GenerateConsoleCtrlEvent`, not merely simulated — must be a
+/// first-class cancel: the reserved `CANCELLED` code, the `cancelled` event's
+/// `source` `ctrl_break`, the honest stderr headline, and the full teardown of
+/// the process tree (T-195, the Windows sibling of the Unix `SIGTERM`/`SIGHUP`
+/// proofs above).
+///
+/// `GenerateConsoleCtrlEvent` can target a *single* process (group) only for
+/// `CTRL_BREAK_EVENT`, and only when that process was created with
+/// `CREATE_NEW_PROCESS_GROUP` (its own pid then *is* the group id) — otherwise the
+/// event broadcasts to every process sharing this test's console, including the
+/// test harness itself. So the runner is spawned with that flag and the event is
+/// generated against its pid alone, leaving this test process unaffected.
+#[cfg(windows)]
+#[test]
+fn cancel_via_ctrl_break_reports_the_cancel_code_and_tears_down_the_tree() {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+    use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+
+    let dir = scratch("ctrl_break");
+    let heartbeat = dir.join("heartbeat.txt");
+    let grandchild = write_grandchild_script(&dir);
+    let root = write_sleeping_root_script(&dir);
+
+    let mut cmd = common::command_with_flags(
+        &dir,
+        &[
+            ("HB", heartbeat.as_path()),
+            ("GRANDCHILD", grandchild.as_path()),
+        ],
+        &["--grace", "1s"],
+        vec!["cmd".to_string(), "/c".to_string(), path_arg(&root)],
+    );
+    cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    let child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the runner");
+
+    // Let the grandchild start heartbeating so CTRL_BREAK lands mid-run, with a
+    // live descendant to tear down.
+    wait_until(|| file_len(&heartbeat) > 0, Duration::from_secs(10));
+
+    let pid = child.id();
+    // SAFETY: a plain FFI call with valid, POD arguments (`CTRL_BREAK_EVENT` is a
+    // fixed constant, `pid` a `u32` this process itself just read back from
+    // `Child::id`). `pid` names the runner's own process group — it was spawned
+    // with `CREATE_NEW_PROCESS_GROUP`, so its own pid *is* the group id — so only
+    // the runner receives this event, not this test process.
+    let generated = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) };
+    assert_ne!(
+        generated, 0,
+        "failed to generate CTRL_BREAK_EVENT for the runner"
+    );
+
+    let out = child.wait_with_output().expect("runner did not exit");
+    assert_eq!(
+        out.status.code(),
+        Some(107),
+        "a CTRL_BREAK cancel must exit with the reserved CANCELLED code"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("run cancelled (Ctrl-Break)"),
+        "the stderr line must name Ctrl-Break: {stderr:?}"
+    );
+
+    // The full terminal sequence must be present, with the cancel attributed to
+    // CTRL_BREAK specifically — not flattened onto `ctrl_c`.
+    let events = read_run_events(&dir);
+    let tags: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event["event"].as_str())
+        .collect();
+    let cancelled = events
+        .iter()
+        .find(|event| event["event"] == "cancelled")
+        .unwrap_or_else(|| panic!("a CTRL_BREAK must write a `cancelled` event: {tags:?}"));
+    assert_eq!(
+        cancelled["source"], "ctrl_break",
+        "the cancel must be attributed to CTRL_BREAK: {cancelled}"
+    );
+    let terminal = events.last().expect("a terminal event");
+    assert_eq!(terminal["event"], "runner_exit");
+    assert_eq!(terminal["source"], "cancelled");
+    assert_eq!(terminal["code"], 107);
+
+    // And the headline guarantee: the whole tree is gone. The detached grandchild
+    // cannot grow its heartbeat after the runner returned.
+    let size_at_return = file_len(&heartbeat);
+    assert!(
+        size_at_return > 0,
+        "the grandchild must have heartbeat before the CTRL_BREAK"
+    );
+    sleep(Duration::from_secs(3));
+    let size_later = file_len(&heartbeat);
+    assert_eq!(
+        size_later, size_at_return,
+        "a descendant survived the CTRL_BREAK teardown (grew from {size_at_return} to {size_later})"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Poll `cond` until it holds or `timeout` elapses (then panic). A tiny spin used
 /// by the cancel tests to wait for the grandchild to come alive.
-#[cfg(unix)]
 fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) {
     let start = std::time::Instant::now();
     while !cond() {
