@@ -192,8 +192,9 @@ mod tests {
     #[test]
     fn the_four_runner_imposed_endings_are_all_distinct() {
         // A caller must be able to tell every runner-imposed ending apart by code:
-        // a --timeout, a local stop signal (Ctrl-C / SIGTERM / SIGHUP, which share
-        // CANCELLED), a control-plane cancel, and a control-plane kill.
+        // a --timeout, a local stop signal (Ctrl-C, on Unix SIGTERM / SIGHUP, on
+        // Windows Ctrl-Break / console close / logoff / shutdown — all of which
+        // share CANCELLED), a control-plane cancel, and a control-plane kill.
         let endings = [TIMEOUT, CANCELLED, CONTROL_CANCELLED, CONTROL_KILLED];
         for (i, a) in endings.iter().enumerate() {
             for b in &endings[i + 1..] {

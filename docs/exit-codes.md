@@ -57,7 +57,8 @@ takes a distinct reserved-band code so a caller can tell them apart:
   `--idle-timeout` (no child output for the idle window) — both `106`, told apart by
   the `timeout` event's `reason` (`overall` / `idle`) rather than by a distinct code,
 - the runner ended it because a **local stop signal** reached it — the operator pressed
-  `Ctrl-C`, or on Unix a `SIGTERM`/`SIGHUP` arrived (`107` for all three, told apart by
+  `Ctrl-C`, on Unix a `SIGTERM`/`SIGHUP` arrived, or on Windows a `Ctrl-Break` / console
+  close / logoff / system shutdown arrived (`107` for all of them, told apart by
   the `cancelled` event's `source` rather than by a distinct code),
 - a control-plane `cancel` command ended it — the same graceful teardown as a Ctrl-C,
   but triggered over the network (`108`), and

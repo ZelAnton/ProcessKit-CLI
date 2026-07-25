@@ -60,10 +60,11 @@ to a dated version section.
   class of ending. A signal the environment deliberately neutralized before launching
   the runner (`SIG_IGN`, as `nohup` does to `SIGHUP`) is left alone rather than
   un-ignored — `nohup processkit-cli run …` keeps surviving a hangup, and nothing is
-  lost, because an ignored signal would not have stopped the runner either. Windows is
-  unchanged and still listens for `Ctrl-C` only; its
-  console-close/logoff/shutdown handler is a separate mechanism, not covered here. See
-  README.md, "Timeouts, cancel, and grace", and docs/schema.md / docs/exit-codes.md.
+  lost, because an ignored signal would not have stopped the runner either. Windows was
+  left unchanged by *this* entry — its `Ctrl-Break`/console-close/logoff/shutdown
+  handling is covered by the Windows entry above, which now joins `Ctrl-C` in the same
+  race. See README.md, "Timeouts, cancel, and grace", and docs/schema.md /
+  docs/exit-codes.md.
 - `run` gained `--idle-timeout <duration>`, a deadline on child **silence** for the
   stuck-worker case (a child that is alive but has long stopped producing output).
   The deadline is re-armed on every chunk of the child's output, so a child that
