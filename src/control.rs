@@ -235,9 +235,18 @@ const CONNECT_DEADLINE: Duration = Duration::from_secs(5);
 /// A live-but-wedged runner is bounded by this instead of hanging the client.
 const CONVERSATION_DEADLINE: Duration = Duration::from_secs(5);
 
-/// How long the *server* spends on a single client exchange before dropping it, so a
-/// client that connects and then stalls cannot wedge the accept loop for other
-/// inspect clients (the run's own path is already independent of this).
+/// How long the *server* spends on a single client exchange before dropping it.
+/// Both platform accept loops ([`ControlServer::serve`], unix and Windows alike)
+/// serve connections strictly **sequentially**: one [`handle_connection`] call is
+/// awaited to completion (or this timeout) before the loop accepts or services the
+/// next, so a client that connects and then stalls blocks every client queued behind
+/// it for up to this long — a run of *N* stalled clients in a row delays the Nth by
+/// up to `N * CONNECTION_DEADLINE`, with no bound on how long a queue of stalled
+/// clients can grow (the run's own path is already independent of this and never
+/// waits on a control client). The channel is owner-only, not exposed to an
+/// untrusted network peer, so this is an accepted latency bound rather than a
+/// vulnerability: what this deadline guarantees is only that *one* stalled client
+/// cannot wedge the loop forever, not that other clients are served concurrently.
 const CONNECTION_DEADLINE: Duration = Duration::from_secs(5);
 
 /// The byte ceiling on the *one* line either side of the wire protocol reads: the
@@ -406,9 +415,12 @@ pub async fn serve(
 }
 
 /// Handle one accepted connection: read the request verb, write the JSON response,
-/// close. Bounded by [`CONNECTION_DEADLINE`] so a client that connects and stalls
-/// cannot wedge the accept loop. Errors are swallowed — a broken client connection is
-/// never the run's problem.
+/// close. Bounded by [`CONNECTION_DEADLINE`], so a stalled client cannot wedge the
+/// accept loop *forever* — but every caller (both platform `serve` loops) awaits this
+/// inline, one connection at a time, so a stalled client still blocks the *next*
+/// client's accept and service for up to [`CONNECTION_DEADLINE`] (see that constant's
+/// doc comment for the unbounded-queue consequence of a run of stalled clients).
+/// Errors are swallowed — a broken client connection is never the run's problem.
 async fn handle_connection<S>(stream: S, source: &SnapshotSource<'_>, commands: &ControlCommandSink)
 where
     S: AsyncRead + AsyncWrite + Unpin,
