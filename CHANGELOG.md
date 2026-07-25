@@ -12,13 +12,23 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+- `cleanup_started`/`cleanup_finished` gained an additive `read_error` field: `true`
+  when the underlying container-member read itself failed, so a `0`/empty fallback
+  is never indistinguishable from a confirmed empty tree or a confirmed-clean
+  teardown (mirrors `output_captured`'s `write_error`). See "Fixed" below.
 
 ### Changed
 -
 
 ### Fixed
--
+- **`cleanup_started`/`cleanup_finished` no longer fabricate a confirmed `0` on a
+  member-read failure.** Both emitters previously turned a `ProcessGroup::members()`
+  read error into a silent `members_before: 0` / `remaining: 0, remaining_pids: []` —
+  indistinguishable from a genuinely empty tree, and inconsistent with the sibling
+  `emit_members_snapshot`'s honest degradation and `wait_grace_or_empty`'s "a read
+  failure is not a confirmed empty tree" policy. Both now warn on stderr on a read
+  failure and set the new `read_error: true` flag instead of letting the fallback
+  stand as an observation; the success path is unaffected.
 
 ## [0.3.0] - 2026-07-25
 

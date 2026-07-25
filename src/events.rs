@@ -97,19 +97,34 @@ pub enum Event {
         signal: Option<i32>,
     },
     /// Container teardown is beginning; `members_before` is the tree size about to
-    /// be reaped.
-    CleanupStarted { members_before: usize },
+    /// be reaped. `read_error` is `true` when the pre-cleanup member read itself
+    /// failed — in that case `members_before` is the same `0` fallback the field
+    /// always carried on a read failure, but no longer stands unqualified as a
+    /// confirmed empty tree; a consumer must check this flag before trusting a `0`
+    /// as an observation rather than a gap (`docs/schema.md`, "cleanup_started").
+    /// Always present and `false` on every successful read — the additive flag
+    /// this event gained alongside `output_captured`'s `write_error` — so the
+    /// success-path payload is otherwise unchanged.
+    CleanupStarted {
+        members_before: usize,
+        read_error: bool,
+    },
     /// Container teardown finished. `remaining_pids` is a post-hard-kill snapshot
     /// (empty on the Job Object / cgroup mechanisms; on the POSIX process-group
     /// fallback an unreaped just-exited child may still be listed as a member —
     /// see [`ProcessGroup::members`](processkit::ProcessGroup::members)).
     /// `soft_terminate` describes the soft-stop tier for a runner-imposed ending
     /// (`signalled` | `unsupported` | `failed`), and is `null` on the natural-exit
-    /// path where no soft stop is attempted.
+    /// path where no soft stop is attempted. `read_error` is `true` when the
+    /// post-kill member read itself failed — in that case `remaining`/
+    /// `remaining_pids` fall back to the same empty snapshot as before, but no
+    /// longer stand unqualified as a confirmed-clean teardown (mirrors
+    /// `cleanup_started`'s flag; `docs/schema.md`, "cleanup_finished").
     CleanupFinished {
         remaining: usize,
         remaining_pids: Vec<u32>,
         soft_terminate: Option<&'static str>,
+        read_error: bool,
     },
     /// A configured ProcessKit resource limit could not be applied. Emitted when a
     /// `run` given `--max-memory`/`--max-processes`/`--cpu-quota` asks for a cap the
@@ -671,11 +686,15 @@ mod tests {
                 code: Some(0),
                 signal: None,
             },
-            Event::CleanupStarted { members_before: 2 },
+            Event::CleanupStarted {
+                members_before: 2,
+                read_error: false,
+            },
             Event::CleanupFinished {
                 remaining: 0,
                 remaining_pids: vec![],
                 soft_terminate: None,
+                read_error: false,
             },
             // One `output_captured`: stdout captured in full (the `abc` vector),
             // stderr empty (the empty-string digest). Both complete — neither
