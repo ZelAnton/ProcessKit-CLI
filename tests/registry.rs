@@ -787,27 +787,36 @@ fn list_reports_an_unprobeable_entry_as_unprobed_not_stale() {
         "a confirmed-stale entry still prints 'stale', unaffected by the unprobed sibling: {stale}"
     );
 
-    // The human-readable table renders the same distinct value, not "stale". The
-    // unprobeable run's own `run_id` contains the substring "unprobed", so a bare
-    // `stdout.contains("unprobed")` would pass even if the HEALTH column printed
-    // "stale" — inspect the row's own HEALTH cell instead.
+    // The human-readable table renders the same distinct value, not "stale". Both
+    // run_ids under test (`run-unprobed-0000`, `run-stale-0000`) contain the very
+    // health-word substring they are meant to distinguish, so a bare
+    // `row.contains("unprobed")` / `row.contains("stale")` would pass no matter what
+    // the HEALTH column actually printed. Instead, locate the HEALTH column by its
+    // header offset — the same technique
+    // `render_table_lines_pads_every_column_to_its_widest_value` in src/list.rs uses
+    // — and assert the actual cell content.
     let out = list(&registry, false);
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let header = stdout
+        .lines()
+        .find(|line| line.starts_with("RUN_ID"))
+        .unwrap_or_else(|| panic!("the human-readable table prints a header row: {stdout}"));
+    let health_col = header
+        .find("HEALTH")
+        .unwrap_or_else(|| panic!("the header names a HEALTH column: {header}"));
+
     let unprobed_row = stdout
         .lines()
         .find(|line| line.contains("run-unprobed-0000"))
         .unwrap_or_else(|| panic!("the human-readable table names the unprobeable run: {stdout}"));
     assert!(
-        unprobed_row.contains("unprobed"),
-        "the unprobeable run's row names its distinct health: {unprobed_row}"
-    );
-    assert!(
-        !unprobed_row.contains("stale"),
-        "the unprobeable run's row must never print the confirmed-dead 'stale': {unprobed_row}"
+        unprobed_row[health_col..].starts_with("unprobed"),
+        "the unprobeable run's HEALTH cell reads 'unprobed', never the confirmed-dead 'stale': {unprobed_row}"
     );
 
-    // Symmetrically, the confirmed-stale sibling still prints "stale" in the
-    // human-readable form too — this table has not been checked for it before.
+    // Symmetrically, the confirmed-stale sibling's own HEALTH cell still reads
+    // "stale" in the human-readable form too — this table has not been checked for
+    // it before.
     let stale_row = stdout
         .lines()
         .find(|line| line.contains("run-stale-0000"))
@@ -815,8 +824,8 @@ fn list_reports_an_unprobeable_entry_as_unprobed_not_stale() {
             panic!("the human-readable table names the confirmed-stale run: {stdout}")
         });
     assert!(
-        stale_row.contains("stale"),
-        "the confirmed-stale run's row still prints 'stale' in the table: {stale_row}"
+        stale_row[health_col..].starts_with("stale"),
+        "the confirmed-stale run's HEALTH cell still reads 'stale' in the table: {stale_row}"
     );
 
     let _ = fs::remove_dir_all(&dir);
