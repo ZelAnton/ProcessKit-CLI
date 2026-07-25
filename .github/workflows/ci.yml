@@ -55,9 +55,12 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      # `--all-features` so the `e2e`-gated tier and its helper worker
-      # (tests/e2e.rs, src/bin/e2e_helper.rs) are linted here too, including their
-      # cfg(unix) paths on this Linux runner.
+      # `--all-features` so every feature-gated tier is linted here too, including
+      # its cfg(unix) paths on this Linux runner: the `e2e` tier and its helper
+      # worker (tests/e2e.rs, src/bin/e2e_helper.rs), the `bench` tier (benches/,
+      # src/bin/bench_emit.rs), and the `stress` tier (tests/stress.rs). Those tiers
+      # each run in their own job or workflow, so this is the one place their code
+      # is lint-gated on every PR.
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
@@ -88,9 +91,10 @@ jobs:
     # are picked up by a plain `cargo test`, plus the through-the-binary
     # integration tests under `tests/`; see docs/architecture.md, "Test
     # tiers"). ubuntu-latest + windows-latest covers both the `cfg(unix)` and
-    # `cfg(windows)` platform halves. The feature-gated `e2e` tier is out of
-    # scope here too, same reasoning as `test`: it spawns real, multi-level
-    # process trees and is heavier — a separate concern from this job's data.
+    # `cfg(windows)` platform halves. The feature-gated `e2e` and `stress` tiers
+    # are out of scope here too, same reasoning as `test`: they spawn real,
+    # multi-level process trees (and, for `stress`, dozens of simultaneous runs)
+    # and are heavier — a separate concern from this job's data.
     continue-on-error: true
     strategy:
       fail-fast: false

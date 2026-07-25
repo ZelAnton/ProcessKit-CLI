@@ -12,7 +12,23 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+- A concurrency stress test tier (`tests/stress.rs`, `stress` Cargo feature)
+  covering the invariants that only break when many runs contend for the two
+  resources every run shares — the per-user registry and the per-run control
+  plane. It launches dozens of simultaneous `run` invocations against one
+  registry directory and drives parallel `list`/`prune`/`wait`/`inspect`/
+  `cancel`/`kill` clients at them, asserting that `prune` never reaps a live
+  entry (including one still inside its reservation window), that a registry
+  scan never loses or duplicates a record under concurrent writes and
+  deletions, that a control client aimed at an unreachable or dying runner
+  refuses with `CONTROL` (103) inside a bounded deadline instead of hanging,
+  and that `wait` never misses — or invents — a completion. Every scenario
+  carries a positive control, so none of those "never" assertions can pass
+  vacuously. Dev-only tooling: off by default, like the `e2e` and `bench`
+  tiers, so it never affects a plain `cargo build`/`cargo test`/`cargo
+  publish`; CI runs it as a separate, non-gating scheduled `stress.yml`
+  workflow (see CONTRIBUTING.md, "Stress tests"). No runtime behavior, CLI
+  surface, exit code, or event-schema change.
 
 ### Changed
 -

@@ -103,6 +103,18 @@ tokio = { version = "1", features = [
 # `required-features` below).
 e2e = []
 
+# Opt-in concurrency stress tier (`tests/stress.rs`). Off by default so `cargo test`
+# stays fast and quiet: the tier launches dozens of simultaneous `run` invocations
+# plus parallel `list`/`prune`/`wait`/`inspect`/`cancel`/`kill` clients against one
+# shared registry and control plane, so it is both slower and noisier (many real
+# processes at once) than the default tier. The dedicated, non-gating
+# `stress.yml` CI workflow enables it (`cargo test --features stress --test
+# stress`). Empty feature set, same pattern as `e2e`/`bench` — it only gates which
+# targets build (see the `[[test]]` `required-features` below). It needs no worker
+# binary of its own: every stress workload is the shipped `processkit-cli` binary
+# itself, driven through `CARGO_BIN_EXE_processkit-cli`.
+stress = []
+
 # Opt-in criterion benchmark tier (`benches/`) plus its `bench_emit` worker. Off
 # by default so a plain `cargo build`/`cargo test`/`cargo publish` never builds
 # it — benchmarks are dev-only tooling, never shipped. The dedicated,
@@ -226,6 +238,17 @@ required-features = ["e2e"]
 name = "e2e"
 path = "tests/e2e.rs"
 required-features = ["e2e"]
+
+# The concurrency stress tier, gated behind the `stress` feature for the same
+# reason the `e2e` tier is gated behind its own: a default `cargo test`, a plain
+# `cargo build`, and `cargo publish` never build or ship it. Unlike `e2e` it needs
+# no companion `[[bin]]` worker — its workload is the `processkit-cli` binary
+# itself (`CARGO_BIN_EXE_processkit-cli`, which Cargo sets for every test target),
+# so this one target is the whole tier.
+[[test]]
+name = "stress"
+path = "tests/stress.rs"
+required-features = ["stress"]
 
 # Test-support worker for the `bench`-gated through-the-binary scenarios
 # (benches/echo_overhead_bench.rs, benches/startup_latency_bench.rs): writes an

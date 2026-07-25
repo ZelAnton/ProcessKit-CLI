@@ -116,6 +116,67 @@ and the harness never kills by (recyclable) PID. CI runs this tier as a separate
 
 [`tests/e2e.rs`]: tests/e2e.rs
 
+## Stress tests
+
+The tiers above each prove a functional path: a helper in isolation, one
+subcommand's contract through the binary, or containment against a scripted
+handful of real processes. [`tests/stress.rs`] covers what none of them can
+reach by construction — the invariants that only break when many runs contend
+for the two resources *every* run shares, the per-user registry
+([`src/registry.rs`](src/registry.rs)) and the per-run control plane
+([`src/control.rs`](src/control.rs)). It launches dozens of simultaneous `run`
+invocations against a single scratch registry directory and drives parallel
+`list`/`prune`/`wait`/`inspect`/`cancel`/`kill` clients at them, asserting four
+properties a race would break:
+
+- `prune` never reaps a **live** entry — including one belonging to a runner
+  still inside its reservation window (the window between creating its lock
+  file and publishing its record);
+- a registry scan never **loses or duplicates** a record while other runs
+  concurrently write and delete their own;
+- a control client aimed at an **unreachable or dying** runner refuses with the
+  reserved `CONTROL` (103) exit code inside a bounded deadline, instead of
+  hanging on a dead endpoint;
+- `wait` never **misses** the completion it is watching for, and never
+  announces one that has not happened.
+
+Each scenario is a *differential*, not an absence check: it plants entries a
+correct `prune` must reap, requires the scanner to actually observe records
+appearing and disappearing, aims the same control clients at live runs that
+must answer `0`, and checks that `wait` really does block (reporting its own
+`WAIT_TIMEOUT`, 112) against a run that is still going. A "never happens"
+assertion with nothing forcing the machinery to *do* anything can pass while
+proving nothing, so every scenario's docstring also records the temporary
+source-level break that was used to confirm the assertion fails when the
+invariant does. Keep that up if you add a scenario.
+
+The tier is gated behind the `stress` Cargo feature, so it is **off** in the
+default `cargo test`. Run it explicitly:
+
+```sh
+cargo test --features stress --test stress -- --nocapture
+```
+
+Knobs, all optional environment variables: `PROCESSKIT_STRESS_RUNS` (how many
+simultaneous runs a scenario launches, default 24) plus per-scenario
+`PROCESSKIT_STRESS_PRUNERS`, `PROCESSKIT_STRESS_CHURN`,
+`PROCESSKIT_STRESS_HAMMERS`, `PROCESSKIT_STRESS_WAITERS`, and
+`PROCESSKIT_STRESS_SECONDS`. Dial `PROCESSKIT_STRESS_RUNS` down on a small
+machine, or up to hunt a race that needs heavier contention.
+
+The scenarios serialize against each other (a process-wide lock inside the
+tier), so `--test-threads` does not change what they measure. Every run is
+pointed at a scratch registry directory of its own via
+`PROCESSKIT_CLI_REGISTRY_DIR` — your own per-user registry is never touched —
+and nothing is ever killed by PID: runs are torn down through the control
+plane, with the owned process handle as a backstop and a `--timeout` on each
+runner so an aborted run leaves nothing behind for long. CI runs this tier as a
+separate, **non-gating** `stress.yml` workflow on a weekly schedule and by
+manual dispatch — never on push/pull request — so a slow or contended runner
+can never block an unrelated PR.
+
+[`tests/stress.rs`]: tests/stress.rs
+
 ## Fuzzing
 
 Beyond the grammar-shaped generators the [proptest] property tier drives,

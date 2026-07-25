@@ -1,0 +1,102 @@
+name: Stress
+
+# Concurrency stress tier (`tests/stress.rs`, `stress` Cargo feature, T-219): the
+# invariants that only break when many runs contend for the two resources this
+# binary shares across every run — the per-user registry (src/registry.rs) and the
+# per-run control plane (src/control.rs). Dozens of simultaneous `run` invocations
+# plus parallel `list`/`prune`/`wait`/`inspect`/`cancel`/`kill` clients, asserting
+# that `prune` never reaps a live entry, a registry scan never loses or duplicates a
+# record, control clients refuse boundedly (CONTROL 103) instead of hanging on a dead
+# runner, and `wait` never misses (or invents) a completion. See tests/stress.rs and
+# CONTRIBUTING.md, "Stress tests".
+#
+# NON-GATING, and this file is where that decision is recorded. There is deliberately
+# no `push:`/`pull_request:` trigger: this workflow runs on a schedule and by manual
+# dispatch only, so it is never a PR check and can never block a merge — the same
+# placement as fuzz.yml and mutants.yml, and for the same reason (it is slower and
+# noisier than the gating `test` job in ci.yml, since it launches real process storms
+# whose timing depends on how loaded the shared runner happens to be).
+#
+# Unlike fuzz.yml/mutants.yml, the test step here does NOT use `continue-on-error`:
+# for those tiers a finding is an expected, reportable result of a discovery run,
+# whereas a failure here is a concurrency regression in shipped behavior, and it
+# should be plainly red in this workflow's own history. Being outside the PR triggers
+# above is what makes it non-blocking; it does not need its failures hidden as well.
+#
+# CI-only addition on its own (this file), but the tier it runs ships a new Cargo
+# feature and test target, so it is not covered by the K-029 CHANGELOG exemption —
+# see the `[Unreleased]` entry.
+
+on:
+  schedule:
+    # Weekly, off-peak UTC — offset from fuzz.yml (Monday) and mutants.yml
+    # (Wednesday) so the scheduled tiers don't compete for the same runner window.
+    - cron: '41 3 * * 5'
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: >-
+          How many simultaneous runs each scenario launches (the tier's
+          PROCESSKIT_STRESS_RUNS knob). Lower it if a runner proves too small;
+          raise it to hunt a race that only shows up under heavier contention.
+        required: false
+        default: '24'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  stress:
+    name: stress (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # All three OSes on purpose, unlike the single-OS `mutants` job: the properties
+    # under test rest on per-platform primitives — the liveness lock is `flock` on
+    # unix and `LockFileEx` on Windows, and the control transport is a unix domain
+    # socket or a Windows named pipe — so a race here can be genuinely
+    # platform-specific, exactly like the `e2e` job's matrix.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    # The scenarios run one at a time (the tier serializes them itself) and each
+    # spends tens of seconds under deliberate load; this bounds a wedged run well
+    # above a healthy one (~1 minute on a developer machine, more on a shared
+    # runner) without letting it sit for the runner's default cap.
+    timeout-minutes: 25
+    steps:
+      # Actions are pinned to a full commit SHA (supply-chain hardening); the
+      # trailing comment records the human-readable version.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@stable # rolling toolchain selector — intentionally unpinned
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # `--nocapture` so each scenario's own diagnostics (client counts, the slowest
+      # bounded client invocation) reach the log even on a pass — the numbers are how
+      # a reader tells "the storm really happened" from "the tier no-oped".
+      #
+      # Every scenario points its whole fleet at a scratch registry directory of its
+      # own (PROCESSKIT_CLI_REGISTRY_DIR), so nothing here touches the runner's own
+      # per-user registry, and each run additionally self-bounds (`--timeout`) so a
+      # cancelled job cannot leave a runner behind.
+      - name: Run the stress tier
+        env:
+          PROCESSKIT_STRESS_RUNS: ${{ github.event.inputs.runs || '24' }}
+        run: cargo test --features stress --test stress -- --nocapture
+
+      - name: Report outcome
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Stress tier (${{ matrix.os }}): ${{ job.status }}"
+            echo
+            echo "Concurrent runs per scenario: \`${{ github.event.inputs.runs || '24' }}\`"
+            if [ "${{ job.status }}" != "success" ]; then
+              echo
+              echo "A failing scenario names the invariant it caught in its assertion" \
+                   "message — see the \"Run the stress tier\" step log above. Each" \
+                   "scenario's docstring in \`tests/stress.rs\` records what regression" \
+                   "that assertion was verified to detect."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

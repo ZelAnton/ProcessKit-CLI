@@ -224,7 +224,7 @@ offers, a shell mode, and PTY support (deferred in the core crate).
 
 ## Test tiers
 
-Three tiers, increasing in weight and decreasing in how often they run:
+Four tiers, increasing in weight and decreasing in how often they run:
 
 - **Unit.** Each `src/*.rs` module carries its own `#[cfg(test)] mod tests`
   (for example the SHA-256 vector tests in `src/hash.rs`, or the
@@ -250,6 +250,31 @@ Three tiers, increasing in weight and decreasing in how often they run:
   `cargo test` and runs explicitly via
   `cargo test --features e2e --test e2e -- --nocapture`; CI runs it as a
   separate job. See `CONTRIBUTING.md`, "End-to-end tests".
+- **Concurrency stress (`stress`, feature-gated).** `tests/stress.rs` targets
+  what the tiers above cannot reach by construction: the invariants that only
+  break when many runs contend for the two resources every run *shares* — the
+  per-user registry ([`src/registry.rs`](../src/registry.rs)) and the per-run
+  control plane ([`src/control.rs`](../src/control.rs)). Where the `e2e` tier
+  scripts a fixed handful of processes, this one launches dozens of
+  simultaneous `run` invocations against one registry directory and drives
+  parallel `list`/`prune`/`wait`/`inspect`/`cancel`/`kill` clients at them,
+  asserting that `prune` never reaps a live entry (including one still inside
+  its reservation window), that a registry scan never loses or duplicates a
+  record under concurrent writes and deletions, that a control client aimed at
+  an unreachable or dying runner refuses with `CONTROL` (103) inside a bounded
+  deadline rather than hanging, and that `wait` never misses — or invents — a
+  completion. Every scenario carries a positive control, so none of those
+  "never" assertions can pass vacuously. Gated behind the `stress` Cargo
+  feature and run via `cargo test --features stress --test stress --
+  --nocapture`; CI runs it as a separate, non-gating scheduled workflow
+  (`.github/workflows/stress.yml`), not on every PR. See `CONTRIBUTING.md`,
+  "Stress tests".
+
+The property-based (proptest), fuzz (`cargo-fuzz`), mutation (`cargo-mutants`),
+and benchmark (criterion) tiers cut across this ladder rather than sitting on a
+rung of it — each re-examines code the tiers above already cover, from a
+different angle. They are documented in `CONTRIBUTING.md` ("Fuzzing", "Mutation
+testing") and `README.md` ("Benchmarks").
 
 ## Normative documents
 
