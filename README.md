@@ -17,7 +17,10 @@ For a map of the modules below, the data flow of one run, and the
 control-plane contour, see [the architecture overview](docs/architecture.md).
 For a consumer/adapter walkthrough — preflight, launching a run, reading the
 JSONL stream, supervision, and housekeeping — see
-[the integration guide](docs/integration.md).
+[the integration guide](docs/integration.md). For symptom-to-cause diagnosis
+of common operator issues (CI resource-limit failures, a stray Windows
+console window, ambiguous run ids, and more), see
+[the troubleshooting guide](docs/troubleshooting.md).
 
 ## Installation
 
@@ -289,15 +292,18 @@ immediately, and `wait`'s `0` must never be read as proof the run existed. See
 
 `list` is the discovery counterpart to `inspect`/`cancel`/`kill`: it scans the same
 per-user registry and prints every entry it finds — `run_id`, health (`live`/
-`stale`), `started_at`, and `endpoint` — for an operator or orchestrator that has
-lost (or never had) a `run_id`. It is read-only and never connects to any runner's
-control transport, so it has none of their unreachable-run failure modes. Without
-`--json` it prints a human-readable table (`no runs registered` for an empty
-registry); with `--json` it prints one JSON object per entry, one per line. An
+`stale`/`unprobed`), `started_at`, and `endpoint` — for an operator or orchestrator
+that has lost (or never had) a `run_id`. It is read-only and never connects to any
+runner's control transport, so it has none of their unreachable-run failure modes.
+Without `--json` it prints a human-readable table (`no runs registered` for an
+empty registry); with `--json` it prints one JSON object per entry, one per line. An
 empty registry is not an error — `list` exits `0` either way — and a stale entry is
 listed rather than hidden, since surfacing a leftover from an abruptly-died runner
-is exactly the point. See [`docs/registry.md`](docs/registry.md), "Discovery —
-`list`".
+is exactly the point. An entry whose liveness lock could not even be *probed*
+(permission denied, a rejected symlink/reparse point) prints as `unprobed`, never
+the confirmed-dead `stale`, so an operator never mistakes "could not tell" for "the
+runner is gone" — the same distinction `prune --json`'s `unprobed` tally and `wait`
+already make. See [`docs/registry.md`](docs/registry.md), "Discovery — `list`".
 
 `list` shows those stale leftovers; `prune` removes them. It reaps every registry
 entry it can **confirm** is stale — the `.json`/`.lock` pair a runner that died
@@ -699,9 +705,9 @@ gracefully (its shared soft-stop → grace → hard-kill teardown, exit `108`), 
 force-kills the whole tree immediately (exit `109`) — each a distinguishable outcome in
 the JSONL stream and by exit code, and each a bounded `CONTROL` (103) failure when the
 run cannot be reached. `list` scans the same registry read-only and prints every
-entry, live or stale, as a table or (with `--json`) as JSON Lines — the discovery
-counterpart for a caller that has lost or never had a `run_id` — and `prune` reaps
-the confirmed-stale leftovers it shows. `wait` blocks on that same registry until a
+entry, whatever its health (`live`/`stale`/`unprobed`), as a table or (with
+`--json`) as JSON Lines — the discovery counterpart for a caller that has lost or
+never had a `run_id` — and `prune` reaps the confirmed-stale leftovers it shows. `wait` blocks on that same registry until a
 run is no longer live, for a supervisor that is not the runner's parent, bounding
 itself with `--timeout` and its own reserved exit code (`112`). `probe` reports and
 verifies the binary's compatibility surface for a consumer's fail-closed launcher
