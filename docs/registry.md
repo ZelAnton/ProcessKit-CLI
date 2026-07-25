@@ -236,6 +236,8 @@ the directory or touches its permissions; a missing or empty registry simply has
 nothing to prune — scans it with the same shared scan `list` uses, and for each
 scanned record deletes **both** its files (`<stem>.json` then `<stem>.lock`, the same
 order [`Registration::remove`] uses) only when it can *confirm* the record is stale.
+On unix it deletes a third leftover of the same death — the control socket that
+record published, see "Reaping the control socket" below.
 
 It then makes a second pass over any **orphaned lock files** — a `.lock` with no
 `.json` sibling at all. Such a `.lock` is invisible to the shared scan (which only
@@ -268,6 +270,67 @@ record naming it, and retries with a fresh stem — never a hard error — both 
 lock is denied and when that identity check fails. Together these close the race a
 lock-probe-only guarantee would otherwise leave open (see "The reaping safety
 invariant" below).
+
+### Reaping the control socket
+
+An abruptly-killed runner leaves more than a `.json`/`.lock` pair behind. On unix its
+control transport is a socket file inside a per-run `0700` directory named
+`pkc-<token>`, created under `/tmp` (or the platform temp directory) and removed only
+by the clean-teardown `Drop` that an abrupt death never runs — see
+[`docs/control-plane.md`](control-plane.md), "Cleanup and leaks". The dead record
+publishes that socket's path in its `endpoint` field, and nothing else on the system
+knows about it, so once the record went the directory was stranded forever: over time,
+`SIGKILL`s and crashes accumulate dead `pkc-*` directories that no `prune` pass ever
+looked at. **Reaping a confirmed-stale entry therefore also reaps the socket that
+entry published**, closing the half of the "leftovers of runners that died abruptly"
+contract that used to stay open.
+
+It is reaped **before** the record naming it, still under the same held lock: the
+record is the only thing that points at the socket directory, so a pass interrupted
+between the two deletions must not be the one that leaves the socket unreferenced.
+
+A record's `endpoint` is untrusted deserialized data, exactly like its
+`liveness.lock_file` (whose own single-component name check the scan already applies
+before ever joining it onto the registry directory) — and this step *deletes* what it
+names, so it is never used as a path on trust. It is first validated by **shape**, and
+a value failing any part of that check simply contributes no deletion at all (the
+record and lock are still reaped as usual — the check gates only this extra step):
+
+- absolute, and written as plain `/`-separated names: a relative path, a `.`/`..`
+  segment, a doubled separator, or an embedded NUL/control character is refused —
+  and refused *as written*, without normalizing anything away first;
+- the final component is exactly the socket file name the control server binds
+  (`c.sock`), and its parent is `pkc-` plus a non-empty token of ASCII alphanumerics
+  and `-` — the character set the transport's own token generator mints;
+- that parent sits **directly** inside one of the base directories the control server
+  binds in (`/tmp`, or the platform temp directory). A perfectly-shaped path anywhere
+  else — `/etc/pkc-x/c.sock`, `$HOME/pkc-x/c.sock`, one directory deeper — is not a
+  candidate.
+
+Shape alone cannot settle whether the path is a symlink, since that answer can change
+between the check and the deletion. So it is settled where it cannot be raced, at open
+time: the validated directory is opened with `O_NOFOLLOW | O_DIRECTORY` (the same
+discipline the liveness probe applies to a lock file), and the socket is then removed
+**relative to that open handle**. A `pkc-…` name that is really a symlink fails the
+open outright, and a swap landing after it cannot redirect the deletion. Two further
+refusals bound what can be deleted: only an entry that really is a **socket** is
+unlinked (a regular file, a symlink, or a device node under that name is left alone),
+and the directory itself is removed with `rmdir`, which never follows a final symlink
+and only ever removes an *empty* directory — so anything unexpected still inside keeps
+the directory too.
+
+Every step is best-effort, exactly like the record/lock deletions: a socket that will
+not go is a leftover to retry next pass, never a reason to abort the reaping of other
+entries. A run whose socket was created under a *different* temp directory than the
+pruning process sees (a changed `TMPDIR` between the run and the prune) keeps its
+socket rather than having an unrecognized path deleted on its behalf. The tally is
+unchanged: a reaped socket is counted by its own entry's `pruned`, not by a counter of
+its own — the socket belongs to that entry and is never reaped without it.
+
+**Windows is unaffected.** A Windows run publishes a named pipe, which lives in the
+kernel object namespace and disappears with the process that created it. There is no
+filesystem leftover to reap, so no endpoint is ever a candidate there and `prune`
+behaves exactly as it did before.
 
 ### The reaping safety invariant
 
@@ -331,10 +394,12 @@ a no-op that exits `0`.
 - **No `--json`** prints a one-line summary (`no stale entries to prune` when there
   was nothing to reap).
 - **`--json`** prints a single JSON object with the tally: `pruned` (paired entries
-  reaped), `live` (live entries left untouched, paired or orphaned lock alike),
-  `unprobed` (entries whose probe failed and were left in place, paired or orphaned
-  lock alike), and `orphaned_locks` (lone `.lock` files with no `.json` sibling that
-  were reaped).
+  reaped — each including whatever control socket that entry published, see "Reaping
+  the control socket" above), `live` (live entries left untouched, paired or orphaned
+  lock alike), `unprobed` (entries whose probe failed and were left in place, paired
+  or orphaned lock alike), and `orphaned_locks` (lone `.lock` files with no `.json`
+  sibling that were reaped). These four fields are unchanged: reaping a socket adds no
+  counter of its own.
 
 ### Previewing a reap — `prune --dry-run`
 
@@ -360,20 +425,32 @@ has no record to pull identifying fields from at all, each candidate is describe
 differently:
 
 - a confirmed-stale **paired entry** is identified by its `run_id` and
-  `started_at`, the same fields `list` already prints for it;
+  `started_at`, the same fields `list` already prints for it, plus the control-socket
+  directory (`socket_dir`) a real reap would remove along with its two files;
 - a confirmed-stale **orphaned lock** is identified by its lock file name (there is
   no `run_id`/`started_at` to report).
 
+`socket_dir` is classified by the very same shape check the real reap applies (see
+"Reaping the control socket" above), so the preview can neither promise a deletion the
+reap would refuse nor stay silent about one it would perform. It is `null` whenever
+that reap would remove nothing — no endpoint was published, the endpoint is not the
+shape a control server creates, or the record is a Windows one, whose named-pipe
+endpoint has no filesystem leftover. Like every other part of a preview it is read
+from the record alone: nothing is stat-ed, so a directory named here may already be
+gone (reaping it is best-effort, exactly like the record/lock deletions).
+
 - **No `--json`** lists each confirmed-stale candidate on its own line — a paired
-  entry as `run_id=<id> started_at=<ts>`, an orphaned lock by its file name — then
-  the same summary-line shape `prune`'s human-readable output uses, prefixed
-  `would` throughout since nothing is actually reaped (`no stale entries to prune
-  (dry run)` when there is nothing to preview).
+  entry as `run_id=<id> started_at=<ts>`, followed by ` socket_dir=<path>` when there
+  is a socket directory to reap with it (omitted entirely when there is not), an
+  orphaned lock by its file name — then the same summary-line shape `prune`'s
+  human-readable output uses, prefixed `would` throughout since nothing is actually
+  reaped (`no stale entries to prune (dry run)` when there is nothing to preview).
 - **`--json`** prints a single JSON object with the exact same aggregate fields
   `prune --json` reports (`pruned`/`live`/`unprobed`/`orphaned_locks`), plus an
   additional `candidates` array: one object per confirmed-stale candidate, internally
-  tagged `"kind":"entry"` (with `run_id`/`started_at`) or
-  `"kind":"orphaned_lock"` (with `lock_file_name`).
+  tagged `"kind":"entry"` (with `run_id`/`started_at`/`socket_dir`, the last always
+  present and `null` when there is no socket to reap) or `"kind":"orphaned_lock"`
+  (with `lock_file_name`).
 - `prune` without `--dry-run` is **unchanged**: its human-readable and `--json`
   output, and its exit codes, are identical to before this flag existed.
 - Like `prune`, `--dry-run` opens the registry through `Registry::open_read_only`,
@@ -487,8 +564,12 @@ could not probe.
   shutdown, all of which the runner catches), or a control-plane
   `cancel`/`kill` — not just the happy path.
 - **Leak → stale.** An abrupt death skips that removal by definition, leaving the
-  record on disk. The released lock makes it detectably stale, per the section above.
-  This is genuinely abrupt death only — a crash, a `SIGKILL`, an outer Job Object
-  terminate — not an ordinary Unix `SIGTERM`/`SIGHUP` or a caught Windows console-
-  control event (`Ctrl-Break`/console close/logoff/system shutdown), all of which the
-  runner catches and turns into the clean removal above.
+  record on disk — and, on unix, the control socket that record published (see
+  "Reaping the control socket" above). The released lock makes the record detectably
+  stale, per the section above. This is genuinely abrupt death only — a crash, a
+  `SIGKILL`, an outer Job Object terminate — not an ordinary Unix `SIGTERM`/`SIGHUP`
+  or a caught Windows console-control event (`Ctrl-Break`/console close/logoff/system
+  shutdown), all of which the runner catches and turns into the clean removal above.
+- **Stale → reaped.** `prune` is what finally clears such a leftover, deleting the
+  record, its lock, and the socket directory together — only once it has *confirmed*
+  the entry stale.

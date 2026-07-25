@@ -315,7 +315,13 @@ processkit-cli prune --json   # reap only the confirmed-stale entries
   a tally: `{"pruned":N,"live":N,"unprobed":N,"orphaned_locks":N}`. A live run
   is never touched, and an entry whose liveness could not even be probed is
   left in place rather than guessed at — see "The reaping safety invariant" in
-  [`docs/registry.md`](registry.md#the-reaping-safety-invariant).
+  [`docs/registry.md`](registry.md#the-reaping-safety-invariant). On unix each
+  reaped entry also takes with it the private control-socket directory that
+  record published, so an abruptly-killed run leaves no `pkc-…` litter in the
+  temp directory either; the tally fields are unchanged (that socket is counted
+  by its own entry's `pruned`). Worth scheduling if your adapter starts many
+  runs — see "Reaping the control socket" in
+  [`docs/registry.md`](registry.md#reaping-the-control-socket).
 
 Both are read-only with respect to any *live* run's control transport; neither
 carries the "could not reach the target run" failure modes of §4.

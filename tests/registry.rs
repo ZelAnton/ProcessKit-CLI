@@ -1512,3 +1512,100 @@ fn prune_dry_run_previews_without_deleting_and_matches_a_real_prune() {
     let _ = child.wait();
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// The `endpoint` the sole registry record publishes, or `None` while it has not
+/// published one (yet, or at all — a run whose control transport could not be stood
+/// up registers a `null` endpoint and still works).
+///
+/// `cfg(unix)` alongside its only caller below: on Windows an endpoint is a named
+/// pipe with no filesystem leftover to look for, so nothing here reads it.
+#[cfg(unix)]
+fn record_endpoint(registry: &Path) -> Option<String> {
+    let record: serde_json::Value =
+        serde_json::from_str(&read_only_record(registry)).expect("the record is JSON");
+    record["endpoint"].as_str().map(str::to_string)
+}
+
+/// T-207 end to end, through the real binary and a real abrupt death: a runner killed
+/// with `SIGKILL` runs no teardown at all, so it strands **both** its registry entry
+/// and the control socket it published — a `0700` `pkc-…` directory holding one
+/// socket, which nothing used to clean up. One `prune` now reaps both.
+///
+/// Unix-only because the leak is: a Windows runner publishes a named pipe, which
+/// lives in the kernel object namespace and disappears with its creator.
+#[cfg(unix)]
+#[test]
+fn prune_reaps_the_control_socket_of_an_abruptly_killed_runner() {
+    let dir = scratch("prune-socket-abrupt");
+    let registry = registry_dir(&dir);
+
+    let mut child = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "socket-run"],
+        long_child(),
+    )
+    .spawn()
+    .expect("spawn the runner");
+
+    // Wait for the record *and* the endpoint it publishes once its transport is up.
+    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+    wait_until(
+        || record_endpoint(&registry).is_some(),
+        Duration::from_secs(10),
+    );
+    let endpoint = record_endpoint(&registry).expect("the live run published an endpoint");
+    let socket = PathBuf::from(&endpoint);
+    let socket_dir = socket
+        .parent()
+        .expect("the endpoint names a socket inside its own directory")
+        .to_path_buf();
+    assert!(
+        socket.exists() && socket_dir.is_dir(),
+        "the live runner's control socket is on disk at {endpoint}"
+    );
+
+    // Abrupt death: `Child::kill` is `SIGKILL` here, so no teardown of any kind runs
+    // — neither the registry entry's removal nor the control server's `Drop`.
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        socket.exists(),
+        "an abruptly-killed runner leaves its control socket behind"
+    );
+    assert_eq!(
+        record_count(&registry),
+        1,
+        "…and its registry record too — the leftover pair prune exists for"
+    );
+
+    let out = prune(&registry, true);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "prune succeeds; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("prune --json prints one JSON object");
+    assert_eq!(
+        report["pruned"], 1,
+        "the confirmed-stale entry is reaped: {report}"
+    );
+    assert_eq!(
+        record_count(&registry),
+        0,
+        "the stale record is gone from the registry"
+    );
+    assert!(
+        !socket.exists(),
+        "the control socket the dead runner published is reaped too, not leaked"
+    );
+    assert!(
+        !socket_dir.exists(),
+        "its private directory goes with it, leaving no `pkc-…` litter behind"
+    );
+
+    let _ = fs::remove_dir_all(&socket_dir);
+    let _ = fs::remove_dir_all(&dir);
+}
