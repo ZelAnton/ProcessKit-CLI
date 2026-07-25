@@ -124,6 +124,7 @@ Container teardown is beginning.
 | Field            | Type    | Notes                                          |
 |------------------|---------|------------------------------------------------|
 | `members_before` | integer | The tree size (member count) about to be reaped. |
+| `read_error`     | boolean | `true` when the pre-cleanup member read itself failed; see "Honest degradation on a teardown read failure" below. |
 
 ### `cleanup_finished`
 
@@ -134,6 +135,7 @@ Container teardown finished (after the hard kill).
 | `remaining`      | integer           | Count of `remaining_pids`.                                              |
 | `remaining_pids` | array of integer  | Post-kill member snapshot; normally empty.                             |
 | `soft_terminate` | string, nullable  | The soft-stop tier for a runner-imposed ending (below); `null` on the natural-exit path. |
+| `read_error`     | boolean | `true` when the post-kill member read itself failed; see "Honest degradation on a teardown read failure" below. |
 
 `remaining_pids` is a snapshot: on the Job Object and cgroup mechanisms a process
 leaves membership on exit, so it is empty after the kill; on the POSIX
@@ -145,6 +147,19 @@ is reaped. `soft_terminate` is one of:
   was sent, and the runner does not pretend otherwise. The grace window still
   elapsed before the atomic Job Object kill.
 - `failed` — the soft signal could not be delivered; the hard kill ran regardless.
+
+**Honest degradation on a teardown read failure.** `members_before`/`remaining`/
+`remaining_pids` are read from the live container (`ProcessGroup::members()`),
+which can itself fail (an OS-level enumeration error). Rather than let a read
+failure masquerade as a confirmed `0`/empty observation, each event carries an
+explicit `read_error` flag: `false` on every successful read (the common case,
+unaffected by this), `true` when the read failed, in which case the numeric
+field(s) fall back to `0`/an empty array — not a fabricated fact, only the
+absence of one. A consumer that treats `cleanup_finished.remaining == 0` as
+"the tree is confirmed empty" must first check `read_error` is `false`; the
+runner also warns on stderr whenever this happens. This mirrors
+`output_captured`'s `write_error` flag (both are explicit failure markers, never
+inferred from the accompanying data alone).
 
 ### `limit_hit`
 
