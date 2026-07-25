@@ -65,6 +65,16 @@ uncontained-launch hazard this project exists to prevent. See
 [`src/probe.rs`](../src/probe.rs) and the normative exit-code table in
 [`docs/exit-codes.md`](exit-codes.md).
 
+`probe --print-schema` is a separate, simpler mode on the same subcommand: it
+prints this binary's embedded JSONL event-schema document instead of the
+report above and exits `0`, so an adapter that only needs the schema for its
+own version — no clone, no tag to match — can fetch it offline without a
+compatibility check. It **cannot be combined with any `--require-*` flag**:
+that combination is rejected as an ordinary `USAGE` (100) parse error, never a
+silent skip of the requested checks, so it can never produce a false "ok" on
+an invocation that also asked `probe` to verify expectations. See
+[`docs/schema.md`](schema.md), "Getting the schema without a git checkout".
+
 ## 2. Launching a run
 
 The recommended invocation for an adapter:
@@ -315,7 +325,13 @@ processkit-cli prune --json   # reap only the confirmed-stale entries
   a tally: `{"pruned":N,"live":N,"unprobed":N,"orphaned_locks":N}`. A live run
   is never touched, and an entry whose liveness could not even be probed is
   left in place rather than guessed at — see "The reaping safety invariant" in
-  [`docs/registry.md`](registry.md#the-reaping-safety-invariant).
+  [`docs/registry.md`](registry.md#the-reaping-safety-invariant). On unix each
+  reaped entry also takes with it the private control-socket directory that
+  record published, so an abruptly-killed run leaves no `pkc-…` litter in the
+  temp directory either; the tally fields are unchanged (that socket is counted
+  by its own entry's `pruned`). Worth scheduling if your adapter starts many
+  runs — see "Reaping the control socket" in
+  [`docs/registry.md`](registry.md#reaping-the-control-socket).
 
 Both are read-only with respect to any *live* run's control transport; neither
 carries the "could not reach the target run" failure modes of §4.

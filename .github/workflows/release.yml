@@ -535,7 +535,11 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       # Package the binary, plus `build.rs`'s generated shell completions and man
-      # pages, into a per-target archive named with the version and the full
+      # pages, plus a static `schema/` snapshot (the JSON Schema document and the
+      # golden event fixture, copied straight from the tagged checkout — these are
+      # tracked repo files, not build.rs output, so `fixtures/schema/v1/` stays the
+      # one and only source of truth; no second generator, nothing to keep in
+      # sync), into a per-target archive named with the version and the full
       # target triple (so the musl build is self-describing:
       # …-x86_64-unknown-linux-musl.tar.gz). .zip on Windows, .tar.gz elsewhere.
       # `build.rs` always runs on the host — even under `--target` cross-compiling
@@ -550,14 +554,17 @@ jobs:
         run: |
           set -euo pipefail
           name="processkit-cli-v${VERSION}-${TARGET}"
-          # Stage the binary plus completions/man in the CWD first so the archive
-          # holds the binary bare at its root (as every prior release did), with
-          # `completions/` and `man/` alongside it — not under a nested
-          # target/<triple>/ or target/assets/ path.
+          # Stage the binary plus completions/man/schema in the CWD first so the
+          # archive holds the binary bare at its root (as every prior release
+          # did), with `completions/`, `man/`, and `schema/` alongside it — not
+          # under a nested target/<triple>/ or target/assets/ path.
           cp "target/${TARGET}/release/processkit-cli.exe" processkit-cli.exe
           cp -r target/assets/completions completions
           cp -r target/assets/man man
-          7z a "${name}.zip" processkit-cli.exe completions man
+          mkdir -p schema
+          cp fixtures/schema/v1/schema.json schema/schema.json
+          cp fixtures/schema/v1/events.jsonl schema/events.jsonl
+          7z a "${name}.zip" processkit-cli.exe completions man schema
           # Checksum the archive right after building it (the `shell: bash` on the
           # windows runner is Git Bash, which bundles coreutils `sha256sum`). The
           # file records the bare archive name, so `sha256sum -c <name>.zip.sha256`
@@ -576,13 +583,18 @@ jobs:
           set -euo pipefail
           name="processkit-cli-v${VERSION}-${TARGET}"
           # `-C DIR` applies to the file names that follow it, so this records
-          # `processkit-cli` relative to the release dir and `completions`/`man`
-          # relative to the job workspace — all three land at the archive root,
-          # bare `processkit-cli` alongside the completions/man trees, exactly as
-          # the Windows step above stages them.
+          # `processkit-cli` relative to the release dir, `completions`/`man`
+          # relative to `target/assets`, and `schema` relative to the job
+          # workspace — all four land at the archive root, bare `processkit-cli`
+          # alongside the completions/man/schema trees, exactly as the Windows
+          # step above stages them.
+          mkdir -p schema
+          cp fixtures/schema/v1/schema.json schema/schema.json
+          cp fixtures/schema/v1/events.jsonl schema/events.jsonl
           tar -czf "${name}.tar.gz" \
             -C "target/${TARGET}/release" processkit-cli \
-            -C "$(pwd)/target/assets" completions man
+            -C "$(pwd)/target/assets" completions man \
+            -C "$(pwd)" schema
           # Checksum the archive right after building it. Linux runners have
           # coreutils `sha256sum`; the macOS runner ships BSD tools without it, so
           # fall back to `shasum -a 256` (identical `<hash>  <file>` output). The

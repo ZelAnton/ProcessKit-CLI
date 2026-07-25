@@ -27,6 +27,31 @@ shapes. Treat every field below as public API.
   (see "Versioning") moves both to a new `fixtures/schema/vN/` directory
   together, never one without the other.
 
+### Getting the schema without a git checkout
+
+`fixtures/schema/v1/schema.json` lives in the repository, so a consumer who
+only has an installed binary (`cargo install`) or an unpacked release
+archive — no clone, no tag to check out — could otherwise only get the exact
+schema for their version by guessing which git tag matches. Two offline
+alternatives avoid that:
+
+- `processkit-cli probe --json --print-schema` prints the schema document
+  embedded into that specific binary at build time (`src/probe.rs`'s
+  `SCHEMA_JSON`, via `include_str!` — the file above stays the single source
+  of truth, this is a verbatim, byte-for-byte copy of it, never a
+  hand-maintained second one). It replaces the usual probe report, and
+  **cannot be combined with any `--require-*` flag**: that combination is
+  rejected at parse time as an ordinary usage error (exit `100`), not silently
+  accepted with the requested checks skipped — a `probe` invocation that asks
+  for expectations to be verified must never exit `0` without verifying them
+  (see `docs/integration.md`, "Fail-closed preflight: `probe`"). `--print-schema`
+  itself is an ordinary, additive CLI surface token
+  (`probe:--print-schema`) like any other `probe` flag.
+- Every release archive (`.github/workflows/release.yml`) bundles a `schema/`
+  directory alongside the binary, `completions/`, and `man/`, containing
+  `schema.json` and the golden `events.jsonl` fixture exactly as checked out
+  for that release.
+
 ## Transport
 
 - Events are written to the file named by `run`'s `--jsonl` option, **never to

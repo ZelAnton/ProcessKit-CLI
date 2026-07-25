@@ -87,6 +87,21 @@ code/docs it is implemented and described in.
   reparse-point check on Windows) are all refused
   (`src/registry.rs`, `is_simple_lock_file_name`,
   `is_windows_reserved_device_name`, `platform::open_lock_file`).
+- **A record steering a deletion outside its own leftovers.** `prune` reaps
+  the Unix control socket a **confirmed-stale** record published, which means
+  a `remove` call driven by that record's `endpoint` — untrusted deserialized
+  data like `lock_file` above. The value is refused unless it is exactly the
+  form the control server publishes (absolute, no `.`/`..`/empty segment as
+  written, final component `c.sock`, parent `pkc-` plus an alphanumeric/`-`
+  token, sitting directly inside one of the temp bases the server binds in),
+  and even then no symlink is followed: the directory is opened
+  `O_NOFOLLOW | O_DIRECTORY` and the socket is unlinked relative to that
+  handle, only if it really is a socket, with the directory itself removed by
+  an empty-only `rmdir`. A value failing any of that deletes nothing at all —
+  the record and its lock are still reaped (`src/registry.rs`,
+  `platform::control_socket_dir_to_reap`,
+  `platform::reap_control_socket_dir`; rationale in
+  [`docs/registry.md`](registry.md#reaping-the-control-socket)).
 - **Launching an incompatible or unusable runner binary uncontained.** The
   side-effect-free `probe` subcommand is a fail-closed preflight contract: it
   spawns no child and touches no registry, reports this binary's version,

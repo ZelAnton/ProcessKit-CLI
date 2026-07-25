@@ -84,7 +84,10 @@ hand-maintained copy of the flags to fall out of sync, and (unlike a
 own runtime surface, so the fail-closed `probe --require-surface` preflight
 (see "Command interface" below) never sees it. `cargo install`/`cargo build`
 from source produce the same two directories under `target/assets/` — see
-`build.rs`'s module doc for the full mechanism.
+`build.rs`'s module doc for the full mechanism. (The release archive ships a
+third directory too, `schema/` — see "JSONL event schema" below; `cargo
+install`/`cargo build` do not produce it, since it is a static copy of a
+tracked fixture, not `build.rs` output.)
 
 Install the completion script for your shell, e.g.:
 
@@ -319,23 +322,28 @@ is removed while its lock is still held, so a second concurrent prune cannot rac
 the same files. A separate pass applies the same confirm-before-delete rule to
 **orphaned lock files** — a lone `.lock` with no `.json` sibling, which the pass
 above can never see — and reaps those too, tallied separately since it deletes one
-file, not a pair. Without `--json` it prints a one-line summary (`no stale entries to
-prune` when there was nothing to do); with `--json` it prints a single JSON object
-`{"pruned":N,"live":N,"unprobed":N,"orphaned_locks":N}`. An empty or never-created
-registry is not an error — `prune` reports a zero tally and exits `0`, and pruning a
-missing registry does not create it. See [`docs/registry.md`](docs/registry.md),
-"Reaping — `prune`".
+file, not a pair. On unix a reaped entry takes a third leftover of the same death with
+it: the private `pkc-…` directory and socket that record published as its control
+endpoint, which nothing else ever cleaned up — reaped only after the endpoint passes a
+strict shape check (it is untrusted data) and without ever following a symlink.
+Without `--json` it prints a one-line summary (`no stale entries to prune` when there
+was nothing to do); with `--json` it prints a single JSON object
+`{"pruned":N,"live":N,"unprobed":N,"orphaned_locks":N}` — unchanged, since a reaped
+socket is counted by its own entry. An empty or never-created registry is not an error
+— `prune` reports a zero tally and exits `0`, and pruning a missing registry does not
+create it. See [`docs/registry.md`](docs/registry.md), "Reaping — `prune`".
 
 `prune --dry-run` previews that same reap without deleting anything: the identical
 scan and the identical liveness classification, just never a `fs::remove_file`, so an
 operator can see what a real `prune` would do before committing to it. Its aggregate
 counts are exactly what a following real `prune` over the same, untouched registry
 state would report. Without `--json` it lists each confirmed-stale candidate (a paired
-entry's `run_id`/`started_at`, or an orphaned lock's file name) followed by a "would
-prune …" summary line; with `--json` (`prune --dry-run --json`) it prints the same
+entry's `run_id`/`started_at`, plus ` socket_dir=<path>` when a control socket would
+be reaped with it, or an orphaned lock's file name) followed by a "would prune …"
+summary line; with `--json` (`prune --dry-run --json`) it prints the same
 `pruned`/`live`/`unprobed`/`orphaned_locks` fields plus an additional `candidates`
-array of the same candidates, each tagged `"kind":"entry"` or
-`"kind":"orphaned_lock"`. `prune` without `--dry-run` is byte-for-byte unchanged. See
+array of the same candidates, each tagged `"kind":"entry"` (with
+`run_id`/`started_at`/`socket_dir`) or `"kind":"orphaned_lock"`. See
 [`docs/registry.md`](docs/registry.md), "Reaping — `prune`".
 
 ## Detached runs
@@ -687,6 +695,14 @@ report them (nullable per-field on platforms/members it can't).
   [`fixtures/schema/v1/events.jsonl`](fixtures/schema/v1/events.jsonl).
 - Machine-readable JSON Schema (draft 2020-12) for the same contract:
   [`fixtures/schema/v1/schema.json`](fixtures/schema/v1/schema.json).
+- **Getting the schema without a git checkout.** A consumer holding only an
+  installed binary or an unpacked release archive — no clone, no tag to match —
+  has two offline ways to get the exact schema its own version emits: run
+  `processkit-cli probe --json --print-schema`, which prints the schema document
+  embedded in that binary at build time (byte-for-byte identical to the
+  `schema.json` above), or unpack the release archive and read the bundled
+  `schema/schema.json` and `schema/events.jsonl` it ships alongside the binary
+  and the shell completions/man pages.
 
 ## Status
 
@@ -713,8 +729,10 @@ run is no longer live, for a supervisor that is not the runner's parent, boundin
 itself with `--timeout` and its own reserved exit code (`112`). `probe` reports and
 verifies the binary's compatibility surface for a consumer's fail-closed launcher
 preflight, with no side effects, exiting `PROBE_INCOMPATIBLE` (110) on an
-incompatible candidate. See [the roadmap](docs/ROADMAP.md) for delivery status
-and the remaining ProcessKit-rs dependencies.
+incompatible candidate; `probe --print-schema` instead prints the binary's
+embedded JSONL event-schema document and exits (see "JSONL event schema"). See
+[the roadmap](docs/ROADMAP.md) for delivery status and the remaining
+ProcessKit-rs dependencies.
 
 ## Development
 

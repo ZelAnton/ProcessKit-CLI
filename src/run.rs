@@ -69,6 +69,7 @@ use processkit::{
 use crate::capture::{CAPTURE_INFLIGHT_MAX_BYTES, CAPTURE_MAX_BYTES, Capture, IdleClock};
 use crate::cli::RunArgs;
 use crate::control::{self, SnapshotSource};
+use crate::duration_fmt::format_duration;
 use crate::events::{self, Emitter, Event, Member};
 use crate::exit::{self, RunnerError};
 use crate::registry;
@@ -2450,18 +2451,6 @@ fn describe_teardown(soft: SoftTerminate, grace: Option<Duration>) -> String {
     }
 }
 
-/// A compact, honest rendering of a duration for diagnostics: whole seconds when
-/// it divides evenly (`5s`), otherwise milliseconds (`500ms`). Not a full
-/// human-time formatter — just enough to echo the deadline/grace back clearly.
-fn format_duration(d: Duration) -> String {
-    let ms = d.as_millis();
-    if ms != 0 && ms.is_multiple_of(1_000) {
-        format!("{}s", ms / 1_000)
-    } else {
-        format!("{ms}ms")
-    }
-}
-
 /// Map a `processkit` launch failure onto the runner-own exit-code band.
 ///
 /// A locate/start failure is [`exit::SPAWN`] — the child never ran; every other
@@ -2954,14 +2943,6 @@ mod tests {
         let msg = describe_teardown(SoftTerminate::Failed, Some(Duration::from_secs(1)));
         assert!(msg.contains("could not be delivered"), "{msg}");
         assert!(msg.contains("hard-killed"), "{msg}");
-    }
-
-    #[test]
-    fn format_duration_is_compact_and_honest() {
-        assert_eq!(format_duration(Duration::from_secs(5)), "5s");
-        assert_eq!(format_duration(Duration::from_millis(500)), "500ms");
-        assert_eq!(format_duration(Duration::from_millis(1500)), "1500ms");
-        assert_eq!(format_duration(Duration::ZERO), "0ms");
     }
 
     /// The `limit_hit.limit` string for each `LimitKind` matches the schema and the

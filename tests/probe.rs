@@ -120,6 +120,8 @@ fn probe_reports_a_consistent_compatible_surface() {
         // Same story for the `run --detach` flag (T-198): a new flag on an existing
         // subcommand enters the advertised surface with no production-code edit.
         "run:--detach",
+        // And for `probe --print-schema` (T-213) itself.
+        "probe:--print-schema",
     ] {
         assert!(
             surface.contains(&token),
@@ -309,6 +311,65 @@ fn a_non_executable_path_fails_the_spawn_distinctly_from_missing() {
         "a non-executable file on Unix is PermissionDenied: {err:?}"
     );
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `probe --print-schema` prints the exact bytes of the schema document embedded
+/// in this binary at build time — byte-for-byte identical to
+/// `fixtures/schema/v1/schema.json` on disk, read independently here at test
+/// time (not via the crate's own `include_str!`) so a real drift between the
+/// two would actually fail this test. Also confirms the flag's side-effect-free,
+/// exit-0 contract: no stderr, no leftover files.
+#[test]
+fn print_schema_prints_the_fixture_verbatim() {
+    let dir = scratch("probe-print-schema");
+    let out = probe(&dir, &["--print-schema"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "printing the schema succeeds: {out:?}"
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "no side-effect diagnostics on stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/schema/v1/schema.json");
+    let fixture = std::fs::read(&fixture_path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", fixture_path.display()));
+    assert_eq!(
+        out.stdout, fixture,
+        "probe --print-schema must print the schema byte-for-byte, matching the fixture on disk"
+    );
+
+    // No side effects, same as a bare probe.
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .expect("read the probe cwd")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "probe --print-schema must not create files in its working directory: {leftovers:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--print-schema` surface-exposes itself in the ordinary probe report too (the
+/// live clap-derived token, see `src/probe.rs`'s `surface_tokens`), and a
+/// consumer can require it via `--require-surface` like any other token.
+#[test]
+fn print_schema_appears_in_the_advertised_surface() {
+    let dir = scratch("probe-print-schema-surface");
+    let out = probe(&dir, &["--require-surface", "probe:--print-schema"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the surface must already advertise probe:--print-schema: {out:?}"
+    );
+    assert_eq!(parse_report(&out)["compatible"], true);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

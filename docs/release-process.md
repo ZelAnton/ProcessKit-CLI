@@ -101,9 +101,12 @@ For each target, the job:
    the binary embeds the released version.
 2. Builds `cargo build --release --locked --target <triple>` (installing a
    cross linker first for the aarch64-glibc leg).
-3. Packages the binary plus `build.rs`'s generated shell completions and man
-   pages into a per-target archive named `processkit-cli-v<version>-<triple>`
-   (`.zip` on Windows via `7z`, `.tar.gz` elsewhere via `tar`).
+3. Packages the binary, `build.rs`'s generated shell completions and man
+   pages, and a `schema/` directory (`schema.json` + `events.jsonl`, copied
+   verbatim from the tracked `fixtures/schema/v1/` — not `build.rs` output, so
+   the fixture stays the single source of truth) into a per-target archive
+   named `processkit-cli-v<version>-<triple>` (`.zip` on Windows via `7z`,
+   `.tar.gz` elsewhere via `tar`).
 4. Computes a `<archive>.sha256` checksum right next to the archive
    (`sha256sum` on Linux/Windows-Git-Bash; `shasum -a 256` fallback on macOS,
    which ships BSD tools without `sha256sum`).
@@ -168,9 +171,10 @@ already-complete release:
   the GitHub Release page both already work; only the prebuilt archive for the
   failed target(s) is missing. Either re-run just that job (the upload is
   `--clobber`-idempotent and the attestation is regenerated), or build it by
-  hand (`cargo build --release --target <triple>`, package + checksum it the
-  same way the job does, then `gh release upload <tag> <archive>
-  <archive>.sha256 --clobber`).
+  hand (`cargo build --release --target <triple>`, package it with the
+  completions/man/`schema/` trees + checksum it the same way the job does —
+  see "What the `build-artifacts` job does" above for the exact contents —
+  then `gh release upload <tag> <archive> <archive>.sha256 --clobber`).
 
 ## GitHub App bypass for a protected `main`
 

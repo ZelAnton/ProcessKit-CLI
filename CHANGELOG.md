@@ -33,11 +33,43 @@ to a dated version section.
   when the underlying container-member read itself failed, so a `0`/empty fallback
   is never indistinguishable from a confirmed empty tree or a confirmed-clean
   teardown (mirrors `output_captured`'s `write_error`). See "Fixed" below.
+- `probe --print-schema`: prints this binary's embedded JSONL event-schema
+  document (`fixtures/schema/v1/schema.json`, embedded at build time via
+  `include_str!`) and exits, so a consumer holding only an installed binary or
+  an unpacked release archive can fetch the exact machine-readable schema its
+  own version emits, entirely offline. New release archives also bundle
+  `schema/schema.json` and `schema/events.jsonl` alongside the binary,
+  completions, and man pages.
 
 ### Changed
 -
 
 ### Fixed
+- **`prune` now reaps the leaked control-socket directory of a run that died
+  abruptly, not only its registry record and lock.** On unix a runner's control
+  transport is a socket inside a per-run `0700` `pkc-<token>` directory under `/tmp`
+  (or the platform temp directory), removed only by a clean teardown; a `SIGKILL`,
+  crash, or outer Job Object terminate stranded that directory forever, since the
+  record naming it was the only thing that pointed at it. `prune` — documented as the
+  cleanup counterpart that reaps "the confirmed-stale leftovers of runners that died
+  abruptly" — covered only half of them, so repeated abrupt deaths accumulated dead
+  `pkc-*` directories in the temp directory. Reaping a **confirmed-stale** entry now
+  removes the socket and its directory too, before the record that names them, and
+  only ever after the record's `endpoint` (untrusted deserialized data, like its
+  `lock_file`) passes a strict shape check: absolute, no `.`/`..`/empty segment as
+  written, final component `c.sock`, parent `pkc-` plus an alphanumeric/`-` token,
+  directly inside one of the temp bases the control server binds in. No symlink is
+  ever followed — the directory is opened `O_NOFOLLOW | O_DIRECTORY` and the socket
+  unlinked relative to that handle, only if it really is a socket — and an endpoint
+  failing any of that deletes nothing at all while its record is still reaped. Live
+  and unprobeable entries keep their sockets, exactly as they keep their files, and
+  every deletion stays best-effort: a socket that will not go never aborts the reaping
+  of other entries. `prune --json`'s tally is unchanged (a reaped socket is counted by
+  its own entry's `pruned`); `prune --dry-run` reports the directory it would reap in
+  a new always-present `socket_dir` field on each `entry` candidate (`null` when there
+  is none), and in the human-readable listing as a trailing ` socket_dir=<path>`.
+  Windows is unaffected: a named pipe lives in the kernel object namespace and
+  disappears with its creator, leaving nothing on disk to reap.
 - **`cleanup_started`/`cleanup_finished` no longer fabricate a confirmed `0` on a
   member-read failure.** Both emitters previously turned a `ProcessGroup::members()`
   read error into a silent `members_before: 0` / `remaining: 0, remaining_pids: []` —
@@ -63,6 +95,11 @@ to a dated version section.
   names the unprobeable one `unprobed`, so cross-checking a refusal against `list`
   (as `docs/troubleshooting.md` advises) agrees instead of conflicting. Only
   free-text stderr changed; no exit code, event, or CLI surface did.
+- `wait --timeout`'s give-up message now renders the deadline the same way `run`'s
+  timeout/grace diagnostics do (e.g. `1500ms`), instead of `Duration`'s `{:?}` Debug
+  form (`1.5s` for the same value) — the two subcommands' stderr no longer disagree
+  on how to print an identical duration. Only free-text stderr changed; no exit
+  code, event, or CLI surface did.
 
 ## [0.3.0] - 2026-07-25
 
