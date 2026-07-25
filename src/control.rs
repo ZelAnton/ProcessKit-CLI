@@ -1057,6 +1057,43 @@ fn reconfirm_target(
     Ok(())
 }
 
+/// The fixed final component of a unix control endpoint: the socket file itself,
+/// inside its own private directory. Deliberately short — the whole path has to fit
+/// `sockaddr_un::sun_path` on the *shortest* platform (see [`imp`]).
+///
+/// Public to the crate because the endpoint shape is no longer known only to its
+/// producer: [`crate::registry::Registry::prune`] reaps the socket a
+/// confirmed-stale record published, and validates the record's `endpoint` against
+/// exactly this shape before deleting anything (T-207). Both sides read the shape
+/// from these two constants and [`socket_base_dirs`], so the producer and the reaper
+/// cannot drift apart.
+#[cfg(unix)]
+pub(crate) const SOCKET_FILE_NAME: &str = "c.sock";
+
+/// The fixed prefix of the per-run private directory that holds a unix control
+/// socket ([`SOCKET_FILE_NAME`]); the rest of the name is a [`unique_token`].
+#[cfg(unix)]
+pub(crate) const SOCKET_DIR_PREFIX: &str = "pkc-";
+
+/// The base directories a unix control socket's private directory is created in, in
+/// preference order: `/tmp` first (short enough to keep the advertised socket path
+/// comfortably below `SUN_LEN` even when the registry itself lives under a deeply
+/// nested CI workspace), then the platform temp directory when that differs.
+///
+/// Shared by the producer ([`imp::ControlServer::bind`], via
+/// `create_private_socket_dir`) and by the reaper
+/// ([`crate::registry::Registry::prune`], which refuses to delete a published
+/// endpoint that does not sit directly inside one of these).
+#[cfg(unix)]
+pub(crate) fn socket_base_dirs() -> Vec<std::path::PathBuf> {
+    let mut bases = vec![std::path::PathBuf::from("/tmp")];
+    let platform_temp = std::env::temp_dir();
+    if platform_temp != bases[0] {
+        bases.push(platform_temp);
+    }
+    bases
+}
+
 /// A unique, PID-free-collision-proof token for a transport endpoint name: the
 /// process id, the current time in nanoseconds, and a per-process counter. Used to
 /// name the unix socket / windows pipe so concurrent runs never collide.
@@ -1081,7 +1118,8 @@ mod imp {
     use tokio::net::{UnixListener, UnixStream};
 
     use super::{
-        ControlCommandSink, Infallible, SnapshotSource, handle_connection, io, unique_token,
+        ControlCommandSink, Infallible, SOCKET_DIR_PREFIX, SOCKET_FILE_NAME, SnapshotSource,
+        handle_connection, io, socket_base_dirs, unique_token,
     };
 
     /// The connected client stream type on this platform — a unix domain socket
@@ -1104,7 +1142,7 @@ mod imp {
         /// appended.
         pub fn bind() -> io::Result<Self> {
             let dir = create_private_socket_dir()?;
-            let path = dir.join("c.sock");
+            let path = dir.join(SOCKET_FILE_NAME);
             let endpoint = match path.to_str() {
                 Some(endpoint) => endpoint.to_string(),
                 None => {
@@ -1159,8 +1197,11 @@ mod imp {
     impl Drop for ControlServer {
         fn drop(&mut self) {
             // Clean teardown removes the socket file (best-effort). An abrupt death
-            // skips this and leaks the socket, exactly like the registry record/lock —
-            // a client detects that run as stale via the registry and never connects.
+            // skips this and strands the socket, exactly like the registry record/lock
+            // — a client detects that run as stale via the registry and never
+            // connects, and `Registry::prune` reaps this directory along with that
+            // record's two files when it confirms the entry stale (T-207), so the
+            // leftover does not accumulate.
             let _ = std::fs::remove_file(&self.path);
             let _ = std::fs::remove_dir(&self.dir);
         }
@@ -1168,21 +1209,22 @@ mod imp {
 
     /// Atomically reserve a short owner-only directory. A pre-created path is never
     /// trusted: `create` must succeed for this process, otherwise a fresh unique token
-    /// is tried. `/tmp` keeps the advertised socket comfortably below SUN_LEN even
-    /// when the registry lives under a deeply nested CI workspace.
+    /// is tried. `/tmp` (the first of [`socket_base_dirs`]) keeps the advertised
+    /// socket comfortably below SUN_LEN even when the registry lives under a deeply
+    /// nested CI workspace.
+    ///
+    /// The name is built from [`SOCKET_DIR_PREFIX`] and the base list from
+    /// [`socket_base_dirs`] — the same two the registry's reaper validates a published
+    /// endpoint against before deleting anything (T-207), so the shape can never drift
+    /// between the side that creates it and the side that cleans it up.
     fn create_private_socket_dir() -> io::Result<PathBuf> {
-        let mut bases = vec![PathBuf::from("/tmp")];
-        let platform_temp = std::env::temp_dir();
-        if platform_temp != bases[0] {
-            bases.push(platform_temp);
-        }
         let mut last_error = None;
-        for base in bases {
+        for base in socket_base_dirs() {
             if !base.is_dir() {
                 continue;
             }
             for _ in 0..16 {
-                let dir = base.join(format!("pkc-{}", unique_token()));
+                let dir = base.join(format!("{SOCKET_DIR_PREFIX}{}", unique_token()));
                 match DirBuilder::new().mode(0o700).create(&dir) {
                     Ok(()) => return Ok(dir),
                     Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {

@@ -14,9 +14,14 @@
 //! produced. It also reaps a second, rarer kind of leftover the same way: a lone
 //! `.lock` file whose `.json` never landed (or whose `.json` was removed but its
 //! `.lock` delete failed), tallied separately as `orphaned_locks` since it deletes
-//! one file, not a `.json`/`.lock` pair. This module is only the thin CLI wrapper: it
-//! opens the registry, calls `prune` (or, under `--dry-run`, `preview_prune`), and
-//! reports the tally.
+//! one file, not a `.json`/`.lock` pair. On unix it reaps a third (T-207): the private
+//! control-socket directory a confirmed-stale record published, the other half of what
+//! an abrupt death leaks — validated by shape first, since the record's endpoint is
+//! untrusted data, and counted under that record's own `pruned` tally rather than a
+//! counter of its own (the socket belongs to the entry being reaped, and cannot be
+//! reaped without it). This module is only the thin CLI wrapper: it opens the
+//! registry, calls `prune` (or, under `--dry-run`, `preview_prune`), and reports the
+//! tally.
 //!
 //! Like `list`, `prune` opens the registry through
 //! [`registry::Registry::open_read_only`] — **not** the mutating [`registry::Registry::open`]
@@ -84,6 +89,14 @@ enum PruneCandidateReport {
         run_id: String,
         /// The record's `started_at`, RFC 3339 UTC with millisecond precision.
         started_at: String,
+        /// The private control-socket directory a real prune would reap along with
+        /// this entry's two files (T-207), or `null` when it would reap none — the
+        /// record published no endpoint, published one that is not the shape a
+        /// control server creates (and so is refused rather than deleted), or is a
+        /// Windows record, whose named-pipe endpoint leaves nothing on disk. Always
+        /// present, so a consumer reads one field rather than inferring from its
+        /// absence — see [`registry::PruneCandidate::Entry::socket_dir`].
+        socket_dir: Option<String>,
     },
     /// A lone `.lock` file with no `.json` sibling a real prune would reap.
     OrphanedLock {
@@ -95,7 +108,15 @@ enum PruneCandidateReport {
 impl From<PruneCandidate> for PruneCandidateReport {
     fn from(candidate: PruneCandidate) -> Self {
         match candidate {
-            PruneCandidate::Entry { run_id, started_at } => Self::Entry { run_id, started_at },
+            PruneCandidate::Entry {
+                run_id,
+                started_at,
+                socket_dir,
+            } => Self::Entry {
+                run_id,
+                started_at,
+                socket_dir,
+            },
             PruneCandidate::OrphanedLock { lock_file_name } => {
                 Self::OrphanedLock { lock_file_name }
             }
@@ -242,6 +263,11 @@ fn print_dry_run_json(preview: PrunePreview) -> Result<(), RunnerError> {
 /// (a paired record's `run_id`/`started_at`, or an orphaned lock's file name), then
 /// the same summary line shape [`print_summary`] prints, prefixed "would" throughout
 /// since nothing was actually reaped.
+///
+/// A paired entry whose published control socket a real prune would reap too (T-207)
+/// names that directory in a trailing `socket_dir=<path>` field; an entry with no
+/// such leftover — no endpoint, an endpoint the reap would refuse, or a Windows
+/// named pipe — simply omits the field rather than printing an empty value.
 fn print_dry_run_summary(preview: &PrunePreview) {
     let outcome = preview.outcome;
     if outcome.pruned == 0
@@ -254,8 +280,16 @@ fn print_dry_run_summary(preview: &PrunePreview) {
     }
     for candidate in &preview.candidates {
         match candidate {
-            PruneCandidate::Entry { run_id, started_at } => {
-                println!("would prune entry run_id={run_id} started_at={started_at}");
+            PruneCandidate::Entry {
+                run_id,
+                started_at,
+                socket_dir,
+            } => {
+                let socket = socket_dir
+                    .as_ref()
+                    .map(|dir| format!(" socket_dir={dir}"))
+                    .unwrap_or_default();
+                println!("would prune entry run_id={run_id} started_at={started_at}{socket}");
             }
             PruneCandidate::OrphanedLock { lock_file_name } => {
                 println!("would prune orphaned lock {lock_file_name}");
@@ -294,6 +328,8 @@ mod tests {
     /// names the plain `prune --json` report does — `pruned`/`live`/`unprobed`/
     /// `orphaned_locks` — plus a `candidates` array whose entries are tagged by
     /// `kind` and carry the documented identifying fields for each candidate shape.
+    /// T-207 added `socket_dir` to the `entry` shape: the control-socket directory a
+    /// real prune would reap along with the record.
     #[test]
     fn prune_dry_run_report_serializes_the_documented_fields() {
         let report = PruneDryRunReport::from(PrunePreview {
@@ -307,6 +343,7 @@ mod tests {
                 PruneCandidate::Entry {
                     run_id: "run-a".to_string(),
                     started_at: "2026-07-22T00:00:00.000Z".to_string(),
+                    socket_dir: Some("/tmp/pkc-1234-abc-0".to_string()),
                 },
                 PruneCandidate::OrphanedLock {
                     lock_file_name: "orphan.lock".to_string(),
@@ -327,8 +364,43 @@ mod tests {
         assert_eq!(candidates[0]["kind"], "entry");
         assert_eq!(candidates[0]["run_id"], "run-a");
         assert_eq!(candidates[0]["started_at"], "2026-07-22T00:00:00.000Z");
+        assert_eq!(candidates[0]["socket_dir"], "/tmp/pkc-1234-abc-0");
         assert_eq!(candidates[1]["kind"], "orphaned_lock");
         assert_eq!(candidates[1]["lock_file_name"], "orphan.lock");
+    }
+
+    /// T-207: an entry candidate whose reap would remove no control socket — no
+    /// endpoint, an endpoint the reap refuses, or a Windows named pipe — still
+    /// carries the `socket_dir` field, explicitly `null`, so a consumer branches on
+    /// one always-present field instead of on a missing key. The human-readable line
+    /// for the same candidate omits the field entirely rather than printing an empty
+    /// value.
+    #[test]
+    fn prune_dry_run_report_serializes_a_null_socket_dir_for_an_entry_without_one() {
+        let report = PruneDryRunReport::from(PrunePreview {
+            outcome: PruneOutcome {
+                pruned: 1,
+                ..PruneOutcome::default()
+            },
+            candidates: vec![PruneCandidate::Entry {
+                run_id: "run-a".to_string(),
+                started_at: "2026-07-22T00:00:00.000Z".to_string(),
+                socket_dir: None,
+            }],
+        });
+        let json = serde_json::to_string(&report).expect("a dry-run report serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let candidate = &value["candidates"]
+            .as_array()
+            .expect("candidates is a JSON array")[0];
+        assert!(
+            candidate.get("socket_dir").is_some(),
+            "socket_dir is always present, even with nothing to reap: {value}"
+        );
+        assert!(
+            candidate["socket_dir"].is_null(),
+            "an entry with no reapable socket reports socket_dir null: {value}"
+        );
     }
 
     /// A dry run over an empty registry reports an empty `candidates` array — not a

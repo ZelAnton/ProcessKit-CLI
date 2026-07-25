@@ -79,6 +79,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use crate::control;
+use crate::duration_fmt::format_duration;
 use crate::exit::{self, RunnerError};
 use crate::registry::{self, RunStatus};
 
@@ -220,8 +221,9 @@ fn wait_timed_out(run_id: &str, limit: Duration, last: RunStatus) -> RunnerError
     RunnerError::new(
         exit::WAIT_TIMEOUT,
         format!(
-            "stopped waiting for run `{run_id}` after {limit:?}: {observed} — \
-             raise or drop `--timeout` to keep waiting"
+            "stopped waiting for run `{run_id}` after {}: {observed} — \
+             raise or drop `--timeout` to keep waiting",
+            format_duration(limit)
         ),
     )
 }
@@ -250,6 +252,24 @@ mod tests {
         assert!(
             message.contains("5s"),
             "echoes the requested deadline: {message}"
+        );
+    }
+
+    /// The deadline renders through the shared [`format_duration`] — the same
+    /// compact, honest form `run` uses — not `Duration`'s `{:?}` Debug output,
+    /// which would print `1.5s` for a `1500ms` timeout and disagree with `run`'s
+    /// own diagnostics for the identical value.
+    #[test]
+    fn wait_timed_out_uses_the_shared_compact_duration_rendering() {
+        let err = wait_timed_out("build-42", Duration::from_millis(1500), RunStatus::Live);
+        let message = err.to_string();
+        assert!(
+            message.contains("1500ms"),
+            "renders the compact form, matching `run`'s diagnostics: {message}"
+        );
+        assert!(
+            !message.contains("1.5s"),
+            "must not fall back to `Duration`'s Debug rendering: {message}"
         );
     }
 

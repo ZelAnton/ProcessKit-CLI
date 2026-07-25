@@ -95,6 +95,11 @@ pub struct Record {
     /// a Windows named-pipe name (see [`crate::control`]). A live runner publishes it
     /// so `inspect`/`cancel`/`kill` clients can reach it; `None` only when the
     /// transport could not be stood up (best-effort degradation).
+    ///
+    /// Untrusted deserialized data on the read side, exactly like
+    /// [`Liveness::lock_file`]: [`Registry::prune`] reaps the unix socket directory a
+    /// **confirmed-stale** record published, and validates this value by shape before
+    /// deleting anything through it (see [`platform::control_socket_dir_to_reap`]).
     pub endpoint: Option<String>,
     /// Run start time, RFC 3339 UTC with millisecond precision (same formatter as the
     /// JSONL events, see [`events::format_rfc3339_utc`]).
@@ -226,12 +231,29 @@ pub struct PrunePreview {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PruneCandidate {
     /// A paired `.json`/`.lock` record: the `run_id`/`started_at` fields a caller
-    /// would otherwise have to open its [`Record`] to find.
+    /// would otherwise have to open its [`Record`] to find, plus the private control
+    /// socket directory the reap would remove along with them.
     Entry {
         /// The record's `run_id`.
         run_id: String,
         /// The record's `started_at`, RFC 3339 UTC with millisecond precision.
         started_at: String,
+        /// The private control-socket directory a real prune would also reap for
+        /// this entry (T-207) — the `pkc-…` directory holding the unix socket the
+        /// record published in [`Record::endpoint`], as classified by the very same
+        /// check the reap itself applies.
+        ///
+        /// `None` whenever that reap would remove nothing: a record with no endpoint
+        /// at all, an endpoint that is not the exact shape this project's control
+        /// server publishes (a corrupt or hand-edited value — it is *not* trusted as
+        /// a path), or a Windows record, whose named-pipe endpoint has no filesystem
+        /// leftover to reap in the first place.
+        ///
+        /// Reported from the record alone, without stat-ing anything (a preview
+        /// touches no filesystem beyond the scan and the liveness probes), so a
+        /// directory named here may already be gone — reaping it is best-effort,
+        /// exactly like the record/lock deletions.
+        socket_dir: Option<String>,
     },
     /// A lone `.lock` file with no `.json` sibling — there is no record to pull
     /// `run_id`/`started_at` from, so it is identified by its file name instead.
@@ -434,11 +456,12 @@ impl Registry {
         Ok(entries)
     }
 
-    /// Reap every **confirmed-stale** entry, deleting both its files, and leave every
-    /// other entry untouched. The safe-by-construction cleanup for the leftover
-    /// `.json`/`.lock` pair an abruptly-killed runner leaves behind (its clean-exit
-    /// [`Registration::remove`] never ran), which the registry would otherwise
-    /// accumulate forever.
+    /// Reap every **confirmed-stale** entry — both its files, plus (on unix) the
+    /// control socket it published — and leave every other entry untouched. The
+    /// safe-by-construction cleanup for what an abruptly-killed runner leaves behind
+    /// once its clean-exit [`Registration::remove`] never runs: the `.json`/`.lock`
+    /// pair the registry would otherwise accumulate forever, and the private socket
+    /// directory nothing else ever cleaned up (see "The third leftover" below).
     ///
     /// The single load-bearing safety property is that pruning deletes **only** an
     /// entry whose liveness probe **succeeded and returned stale** — and nothing else:
@@ -467,7 +490,7 @@ impl Registry {
     /// produced.
     ///
     /// A confirmed-stale entry is reaped **while its lock is still held** (see
-    /// [`probe_for_prune`]): the reclaim keeps the exclusive lock across the two
+    /// [`probe_for_prune`]): the reclaim keeps the exclusive lock across the
     /// deletions, so a second concurrent prune sees the entry as live and skips it
     /// rather than racing on the same files — the "hold the lock to reclaim" pattern
     /// `docs/registry.md` documents. Deletion mirrors [`Registration::remove`]: the
@@ -475,6 +498,36 @@ impl Registry {
     /// error on one entry never aborts the reaping of the others (a leftover just reads
     /// as stale again next time). Running prune over an already-clean registry is a
     /// no-op, not an error.
+    ///
+    /// **The third leftover: the control socket (T-207).** On unix a runner also
+    /// leaves its control transport behind when it dies abruptly — a `0700` private
+    /// directory under `/tmp` holding one socket file (`crate::control`'s
+    /// `ControlServer::bind`, removed only by its `Drop` on a clean teardown), whose
+    /// path the dead record still publishes in [`Record::endpoint`]. Nothing else
+    /// ever reaps it, and the record naming it is about to be deleted, so a
+    /// confirmed-stale entry's socket directory is removed here too — otherwise
+    /// `prune`, the documented cleanup counterpart for "runners that died abruptly",
+    /// would keep closing only half of that leak. Three properties bound it:
+    ///
+    /// - **The endpoint is not trusted as a path.** It is untrusted deserialized data
+    ///   exactly like `liveness.lock_file`, so it is validated by *shape* first —
+    ///   [`platform::control_socket_dir_to_reap`], which yields a directory only for
+    ///   the exact `<temp base>/pkc-<token>/c.sock` form the control server publishes,
+    ///   and `None` for anything else (absent, empty, relative, `..`-carrying,
+    ///   differently named, or outside those bases). A record that fails it keeps
+    ///   whatever its endpoint pointed at and is still reaped itself: the check gates
+    ///   only this extra deletion.
+    /// - **No symlink is ever followed.** The validated directory is opened
+    ///   `O_NOFOLLOW | O_DIRECTORY` and the socket is unlinked relative to that
+    ///   handle, so neither component can be swapped for a link redirecting the
+    ///   deletion elsewhere (see [`platform::reap_control_socket_dir`]).
+    /// - **Best-effort, like every other deletion here.** A socket that will not go
+    ///   is left behind for the next pass and never aborts the reaping of other
+    ///   entries.
+    ///
+    /// On Windows this step does nothing at all: a named pipe lives in the kernel
+    /// object namespace and vanishes with the process that created it, leaving no
+    /// filesystem leftover to reap.
     ///
     /// A second pass, after the paired-record pass above, reaps **orphaned lock
     /// files**: `.lock` files with no sibling `.json` at all, invisible to
@@ -498,17 +551,30 @@ impl Registry {
     pub fn prune(&self) -> io::Result<PruneOutcome> {
         let mut outcome = PruneOutcome::default();
         for ScannedRecord {
+            record,
             json_path,
             lock_path,
-            ..
         } in self.scan()?
         {
             match probe_for_prune(&lock_path) {
-                // Confirmed stale: reap both files while still holding the acquired
-                // lock (when there was one). The record is deleted first, then the
-                // lock file, mirroring `Registration::remove`; the held lock is
-                // released only when `_held_lock` drops after both deletes.
+                // Confirmed stale: reap the entry's leftovers while still holding the
+                // acquired lock (when there was one). The socket the record published
+                // goes first, then the record, then the lock file (the last two in
+                // `Registration::remove`'s own order); the held lock is released only
+                // when `_held_lock` drops after all of them.
                 Ok(PruneProbe::Reapable(_held_lock)) => {
+                    // T-207: the control socket is reaped *before* the record that
+                    // names it. The record is the only thing that points at the
+                    // socket's directory, so a pass interrupted between the two
+                    // deletions must not be the one that leaves the socket
+                    // unreferenced — the reverse order would strand it forever, while
+                    // this order at worst re-reaps an already-socket-less record next
+                    // pass.
+                    if let Some(socket_dir) =
+                        platform::control_socket_dir_to_reap(record.endpoint.as_deref())
+                    {
+                        platform::reap_control_socket_dir(&socket_dir);
+                    }
                     let _ = fs::remove_file(&json_path);
                     let _ = fs::remove_file(&lock_path);
                     outcome.pruned += 1;
@@ -551,6 +617,14 @@ impl Registry {
     /// ([`PrunePreview::outcome`]) is exactly what a following, untouched `prune`
     /// pass over the same on-disk state would report — see this module's
     /// `preview_prune_matches_a_real_prune_over_identical_state` test.
+    ///
+    /// The control socket a confirmed-stale record published (T-207) is reported the
+    /// same way: [`PruneCandidate::Entry::socket_dir`] names the directory a real
+    /// reap would remove, classified by the identical
+    /// [`platform::control_socket_dir_to_reap`] call `prune` makes — so the preview
+    /// can neither name a socket directory the reap would refuse nor stay silent
+    /// about one it would delete. Classification is purely lexical there too, so this
+    /// still stats nothing and still removes nothing.
     pub fn preview_prune(&self) -> io::Result<PrunePreview> {
         let mut outcome = PruneOutcome::default();
         let mut candidates = Vec::new();
@@ -562,10 +636,17 @@ impl Registry {
             match probe_for_prune(&lock_path) {
                 // Confirmed stale: unlike `prune`, nothing is reclaimed under the
                 // lock — release it immediately and record the candidate instead of
-                // deleting anything.
+                // deleting anything. The published control socket is classified
+                // through the very same `control_socket_dir_to_reap` the real reap
+                // uses (T-207), so the preview names a socket directory exactly when
+                // a real prune would delete one; it is reported, not stat-ed.
                 Ok(PruneProbe::Reapable(held_lock)) => {
                     drop(held_lock);
                     candidates.push(PruneCandidate::Entry {
+                        socket_dir: platform::control_socket_dir_to_reap(
+                            record.endpoint.as_deref(),
+                        )
+                        .map(|dir| dir.to_string_lossy().into_owned()),
                         run_id: record.run_id,
                         started_at: record.started_at,
                     });
@@ -1348,11 +1429,14 @@ pub(crate) fn current_user_sid_string() -> io::Result<String> {
 mod platform {
     //! Unix registry primitives: `0700` directories and BSD `flock` liveness locks.
 
+    use std::ffi::CString;
     use std::fs::{self, DirBuilder, File, Permissions};
     use std::io;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::path::{Path, PathBuf};
+
+    use crate::control::{SOCKET_DIR_PREFIX, SOCKET_FILE_NAME, socket_base_dirs};
 
     /// Owner-only directory: mode `0700`, re-asserted with `chmod` (which, unlike the
     /// initial `mkdir`, is not filtered by the umask) so both a freshly created and a
@@ -1446,6 +1530,186 @@ mod platform {
     pub fn is_owner_only(dir: &Path) -> io::Result<bool> {
         let mode = fs::metadata(dir)?.permissions().mode();
         Ok(mode & 0o777 == 0o700)
+    }
+
+    /// The private control-socket directory a record's published `endpoint` names —
+    /// or `None` when that value is not, to the letter, the shape this project's own
+    /// control server publishes (T-207).
+    ///
+    /// **`endpoint` is untrusted deserialized data**, exactly like
+    /// [`super::Liveness::lock_file`] (see [`super::is_simple_lock_file_name`]): a
+    /// corrupt or hand-edited record can carry any string `serde_json` accepts into a
+    /// `String` field, and [`super::Registry::prune`] is about to *delete* what this
+    /// returns. So the value is never used as a path on trust — it must match the
+    /// exact form [`crate::control`]'s `ControlServer::bind` publishes:
+    ///
+    /// - absolute, and made of nothing but plain `/`-separated names — so a relative
+    ///   path, a `.` or `..` segment anywhere, and a doubled separator are all out
+    ///   **before** anything is resolved, and no `..` can climb out of the directory
+    ///   this returns;
+    /// - final component exactly [`SOCKET_FILE_NAME`];
+    /// - its parent named [`SOCKET_DIR_PREFIX`] plus a non-empty token of ASCII
+    ///   alphanumerics and `-` only — the character set `control::unique_token` mints;
+    /// - that parent sitting **directly** inside one of [`socket_base_dirs`]'s bases,
+    ///   the very directories `bind` creates it in — so a well-formed-looking path
+    ///   anywhere else (`/etc/pkc-x/c.sock`, `$HOME/pkc-x/c.sock`) is refused.
+    ///
+    /// Both [`super::Registry::prune`] (which reaps the directory) and
+    /// [`super::Registry::preview_prune`] (which only reports it) classify through
+    /// this one function, so a preview can never name a candidate a real reap would
+    /// not touch — the same "one classification, two actions" discipline
+    /// [`super::probe_for_prune`] already gives the two passes (see [K-024]).
+    ///
+    /// This is a **purely lexical** verdict: it touches no filesystem, so it cannot
+    /// be raced, and it deliberately does not check that the directory exists (a
+    /// preview must not stat anything, and a reap has to survive the directory being
+    /// gone anyway). The symlink question is settled where it can be settled without
+    /// a TOCTOU window — at open time, in [`reap_control_socket_dir`].
+    ///
+    /// A run whose socket lived under a *different* temp directory than the pruning
+    /// process sees (a changed `TMPDIR` between the run and the prune) simply fails
+    /// this check and keeps its socket: refusing to delete an unrecognized path is
+    /// the whole point, and the record itself is still reaped.
+    pub fn control_socket_dir_to_reap(endpoint: Option<&str>) -> Option<PathBuf> {
+        socket_dir_within(endpoint?, &socket_base_dirs())
+    }
+
+    /// [`control_socket_dir_to_reap`] against an explicit list of allowed base
+    /// directories — the whole check, with its one environment-derived input
+    /// ([`socket_base_dirs`]) passed in so it can be exercised deterministically.
+    pub fn socket_dir_within(endpoint: &str, bases: &[PathBuf]) -> Option<PathBuf> {
+        // Reject any embedded NUL or control character up front: a NUL truncates the
+        // name at the OS boundary, and no path this project publishes contains one.
+        if endpoint.chars().any(char::is_control) {
+            return None;
+        }
+        // Deliberately parsed as raw `/`-separated segments rather than through
+        // `Path::components()`: that iterator *normalizes* — it silently drops `.`
+        // and empty (doubled-separator) segments — so a value like `/tmp/./pkc-1/
+        // c.sock` would inspect as though it were the published form. Here every
+        // segment is checked as written, and `.`/`..`/empty are all refused, so what
+        // this returns is a path with no traversal or normalization left in it.
+        let mut segments = endpoint.split('/');
+        // An absolute path, and only an absolute path, splits with an empty leading
+        // segment.
+        if segments.next() != Some("") {
+            return None;
+        }
+        let segments: Vec<&str> = segments.collect();
+        if segments
+            .iter()
+            .any(|segment| segment.is_empty() || *segment == "." || *segment == "..")
+        {
+            return None;
+        }
+
+        // `<base…>/pkc-<token>/c.sock`: the socket file itself, its private directory,
+        // and the base directory that directory was created in.
+        let [base_segments @ .., dir_name, file_name] = segments.as_slice() else {
+            return None;
+        };
+        if *file_name != SOCKET_FILE_NAME {
+            return None;
+        }
+        let token = dir_name.strip_prefix(SOCKET_DIR_PREFIX)?;
+        if token.is_empty() || !token.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return None;
+        }
+        // The directory must sit *directly* in a base `ControlServer::bind` uses —
+        // one level, no deeper — so nothing outside those bases is ever a candidate.
+        // The bases themselves come from this process's own environment, not from the
+        // record, so they are compared as paths (`/tmp` and `/tmp/` are one place),
+        // while the untrusted part above had to match to the character.
+        let base = PathBuf::from(format!("/{}", base_segments.join("/")));
+        if !bases.contains(&base) {
+            return None;
+        }
+        Some(base.join(dir_name))
+    }
+
+    /// Reap a confirmed-stale record's control socket and the private directory that
+    /// holds it, **without ever following a symlink** at either component — the
+    /// deletion half of T-207, run only on a directory
+    /// [`control_socket_dir_to_reap`] has already validated (never on a raw
+    /// `endpoint` value).
+    ///
+    /// Best-effort by design, exactly like the record/lock deletions it accompanies:
+    /// every failure is swallowed, because a socket that could not be removed is a
+    /// leftover to retry next pass, never a reason to abort the reaping of other
+    /// entries.
+    pub fn reap_control_socket_dir(dir: &Path) {
+        let _ = remove_socket_dir(dir);
+    }
+
+    /// The fallible body of [`reap_control_socket_dir`].
+    ///
+    /// `O_NOFOLLOW | O_DIRECTORY` is the same open-time discipline
+    /// [`open_lock_file`] applies to a lock file (see [K-024]): the `pkc-…`
+    /// component must *be* a directory and must not be a symlink, so a link planted
+    /// (or swapped in) under that name fails the open outright instead of redirecting
+    /// the deletion somewhere else. Everything below then happens **relative to that
+    /// open handle**, so even a swap landing after the open cannot misdirect it.
+    ///
+    /// The directory itself is removed by path — but `rmdir` never follows a symlink
+    /// at its final component and only ever removes an *empty* directory, so the
+    /// worst a post-open swap can do here is make this call fail. Anything unexpected
+    /// left inside (an extra file, a refused non-socket, see [`unlink_socket_in`])
+    /// keeps the directory too, rather than being deleted along with it.
+    fn remove_socket_dir(dir: &Path) -> io::Result<()> {
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(dir)?;
+        unlink_socket_in(&handle)?;
+        drop(handle);
+        fs::remove_dir(dir)
+    }
+
+    /// Unlink the control socket inside an already-opened, already-validated private
+    /// directory — addressed *relative to that open handle* (`fstatat`/`unlinkat`),
+    /// never by a path that could be re-resolved somewhere else in between.
+    ///
+    /// The entry is unlinked only when it really is a **socket**, checked through the
+    /// same handle and without following a symlink: a regular file, a symlink, a
+    /// directory, or a device node under that name is not something a control server
+    /// ever created, so it is refused rather than deleted. An entry that is already
+    /// gone is not a failure — there is simply nothing left to unlink, and the
+    /// directory removal that follows can still proceed.
+    fn unlink_socket_in(dir: &File) -> io::Result<()> {
+        let name = CString::new(SOCKET_FILE_NAME).map_err(io::Error::other)?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `dir` owns a valid directory fd for the whole call and `name` is a
+        // NUL-terminated C string that outlives it; both are only read. `stat` is
+        // written by the kernel and is read below only after a success return.
+        let statted = unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if statted != 0 {
+            let err = io::Error::last_os_error();
+            return if err.kind() == io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(err)
+            };
+        }
+        // SAFETY: the call above returned success, so the kernel initialized `stat`.
+        let mode = unsafe { stat.assume_init() }.st_mode;
+        if mode & libc::S_IFMT != libc::S_IFSOCK {
+            return Err(io::Error::other(
+                "the endpoint's file is not a socket; refusing to delete it",
+            ));
+        }
+        // SAFETY: same fd/name validity as the `fstatat` above; `unlinkat` only reads
+        // them, and removes exactly one non-directory entry of the open directory.
+        if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
 
@@ -1931,6 +2195,28 @@ mod platform {
         let bytes = unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), len) };
         Ok(bytes.to_vec())
     }
+
+    /// The Windows twin of the unix control-socket classifier (T-207): **never** a
+    /// candidate, because there is nothing on disk to reap.
+    ///
+    /// A Windows run publishes a *named pipe* (`\\.\pipe\processkit-cli-…`, see
+    /// [`crate::control`]), which lives in the kernel object namespace rather than
+    /// the filesystem: the last handle to it closes when its creator dies — abruptly
+    /// or not — and the name disappears with it. There is no leftover directory to
+    /// accumulate, so the reap this classifies for is a unix-only concern and every
+    /// endpoint here classifies `None`. That also means [`super::Registry::prune`]'s
+    /// and [`super::Registry::preview_prune`]'s behavior on Windows is exactly what
+    /// it was before T-207.
+    pub fn control_socket_dir_to_reap(_endpoint: Option<&str>) -> Option<PathBuf> {
+        None
+    }
+
+    /// The Windows twin of the unix control-socket reaper (T-207): a no-op, and in
+    /// practice unreachable — [`control_socket_dir_to_reap`] never yields a directory
+    /// to pass it. It exists so the shared `prune`/`preview_prune` code can classify
+    /// and act through one pair of platform functions without a `cfg` of its own,
+    /// exactly as it already does for [`open_lock_file`]/[`try_lock_exclusive`].
+    pub fn reap_control_socket_dir(_dir: &Path) {}
 }
 
 #[cfg(test)]
@@ -2211,10 +2497,23 @@ mod tests {
     /// value, simulating a corrupt or adversarial deserialized entry a real runner
     /// would never write (`register` only ever mints a safe `run-<hex>-<hex>.lock`).
     fn write_record(dir: &Path, stem: &str, run_id: &str, lock_file: &str) {
+        write_record_with_endpoint(dir, stem, run_id, lock_file, None);
+    }
+
+    /// Like [`write_record`], but also publishing an `endpoint` — the control-transport
+    /// address a record carries, and the value T-207's socket reap validates by shape
+    /// before it deletes anything through it.
+    fn write_record_with_endpoint(
+        dir: &Path,
+        stem: &str,
+        run_id: &str,
+        lock_file: &str,
+        endpoint: Option<&str>,
+    ) {
         let record = Record {
             registry_version: REGISTRY_VERSION,
             run_id: run_id.to_string(),
-            endpoint: None,
+            endpoint: endpoint.map(str::to_string),
             started_at: events::format_rfc3339_utc(SystemTime::now()),
             liveness: Liveness {
                 kind: LIVENESS_ADVISORY_LOCK.to_string(),
@@ -2223,6 +2522,67 @@ mod tests {
         };
         let json = serde_json::to_string(&record).expect("serialize the record");
         fs::write(dir.join(format!("{stem}.json")), json).expect("write the record");
+    }
+
+    /// A unique, not-yet-created path of exactly the shape `ControlServer::bind`
+    /// creates a private control-socket directory at — `pkc-<token>` directly inside
+    /// the platform temp directory, which is always one of `control::socket_base_dirs`'
+    /// bases. The token is per-call-site plus a process-wide counter on top of the
+    /// pid, for the same reason [`scratch`] carries one (see [K-026]).
+    ///
+    /// Deliberately much shorter than a [`scratch`] name: a real unix socket is bound
+    /// inside it, and the whole path has to stay within `sockaddr_un::sun_path` on the
+    /// shortest platform — macOS, whose temp directory is itself ~50 characters (see
+    /// [K-009]). Keep the tags short for the same reason.
+    #[cfg(unix)]
+    fn socket_dir_path(tag: &str) -> PathBuf {
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "{}t{tag}-{}-{n}",
+            crate::control::SOCKET_DIR_PREFIX,
+            std::process::id()
+        ))
+    }
+
+    /// The counterpart to [`socket_dir_path`] for a directory that must **not** be a
+    /// reap candidate: a unique, short, not-yet-created directory in the platform temp
+    /// directory whose name is not the published `pkc-` form, used as the parent of an
+    /// off-base fixture (or as a symlink's target). Short for the same `sun_path`
+    /// reason [`socket_dir_path`] is.
+    #[cfg(unix)]
+    fn off_base_dir(tag: &str) -> PathBuf {
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("pkt{tag}-{}-{n}", std::process::id()))
+    }
+
+    /// A ready-made leftover of an abruptly-killed runner's control transport: the
+    /// private `pkc-…` directory of [`socket_dir_path`], with a **real** bound unix
+    /// socket inside it. Returns the directory and the endpoint string a record would
+    /// publish for it.
+    #[cfg(unix)]
+    fn socket_fixture(tag: &str) -> (PathBuf, String) {
+        let dir = socket_dir_path(tag);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).expect("create the private control-socket directory");
+        let endpoint = bind_socket_in(&dir);
+        (dir, endpoint)
+    }
+
+    /// Bind a real unix socket at `<dir>/c.sock` and return its path as the endpoint a
+    /// record publishes. The listener is dropped immediately on purpose: a bound unix
+    /// socket file outlives its listener (only an unlink removes it), which is exactly
+    /// the leftover an abruptly-killed runner strands on disk.
+    #[cfg(unix)]
+    fn bind_socket_in(dir: &Path) -> String {
+        let path = dir.join(crate::control::SOCKET_FILE_NAME);
+        let listener = std::os::unix::net::UnixListener::bind(&path)
+            .expect("bind the fixture's control socket");
+        drop(listener);
+        path.to_str()
+            .expect("the fixture's socket path is UTF-8")
+            .to_string()
     }
 
     /// Like [`write_record`], but with an explicit `started_at` string instead of
@@ -3149,9 +3509,11 @@ mod tests {
         assert!(
             preview.candidates.iter().any(|candidate| matches!(
                 candidate,
-                PruneCandidate::Entry { run_id, .. } if run_id == "dead"
+                PruneCandidate::Entry { run_id, socket_dir, .. }
+                    if run_id == "dead" && socket_dir.is_none()
             )),
-            "the confirmed-stale paired entry is a candidate: {:?}",
+            "the confirmed-stale paired entry is a candidate, and — having published no \
+             endpoint — names no control socket to reap with it: {:?}",
             preview.candidates
         );
         assert!(
@@ -3195,6 +3557,550 @@ mod tests {
             !missing.exists(),
             "previewing a missing registry must not create its directory"
         );
+    }
+
+    /// T-207, the shape guard on its own: an `endpoint` is a candidate for the socket
+    /// reap **only** in the exact form `ControlServer::bind` publishes, and every
+    /// other form — including the ones a corrupt or adversarial record could carry —
+    /// yields nothing to delete. Exercised against explicit bases so the verdict does
+    /// not depend on the host's `TMPDIR`, and covering the boundary cases a
+    /// hand-rolled path validator is easy to get wrong on (see [K-030]): an empty
+    /// value, a relative path, `..` segments anywhere, a NUL/control character, a
+    /// deeper or shallower nesting, a near-miss directory name, and a directory
+    /// outside the allowed bases entirely.
+    #[cfg(unix)]
+    #[test]
+    fn control_socket_endpoints_are_accepted_only_in_the_published_shape() {
+        let bases = [PathBuf::from("/tmp"), PathBuf::from("/var/tmp/scratch")];
+
+        // The real thing: what `unique_token`'s pid-nanos-counter form actually looks
+        // like, under either base.
+        for (endpoint, expected) in [
+            (
+                "/tmp/pkc-12345-17a2b3c4d5e-0/c.sock",
+                "/tmp/pkc-12345-17a2b3c4d5e-0",
+            ),
+            ("/var/tmp/scratch/pkc-1/c.sock", "/var/tmp/scratch/pkc-1"),
+        ] {
+            assert_eq!(
+                platform::socket_dir_within(endpoint, &bases),
+                Some(PathBuf::from(expected)),
+                "the published endpoint shape must be recognized: {endpoint:?}"
+            );
+        }
+
+        for endpoint in [
+            // Empty / relative / not a path this project ever publishes.
+            "",
+            "c.sock",
+            "tmp/pkc-1/c.sock",
+            "pkc-1/c.sock",
+            // Traversal, anywhere in the value — refused before anything resolves it.
+            "/tmp/pkc-1/../pkc-2/c.sock",
+            "/tmp/../tmp/pkc-1/c.sock",
+            "/tmp/pkc-1/c.sock/..",
+            // Normalization-equivalent spellings `Path::components()` would silently
+            // erase: a `.` segment, a doubled separator, a trailing separator. None
+            // of them is what `bind` publishes, so none is accepted here either.
+            "/tmp/./pkc-1/c.sock",
+            "/tmp//pkc-1/c.sock",
+            "//tmp/pkc-1/c.sock",
+            "/tmp/pkc-1/c.sock/",
+            // NUL / control characters.
+            "/tmp/pkc-1/c.sock\0",
+            "/tmp/pkc-1\n/c.sock",
+            // Wrong file name, or no file at all.
+            "/tmp/pkc-1/other.sock",
+            "/tmp/pkc-1/c.sock.bak",
+            "/tmp/pkc-1/C.SOCK",
+            "/tmp/pkc-1",
+            "/tmp/pkc-1/",
+            // Wrong directory name: near-miss prefix, wrong case, empty token, or a
+            // token carrying characters `unique_token` never mints.
+            "/tmp/notpkc-1/c.sock",
+            "/tmp/PKC-1/c.sock",
+            "/tmp/pkc-/c.sock",
+            "/tmp/pkc-1 2/c.sock",
+            "/tmp/pkc-1.2/c.sock",
+            "/tmp/pkc-1:2/c.sock",
+            // Right shape, wrong place: too deep, too shallow, or a base that is not
+            // one a control server ever binds in.
+            "/tmp/sub/pkc-1/c.sock",
+            "/tmp/pkc-1/sub/c.sock",
+            "/pkc-1/c.sock",
+            "/etc/pkc-1/c.sock",
+            "/var/tmp/pkc-1/c.sock",
+            "/tmp/c.sock",
+            // A Windows named pipe, which is not a filesystem path at all.
+            r"\\.\pipe\processkit-cli-1234-abc-0",
+        ] {
+            assert_eq!(
+                platform::socket_dir_within(endpoint, &bases),
+                None,
+                "an endpoint outside the published shape must yield nothing to delete: \
+                 {endpoint:?}"
+            );
+        }
+    }
+
+    /// The anti-drift check between the transport that *publishes* an endpoint and the
+    /// reaper that consumes it: an endpoint a **real** `ControlServer::bind` just
+    /// produced must classify as a reap candidate, must name the very directory that
+    /// bind created, and must actually be removable by the reaper — a real
+    /// tokio-bound socket, not a hand-built fixture. If the socket's naming, its
+    /// private directory's prefix, or the bases it is created in ever change on the
+    /// control side, this fails loudly instead of the reap quietly going silent and
+    /// the leak this task closes coming back.
+    ///
+    /// `#[tokio::test]`, not `#[test]`: `UnixListener::bind` needs a reactor (see
+    /// [K-009]).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_freshly_bound_control_endpoint_is_recognized_and_reapable() {
+        let server = crate::control::ControlServer::bind().expect("bind a control server");
+        let endpoint = server.endpoint().to_string();
+
+        let candidate = platform::control_socket_dir_to_reap(Some(&endpoint))
+            .expect("a freshly published endpoint must classify as a reap candidate");
+        assert_eq!(
+            candidate.join(crate::control::SOCKET_FILE_NAME),
+            PathBuf::from(&endpoint),
+            "the classified directory must be the one the socket was bound in"
+        );
+        assert!(
+            candidate.is_dir() && Path::new(&endpoint).exists(),
+            "sanity: bind really created the directory and the socket"
+        );
+
+        // Reap it exactly as a confirmed-stale record's would be reaped. The socket is
+        // still bound here — an abruptly-killed runner's is too, from the filesystem's
+        // point of view — and it goes, along with its directory.
+        platform::reap_control_socket_dir(&candidate);
+        assert!(
+            !Path::new(&endpoint).exists(),
+            "a real published control socket is unlinked by the reaper"
+        );
+        assert!(
+            !candidate.exists(),
+            "its private directory goes with it, leaving nothing behind"
+        );
+
+        // The server's own clean-teardown Drop is best-effort and copes with the
+        // files already being gone.
+        drop(server);
+    }
+
+    /// T-207, the leak this task closes: reaping a confirmed-stale entry also removes
+    /// the control socket that entry published and the private directory holding it —
+    /// the other half of what an abruptly-killed runner strands on disk, which no
+    /// pass ever cleaned up before.
+    #[cfg(unix)]
+    #[test]
+    fn prune_reaps_the_control_socket_a_confirmed_stale_record_published() {
+        let dir = scratch("prune-socket-reap");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+        let (socket_dir, endpoint) = socket_fixture("reap");
+
+        let registration = registry
+            .register("victim", Some(&endpoint), SystemTime::now())
+            .expect("register run");
+        let record_path = registration.record_path().to_owned();
+        let lock_path = registration.lock_path().to_owned();
+        // Abrupt death: the lock is released, and every file — record, lock, and the
+        // socket the clean-teardown `Drop` never got to remove — is left behind.
+        registration.simulate_abrupt_death();
+        assert!(
+            Path::new(&endpoint).exists() && socket_dir.exists(),
+            "the abrupt-death fixture leaves the control socket on disk"
+        );
+
+        let outcome = registry.prune().expect("prune must not fail");
+        assert_eq!(
+            outcome,
+            PruneOutcome {
+                pruned: 1,
+                live: 0,
+                unprobed: 0,
+                orphaned_locks: 0,
+            },
+            "the confirmed-stale entry is reaped"
+        );
+        assert!(
+            !record_path.exists() && !lock_path.exists(),
+            "both registry files of the reaped entry are deleted"
+        );
+        assert!(
+            !Path::new(&endpoint).exists(),
+            "the control socket the reaped record published is deleted too"
+        );
+        assert!(
+            !socket_dir.exists(),
+            "the socket's private directory is reaped with it, not left behind empty"
+        );
+
+        let _ = fs::remove_dir_all(&socket_dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A **live** run's control socket is never touched — the same guarantee the live
+    /// entry's own files already have. The socket reap runs only inside the
+    /// confirmed-stale arm, so a live runner keeps the transport its clients are
+    /// still connecting to.
+    #[cfg(unix)]
+    #[test]
+    fn prune_never_reaps_the_control_socket_of_a_live_entry() {
+        let dir = scratch("prune-socket-live");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+        let (socket_dir, endpoint) = socket_fixture("live");
+
+        let live = registry
+            .register("alive", Some(&endpoint), SystemTime::now())
+            .expect("register the live run");
+
+        let outcome = registry.prune().expect("prune must not fail");
+        assert_eq!(
+            outcome,
+            PruneOutcome {
+                pruned: 0,
+                live: 1,
+                unprobed: 0,
+                orphaned_locks: 0,
+            },
+            "the live entry is counted as kept, not reaped"
+        );
+        assert!(
+            Path::new(&endpoint).exists() && socket_dir.exists(),
+            "a live run's control socket and its directory must survive prune untouched"
+        );
+
+        live.remove();
+        let _ = fs::remove_dir_all(&socket_dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An entry whose liveness probe **fails** keeps its control socket too: liveness
+    /// is unknown, not confirmed stale, so nothing about that entry is deleted — the
+    /// socket included. The probe is forced to fail with the cross-platform
+    /// lock-file-is-a-directory trick from [K-014], never `chmod 0o000`.
+    #[cfg(unix)]
+    #[test]
+    fn prune_leaves_the_control_socket_of_an_unprobeable_entry_alone() {
+        let dir = scratch("prune-socket-unprobeable");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+        let (socket_dir, endpoint) = socket_fixture("unpr");
+
+        fs::create_dir(dir.join("broken.lock"))
+            .expect("create the directory the lock name resolves to");
+        write_record_with_endpoint(&dir, "broken", "broken", "broken.lock", Some(&endpoint));
+
+        let outcome = registry.prune().expect("prune must not fail");
+        assert_eq!(
+            outcome,
+            PruneOutcome {
+                pruned: 0,
+                live: 0,
+                unprobed: 1,
+                orphaned_locks: 0,
+            },
+            "an unprobeable entry is kept"
+        );
+        assert!(
+            dir.join("broken.json").exists(),
+            "an unprobeable record is never reaped"
+        );
+        assert!(
+            Path::new(&endpoint).exists() && socket_dir.exists(),
+            "an unprobeable entry's control socket is never reaped either"
+        );
+
+        let _ = fs::remove_dir_all(&socket_dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The symlink attack the [K-024] `O_NOFOLLOW` discipline exists for, aimed at the
+    /// socket directory instead of a lock file: a `pkc-…` name inside a base that is
+    /// really a **symlink** to somewhere else entirely. The name passes the lexical
+    /// shape check (it is exactly the published form), so only the open-time refusal
+    /// stands between the reap and the link's target — and it holds: nothing behind
+    /// the link is deleted, and the link itself is left in place rather than being
+    /// followed. The record is still reaped, since the endpoint check gates only the
+    /// extra socket deletion.
+    #[cfg(unix)]
+    #[test]
+    fn prune_refuses_to_follow_a_symlinked_control_socket_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch("prune-socket-symlink");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+
+        // What the link points at: a directory holding a socket named exactly like a
+        // published one, plus an unrelated bystander file.
+        let decoy = off_base_dir("dcy");
+        let _ = fs::remove_dir_all(&decoy);
+        fs::create_dir_all(&decoy).expect("create the decoy target directory");
+        let decoy_socket = bind_socket_in(&decoy);
+        let bystander = decoy.join("bystander");
+        fs::write(&bystander, b"not yours to delete").expect("write the bystander file");
+
+        // The endpoint: a perfectly-shaped `<base>/pkc-<token>/c.sock`, whose
+        // directory component is a symlink onto the decoy.
+        let link = socket_dir_path("link");
+        let _ = fs::remove_dir_all(&link);
+        symlink(&decoy, &link).expect("create the symlinked socket directory");
+        let endpoint = link.join(crate::control::SOCKET_FILE_NAME);
+        let endpoint = endpoint.to_str().expect("a UTF-8 endpoint");
+        assert!(
+            platform::control_socket_dir_to_reap(Some(endpoint)).is_some(),
+            "sanity: the lexical shape check passes, so only the open-time refusal \
+             can stop this reap"
+        );
+
+        write_record_with_endpoint(&dir, "linked", "linked", "linked.lock", Some(endpoint));
+
+        let outcome = registry.prune().expect("prune must not fail");
+        assert_eq!(
+            outcome,
+            PruneOutcome {
+                pruned: 1,
+                live: 0,
+                unprobed: 0,
+                orphaned_locks: 0,
+            },
+            "the record itself is still reaped — the endpoint check gates only the \
+             socket deletion"
+        );
+        assert!(
+            Path::new(&decoy_socket).exists(),
+            "the symlink's target must not be followed: the socket behind it survives"
+        );
+        assert!(
+            bystander.exists() && decoy.exists(),
+            "nothing behind the symlink is deleted"
+        );
+        assert!(
+            fs::symlink_metadata(&link).is_ok(),
+            "the symlink itself is left in place, not resolved and reaped"
+        );
+
+        let _ = fs::remove_file(&link);
+        let _ = fs::remove_dir_all(&decoy);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Even inside a genuine, validated `pkc-…` directory, only a real **socket** is
+    /// unlinked: a regular file planted under the socket's name is refused, and the
+    /// directory holding it is then left alone too (rather than being emptied of
+    /// whatever happens to sit there). The record is reaped as usual.
+    #[cfg(unix)]
+    #[test]
+    fn prune_refuses_to_delete_an_endpoint_that_is_not_a_socket() {
+        let dir = scratch("prune-socket-not-a-socket");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+
+        let socket_dir = socket_dir_path("file");
+        let _ = fs::remove_dir_all(&socket_dir);
+        fs::create_dir(&socket_dir).expect("create the private control-socket directory");
+        let planted = socket_dir.join(crate::control::SOCKET_FILE_NAME);
+        fs::write(&planted, b"a regular file, not a socket").expect("plant the decoy file");
+        let endpoint = planted.to_str().expect("a UTF-8 endpoint").to_string();
+
+        write_record_with_endpoint(&dir, "planted", "planted", "planted.lock", Some(&endpoint));
+
+        let outcome = registry.prune().expect("prune must not fail");
+        assert_eq!(
+            outcome,
+            PruneOutcome {
+                pruned: 1,
+                live: 0,
+                unprobed: 0,
+                orphaned_locks: 0,
+            },
+            "the record is reaped whatever its endpoint turned out to be"
+        );
+        assert!(
+            planted.exists(),
+            "a file that is not a socket is refused, never deleted"
+        );
+        assert!(
+            socket_dir.exists(),
+            "the directory still holding the refused file is left alone too"
+        );
+
+        let _ = fs::remove_dir_all(&socket_dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A well-formed-looking endpoint **outside** the base directories a control
+    /// server ever binds in deletes nothing at all: the record is reaped, and the
+    /// directory it pointed at — socket, sibling file, and the directory itself —
+    /// survives untouched. This is the property that keeps a corrupt or hand-edited
+    /// record from steering the reap at an arbitrary path.
+    #[cfg(unix)]
+    #[test]
+    fn prune_ignores_an_endpoint_outside_the_control_socket_bases() {
+        let dir = scratch("prune-socket-outside");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+
+        // `<temp>/<other>/pkc-1/c.sock`: the right *shape*, one level too deep to be a
+        // directory `ControlServer::bind` created.
+        let outside = off_base_dir("off");
+        let _ = fs::remove_dir_all(&outside);
+        let elsewhere = outside.join("pkc-1");
+        fs::create_dir_all(&elsewhere).expect("create the off-base directory");
+        let socket = bind_socket_in(&elsewhere);
+        let bystander = elsewhere.join("bystander");
+        fs::write(&bystander, b"not yours to delete").expect("write the bystander file");
+        assert!(
+            platform::control_socket_dir_to_reap(Some(&socket)).is_none(),
+            "sanity: an endpoint outside the published bases is not a candidate"
+        );
+
+        write_record_with_endpoint(&dir, "offbase", "offbase", "offbase.lock", Some(&socket));
+
+        let outcome = registry.prune().expect("prune must not fail");
+        assert_eq!(
+            outcome,
+            PruneOutcome {
+                pruned: 1,
+                live: 0,
+                unprobed: 0,
+                orphaned_locks: 0,
+            },
+            "the record itself is reaped as usual"
+        );
+        assert!(
+            Path::new(&socket).exists() && bystander.exists() && elsewhere.exists(),
+            "nothing outside the published socket bases is deleted"
+        );
+
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `prune --dry-run`'s side of T-207: the preview names the socket directory a
+    /// real reap would remove — and stays silent for an entry whose endpoint that
+    /// reap would refuse — without removing either. The following real prune then
+    /// does exactly what the preview said: one socket reaped, the refused one
+    /// untouched.
+    #[cfg(unix)]
+    #[test]
+    fn preview_prune_reports_the_control_socket_it_would_reap_and_removes_nothing() {
+        let dir = scratch("preview-socket");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+
+        // One confirmed-stale entry whose endpoint the reap accepts...
+        let (socket_dir, endpoint) = socket_fixture("pvw");
+        write_record_with_endpoint(
+            &dir,
+            "reapable",
+            "reapable",
+            "reapable.lock",
+            Some(&endpoint),
+        );
+
+        // ...and one whose endpoint it refuses (right shape, wrong place).
+        let outside = off_base_dir("pvw");
+        let _ = fs::remove_dir_all(&outside);
+        let elsewhere = outside.join("pkc-1");
+        fs::create_dir_all(&elsewhere).expect("create the off-base directory");
+        let refused = bind_socket_in(&elsewhere);
+        write_record_with_endpoint(&dir, "refused", "refused", "refused.lock", Some(&refused));
+
+        let preview = registry
+            .preview_prune()
+            .expect("preview_prune must not fail");
+        assert_eq!(
+            preview.outcome,
+            PruneOutcome {
+                pruned: 2,
+                live: 0,
+                unprobed: 0,
+                orphaned_locks: 0,
+            },
+            "both records are confirmed-stale candidates"
+        );
+        assert!(
+            preview.candidates.iter().any(|candidate| matches!(
+                candidate,
+                PruneCandidate::Entry { run_id, socket_dir: Some(reported), .. }
+                    if run_id == "reapable" && Path::new(reported) == socket_dir
+            )),
+            "the preview names the socket directory a real reap would remove: {:?}",
+            preview.candidates
+        );
+        assert!(
+            preview.candidates.iter().any(|candidate| matches!(
+                candidate,
+                PruneCandidate::Entry { run_id, socket_dir, .. }
+                    if run_id == "refused" && socket_dir.is_none()
+            )),
+            "the preview names no socket for an endpoint the reap would refuse: {:?}",
+            preview.candidates
+        );
+        assert!(
+            Path::new(&endpoint).exists() && Path::new(&refused).exists(),
+            "a preview must not delete either socket"
+        );
+
+        // The real pass now does exactly what the preview described.
+        registry.prune().expect("prune must not fail");
+        assert!(
+            !Path::new(&endpoint).exists() && !socket_dir.exists(),
+            "the previewed socket directory is what the real reap removes"
+        );
+        assert!(
+            Path::new(&refused).exists(),
+            "the endpoint the preview reported no candidate for is still not deleted"
+        );
+
+        let _ = fs::remove_dir_all(&socket_dir);
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The Windows side of T-207: a named-pipe endpoint is never a socket candidate —
+    /// the pipe lives in the kernel object namespace and disappears with its creator,
+    /// so there is no filesystem leftover to classify. The preview reports no socket
+    /// directory and the reap deletes exactly the two registry files it always did.
+    #[cfg(windows)]
+    #[test]
+    fn a_named_pipe_endpoint_is_never_a_control_socket_candidate() {
+        let dir = scratch("prune-socket-pipe");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+
+        let endpoint = r"\\.\pipe\processkit-cli-1234-17a2b3c4d5e-0";
+        write_record_with_endpoint(&dir, "piped", "piped", "piped.lock", Some(endpoint));
+
+        let preview = registry
+            .preview_prune()
+            .expect("preview_prune must not fail");
+        assert!(
+            preview.candidates.iter().any(|candidate| matches!(
+                candidate,
+                PruneCandidate::Entry { run_id, socket_dir, .. }
+                    if run_id == "piped" && socket_dir.is_none()
+            )),
+            "a named-pipe endpoint names no directory to reap: {:?}",
+            preview.candidates
+        );
+
+        let outcome = registry.prune().expect("prune must not fail");
+        assert_eq!(
+            outcome,
+            PruneOutcome {
+                pruned: 1,
+                live: 0,
+                unprobed: 0,
+                orphaned_locks: 0,
+            },
+            "the record is reaped exactly as it was before the socket reap existed"
+        );
+        assert!(
+            !dir.join("piped.json").exists(),
+            "the confirmed-stale record is gone"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The `wait` read path end to end on the ordinary lifecycle: a registered run

@@ -75,10 +75,18 @@ code (`AGENTS.md`, "Exit-code fidelity").
 On a clean teardown (a normal child exit, a `--timeout`, or a `Ctrl-C`) the transport
 is torn down with the run — on unix the socket file and its private directory are
 removed. An **abrupt** runner death (crash, `SIGKILL`, a parent's Job Object
-terminate) skips that removal, leaking the socket directory exactly as it leaks the
-registry record and lock. That leak is inert: a client detects the run as stale
-through the registry *before* it ever connects, so it never touches the orphaned
-socket. On Windows the pipe simply vanishes with the process.
+terminate) skips that removal, stranding the socket directory exactly as it strands
+the registry record and lock. The leak is inert while it lasts: a client detects the
+run as stale through the registry *before* it ever connects, so it never touches the
+orphaned socket.
+
+It does not last, either. `prune` reaps all three together: reaping a
+**confirmed-stale** record now also removes the `pkc-…` directory and socket that
+record published, so an abrupt death no longer accumulates dead socket directories in
+`/tmp` — see [`docs/registry.md`](registry.md), "Reaping — `prune`", for the shape
+check that endpoint has to pass first (it is untrusted data, like everything else in
+a record) and for what the reaper deliberately refuses to touch. On Windows there is
+nothing to reap: the pipe simply vanishes with the process.
 
 ## Wire protocol
 
