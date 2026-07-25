@@ -210,7 +210,8 @@ change the standard-I/O path:
   directly. There is no output pump, echo, tee, or transcript capture in this mode;
   the child writes to the inherited destinations itself. JSONL events still go only
   to `--jsonl`, and runner diagnostics still avoid stdout. This mode conflicts with
-  `--capture-dir`, `--create-no-window`, `--inherit-stdin`, and `--stdin-file`.
+  `--capture-dir`, `--create-no-window`, `--inherit-stdin`, `--stdin-file`, and
+  `--no-echo` (there is no pump to suppress in this mode).
   `probe --json` advertises the capability as `run:--inherit-stdio`.
 
 - `--inherit-stdin` gives the child the runner's own stdin handle. It can read from

@@ -96,6 +96,12 @@ processkit-cli run \
   explicit truncation/write-error flags per stream (the `output_captured`
   event, §3) — use this when the adapter needs the transcript as a file rather
   than (or in addition to) the live echo.
+- **`--no-echo`** suppresses the runner's own live retransmission of the
+  child's stdout/stderr — the exact "pure noise" an adapter reading results
+  from `--jsonl`/`--capture-dir` alone does not want interleaved with its own
+  output. The pipe, `--capture-dir`, and the JSONL stream are all unaffected;
+  it conflicts with `--inherit-stdio`, which runs no pump to suppress in the
+  first place.
 - **`--env-clear` / `--env-remove <KEY>` / `--env <KEY=VALUE>`** give the
   adapter control over the child's environment, applied in that fixed order —
   clear, then remove, then set — regardless of flag order on the command line,

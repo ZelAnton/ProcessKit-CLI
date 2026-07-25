@@ -1,14 +1,17 @@
-//! Bounded stdout/stderr capture to files, teed *alongside* the live echo.
+//! Bounded stdout/stderr capture to files, teed *alongside* the runner's echo sink.
 //!
 //! `--capture-dir <dir>` turns on a per-stream transcript: the child's stdout and
-//! stderr are written to `<dir>/stdout.log` and `<dir>/stderr.log` while the live
-//! echo to the runner's own stdout/stderr continues unchanged (`AGENTS.md`,
-//! "Streams are strictly separated"; the task's "don't break live echo"). Capture
-//! rides ProcessKit's existing per-stream tee — a [`CaptureTee`] wraps the same
-//! `tokio::io::stdout()`/`stderr()` sink `run` already tees to and mirrors every
-//! echoed byte into a bounded capture file — so no second output-reading path is
-//! invented and the child's back-pressure is exactly the live echo's (the tee is
-//! awaited on ProcessKit's line pump). The pump's own memory bound is ProcessKit's
+//! stderr are written to `<dir>/stdout.log` and `<dir>/stderr.log`, independent of
+//! whether the runner's own echo is live or suppressed (`AGENTS.md`, "Streams are
+//! strictly separated"; the task's "don't break live echo"). Capture rides
+//! ProcessKit's existing per-stream tee — a [`CaptureTee`] wraps whatever sink
+//! `run`'s sink-selection block already tees to (`tokio::io::stdout()`/`stderr()`
+//! by default, or `tokio::io::sink()` under `--no-echo` — see `src/run.rs` and
+//! K-050) and mirrors every byte the pump observes into a bounded capture file —
+//! so no second output-reading path is invented and the child's back-pressure is
+//! exactly the echo sink's (the tee is awaited on ProcessKit's line pump).
+//! `--no-echo` changes only which sink is wrapped, never what capture records.
+//! The pump's own memory bound is ProcessKit's
 //! [`OutputBufferPolicy`](processkit::OutputBufferPolicy): `run` hands the kernel a
 //! byte-capped policy so a single never-terminated line cannot grow the pump's
 //! in-flight assembly buffer without limit — the runner writes no draining/limiting

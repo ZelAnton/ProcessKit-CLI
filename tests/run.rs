@@ -554,11 +554,17 @@ fn custom_capture_max_bytes_clips_the_stream_at_the_configured_ceiling() {
 /// `--no-echo` added — and comparing: the plain run's own stdout/stderr carry the
 /// child's output as usual (see `passes_child_streams_through_without_mixing`);
 /// the `--no-echo` run's carry none of it; both runs' `--capture-dir` files hold
-/// the exact same bytes; and both runs' JSONL streams are identical once the
-/// fields expected to vary between two separate invocations of the same script
-/// (timestamps, PIDs, and the per-run `--capture-dir` file path) are stripped —
-/// the inline (rather than per-scratch-dir script file) program keeps argv, and
-/// so `command.argv_sha256`, identical between the two runs as well.
+/// the exact same bytes; and both runs' JSONL streams carry the same sequence of
+/// event types and agree on the fields `--no-echo` is actually contracted not to
+/// change (`root_exited`, `runner_exit`, and `output_captured`'s per-stream
+/// byte/hash/truncation/write-error metadata — see `assert_run_outcome_matches`/
+/// `assert_output_captured_matches`). This deliberately stops short of a
+/// full-payload comparison: some fields (e.g. `cleanup_finished.remaining`,
+/// `members_snapshot.members`) are live, racy snapshots of process-tree state
+/// that this project documents as such, not deterministic values two separate
+/// invocations are guaranteed to agree on (see `Event::CleanupFinished`'s doc
+/// comment) — comparing them would make this test flaky rather than prove
+/// anything about `--no-echo`.
 #[test]
 fn no_echo_suppresses_the_live_relay_but_leaves_capture_and_events_whole() {
     let script = if cfg!(windows) {
@@ -652,64 +658,223 @@ fn no_echo_suppresses_the_live_relay_but_leaves_capture_and_events_whole() {
         "the capture file is full even with the live echo suppressed"
     );
 
-    // The JSONL stream is identical once the fields expected to vary between two
-    // separate invocations (timestamps, PIDs, the per-run capture file path) are
-    // stripped.
-    let baseline_events = normalized_run_events(&baseline_dir);
-    let no_echo_events = normalized_run_events(&no_echo_dir);
+    // The JSONL stream's *shape* is unaffected by --no-echo: same sequence of
+    // event types, and the same values on the handful of fields the flag is
+    // actually contracted not to change. This deliberately does **not** compare
+    // full payloads: several fields are live, racy snapshots of process-tree
+    // state at the moment they were read (`cleanup_started.members_before`,
+    // `cleanup_finished.remaining`, `members_snapshot.members`) and are
+    // documented as such (see `Event::CleanupFinished`'s doc comment) — they can
+    // legitimately differ between two otherwise-identical invocations of the
+    // same script on a loaded host or a different teardown mechanism, and
+    // comparing them here would make this test flaky rather than prove anything
+    // about `--no-echo`.
+    let baseline_events = read_run_events(&baseline_dir);
+    let no_echo_events = read_run_events(&no_echo_dir);
     assert_eq!(
-        baseline_events, no_echo_events,
-        "the JSONL stream must be unaffected by --no-echo once variable fields are stripped"
+        event_type_sequence(&baseline_events),
+        event_type_sequence(&no_echo_events),
+        "--no-echo must not change the sequence of emitted event types"
     );
+    assert_run_outcome_matches(&baseline_events, &no_echo_events);
+    assert_output_captured_matches(&baseline_events, &no_echo_events);
 
     let _ = std::fs::remove_dir_all(&baseline_dir);
     let _ = std::fs::remove_dir_all(&no_echo_dir);
 }
 
-/// `read_run_events`, with every field expected to vary between two otherwise
-/// identical invocations of the same script — wall-clock time, PIDs, and the
-/// per-run `--capture-dir` file path — stripped out, so two separate runs'
-/// streams can be compared byte-for-byte on everything else (used by
-/// `no_echo_suppresses_the_live_relay_but_leaves_capture_and_events_whole`).
-fn normalized_run_events(dir: &Path) -> Vec<Value> {
-    let mut events = read_run_events(dir);
-    for event in &mut events {
-        strip_variable_fields(event);
-    }
+/// The ordered sequence of `event` tag values in a run's JSONL stream (e.g.
+/// `["run_started", "members_snapshot", "root_exited", ...]`) — the part of the
+/// stream that is deterministic across two otherwise-identical invocations of
+/// the same script, unlike the live process-tree snapshots some events carry.
+fn event_type_sequence(events: &[Value]) -> Vec<&str> {
     events
+        .iter()
+        .map(|e| e["event"].as_str().expect("every event has a tag"))
+        .collect()
 }
 
-/// Recursively remove JSON object keys whose value is expected to vary between
-/// two separate invocations of the same script: `time` (wall clock), `root_pid`/
-/// `pid`/`ppid`/`start_time` (process identity/lifetime), `remaining_pids` (a
-/// post-teardown PID snapshot), and `path` (the `output_captured` capture-file
-/// path, which embeds the per-run scratch directory).
-fn strip_variable_fields(value: &mut Value) {
-    const VARIABLE_KEYS: &[&str] = &[
-        "time",
-        "root_pid",
-        "pid",
-        "ppid",
-        "start_time",
-        "remaining_pids",
-        "path",
-    ];
-    match value {
-        Value::Object(map) => {
-            for key in VARIABLE_KEYS {
-                map.remove(*key);
-            }
-            for v in map.values_mut() {
-                strip_variable_fields(v);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                strip_variable_fields(item);
-            }
-        }
-        _ => {}
+/// Asserts that two runs' `root_exited` and `runner_exit` events agree on
+/// exactly the fields `--no-echo` is contracted not to change: the child's own
+/// outcome (`outcome`/`code`/`signal`) and the runner's terminal verdict
+/// (`code`/`source`/`child_code`). Both events are expected in each stream —
+/// this is a natural child exit, not a runner-imposed ending.
+fn assert_run_outcome_matches(baseline: &[Value], no_echo: &[Value]) {
+    let find = |events: &[Value], tag: &str| -> Value {
+        events
+            .iter()
+            .find(|e| e["event"] == tag)
+            .unwrap_or_else(|| panic!("a {tag} event is present"))
+            .clone()
+    };
+
+    let baseline_root_exited = find(baseline, "root_exited");
+    let no_echo_root_exited = find(no_echo, "root_exited");
+    for field in ["outcome", "code", "signal"] {
+        assert_eq!(
+            baseline_root_exited[field], no_echo_root_exited[field],
+            "--no-echo must not change root_exited.{field}"
+        );
     }
+
+    let baseline_runner_exit = find(baseline, "runner_exit");
+    let no_echo_runner_exit = find(no_echo, "runner_exit");
+    for field in ["code", "source", "child_code"] {
+        assert_eq!(
+            baseline_runner_exit[field], no_echo_runner_exit[field],
+            "--no-echo must not change runner_exit.{field}"
+        );
+    }
+}
+
+/// Asserts that two runs' `output_captured` events agree on exactly the fields
+/// `--capture-dir` is contracted to report regardless of `--no-echo`: the full
+/// byte counter, content hash, truncation flag, and write-error flag, for both
+/// streams. `path` is deliberately excluded — it embeds the per-run scratch
+/// directory and is expected to differ.
+fn assert_output_captured_matches(baseline: &[Value], no_echo: &[Value]) {
+    let baseline_captured = baseline
+        .iter()
+        .find(|e| e["event"] == "output_captured")
+        .expect("baseline run emits output_captured");
+    let no_echo_captured = no_echo
+        .iter()
+        .find(|e| e["event"] == "output_captured")
+        .expect("--no-echo run emits output_captured");
+    for stream in ["stdout", "stderr"] {
+        for field in ["bytes", "sha256", "truncated", "write_error"] {
+            assert_eq!(
+                baseline_captured[stream][field], no_echo_captured[stream][field],
+                "--no-echo must not change output_captured.{stream}.{field}"
+            );
+        }
+    }
+}
+
+/// `--no-echo` with **no** `--capture-dir` — the main documented use case
+/// (README/CHANGELOG advertise it for an embedding orchestrator that reads the
+/// result from `--jsonl` alone): the runner's own stdout/stderr carry none of
+/// the child's output, while `root_exited`/`runner_exit` still report the
+/// child's real outcome unchanged.
+#[test]
+fn bare_no_echo_suppresses_the_relay_without_capture_dir() {
+    let dir = scratch("no-echo-bare");
+    let out = run_with_flags(&dir, &[], &["--no-echo"], shell_inline("exit 0"));
+    assert_eq!(out.status.code(), Some(0), "the child exits cleanly");
+    assert!(
+        out.stdout.is_empty(),
+        "--no-echo without --capture-dir must still suppress the runner's stdout relay: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "--no-echo without --capture-dir must still suppress the runner's stderr relay: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let events = read_run_events(&dir);
+    let root_exited = events
+        .iter()
+        .find(|e| e["event"] == "root_exited")
+        .expect("a root_exited event");
+    assert_eq!(root_exited["outcome"], "exited");
+    assert_eq!(root_exited["code"], 0);
+
+    let runner_exit = events.last().expect("a terminal event");
+    assert_eq!(runner_exit["event"], "runner_exit");
+    assert_eq!(runner_exit["code"], 0);
+    assert_eq!(runner_exit["source"], "child_exit");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--no-echo` combined with `--idle-timeout` (K-050): the `IdleClock` must stay
+/// wired to the pump *underneath* the suppressed echo, not just the
+/// `--capture-dir` tee — a silent child is still reaped on the idle deadline,
+/// and a child that keeps producing output (even though none of it reaches the
+/// runner's own stdout/stderr) still resets the idle clock and is left to exit
+/// on its own. Mirrors `idle_timeout_emits_timeout_with_idle_reason`
+/// (`tests/events.rs`) and the chatty-vs-silent pairing in
+/// `idle_timeout_reaps_a_silent_child_but_spares_a_chatty_one` (`tests/e2e.rs`),
+/// with `--no-echo` added to both sides.
+#[test]
+fn no_echo_still_lets_idle_timeout_reap_a_silent_child_but_spares_a_chatty_one() {
+    // Silent child: with --no-echo, the runner's own stdout must stay empty
+    // (the child never writes to it anyway) *and* the idle deadline must still
+    // fire — proving the idle clock observes the pump, not the (now-discarded)
+    // echo sink.
+    let silent_dir = scratch("no-echo-idle-silent");
+    let long_silent = if cfg!(windows) {
+        shell_inline("ping -n 300 127.0.0.1 >nul")
+    } else {
+        shell_inline("sleep 300")
+    };
+    let silent_out = run_with_flags(
+        &silent_dir,
+        &[],
+        &["--idle-timeout", "1s", "--grace", "500ms", "--no-echo"],
+        long_silent,
+    );
+    assert_eq!(
+        silent_out.status.code(),
+        Some(106),
+        "a silent child under --no-echo is still reaped by --idle-timeout with the reserved \
+         TIMEOUT code; stderr: {}",
+        String::from_utf8_lossy(&silent_out.stderr)
+    );
+    // Only the *child's* echo is suppressed by --no-echo; the runner's own
+    // idle-timeout diagnostic (a bounded, runner-authored line, distinct from
+    // anything the silent child could have written) is unaffected and expected
+    // on stderr here, exactly as it is without --no-echo.
+    assert!(
+        silent_out.stdout.is_empty(),
+        "--no-echo suppresses the child's stdout relay even on an idle-timeout ending: {:?}",
+        String::from_utf8_lossy(&silent_out.stdout)
+    );
+    let silent_events = read_run_events(&silent_dir);
+    let timeout = silent_events
+        .iter()
+        .find(|e| e["event"] == "timeout")
+        .expect("the silent child produced a timeout event");
+    assert_eq!(
+        timeout["reason"], "idle",
+        "the --idle-timeout trigger is reported with reason=idle: {timeout}"
+    );
+    let _ = std::fs::remove_dir_all(&silent_dir);
+
+    // Chatty child: keeps writing well inside the idle window, so it must
+    // outlive the run and exit on its own even though --no-echo discards every
+    // byte it writes before it ever reaches the runner's own stdout/stderr.
+    let chatty_dir = scratch("no-echo-idle-chatty");
+    let chatty_script = if cfg!(windows) {
+        "for /L %i in (1,1,3) do (echo tick & ping -n 2 127.0.0.1 >nul)"
+    } else {
+        "for i in 1 2 3; do echo tick; sleep 1; done"
+    };
+    let chatty_out = run_with_flags(
+        &chatty_dir,
+        &[],
+        &["--idle-timeout", "2s", "--no-echo"],
+        shell_inline(chatty_script),
+    );
+    assert_eq!(
+        chatty_out.status.code(),
+        Some(0),
+        "a child whose gaps stay under the idle window outlives --idle-timeout even under \
+         --no-echo; stderr: {}",
+        String::from_utf8_lossy(&chatty_out.stderr)
+    );
+    assert!(
+        chatty_out.stdout.is_empty() && chatty_out.stderr.is_empty(),
+        "--no-echo suppresses the relay for the chatty child too"
+    );
+    let chatty_events = read_run_events(&chatty_dir);
+    assert!(
+        chatty_events.iter().all(|e| e["event"] != "timeout"),
+        "a child whose silences stay under the idle window must not trigger an idle timeout \
+         even under --no-echo: {chatty_events:?}"
+    );
+    let _ = std::fs::remove_dir_all(&chatty_dir);
 }
 
 /// A script that writes well over 50 bytes to stdout (repeated fixed-width

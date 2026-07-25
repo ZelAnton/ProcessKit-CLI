@@ -332,7 +332,8 @@ not be opened — and carries the reserved `SETUP` code (111), distinct from `in
 
 Bounded stdout/stderr capture finished. Emitted **only** when `run` was given
 `--capture-dir <dir>`: the child's stdout and stderr are teed into
-`<dir>/stdout.log` and `<dir>/stderr.log` alongside the unchanged live echo, and
+`<dir>/stdout.log` and `<dir>/stderr.log` alongside the live echo — suppressed
+when `--no-echo` is also given, which does not change what is captured — and
 this event records, per stream, what was captured. A run without `--capture-dir`
 does not emit it (the stream is otherwise byte-for-byte identical).
 `--inherit-stdio` conflicts with `--capture-dir`, because direct child output

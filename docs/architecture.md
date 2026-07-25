@@ -94,18 +94,25 @@ implemented in `run::execute`/`run::run_async` (`src/run.rs`):
 2. **Select the I/O path.** By default, `processkit`'s line pump concurrently
    reads the child's stdout/stderr and drives two things off the same read: the
    live echo to this process's own stdout/stderr (`src/run.rs`), and — when
-   `--capture-dir` is set — the per-stream tee in `src/capture.rs`.
+   `--capture-dir` is set — the per-stream tee in `src/capture.rs`. `--no-echo`
+   swaps only the echo sink for a discarding one (`tokio::io::sink()` in place
+   of `tokio::io::stdout()`/`stderr()`); the pump, the `--capture-dir` tee, and
+   the `--idle-timeout` clock's re-arming on every observed chunk are all
+   unaffected — see `src/run.rs`'s sink-selection block and K-050.
    `--inherit-stdio` instead gives the child the runner's three handles directly;
-   it conflicts with capture, so there is no pump or tee. When ProcessKit selects
+   it conflicts with capture (and with `--no-echo`, which has no pump to act on
+   in this mode), so there is no pump or tee. When ProcessKit selects
    POSIX process-group containment and stdin is a terminal, `run` temporarily
    assigns the terminal's foreground group to the child and restores the original
    group during cleanup. A `members_snapshot` event records the container's
    member list — enriched with `ppid`/executable `name`/`start_time` via
    ProcessKit's `members_info()` wherever the platform can report them
    (`docs/schema.md`, "Enriched member fields") — in either path.
-3. **Capture and hash.** `src/capture.rs`'s `CaptureTee` mirrors every echoed
-   byte into a bounded capture file per stream, hashing what actually reached
-   disk with `src/hash.rs`'s incremental SHA-256 and recording an explicit
+3. **Capture and hash.** `src/capture.rs`'s `CaptureTee` mirrors every byte the
+   pump observes into a bounded capture file per stream — independent of
+   whether that byte is also echoed (`--no-echo` does not change what is
+   captured) — hashing what actually reached disk with `src/hash.rs`'s
+   incremental SHA-256 and recording an explicit
    ceiling-truncation flag and write-error flag — never inferred from the
    file's size. This stage is a no-op, with no capture files and no
    `output_captured` event, unless `--capture-dir` was passed; clap rejects
