@@ -47,7 +47,7 @@ path = "src/lib.rs"
 # ---------------------------------------------------------------------------
 [dependencies]
 # Command-line parsing. The `derive` API expresses the normative CLI surface —
-# the seven subcommands (run/inspect/cancel/kill/list/prune/probe), their
+# the eight subcommands (run/inspect/cancel/kill/wait/list/prune/probe), their
 # flags, and the verbatim `-- <program> <args...>` tail — that AGENTS.md
 # counts as part of the compatibility surface.
 clap = { version = "4", features = ["derive"] }

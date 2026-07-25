@@ -13,11 +13,13 @@ format**, and **staleness signal**. The transport those clients speak over, and 
 `inspect` client itself, are described in [`docs/control-plane.md`](control-plane.md);
 here we define only the registry.
 
-`list` (see "Discovery" below) and `prune` (see "Reaping" below) are the two clients
-that read the registry directly, without connecting to any runner's control
-transport: `list` scans every entry and prints it, so an operator
-that has lost (or never had) a `run_id` can find one before reaching for
-`inspect`/`cancel`/`kill`, and `prune` reaps the entries `list` would show as stale.
+`list` (see "Discovery" below), `prune` (see "Reaping" below), and `wait` (see
+"Waiting" below) are the clients that read the registry directly, without connecting
+to any runner's control transport: `list` scans every entry and prints it, so an
+operator that has lost (or never had) a `run_id` can find one before reaching for
+`inspect`/`cancel`/`kill`; `prune` reaps the entries `list` would show as stale; and
+`wait` blocks on one entry until it is no longer live, so a supervisor that is not the
+runner's parent can still wait for a run to end.
 
 ## Location
 
@@ -40,9 +42,10 @@ The registry directory is created **restricted to its owner**, and the restricti
 is re-asserted on every *mutating* open (`run`'s path, so a pre-existing directory
 is locked down too before a record is written into it). A record names a run's
 private control-channel endpoint, so a world-readable registry would hand that
-channel to any local process. `list`'s **read-only** open (see "Discovery" below)
-deliberately does neither: it does not create the directory and does not touch its
-permissions, since a read-only scan must not mutate registry state.
+channel to any local process. The **read-only** open every other client takes —
+`list`, `prune`, `wait`, and the control clients — deliberately does neither: it does
+not create the directory and does not touch its permissions, since a read-only scan
+must not mutate registry state.
 
 - **Unix:** mode `0700`. Applied at creation and re-asserted with `chmod` (which,
   unlike the creating `mkdir`, is not filtered by the umask).
@@ -119,8 +122,9 @@ The registry does **not** enforce uniqueness of `run_id` at `register` time: two
 concurrent runs started with the same explicit `--run-id` are both written as
 independent entries (independent opaque file stems — see "No PID addressing" above)
 and both read as live for as long as they run. Resolution is therefore the client's
-job, in `resolve_live_endpoint` (`src/control.rs`), and it is deliberately
-conservative:
+job — in `resolve_live_endpoint` (`src/control.rs`) for the control-plane verbs, and
+in `Registry::probe_run` (`src/registry.rs`) for the registry-only `wait`, which
+reaches the same verdict from its own scan — and it is deliberately conservative:
 
 - The client scans every entry and filters to those matching the requested
   `run_id`, then counts how many of *those* are live (see "Staleness" above) —
@@ -134,12 +138,14 @@ conservative:
   [`docs/control-plane.md`](control-plane.md).
 - **More than one** live match → also a `CONTROL` (103) failure, "ambiguous run
   id", instead of silently acting on whichever entry the directory scan happens
-  to return first. This applies to **every** client the same way — the
-  destructive `cancel`/`kill` verbs *and* the read-only `inspect` — rather than a
-  softer fallback for `inspect`: guessing wrong on a mutating verb ends the
-  *other* run instead of the intended one, and a snapshot of the wrong run under
-  `inspect` is exactly as misleading as acting on it. A caller that hits this is
-  expected to pick a `--run-id` that is unique among currently live runs.
+  to return first. This applies to **every** by-`run-id` client the same way — the
+  destructive `cancel`/`kill` verbs, the read-only `inspect`, and the registry-only
+  `wait` — rather than a softer fallback for the read-only ones: guessing wrong on a
+  mutating verb ends the *other* run instead of the intended one, a snapshot of the
+  wrong run under `inspect` is exactly as misleading as acting on it, and a `wait`
+  that silently tracked one of two duplicates would report "your run finished" on the
+  strength of the wrong run's ending. A caller that hits this is expected to pick a
+  `--run-id` that is unique among currently live runs.
 - **Exactly one** live match → only now does its endpoint matter: resolved
   normally if it published one, or a distinguishable `CONTROL` (103) failure
   ("the run is live but exposes no control endpoint") if it did not.
@@ -308,6 +314,84 @@ a no-op that exits `0`.
   `unprobed` (entries whose probe failed and were left in place, paired or orphaned
   lock alike), and `orphaned_locks` (lone `.lock` files with no `.json` sibling that
   were reaped).
+
+## Waiting — `wait`
+
+`processkit-cli wait --run-id <id> [--timeout <duration>]` is the *lifetime*
+counterpart to `list`'s discovery and `prune`'s cleanup: it blocks while the named run
+is live and returns as soon as it is not. It exists for the supervisor that did **not**
+start the run — an adapter that restarted, a cleanup step, anything holding only a
+`run_id` — and therefore has no child process to wait on. Like `list` and `prune` it
+opens the registry through `Registry::open_read_only` (`src/registry.rs`), so waiting
+never creates the registry directory or touches its permissions, and unlike
+`inspect`/`cancel`/`kill` it never connects to the run's control transport: the run is
+not disturbed, not ended, and not even aware of the waiter. A run whose transport never
+came up (a `null` `endpoint`, see "Record format" above) is still perfectly waitable —
+`wait` needs no endpoint.
+
+**How it waits.** Liveness is the advisory lock described under "Staleness" above, and
+that lock offers no event, notification, or wakeup a third process could subscribe to.
+Waiting on it is therefore honest *periodic probing* — one scan plus one non-blocking
+lock attempt per matching record, a few times a second (`POLL_INTERVAL` in
+`src/wait.rs`) — not an event subscription dressed up as one. Blocking on the lock
+itself would be worse than merely slow-to-notice: acquiring a stale entry's lock is how
+a *reclaimer* claims it (see "Reaping" above), and it would still miss the ordinary
+clean exit, which deletes both files rather than handing the lock over.
+
+**Three outcomes, by exit code:**
+
+- **`0`** — the run is over: no record matches the `run_id` any more, or every record
+  that does probed as stale.
+- **`WAIT_TIMEOUT` (112)** — the `--timeout` given to `wait` elapsed while the run was
+  still live. This is *the waiter's* deadline, not the run's: the run was left running,
+  untouched, and will report its own ending in its own time. It is deliberately not the
+  run's `TIMEOUT` (106), which means the opposite — see
+  [`docs/exit-codes.md`](exit-codes.md), "A waiter's deadline is not a run's deadline".
+  Without `--timeout`, `wait` blocks indefinitely.
+- **`CONTROL` (103)** — the `run_id` is ambiguous: more than one live entry matches, so
+  there is no single run whose end could be waited for (see "Run id resolution" above).
+  Re-checked on every probe, not just the first, since a duplicate can register at any
+  moment.
+
+Nothing is printed on success — the exit code is the whole answer, so `wait` has no
+output format to keep stable and no `--json` to add one. A registry that cannot be
+opened or read at all is a `SETUP` (111) failure, exactly as it is for `list`/`prune`.
+
+### An unknown `run_id` reads as "finished"
+
+A run that exits cleanly **deletes its own registry entry** (see "Lifecycle" below), and
+the registry keeps no history of what used to be there. So "`build-42` was never
+registered" and "`build-42` finished a moment before you asked" are the *same
+observation*: no matching record. Nothing in the registry can separate them.
+
+`wait` therefore answers both the same way — exit `0`, "it is not running" — rather than
+inventing a third outcome that could only ever be a guess. Failing on an unknown id
+would be worse than unhelpful: it would make the result depend on *when* the caller
+asked, turning the ordinary, expected race (the run finished while the adapter was
+starting up) into a hard error — precisely the failure mode a `wait` command exists to
+remove.
+
+The consequence a caller must plan for is the mirror image: **a mistyped `run_id`
+returns `0` immediately**, indistinguishable from a fast, successful run. `wait`'s `0`
+means "not running", never "existed and completed". A caller that needs the stronger
+fact must establish it separately — it launched the run itself, or it saw the id in
+`list` — and must not read a `0` as proof the run ever existed.
+
+### Liveness it cannot confirm
+
+One case is neither live nor confirmed over: a matching record whose lock file cannot be
+probed at all (a directory in its place, a permission error, a rejected reparse point —
+the same "probe failed" case "The reaping safety invariant" above keeps apart from
+"confirmed stale"). `Registry::entries` collapses that failure into `stale`, which is
+right for `list`/`inspect`, whose worst case is showing or refusing; it is wrong for
+`wait`, whose `0` is a positive claim about a run's lifetime.
+
+So `wait` probes on its own path and **keeps waiting** on an unconfirmable entry rather
+than announcing a completion it never observed. A bounded caller still gets a definite
+answer when `--timeout` elapses (`WAIT_TIMEOUT`, honestly meaning "could not confirm
+completion in time"); an unbounded one keeps waiting for a real verdict. This is the
+same "unknown is not confirmed" stance `prune` takes when it refuses to reap an entry it
+could not probe.
 
 ## Lifecycle
 

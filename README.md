@@ -173,6 +173,7 @@ processkit-cli run     [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl>
 processkit-cli inspect --run-id <id> --json
 processkit-cli cancel  --run-id <id>
 processkit-cli kill    --run-id <id>
+processkit-cli wait    --run-id <id> [--timeout <duration>]
 processkit-cli list    [--json]
 processkit-cli prune   [--json]
 processkit-cli probe   --json [--require-schema-version <N>]
@@ -263,6 +264,25 @@ it is a bounded `CONTROL` (103) failure — never a hang. Cleanup after an abrup
 death follows the platform-specific `abrupt_cleanup` guarantee above; only Windows
 currently guarantees the whole tree.
 
+`wait` is the *lifetime* counterpart to those three: it blocks while the named run is
+live in the registry and exits `0` as soon as it is not. It exists for a supervisor
+that did **not** start the run — an adapter that restarted, a cleanup step, anything
+holding only a `run_id` — and so has no child process to wait on. Like `list`/`prune`
+it is registry-only: it never connects to the run's control transport, never mutates
+registry state, and never ends or otherwise disturbs the run (a run whose transport
+never came up is still waitable, since `wait` needs no endpoint). Because the liveness
+signal is an OS advisory lock with no event to subscribe to, waiting is honest periodic
+probing, not a notification. `--timeout` bounds **the wait**, not the run: when it
+elapses the run is left running and `wait` exits with its own reserved code `112`,
+never the run's `TIMEOUT` (`106`) — and an ambiguous `run_id` (more than one live run
+under it) is the same `CONTROL` (103) refusal every other by-`run-id` command gives.
+Nothing is printed on success; the exit code is the answer. One deliberate design
+choice deserves a caller's attention: since a clean exit deletes its own registry
+entry, an **unknown** `run_id` is indistinguishable from one that already finished and
+was cleaned up, so both exit `0` — meaning a typo'd `run_id` returns success
+immediately, and `wait`'s `0` must never be read as proof the run existed. See
+[`docs/registry.md`](docs/registry.md), "Waiting — `wait`".
+
 `list` is the discovery counterpart to `inspect`/`cancel`/`kill`: it scans the same
 per-user registry and prints every entry it finds — `run_id`, health (`live`/
 `stale`), `started_at`, and `endpoint` — for an operator or orchestrator that has
@@ -307,7 +327,10 @@ they can never be mistaken for a child result, and so each ending is tellable fr
 others by code alone. This is part of the project's compatibility surface — see
 [the exit-code contract](docs/exit-codes.md). The preflight `probe` adds one code
 to the reserved band — `PROBE_INCOMPATIBLE` (`110`) — for an incompatible launch
-candidate.
+candidate, and `wait` adds one more — `WAIT_TIMEOUT` (`112`) — for its own deadline
+elapsing while the run it was watching is still live. That last one describes the
+*waiting client*, not the run: nothing was stopped, so it is deliberately distinct
+from the run's own `TIMEOUT` (`106`).
 
 ## Timeouts, cancel, and grace
 
@@ -592,7 +615,10 @@ force-kills the whole tree immediately (exit `109`) — each a distinguishable o
 the JSONL stream and by exit code, and each a bounded `CONTROL` (103) failure when the
 run cannot be reached. `list` scans the same registry read-only and prints every
 entry, live or stale, as a table or (with `--json`) as JSON Lines — the discovery
-counterpart for a caller that has lost or never had a `run_id`. `probe` reports and
+counterpart for a caller that has lost or never had a `run_id` — and `prune` reaps
+the confirmed-stale leftovers it shows. `wait` blocks on that same registry until a
+run is no longer live, for a supervisor that is not the runner's parent, bounding
+itself with `--timeout` and its own reserved exit code (`112`). `probe` reports and
 verifies the binary's compatibility surface for a consumer's fail-closed launcher
 preflight, with no side effects, exiting `PROBE_INCOMPATIBLE` (110) on an
 incompatible candidate. See [the roadmap](docs/ROADMAP.md) for delivery status

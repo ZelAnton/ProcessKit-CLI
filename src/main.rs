@@ -16,7 +16,7 @@ use clap::error::ErrorKind;
 
 use processkit_cli::cli::{Cli, Command};
 use processkit_cli::exit::{self, RunnerError};
-use processkit_cli::{control, list, probe, prune, run};
+use processkit_cli::{control, list, probe, prune, run, wait};
 
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
@@ -26,14 +26,16 @@ fn main() -> ExitCode {
 
     // `run` owns the process's exit path: on a completed container it hard-exits
     // with the child's exact (full-width) code, so it never returns here. Every
-    // other subcommand reaches a live runner (`inspect`/`cancel`/`kill`) or is
-    // self-contained (`probe`) and reports through the shared runner-error path
-    // below.
+    // other subcommand either reaches a live runner over the control plane
+    // (`inspect`/`cancel`/`kill`), reads the per-user registry without contacting
+    // any runner (`wait`/`list`/`prune`), or is entirely self-contained (`probe`) —
+    // and each reports through the shared runner-error path below.
     match cli.command {
         Command::Run(args) => run::execute(*args),
         Command::Inspect(args) => report(control::inspect(&args.run_id)),
         Command::Cancel(args) => report(control::cancel(&args.run_id)),
         Command::Kill(args) => report(control::kill(&args.run_id)),
+        Command::Wait(args) => report(wait::run(&args.run_id, args.timeout)),
         Command::List(args) => report(list::run(args.json)),
         Command::Prune(args) => report(prune::run(args.json)),
         Command::Probe(args) => report(probe::run(&args)),

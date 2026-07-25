@@ -902,13 +902,18 @@ fn unreachable_run(action: &str, run_id: &str, detail: String) -> RunnerError {
     )
 }
 
-/// An "ambiguous run id" error: `count` distinct live, reachable registry entries
-/// share `run_id`, so [`resolve_live_endpoint`] refuses to guess which one `action`
-/// means — reserving the same [`exit::CONTROL`] code as every other unreachable-run
-/// result (still "could not reach *the* target run": there is no single one to
-/// reach). See `docs/registry.md`, "Run id resolution — ambiguity is a hard
-/// failure".
-fn ambiguous_run(action: &str, run_id: &str, count: usize) -> RunnerError {
+/// An "ambiguous run id" error: `count` distinct live registry entries share
+/// `run_id`, so the client refuses to guess which one `action` means — reserving the
+/// same [`exit::CONTROL`] code as every other unreachable-run result (still "could
+/// not reach *the* target run": there is no single one to reach). See
+/// `docs/registry.md`, "Run id resolution — ambiguity is a hard failure".
+///
+/// Shared, as the one place this verdict is worded, by both kinds of by-`run-id`
+/// client: the control-plane verbs here (through [`resolve_in_registry`]) and the
+/// registry-only [`crate::wait`], which reaches the identical conclusion from its own
+/// scan without ever contacting a runner. `pub(crate)` for that second caller only —
+/// it is not part of any exported surface.
+pub(crate) fn ambiguous_run(action: &str, run_id: &str, count: usize) -> RunnerError {
     RunnerError::new(
         exit::CONTROL,
         format!(

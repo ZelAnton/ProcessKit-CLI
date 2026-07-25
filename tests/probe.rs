@@ -111,6 +111,12 @@ fn probe_reports_a_consistent_compatible_surface() {
         "run:--stdin-file",
         "inspect:--json",
         "probe:--require-schema-version",
+        // The `wait` subcommand and its flags (T-197) appear here automatically too:
+        // the surface is derived from the live clap tree, so a new subcommand needs
+        // no hand-maintained token list anywhere in production code.
+        "wait",
+        "wait:--run-id",
+        "wait:--timeout",
     ] {
         assert!(
             surface.contains(&token),

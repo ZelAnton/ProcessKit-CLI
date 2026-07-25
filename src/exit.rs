@@ -31,8 +31,14 @@ pub const SPAWN: u8 = 101;
 /// ProcessKit backend/containment failure: the kernel container, job object, IPC
 /// endpoint, or run registry could not be established.
 pub const BACKEND: u8 = 102;
-/// A control-plane command (`inspect`/`cancel`/`kill`) could not reach its target
-/// run: no such run id, a stale/dead registry entry, or an IPC failure.
+/// A by-`run-id` command could not be resolved to **the** single live run it
+/// names. For the control-plane clients (`inspect`/`cancel`/`kill`) that covers
+/// every way the target cannot be reached: no such run id, a stale/dead registry
+/// entry, or an IPC failure. The registry-only [`crate::wait`] shares just one of
+/// those reasons — an **ambiguous** run id, more than one live run registered under
+/// it — and reports it with this same code even though it speaks to no runner,
+/// because it is the same verdict: there is no single target run to act on (see
+/// `docs/registry.md`, "Run id resolution — ambiguity is a hard failure").
 pub const CONTROL: u8 = 103;
 /// Unexpected runner fault — the runner reached a state its own logic rules out,
 /// or lost a trustworthy view of the run it cannot recover from (a `wait` on the
@@ -102,8 +108,25 @@ pub const PROBE_INCOMPATIBLE: u8 = 110;
 /// stays [`INTERNAL`]. Splitting them out keeps `INTERNAL` (104) honestly meaning
 /// "a runner bug", so a consumer is never misled into reading a setup error as one.
 /// Takes the next free code after [`PROBE_INCOMPATIBLE`] so no existing assignment
-/// shifts; `112`–`119` remain reserved.
+/// shifts; `113`–`119` remain reserved.
 pub const SETUP: u8 = 111;
+/// The **`wait` subcommand's own** deadline elapsed while the run it was waiting for
+/// was still live: `wait --run-id <id> --timeout <duration>` gave up rather than
+/// block forever. This is *the waiter's* timeout, not the run's — the run itself was
+/// neither ended nor even touched (`wait` is read-only and never reaches the runner),
+/// and it keeps going after this exit. That is precisely why it cannot reuse
+/// [`TIMEOUT`] (106), which means the opposite: *the runner* enforced a deadline and
+/// tore the child's tree down. A caller reading `112` learns "I stopped waiting",
+/// never "the run was stopped"; the run's own ending, whenever it comes, is still
+/// reported by its own process exit and its `runner_exit` event.
+///
+/// Nor is it a [`CONTROL`] (103) failure: the run *was* resolved unambiguously and
+/// found perfectly healthy — nothing was unreachable — so folding the two together
+/// would tell a caller "I could not find your run" when the truth is "I found it, it
+/// is still running". Takes the next free code after [`SETUP`] so no existing
+/// assignment shifts; `113`–`119` remain reserved. See [`crate::wait`] and
+/// `docs/registry.md`, "Waiting — `wait`".
+pub const WAIT_TIMEOUT: u8 = 112;
 
 /// A runner-own failure carrying the exit code it should surface and a
 /// human-readable message. Distinct from a child's exit — a child's code is
@@ -156,6 +179,7 @@ mod tests {
             CONTROL_KILLED,
             PROBE_INCOMPATIBLE,
             SETUP,
+            WAIT_TIMEOUT,
         ] {
             assert!(
                 (RUNNER_RANGE_START..=RUNNER_RANGE_END).contains(&code),
@@ -181,6 +205,7 @@ mod tests {
             CONTROL_KILLED,
             PROBE_INCOMPATIBLE,
             SETUP,
+            WAIT_TIMEOUT,
         ];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {
@@ -201,5 +226,22 @@ mod tests {
                 assert_ne!(a, b, "two runner-imposed endings collided on {a}");
             }
         }
+    }
+
+    #[test]
+    fn a_waiters_own_timeout_is_not_a_runs_timeout() {
+        // The two deadlines mean opposite things and must never collapse onto one
+        // code: `TIMEOUT` says the *runner* ended the run, `WAIT_TIMEOUT` says a
+        // read-only `wait` client stopped waiting while the run carried on
+        // untouched. Nor is a waiter's timeout an unreachable-run failure — the run
+        // was resolved and found healthy — so it is distinct from `CONTROL` too.
+        assert_ne!(
+            WAIT_TIMEOUT, TIMEOUT,
+            "a waiter giving up must not read as the run being torn down"
+        );
+        assert_ne!(
+            WAIT_TIMEOUT, CONTROL,
+            "a waiter giving up must not read as an unreachable/ambiguous run"
+        );
     }
 }

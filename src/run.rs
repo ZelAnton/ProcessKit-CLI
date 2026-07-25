@@ -1092,11 +1092,11 @@ fn finish(
 /// whole-tree container capable of what was asked could not be established here"),
 /// so the caller **deliberately reuses** the existing [`exit::BACKEND`] (102) code
 /// and the `container_error` `runner_exit` `source` rather than minting a new code
-/// in the free `112`–`119` slots. The distinguishing signal is the dedicated
+/// from the reserved band's free slots. The distinguishing signal is the dedicated
 /// `limit_hit` event emitted immediately before the shared tail — the authoritative,
 /// machine-readable channel (`docs/exit-codes.md`, "Why a band is not enough on its
-/// own"; the numeric exit code is only a best-effort hint). Codes `112`–`119` stay
-/// reserved.
+/// own"; the numeric exit code is only a best-effort hint). No reserved-band slot was
+/// spent on it (`113`–`119` stay reserved today).
 fn create_group(args: &RunArgs) -> processkit::Result<ProcessGroup> {
     match build_limit_options(args) {
         Some(options) => ProcessGroup::with_options(options),

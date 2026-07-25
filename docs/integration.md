@@ -192,19 +192,24 @@ source means the child's own exit code was never produced or is not what
 [`docs/schema.md`](schema.md#runner_exit) and the exit-code contract in
 [`docs/exit-codes.md`](exit-codes.md).
 
-## 4. Supervising a live run: `inspect` / `cancel` / `kill`
+## 4. Supervising a live run: `inspect` / `cancel` / `kill` / `wait`
 
 Once a run has started (its `run_id` is known — supplied at launch, per §2),
-an adapter can query and steer it while it is still live, over the local
-control plane described normatively in
-[`docs/control-plane.md`](control-plane.md). Every verb resolves the target
-purely by `run_id` through the per-user registry — never by PID:
+an adapter can query, steer, and wait for it while it is still live. Every
+command resolves the target purely by `run_id` through the per-user registry —
+never by PID:
 
 ```sh
 processkit-cli inspect --run-id build-42 --json
 processkit-cli cancel  --run-id build-42
 processkit-cli kill    --run-id build-42
+processkit-cli wait    --run-id build-42 --timeout 10m
 ```
+
+The first three reach the live runner over the local control plane described
+normatively in [`docs/control-plane.md`](control-plane.md); `wait` does not
+contact the runner at all and is described in [`docs/registry.md`](registry.md),
+"Waiting — `wait`".
 
 - **`inspect`** is read-only: it prints a JSON snapshot (`mechanism`,
   `root_pid`, `started_at`, the current `members`) to stdout and changes
@@ -214,6 +219,12 @@ processkit-cli kill    --run-id build-42
   `CONTROL_CANCELLED` (`108`).
 - **`kill`** hard-kills the whole tree **immediately** — no soft stop, no
   grace — exiting the run with `CONTROL_KILLED` (`109`).
+- **`wait`** blocks until the run is no longer live and exits `0`. It is the
+  answer for an adapter that is **not** the runner's parent — one that
+  restarted, or that supervises runs another process launched — and so has no
+  child process to wait on. It prints nothing (the exit code is the answer),
+  never touches the run, and needs no control endpoint, so it also works for a
+  run whose transport never came up.
 
 Both mutating verbs' outcomes are also written to the *target run's own*
 `--jsonl` stream (a `cancelled`/`killed` event with `source`
@@ -221,9 +232,38 @@ Both mutating verbs' outcomes are also written to the *target run's own*
 an adapter watching that stream sees the command take effect even without
 reading the `cancel`/`kill` client's own ack.
 
-**`CONTROL` (103)** is the one exit code every one of these three clients can
-return, for the same reason in every case: the target run could not be
-reached. See §6 for the concrete situations that produce it.
+**Waiting for a run an adapter did not launch.** The typical shape — cancel a
+run, then confirm it is really gone before releasing the resources it held:
+
+```sh
+processkit-cli cancel --run-id build-42          # 0: the runner acked
+processkit-cli wait   --run-id build-42 --timeout 30s
+case $? in
+  0)   ;;                    # the run is over; its own exit/JSONL say how it ended
+  112) ;;                    # still live at the deadline — the run was NOT touched
+  103) ;;                    # ambiguous run id: more than one live run uses it (§6)
+esac
+```
+
+- **`0`** means "not running". It is also what an unknown `run_id` returns, on
+  purpose: a clean exit deletes its own registry entry, so "never registered"
+  and "already finished and cleaned up" are the same observation, and failing
+  on the second would turn the ordinary "it finished while I was starting up"
+  race into an error. The flip side an adapter must respect: a typo'd
+  `run_id` also returns `0`, so **never read `wait`'s `0` as proof the run
+  existed** — establish that from the launch itself or from `list` (§5).
+- **`WAIT_TIMEOUT` (112)** is *the waiter's* deadline, not the run's: the run
+  was left running and untouched, and is still going. Do not confuse it with
+  the run's own `TIMEOUT` (`106`) in §3's table, which means the runner tore
+  the tree down. Retrying the same `wait` is a reasonable response to a `112`.
+- **`CONTROL` (103)** here means only one thing — an ambiguous `run_id` (§6);
+  `wait` has no runner to fail to reach.
+- Without `--timeout`, `wait` blocks indefinitely. Prefer an explicit deadline
+  in an adapter, so a supervisor never inherits an unbounded wait.
+
+**`CONTROL` (103)** is the one exit code all four of these clients can return,
+for the same underlying reason: the command could not be resolved to *the*
+single target run. See §6 for the concrete situations that produce it.
 
 ## 5. Housekeeping: `list` / `prune`
 
@@ -271,16 +311,19 @@ carries the "could not reach the target run" failure modes of §4.
   bounded `CONTROL` (103) failure, never a wedge: every wait in the control
   plane (connecting, and the request/response exchange) is deadline-bounded.
 - **Ambiguous `run_id`.** The registry does not enforce `run_id` uniqueness;
-  if more than one **live** entry matches, every verb — including read-only
-  `inspect` — fails closed with `CONTROL` (103) rather than guessing which
-  entry the scan happened to return first. Keep `run_id`s unique among an
-  adapter's own concurrently-live runs (§2) to avoid this entirely.
+  if more than one **live** entry matches, every by-`run-id` command — the
+  read-only `inspect` and `wait` included — fails closed with `CONTROL` (103)
+  rather than guessing which entry the scan happened to return first. Keep
+  `run_id`s unique among an adapter's own concurrently-live runs (§2) to avoid
+  this entirely.
 - **`CONTROL`-class exit codes are not run outcomes.** A `103` from
-  `inspect`/`cancel`/`kill` describes the *client's* inability to reach a
-  target — it says nothing about how the target run itself ended (or is
-  still running). Do not conflate it with the run-outcome codes in §3's table
-  (`106`–`109`, or the child's own code); those come only from the run's own
-  process exit and its `runner_exit` event.
+  `inspect`/`cancel`/`kill`/`wait` describes the *client's* inability to
+  resolve or reach a single target — it says nothing about how the target run
+  itself ended (or is still running). Do not conflate it with the run-outcome
+  codes in §3's table (`106`–`109`, or the child's own code); those come only
+  from the run's own process exit and its `runner_exit` event. The same
+  separation applies to `WAIT_TIMEOUT` (112): it is the *waiting client*
+  giving up, never the run being stopped (§4).
 - **`SETUP` (111) vs. `INTERNAL` (104).** A `run` that could not write its
   `--jsonl`/`--capture-dir`, or open a `--stdin-file`, fails closed with
   `SETUP` (111) — an ordinary, usually-actionable environment problem (bad

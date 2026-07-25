@@ -4,7 +4,10 @@
 //! `--timeout`) tears the entry down too, `inspect` reaches a live run over the
 //! registry + local transport, and the mutating `cancel`/`kill` verbs reach the same
 //! live runner and end it with their own reserved exit codes — each falling back to
-//! the reserved `CONTROL` code when the run cannot be reached. These prove the
+//! the reserved `CONTROL` code when the run cannot be reached. `wait` is the
+//! registry-only client alongside them: it blocks on a live run's entry until the run
+//! is gone, gives up with its own reserved `WAIT_TIMEOUT` code, and refuses an
+//! ambiguous id, all without ever contacting a runner. These prove the
 //! *binary's* registry/control lifecycle end-to-end; the fine-grained mechanics —
 //! owner-only permissions, stale detection, concurrency, the wire snapshot, verb
 //! routing — are unit-tested in `src/registry.rs` and `src/control.rs`.
@@ -17,7 +20,7 @@ mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -794,6 +797,291 @@ fn write_stale_entry(registry: &Path, stem: &str) {
     // An unlocked lock file: present on disk, but held by no one, so the prune probe
     // takes its exclusive lock and confirms the entry stale.
     fs::write(registry.join(&lock_name), b"").expect("write the unlocked lock file");
+}
+
+/// Spawn `wait --run-id <id> [--timeout <duration>]` against `registry` **without**
+/// waiting for it, so a test can observe whether the client is still blocked while the
+/// run under test is live — the only way to prove blocking rather than infer it from
+/// elapsed time. stdout/stderr are piped and read once the client is reaped.
+fn spawn_wait(registry: &Path, run_id: &str, timeout: Option<&str>) -> Child {
+    let mut cmd = Command::new(bin());
+    cmd.args(["wait", "--run-id", run_id]);
+    if let Some(timeout) = timeout {
+        cmd.args(["--timeout", timeout]);
+    }
+    cmd.env("PROCESSKIT_CLI_REGISTRY_DIR", registry)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the wait client")
+}
+
+/// Run `wait` to completion against `registry` and hand back its output.
+fn wait_for_run(registry: &Path, run_id: &str, timeout: Option<&str>) -> Output {
+    spawn_wait(registry, run_id, timeout)
+        .wait_with_output()
+        .expect("the wait client exits")
+}
+
+/// The core `wait` contract, proved by *observation* rather than by timing: while the
+/// target run is live the client is still running (checked repeatedly, against a run
+/// confirmed live through its own registry record at the same moment), and once the run
+/// finishes the client returns `0`.
+///
+/// The "still blocked" half is what makes this test non-vacuous: a `wait` that returned
+/// immediately — the obvious way for this feature to be silently broken — would be
+/// caught by the `try_wait` probes below, not merely produce a suspiciously short
+/// elapsed time. The differential companion is
+/// `wait_returns_at_once_for_a_stale_entry`: the same client against a *non*-live entry
+/// returns straight away, so blocking here is caused by the run's liveness rather than
+/// by `wait` always blocking.
+#[test]
+fn wait_blocks_until_a_live_run_finishes() {
+    let dir = scratch("wait-live");
+    let registry = registry_dir(&dir);
+    let mut runner = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "wait-me"],
+        inspectable_child(),
+    )
+    .spawn()
+    .expect("spawn the runner");
+
+    // The run is waitable once its record is published.
+    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+
+    let mut waiter = spawn_wait(&registry, "wait-me", None);
+
+    // While the run is live the waiter must still be blocked. Probed several times
+    // over ~1s, each time cross-checked against the registry actually still holding
+    // the live record — so a passing probe can never mean "the run was already over".
+    for _ in 0..4 {
+        sleep(Duration::from_millis(250));
+        if record_count(&registry) == 0 {
+            panic!("the run ended sooner than this fixture expects; test is inconclusive");
+        }
+        assert!(
+            waiter.try_wait().expect("poll the wait client").is_none(),
+            "`wait` must still be blocked while the run is live"
+        );
+    }
+
+    // Let the run finish on its own (a clean exit removes its entry)...
+    let status = runner.wait().expect("the runner exits");
+    assert!(status.success(), "the fixture run exits cleanly");
+
+    // ...and the waiter must then return promptly, with success and no output.
+    let out = waiter
+        .wait_with_output()
+        .expect("the wait client exits once the run is over");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "waiting for a run that finished exits 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "`wait` prints nothing on success — the exit code is the answer: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A stale entry (a leftover `.json`/`.lock` pair from a runner that died abruptly, with
+/// nobody holding the lock) is not a run to wait for: `wait` classifies it through the
+/// same liveness probe every other client uses and returns at once.
+///
+/// The `--timeout` is what makes this a real assertion rather than a timing guess: the
+/// stale fixture never disappears, so an implementation that mistook it for live could
+/// only ever exit `WAIT_TIMEOUT` (112) here. Exiting `0` therefore proves the entry was
+/// actively classified as not-live — and, together with
+/// `wait_blocks_until_a_live_run_finishes`, that `wait` blocks on liveness rather than
+/// on nothing at all.
+#[test]
+fn wait_returns_at_once_for_a_stale_entry() {
+    let dir = scratch("wait-stale");
+    let registry = registry_dir(&dir);
+    write_stale_entry(&registry, "run-stale-0000");
+
+    let out = wait_for_run(&registry, "run-stale-0000", Some("10s"));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a stale entry means the run is over, so wait succeeds instead of timing out; \
+         stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `wait` is read-only: classifying the entry must not reap it (that is `prune`'s
+    // job) or otherwise disturb the registry.
+    assert!(
+        registry.join("run-stale-0000.json").exists()
+            && registry.join("run-stale-0000.lock").exists(),
+        "a read-only wait must leave the stale entry's files on disk"
+    );
+
+    // The same immediate `0` for a run id that was never registered at all — the
+    // documented conflation with "already finished and cleaned up" (a clean exit
+    // deletes its own record, so the two are the same observation).
+    let out = wait_for_run(&registry, "never-registered", Some("10s"));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an unknown run id reads as finished, not as an error; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The waiter's **own** deadline: `--timeout` elapsing on a live, non-finishing run is
+/// reported with the reserved `WAIT_TIMEOUT` code (112) — not `0` (which would claim the
+/// run is over), not the run's own `TIMEOUT` (106), and not `CONTROL` (103) (nothing was
+/// unreachable). The run itself is untouched by the give-up and is still live afterwards.
+#[test]
+fn wait_times_out_on_a_live_run_with_its_own_reserved_code() {
+    let dir = scratch("wait-timeout");
+    let registry = registry_dir(&dir);
+    let mut runner = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "long-runner"],
+        long_child(),
+    )
+    .spawn()
+    .expect("spawn the runner");
+
+    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+
+    let out = wait_for_run(&registry, "long-runner", Some("1s"));
+    assert_eq!(
+        out.status.code(),
+        Some(112),
+        "a waiter's own deadline exits with the reserved WAIT_TIMEOUT code; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "a timed-out wait prints nothing on stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("long-runner"),
+        "the failure names the run: {stderr}"
+    );
+    assert!(
+        stderr.contains("still live"),
+        "the failure says the run outlived the wait, not that it was stopped: {stderr}"
+    );
+
+    // The give-up left the run completely alone — it is still registered and running.
+    assert_eq!(
+        record_count(&registry),
+        1,
+        "a wait that gave up must not have ended the run it was waiting for"
+    );
+    assert!(
+        runner.try_wait().expect("poll the runner").is_none(),
+        "the run is still going after the waiter gave up"
+    );
+
+    let _ = runner.kill();
+    let _ = runner.wait();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Two concurrent live runs under one `--run-id` leave no single run to wait for, so
+/// `wait` fails closed with the same `CONTROL` (103) "ambiguous run id" verdict
+/// `inspect`/`cancel`/`kill` give — rather than silently tracking whichever entry the
+/// directory scan happened to return first. Neither run is disturbed.
+#[test]
+fn wait_reports_ambiguous_run_id_for_duplicate_run_ids() {
+    let dir = scratch("wait-ambiguous");
+    let registry = registry_dir(&dir);
+    let run_id = "dup-wait";
+
+    let mut first = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", run_id],
+        long_child(),
+    )
+    .spawn()
+    .expect("spawn the first runner");
+    let mut second = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", run_id],
+        long_child(),
+    )
+    .spawn()
+    .expect("spawn the second runner");
+
+    wait_until(|| record_count(&registry) == 2, Duration::from_secs(10));
+
+    // A generous `--timeout` that must never be reached: the ambiguity is a hard
+    // failure detected on the very first probe, so a 112 here would mean `wait` sat on
+    // an ambiguous id instead of refusing it.
+    let out = wait_for_run(&registry, run_id, Some("30s"));
+    assert_eq!(
+        out.status.code(),
+        Some(103),
+        "an ambiguous run id is a CONTROL failure for wait too; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ambiguous"),
+        "the wait failure names the reason: {stderr}"
+    );
+    assert!(
+        stderr.contains(run_id),
+        "the wait failure names the run: {stderr}"
+    );
+
+    // The rejected command touched neither run.
+    assert_eq!(
+        record_count(&registry),
+        2,
+        "a rejected ambiguous wait must not end either run"
+    );
+
+    let _ = first.kill();
+    let _ = first.wait();
+    let _ = second.kill();
+    let _ = second.wait();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `wait` is documented as read-only and must never mutate registry state just to look:
+/// waiting on a never-yet-created registry must leave the directory absent (and, since
+/// an absent registry holds no live run, return `0` at once).
+#[test]
+fn wait_does_not_create_the_registry_directory() {
+    let dir = scratch("wait-no-create");
+    let registry = registry_dir(&dir);
+    assert!(
+        !registry.exists(),
+        "the scratch registry directory starts absent"
+    );
+
+    let out = wait_for_run(&registry, "ghost", Some("10s"));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a missing registry holds no live run, so the wait is already over; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !registry.exists(),
+        "a read-only `wait` must not create the registry directory as a side effect"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
 }
 
 /// The end-to-end reaping contract: `prune` deletes a confirmed-stale entry from disk

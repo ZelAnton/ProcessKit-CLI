@@ -12,6 +12,42 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- **New `wait --run-id <id> [--timeout <duration>]` subcommand**: block until a run
+  recorded in the per-user registry is no longer live. It closes the one supervision
+  gap the control plane left open — a supervisor that did *not* start the run (an
+  adapter that restarted, a cleanup step, anything holding only a `run_id`) has no
+  child process to wait on, and previously had to hand-roll a polling loop around
+  `inspect` and read run lifetime out of `CONTROL` refusals, which conflate "I could
+  not reach it" with "it finished". `wait` is registry-only: it opens the registry
+  read-only (like `list`/`prune`, so waiting never creates the directory or touches
+  its permissions), never connects to the run's control transport, never ends or
+  disturbs the run, and needs no control endpoint — so a run whose transport never
+  came up is still waitable. Because the liveness signal is an OS advisory lock with
+  no event to subscribe to, it waits by honest periodic probing rather than pretending
+  to be notified. Three outcomes, by exit code: the run is over (`0`), the wait's own
+  `--timeout` elapsed with the run still live (the **new reserved code
+  `WAIT_TIMEOUT` = 112**, see *Exit codes* below), or the `run_id` is ambiguous —
+  more than one live run registered under it, so there is no single run to wait for —
+  which reuses the same `CONTROL` (103) refusal `inspect`/`cancel`/`kill` give.
+  Nothing is printed on success; the exit code is the whole answer. `--timeout` reuses
+  `run --timeout`'s exact parser and grammar (including its rejection of a degenerate
+  `0`), and omitting it blocks indefinitely. **One deliberate design choice callers
+  must plan for:** a run that exits cleanly deletes its own registry entry, so an
+  *unknown* `run_id` is indistinguishable from one that already finished and was
+  cleaned up — both exit `0`. That keeps the ordinary "the run finished while I was
+  starting up" race from becoming a hard error, at the price that a typo'd `run_id`
+  also returns success immediately: `wait`'s `0` means "not running", never "existed
+  and completed". `probe --json` advertises the new surface automatically (`wait`,
+  `wait:--run-id`, `wait:--timeout`). See README.md, "Command interface", and
+  docs/registry.md, "Waiting — `wait`".
+- **New reserved exit code `WAIT_TIMEOUT` (112)**, taking the next free slot after
+  `SETUP` (111) in the reserved `100`–`119` band (`113`–`119` remain reserved). It is
+  minted only by `wait`, and only when *the waiter's* `--timeout` elapsed while the
+  run was still live — the run itself was never touched and is still going.
+  Deliberately not `TIMEOUT` (106), which means the opposite (the *runner* enforced a
+  deadline and tore the child's tree down), and not `CONTROL` (103), since the run was
+  resolved unambiguously and found healthy. See docs/exit-codes.md, "A waiter's
+  deadline is not a run's deadline".
 - **Windows: `Ctrl-Break`, console close, logoff, and system shutdown now end a run
   through the full cancel teardown** instead of the OS's default handling silently
   ending the runner. The console-control events `CTRL_BREAK_EVENT`,

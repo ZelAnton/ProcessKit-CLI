@@ -12,7 +12,8 @@
 //!   endpoint, so a world-readable registry would leak a control channel to any
 //!   local process. [`Registry::open`] (the mutating path a run about to write a
 //!   record uses) re-asserts the restriction on every call so a pre-existing
-//!   directory is locked down too; [`Registry::open_read_only`] (`list`'s path)
+//!   directory is locked down too; [`Registry::open_read_only`] (the path every
+//!   read-only client takes — `list`/`prune`/`wait` and the control clients)
 //!   deliberately does neither — a read-only scan must not create the directory or
 //!   touch its permissions.
 //! - **No PID addressing.** A record is never indexed or identified by a bare PID
@@ -145,7 +146,8 @@ pub struct Entry {
 /// parsable JSON, a well-formed `started_at`, and a simple in-directory `lock_file`
 /// name — paired with the two on-disk paths it resolves to. The shared product of
 /// [`Registry::scan`], consumed by [`Registry::entries`] (which probes each into an
-/// [`Entry`]) and [`Registry::prune`] (which reaps only the confirmed-stale ones).
+/// [`Entry`]), [`Registry::prune`] (which reaps only the confirmed-stale ones), and
+/// [`Registry::probe_run`] (which probes only the ones matching one `run_id`).
 struct ScannedRecord {
     record: Record,
     /// The record file (`<stem>.json`) — what [`Entry::path`] carries and what prune
@@ -183,6 +185,38 @@ pub struct PruneOutcome {
     pub orphaned_locks: usize,
 }
 
+/// What one [`Registry::probe_run`] pass concluded about a single `run_id` — the
+/// question `wait` (see [`crate::wait`]) asks the registry over and over: *is this
+/// run still going?*
+///
+/// Deliberately **not** expressed as a bare `bool` (or as [`Health`]): the honest
+/// answer has four cases, and collapsing them would either invent liveness the probe
+/// never confirmed or hide the ambiguity a duplicated `run_id` creates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStatus {
+    /// **Confirmed finished.** Every record matching the `run_id` probed as
+    /// [`Health::Stale`], or there is no matching record at all. The two are one
+    /// case on purpose: a run that exits cleanly deletes its own entry, so "never
+    /// registered" and "already finished and cleaned up" are indistinguishable from
+    /// the registry alone — see [`Registry::probe_run`].
+    Finished,
+    /// **Still going.** Exactly one matching record is confirmed live (a runner
+    /// holds its advisory lock).
+    Live,
+    /// **Not a single run.** More than one matching record is confirmed live at
+    /// once — the registry never enforces `run_id` uniqueness (`docs/registry.md`,
+    /// "Run id resolution"), so the id does not name one run and no per-run question
+    /// can be answered about it. Carries how many live records collided.
+    Ambiguous { live: usize },
+    /// **Unknown.** No matching record is confirmed live, but at least one could not
+    /// be probed at all (its lock file would not open, or the lock call errored), so
+    /// "finished" cannot be *confirmed* — only assumed. Kept apart from
+    /// [`RunStatus::Finished`] for the same reason [`Registry::prune`] keeps its
+    /// probe `Err` apart from a confirmed-stale entry (see [K-024]): an unprobeable
+    /// entry is not evidence of anything.
+    Unprobed,
+}
+
 /// A handle onto the per-user run registry directory.
 pub struct Registry {
     dir: PathBuf,
@@ -196,10 +230,10 @@ impl Registry {
     /// This is the *mutating* open used by [`Registry::register`]'s caller (`run`):
     /// it must create the directory (and re-assert its owner-only permissions on a
     /// pre-existing one) because a run is about to write a record into it. A caller
-    /// that only wants to *read* the registry — `list`/`prune`, and the control
-    /// clients `inspect`/`cancel`/`kill` — must use [`Registry::open_read_only`]
-    /// instead, so a read-only scan cannot itself create registry state or touch
-    /// its permissions.
+    /// that only wants to *read* the registry — `list`/`prune`/`wait`, and the
+    /// control clients `inspect`/`cancel`/`kill` — must use
+    /// [`Registry::open_read_only`] instead, so a read-only scan cannot itself create
+    /// registry state or touch its permissions.
     pub fn open() -> io::Result<Self> {
         Self::open_in(resolve_dir()?)
     }
@@ -214,8 +248,8 @@ impl Registry {
 
     /// Open the per-user registry **without** creating its directory or touching its
     /// permissions — the read-only counterpart of [`Registry::open`], for callers
-    /// (`list`/`prune`, and the control clients `inspect`/`cancel`/`kill`) that
-    /// must never mutate registry state just to look at it. The
+    /// (`list`/`prune`/`wait`, and the control clients `inspect`/`cancel`/`kill`)
+    /// that must never mutate registry state just to look at it. The
     /// location is resolved exactly as [`Registry::open`] resolves it
     /// ([`REGISTRY_DIR_ENV`] if set, else the platform default); a directory that
     /// does not exist yet is not an error here either — [`Registry::entries`]
@@ -433,6 +467,84 @@ impl Registry {
         Ok(outcome)
     }
 
+    /// Ask the registry, in one pass, whether the run named `run_id` is still going —
+    /// the read step [`crate::wait`] polls, and the third consumer of [`Registry::scan`]
+    /// alongside [`Registry::entries`] and [`Registry::prune`].
+    ///
+    /// **Why this does not read [`Entry::health`].** `entries()` folds a probe *error*
+    /// into [`Health::Stale`] (`"could not confirm liveness ⇒ treat as not live"`), which
+    /// is right for `inspect`/`cancel`/`kill`, whose worst case is refusing to act. It is
+    /// wrong here: `wait` returning "finished" is a positive claim about a run's lifetime,
+    /// and minting it from a probe that never actually ran would report a live run as
+    /// over. So this probes on its own path through [`probe_health`], whose
+    /// `Ok(Live)` / `Ok(Stale)` / `Err` triple keeps the failure distinct — the same
+    /// discipline [`Registry::prune`] applies with [`probe_for_prune`] for the same
+    /// reason (see [K-024]), differing only in what it does with the acquired lock:
+    /// prune *reclaims* the entry and keeps the lock held across its deletions, while
+    /// this is a pure query and releases it immediately, exactly as `list` does.
+    ///
+    /// **Counting.** Matching records are selected by the identity predicate — the
+    /// `run_id` field — **first**, and only then classified by health; folding both into
+    /// one filter pass is how an ambiguity check silently undercounts (see [K-016], where
+    /// a live-but-endpoint-less duplicate evaded exactly this check in `src/control.rs`).
+    /// A live entry counts as a duplicate here whether or not it publishes an `endpoint`,
+    /// and for a stronger reason than in `control`: `wait` needs no endpoint at all, so a
+    /// run whose control transport never came up is still a perfectly ordinary run to
+    /// wait for.
+    ///
+    /// **The `run_id` nobody registered.** A record is absent for two indistinguishable
+    /// reasons — the id was never used, or the run finished and deleted its own entry on
+    /// the way out ([`Registration::remove`]) — and the registry keeps no history that
+    /// could tell them apart. Both therefore yield [`RunStatus::Finished`]: the same
+    /// answer for the same observation, rather than a guess dressed up as a distinct
+    /// outcome. See [`crate::wait`] and `docs/registry.md`, "Waiting — `wait`", for the
+    /// consequence a caller must plan for (a typo in a `run_id` reads as "already
+    /// finished", not as an error).
+    ///
+    /// Read-only and PID-free like every other scan-side consumer: it opens each lock
+    /// file only to test the lock, deletes nothing, creates nothing, and reaches an entry
+    /// only through the record path the directory scan produced. Corrupt records `scan`
+    /// already skips are invisible here too, exactly as they are to `entries`/`prune`.
+    /// Only a wholesale-unreadable registry directory is an `Err` (see [`Registry::scan`]).
+    pub fn probe_run(&self, run_id: &str) -> io::Result<RunStatus> {
+        let mut live = 0usize;
+        let mut unprobed = 0usize;
+        for ScannedRecord {
+            record, lock_path, ..
+        } in self.scan()?
+        {
+            // Identity first: whether this record is *about* the requested run is
+            // decided by `run_id` alone, before any liveness question is asked.
+            if record.run_id != run_id {
+                continue;
+            }
+            match probe_health(&lock_path) {
+                Ok(Health::Live) => live += 1,
+                // Confirmed stale: this record is a leftover, not a running run, and
+                // contributes nothing to either count.
+                Ok(Health::Stale) => {}
+                Err(_) => unprobed += 1,
+            }
+        }
+
+        if live > 1 {
+            // Two or more live runs under one id: nothing per-run can be answered, and
+            // guessing would silently wait on whichever entry the scan happened to yield
+            // first. Reported ahead of the `unprobed` tally below because a *confirmed*
+            // ambiguity is a stronger fact than an unconfirmed liveness.
+            return Ok(RunStatus::Ambiguous { live });
+        }
+        if live == 1 {
+            return Ok(RunStatus::Live);
+        }
+        if unprobed > 0 {
+            // Nothing is confirmed live, but something could not be probed — so
+            // "finished" is unconfirmed, and saying it would be a fabrication.
+            return Ok(RunStatus::Unprobed);
+        }
+        Ok(RunStatus::Finished)
+    }
+
     /// The `.lock` files in the registry directory that have no sibling `.json`
     /// record — the candidates [`Registry::prune`]'s second pass probes. Unlike
     /// [`Registry::scan`]'s `.json` records, there is no per-file corruption guard to
@@ -497,11 +609,13 @@ impl Registry {
 
     /// Scan the registry directory into the records that pass every corruption guard,
     /// each paired with the two on-disk paths it resolves to — the shared read step
-    /// under both [`Registry::entries`] (which probes each into an [`Entry`]) and
-    /// [`Registry::prune`] (which reaps only the confirmed-stale ones). Sharing this
-    /// step guarantees the two paths agree exactly on which records are corrupt-and-
-    /// skipped versus real-and-probed, so prune can never act on a record `entries`
-    /// would have dropped. A missing directory is simply an empty registry.
+    /// under [`Registry::entries`] (which probes each into an [`Entry`]),
+    /// [`Registry::prune`] (which reaps only the confirmed-stale ones), and
+    /// [`Registry::probe_run`] (which probes only those matching one `run_id`).
+    /// Sharing this step guarantees all three paths agree exactly on which records are
+    /// corrupt-and-skipped versus real-and-probed, so prune can never act on a record
+    /// `entries` would have dropped, and `wait` can never wait on one neither of them
+    /// can see. A missing directory is simply an empty registry.
     ///
     /// Two distinct levels of read failure are handled differently. `fs::read_dir`
     /// itself failing (the registry directory as a whole is unreadable — permissions,
@@ -2706,5 +2820,180 @@ mod tests {
             !missing.exists(),
             "pruning a missing registry must not create its directory"
         );
+    }
+
+    /// The `wait` read path end to end on the ordinary lifecycle: a registered run
+    /// probes as [`RunStatus::Live`] while its runner holds the lock, and as
+    /// [`RunStatus::Finished`] the moment its clean exit removes the entry.
+    #[test]
+    fn probe_run_tracks_a_run_from_live_to_finished() {
+        let dir = scratch("probe-run-lifecycle");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+        let registration = registry
+            .register("waited", None, SystemTime::now())
+            .expect("register run");
+
+        assert_eq!(
+            registry.probe_run("waited").expect("probe"),
+            RunStatus::Live,
+            "a run whose runner holds its lock is live"
+        );
+
+        registration.remove();
+        assert_eq!(
+            registry.probe_run("waited").expect("probe"),
+            RunStatus::Finished,
+            "a clean exit removes the entry, so the run reads as finished"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The documented conflation: a `run_id` with no record at all is
+    /// [`RunStatus::Finished`], because a run that exits cleanly deletes its own
+    /// entry — "never registered" and "already finished and cleaned up" are the same
+    /// observation, and the registry keeps no history that could separate them.
+    #[test]
+    fn probe_run_reports_an_unknown_run_id_as_finished() {
+        let dir = scratch("probe-run-unknown");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+
+        assert_eq!(
+            registry.probe_run("never-registered").expect("probe"),
+            RunStatus::Finished,
+            "an id nobody registered is indistinguishable from one already cleaned up"
+        );
+
+        // The same answer with an unrelated live run in the registry: matching is by
+        // `run_id`, so another run's liveness never leaks into this one's verdict.
+        let other = registry
+            .register("someone-else", None, SystemTime::now())
+            .expect("register an unrelated run");
+        assert_eq!(
+            registry.probe_run("never-registered").expect("probe"),
+            RunStatus::Finished,
+            "an unrelated live run must not make an unknown id look live"
+        );
+
+        other.remove();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An abruptly-killed runner leaves both files on disk, yet the run is over: the
+    /// released lock makes the entry confirmed-stale, so `wait` stops waiting. The
+    /// files are left exactly where they are — `probe_run` is a query, not a reaper
+    /// (that is `prune`'s job).
+    #[test]
+    fn probe_run_reports_a_stale_leftover_as_finished_without_reaping_it() {
+        let dir = scratch("probe-run-stale");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+        let registration = registry
+            .register("crashed", None, SystemTime::now())
+            .expect("register run");
+        let record_path = registration.record_path().to_owned();
+        let lock_path = registration.lock_path().to_owned();
+
+        registration.simulate_abrupt_death();
+
+        assert_eq!(
+            registry.probe_run("crashed").expect("probe"),
+            RunStatus::Finished,
+            "a leftover entry whose lock is released means the run is over"
+        );
+        assert!(
+            record_path.exists() && lock_path.exists(),
+            "a read-only probe must leave the stale entry's files on disk"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Two live runs under one `run_id` (the registry never enforces uniqueness) make
+    /// the id name no single run, so the verdict is [`RunStatus::Ambiguous`] with the
+    /// live count — never a silent pick of whichever entry the scan yielded first.
+    ///
+    /// One of the duplicates deliberately publishes **no endpoint**: liveness is
+    /// counted by the identity predicate (`run_id`) alone, before any secondary
+    /// attribute, which is exactly the undercount [K-016] found in `src/control.rs`
+    /// when the two were folded into one filter pass. Here the point is even sharper
+    /// than there — `wait` never needs an endpoint at all, so an endpoint-less live
+    /// run is an entirely ordinary run to wait for, not a lesser one.
+    #[test]
+    fn probe_run_reports_ambiguity_counting_even_an_endpoint_less_duplicate() {
+        let dir = scratch("probe-run-ambiguous");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+        let now = SystemTime::now();
+
+        let with_endpoint = registry
+            .register("dup", Some("endpoint-a"), now)
+            .expect("register the first duplicate");
+        let without_endpoint = registry
+            .register("dup", None, now)
+            .expect("register the second duplicate");
+
+        assert_eq!(
+            registry.probe_run("dup").expect("probe"),
+            RunStatus::Ambiguous { live: 2 },
+            "two live runs under one id is an ambiguity, counted by run_id alone"
+        );
+
+        // Once one of them ends, the id names a single run again and the wait can
+        // resume normally — the ambiguity is a property of the moment, not a curse
+        // on the id.
+        without_endpoint.remove();
+        assert_eq!(
+            registry.probe_run("dup").expect("probe"),
+            RunStatus::Live,
+            "with one duplicate gone the surviving run is unambiguously live"
+        );
+
+        with_endpoint.remove();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The [K-024] property this method exists for: a matching record whose liveness
+    /// **cannot be probed** (its lock name resolves to a *directory*, so the
+    /// write-open fails with a semantic error for any user — the cross-platform trick
+    /// from [K-014], never `chmod 0o000`) must read as [`RunStatus::Unprobed`], never
+    /// as [`RunStatus::Finished`]. Folding the probe error into "stale" the way
+    /// [`Registry::entries`] does would have `wait` announce a run finished on the
+    /// strength of a probe that never ran.
+    #[test]
+    fn probe_run_reports_an_unprobeable_record_as_unprobed_not_finished() {
+        let dir = scratch("probe-run-unprobeable");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+
+        let broken_lock_dir = dir.join("broken.lock");
+        fs::create_dir(&broken_lock_dir).expect("create the directory the lock name resolves to");
+        write_record(&dir, "broken", "opaque", "broken.lock");
+
+        assert_eq!(
+            registry.probe_run("opaque").expect("probe"),
+            RunStatus::Unprobed,
+            "an unprobeable record leaves the run's fate unknown, not confirmed over"
+        );
+        // Contrast: `entries()` collapses the same probe failure into `Stale`, which
+        // is exactly the collapsed value this method must not be built on.
+        let entries = registry.entries().expect("scan");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].health,
+            Health::Stale,
+            "entries() still degrades an unprobeable entry to stale, as documented"
+        );
+
+        // A confirmed-live record under the same id outranks the unknown one: there
+        // is something definite to wait for.
+        let live = registry
+            .register("opaque", None, SystemTime::now())
+            .expect("register a live run under the same id");
+        assert_eq!(
+            registry.probe_run("opaque").expect("probe"),
+            RunStatus::Live,
+            "a confirmed-live record is a stronger fact than an unprobeable one"
+        );
+
+        live.remove();
+        let _ = fs::remove_dir_all(&dir);
     }
 }

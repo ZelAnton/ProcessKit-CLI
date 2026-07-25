@@ -31,7 +31,7 @@ failure is not mistaken for a child result.
 | 100  | `USAGE`           | Invalid command line: unknown flag, missing required option, malformed value (including a bad `--timeout`/`--grace` duration), or bad subcommand form. |
 | 101  | `SPAWN`           | The target program could not be started (not found, not executable, bad `--cwd`, permission denied). |
 | 102  | `BACKEND`         | ProcessKit backend/containment failure: kernel container, job object, IPC endpoint, or run registry could not be established — including a requested resource limit (`--max-memory` / `--max-processes` / `--cpu-quota`) the active mechanism could not apply (the machine-readable `limit_hit` event names which one; see "Resource limits" below). |
-| 103  | `CONTROL`         | An `inspect` / `cancel` / `kill` command could not reach its target run: no such run id, a stale/dead registry entry, an ambiguous run id (more than one live run registered under it), or an IPC failure. |
+| 103  | `CONTROL`         | A by-`run-id` command could not be resolved to **the** single live run it names. For `inspect` / `cancel` / `kill` that covers every way the target cannot be reached: no such run id, a stale/dead registry entry, an ambiguous run id (more than one live run registered under it), or an IPC failure. The registry-only `wait` shares exactly one of those reasons — an **ambiguous** run id — and reports it with this same code even though it contacts no runner: there is no single run to wait for. |
 | 104  | `INTERNAL`        | Unexpected runner fault: the runner reached a state its own logic rules out, or lost a trustworthy view of the run (a `wait` on the child failed and its fate is unknown; the backend returned an outcome this build cannot render). Reported with this code instead of panicking. **A genuine runner bug** — an ordinary setup failure is `SETUP` (111), not this. |
 | 105  | `NOT_IMPLEMENTED` | **Retired.** Formerly minted for a defined-but-not-yet-built code path; every subcommand is now implemented, so no active path mints it. The number stays permanently reserved (see "Stability" below) — it is never reused for a different meaning. |
 | 106  | `TIMEOUT`         | The run exceeded a runner deadline — the whole-run `--timeout`, or the `--idle-timeout` (the child went silent past the idle window) — and the runner tore the process tree down. A runner-*imposed outcome*, not a child exit. The two are told apart by the `timeout` event's `reason` (`overall` / `idle`), not by the code; both reuse `106` (see "Timeout, cancel, and kill" below). |
@@ -40,8 +40,9 @@ failure is not mistaken for a child result.
 | 109  | `CONTROL_KILLED`  | The run was killed by a control-plane `kill` command: the runner hard-killed the whole tree immediately (no soft stop, no grace). Distinct from every other runner-imposed ending. |
 | 110  | `PROBE_INCOMPATIBLE` | The **preflight probe** (`processkit-cli probe`) found this binary's compatibility surface does not satisfy a `--require-*` expectation. A *pre-launch* verdict, not a run outcome — no child is ever spawned by a probe. See "Preflight probe" below. |
 | 111  | `SETUP`           | A fail-closed **setup / support failure**: a prerequisite the runner needs to run — or to report a result — could not be established or produced for an ordinary reason (its async runtime would not build, a required `--jsonl`/`--capture-dir` output or `--stdin-file` input could not be opened, or a `probe`/`inspect`/control reply would not serialize). An environment/resource condition the caller can usually act on (a bad path, missing permissions, exhausted resources), **not** a runner bug — that stays `INTERNAL` (104). See "Setup failures vs internal faults" below. |
+| 112  | `WAIT_TIMEOUT`    | The **`wait` subcommand's own** deadline (`wait --run-id <id> --timeout <duration>`) elapsed while the run it was waiting for was still live. *The waiter* gave up; the run was never touched — `wait` is read-only and reaches no runner — and is still going. Deliberately **not** `TIMEOUT` (106), which means the opposite (the *runner* enforced a deadline and tore the child's tree down), and not `CONTROL` (103), since the run was resolved unambiguously and found perfectly healthy. See "A waiter's deadline is not a run's deadline" below. |
 
-Codes `112`–`119` are **reserved** for future runner-own conditions. `--help`
+Codes `113`–`119` are **reserved** for future runner-own conditions. `--help`
 and `--version` are not failures: they print to stdout and exit `0`.
 
 ## Timeout, cancel, and kill: runner-imposed outcomes
@@ -76,6 +77,30 @@ grace"). As with every runner-own code, the numeric value is a best-effort signa
 the authoritative, machine-readable form of these outcomes is the `timeout` /
 `cancelled` / `killed` event (and the terminal `runner_exit`) in the versioned JSONL
 stream — see `docs/schema.md`.
+
+## A waiter's deadline is not a run's deadline
+
+`WAIT_TIMEOUT` (112) is the one code in this table that describes **the client**, not
+the run. It is minted only by `wait --run-id <id> --timeout <duration>` (see
+[`docs/registry.md`](registry.md), "Waiting — `wait`"), and only for one situation: the
+wait deadline elapsed while the run was still live, so the command stopped waiting.
+
+The distinction from `TIMEOUT` (106) is the whole reason it exists, and the two must
+never be conflated:
+
+- **`TIMEOUT` (106)** is reported by the *run's own process*: the runner enforced
+  `--timeout`/`--idle-timeout` and tore the child's process tree down. The run is over,
+  and it ended because of the deadline.
+- **`WAIT_TIMEOUT` (112)** is reported by a *separate, read-only `wait` process*: it
+  gave up watching. Nothing was sent to the runner — `wait` never connects to the
+  control transport — so the run is unaffected, still running, and will end (and report
+  its own outcome, with its own exit code and `runner_exit` event) whenever it does.
+
+Nor is it a `CONTROL` (103) failure: nothing was unreachable or ambiguous — the run was
+resolved to exactly one live entry and found perfectly healthy — so reporting "could not
+reach the run" would be false. A caller that hits `112` has learned one fact and only
+one: *the run had not finished yet*. Retrying the same `wait` is a perfectly reasonable
+response to it, unlike a `103`, which will keep failing until the registry state changes.
 
 ## Preflight probe: a pre-launch verdict, not a run outcome
 
@@ -129,7 +154,7 @@ When `run` is given a whole-tree resource cap (`--max-memory`, `--max-processes`
 or `--cpu-quota`) that the active containment mechanism cannot apply, the run ends
 with **`BACKEND` (102)** and a `runner_exit` `source` of `container_error` — the
 same code as any other container-creation failure — **not** a new code from the
-reserved `112`–`119` slots. This is a deliberate choice: the failure is genuinely
+reserved band's free slots. This is a deliberate choice: the failure is genuinely
 that a *whole-tree container capable of the requested cap could not be established*
 here (macOS/BSD and the Linux process-group fallback have no such container at all;
 a Linux cgroup v2 whose controllers can't be enabled — under systemd, an ordinary
@@ -144,7 +169,7 @@ machine-readable channel, exactly as this document's core principle holds the ex
 code to be only a best-effort hint (see "Why a band is not enough on its own"
 below). A nonsensical value (`--max-memory 0`, a non-positive/non-finite
 `--cpu-quota`) is instead a `USAGE` (100) argument error, rejected at parse time
-before any container is touched. Codes `112`–`119` therefore stay reserved.
+before any container is touched. No reserved-band slot was spent on it.
 
 ## Why a band is not enough on its own
 
@@ -169,6 +194,7 @@ are additionally recorded out of band.
   do that yet" — but the number is not reassigned to a new meaning; it stays
   reserved and unused going forward.
 - New runner-own conditions take the **next free code** in the reserved range
-  rather than overloading an existing one. `SETUP` (111) is the most recent, taking
-  the next free slot after `PROBE_INCOMPATIBLE` (110); codes `112`–`119` remain
-  reserved.
+  rather than overloading an existing one. `WAIT_TIMEOUT` (112) is the most recent,
+  taking the next free slot after `SETUP` (111) rather than overloading `TIMEOUT`
+  (106), whose meaning is the opposite one (see "A waiter's deadline is not a run's
+  deadline" above); codes `113`–`119` remain reserved.

@@ -311,6 +311,12 @@ mod tests {
             "run:--cpu-quota",
             "inspect:--json",
             "cancel:--run-id",
+            // `wait` (T-197) is derived from the live clap tree like every other
+            // subcommand — a new subcommand and its flags enter the surface with no
+            // edit to this module's production code at all.
+            "wait",
+            "wait:--run-id",
+            "wait:--timeout",
             "probe:--json",
             "probe:--require-schema-version",
             "probe:--require-exit-code-band",

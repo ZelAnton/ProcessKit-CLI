@@ -33,7 +33,10 @@
 //! and prints every entry, live or stale, for a caller that has lost (or never
 //! had) a `run_id`; [`prune`] is the cleanup counterpart, reaping the
 //! confirmed-stale leftovers of runners that died abruptly while never touching a
-//! live entry. The compatibility surface — CLI flags (see [`cli`]), the exit-code
+//! live entry; and [`wait`] is the *lifetime* counterpart, blocking on the same
+//! registry until a run is no longer live, for a supervisor that is not the
+//! runner's parent and so cannot wait on it as a child process. The compatibility
+//! surface — CLI flags (see [`cli`]), the exit-code
 //! contract (see [`exit`] and `docs/exit-codes.md`), and the JSONL `schema_version`
 //! (see [`events`] and `docs/schema.md`) — is fixed.
 
@@ -59,6 +62,8 @@ pub mod prune;
 pub mod registry;
 #[doc(hidden)]
 pub mod run;
+#[doc(hidden)]
+pub mod wait;
 #[cfg(windows)]
 #[doc(hidden)]
 pub mod win_security;

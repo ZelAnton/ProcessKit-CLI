@@ -34,6 +34,8 @@ pub enum Command {
     Cancel(TargetArgs),
     /// Hard-kill a live run's container immediately.
     Kill(TargetArgs),
+    /// Block until a run recorded in the per-user registry has finished.
+    Wait(WaitArgs),
     /// List every run recorded in the per-user registry, live and stale alike.
     List(ListArgs),
     /// Reap the registry's confirmed-stale entries — the leftover records of runners
@@ -249,6 +251,39 @@ pub struct TargetArgs {
     /// The run to act on.
     #[arg(long, value_name = "id")]
     pub run_id: String,
+}
+
+/// `wait --run-id <id> [--timeout <duration>]`
+///
+/// Blocks while the named run is still live in the per-user registry and returns as
+/// soon as it is not — the supervision primitive for a caller that is **not** the
+/// runner's parent and so cannot simply wait on a child process (see
+/// [`crate::wait`], which implements it, and `docs/registry.md`, "Waiting —
+/// `wait`"). Read-only in every sense: it scans the registry, never connects to the
+/// run's control transport, never mutates registry state, and never ends the run.
+#[derive(Debug, Args)]
+pub struct WaitArgs {
+    /// The run to wait for.
+    #[arg(long, value_name = "id")]
+    pub run_id: String,
+
+    /// Give up after this long instead of waiting indefinitely. This is a deadline
+    /// on **the wait**, not on the run: when it elapses the run is left running,
+    /// completely untouched, and `wait` exits with its own reserved
+    /// [`crate::exit::WAIT_TIMEOUT`] (112) — never the run's
+    /// [`crate::exit::TIMEOUT`] (106), which would claim the runner tore the tree
+    /// down. Omit it to block until the run actually finishes.
+    ///
+    /// Same grammar and parse-time validation as `run --timeout` — the very same
+    /// [`parse_positive_duration`], not a second parser — so a malformed value is
+    /// the same `USAGE` (100) form error, and `0` is rejected here for the same
+    /// reason it is there: a zero deadline never actually waits (it expires on the
+    /// first check and reports `WAIT_TIMEOUT` for any still-live run), which is a
+    /// typo far more often than an intent. A caller that genuinely wants a single
+    /// non-blocking check asks for the shortest real wait instead
+    /// (`--timeout 1ms`).
+    #[arg(long, value_name = "duration", value_parser = parse_positive_duration)]
+    pub timeout: Option<Duration>,
 }
 
 /// `list [--json]`
@@ -676,6 +711,60 @@ mod tests {
             panic!("expected the prune subcommand");
         };
         assert!(args.json);
+    }
+
+    #[test]
+    fn wait_requires_a_run_id_and_leaves_the_timeout_optional() {
+        let cli = Cli::try_parse_from(["processkit-cli", "wait", "--run-id", "r1"])
+            .expect("a bare wait names only the run");
+        let Command::Wait(args) = cli.command else {
+            panic!("expected the wait subcommand");
+        };
+        assert_eq!(args.run_id, "r1");
+        assert!(
+            args.timeout.is_none(),
+            "omitting --timeout means wait blocks until the run finishes"
+        );
+
+        assert!(
+            Cli::try_parse_from(["processkit-cli", "wait"]).is_err(),
+            "--run-id is required: there is no default run to wait for"
+        );
+    }
+
+    #[test]
+    fn wait_parses_a_timeout_with_the_same_grammar_as_run_timeout() {
+        // `wait --timeout` reuses `parse_positive_duration` verbatim, so every form
+        // `run --timeout` accepts lands here as the same ready `Duration`.
+        for (raw, expected) in [
+            ("30", Duration::from_secs(30)),
+            ("500ms", Duration::from_millis(500)),
+            ("5s", Duration::from_secs(5)),
+            ("2m", Duration::from_secs(120)),
+            ("1h", Duration::from_secs(3600)),
+        ] {
+            let cli =
+                Cli::try_parse_from(["processkit-cli", "wait", "--run-id", "r1", "--timeout", raw])
+                    .expect("a valid wait invocation");
+            let Command::Wait(args) = cli.command else {
+                panic!("expected the wait subcommand");
+            };
+            assert_eq!(args.timeout, Some(expected), "`wait --timeout {raw}`");
+        }
+    }
+
+    #[test]
+    fn wait_rejects_a_malformed_or_zero_timeout() {
+        // Shared parser, shared rejections: a malformed value is a `USAGE` form
+        // error at parse time, and `0` is refused for the same reason `run
+        // --timeout 0` is — a deadline that never actually waits.
+        for bad in ["soon", "-5", "1.5s", "5x", "0", "0ms", "0s"] {
+            assert!(
+                Cli::try_parse_from(["processkit-cli", "wait", "--run-id", "r1", "--timeout", bad])
+                    .is_err(),
+                "a malformed or degenerate `wait --timeout {bad}` must fail at parse time"
+            );
+        }
     }
 
     #[test]
