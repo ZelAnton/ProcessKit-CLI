@@ -242,21 +242,30 @@ const CONVERSATION_DEADLINE: Duration = Duration::from_secs(5);
 /// next, so a client that connects and then stalls blocks every client queued behind
 /// it, with no bound on how long a queue of stalled clients can grow (the run's own
 /// path is already independent of this and never waits on a control client). This is
-/// not merely an added-latency bound for the client stuck behind the stall: every
-/// real client's own deadlines are the *same* 5 seconds — [`CONNECT_DEADLINE`] on
-/// unix (where the kernel backlog admits the connection but nothing then answers, so
-/// [`CONVERSATION_DEADLINE`] fires) and, on Windows, either [`CONVERSATION_DEADLINE`]
-/// (for the client that lands on the next pre-created pipe instance and still gets no
-/// answer) or `ERROR_PIPE_BUSY` retries against [`CONNECT_DEADLINE`] (for whoever is
-/// queued behind that). So a client queued behind one stalled peer does not simply
-/// wait longer for service — it typically fails outright with the reserved
-/// [`exit::CONTROL`] (103) exit code before this deadline even elapses server-side;
-/// for `cancel`/`kill` that means the command was never delivered (fail-closed, but a
-/// real failure, not a delay). The channel is owner-only, not exposed to an untrusted
-/// network peer, so this is not a network-facing vulnerability: what this deadline
-/// guarantees is only that *one* stalled client cannot wedge the loop forever, not
-/// that other clients are served concurrently or even reliably reach the server at
-/// all while queued behind it.
+/// not merely an added-latency bound for the client stuck behind the stall — but the
+/// threshold at which a queued client actually fails is **two** stalled peers ahead
+/// of it, not one. A real client's own deadlines are the *same* 5 seconds as this
+/// one, but they start only once *that* client connects — after the stalled peer(s)
+/// already ahead of it were accepted, so its own window starts later than the
+/// server-side window of the stalled peer immediately ahead. Consequently, behind
+/// exactly **one** stalled peer a client usually still gets served, just later — with
+/// added latency up to roughly this deadline (the margin is how much later it
+/// connected than the stalled peer; if the two connect almost simultaneously, it is a
+/// race). Starting from a **second** stalled peer already queued ahead, though, the
+/// accumulated wait exceeds the trailing client's own 5 seconds and it is dropped
+/// without ever being serviced: on unix this surfaces as [`CONVERSATION_DEADLINE`]
+/// firing (the kernel backlog admits the connection immediately, so
+/// [`CONNECT_DEADLINE`] never triggers on unix in this scenario), and on Windows as
+/// either [`CONVERSATION_DEADLINE`] (for a client that lands on a pre-created pipe
+/// instance and still gets no answer in time) or `ERROR_PIPE_BUSY` retries against
+/// [`CONNECT_DEADLINE`] (for whoever queues behind that). Either way the failure
+/// surfaces as the reserved [`exit::CONTROL`] (103) exit code; for `cancel`/`kill`
+/// that means the command was never delivered (fail-closed, but a real failure, not a
+/// delay). The channel is owner-only, not exposed to an untrusted network peer, so
+/// this is not a network-facing vulnerability: what this deadline guarantees is only
+/// that *one* stalled client cannot wedge the loop forever, not that other clients
+/// are served concurrently or reliably reach the server once a deep-enough queue of
+/// stalled clients is ahead of them.
 const CONNECTION_DEADLINE: Duration = Duration::from_secs(5);
 
 /// The byte ceiling on the *one* line either side of the wire protocol reads: the
@@ -428,9 +437,9 @@ pub async fn serve(
 /// close. Bounded by [`CONNECTION_DEADLINE`], so a stalled client cannot wedge the
 /// accept loop *forever* — but every caller (both platform `serve` loops) awaits this
 /// inline, one connection at a time, so a stalled client still blocks the *next*
-/// client's accept and service (see [`CONNECTION_DEADLINE`]'s doc comment: because
-/// every real client's own deadlines are the same 5 seconds as this one, a client
-/// queued behind a stall typically does not just wait longer — it fails outright with
+/// client's accept and service (see [`CONNECTION_DEADLINE`]'s doc comment for the
+/// exact threshold: behind one stalled peer a client is usually still served, just
+/// later; behind two or more stalled peers it typically fails outright with
 /// [`exit::CONTROL`] before ever being serviced). Errors are swallowed — a broken
 /// client connection is never the run's problem.
 async fn handle_connection<S>(stream: S, source: &SnapshotSource<'_>, commands: &ControlCommandSink)
