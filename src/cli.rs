@@ -373,8 +373,9 @@ pub struct PruneArgs {
 /// this binary cannot meet makes `probe` fail closed with
 /// [`crate::exit::PROBE_INCOMPATIBLE`] (110) instead of a false "ok". `--print-schema`
 /// is a separate, simpler contract on the same subcommand: it prints the embedded
-/// schema document instead of the report and skips `--require-*` evaluation
-/// entirely (see its own doc comment below).
+/// schema document instead of the report, and clap rejects it outright (`USAGE`,
+/// 100) if combined with any `--require-*` flag rather than silently skipping
+/// their evaluation (see its own doc comment below).
 #[derive(Debug, Args)]
 pub struct ProbeArgs {
     /// Emit the report as JSON. Required to match the fixed form (JSON is the only
@@ -406,13 +407,24 @@ pub struct ProbeArgs {
     /// (`fixtures/schema/v1/schema.json`, embedded at build time via
     /// `include_str!`, see [`crate::probe::SCHEMA_JSON`]) to stdout, byte-for-byte
     /// identical to that fixture file, and exit successfully — **instead of**
-    /// evaluating or printing the usual probe report. Any `--require-*` flags on
-    /// the same invocation are ignored when this flag is set. This lets a
-    /// consumer holding only an installed binary or an unpacked release archive
-    /// (no git checkout, no tag to match) fetch the exact machine-readable schema
-    /// its own version emits, entirely offline (see `docs/schema.md` and
-    /// README's "JSONL event schema").
-    #[arg(long)]
+    /// evaluating or printing the usual probe report. **Cannot be combined with
+    /// any `--require-*` flag**: clap rejects that combination as an ordinary
+    /// usage error (exit `100`), the same code any other malformed `probe`
+    /// invocation gets, rather than silently skipping the requested checks and
+    /// exiting `0` — a probe that were asked to verify expectations must never
+    /// report a false "ok" (see the module-level fail-closed contract in
+    /// `src/probe.rs`). This lets a consumer holding only an installed binary or
+    /// an unpacked release archive (no git checkout, no tag to match) fetch the
+    /// exact machine-readable schema its own version emits, entirely offline
+    /// (see `docs/schema.md` and README's "JSONL event schema").
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "require_schema_version",
+            "require_exit_code_band",
+            "require_surface"
+        ]
+    )]
     pub print_schema: bool,
 }
 
@@ -1368,16 +1380,57 @@ mod tests {
             "--print-schema is opt-in, off by default"
         );
 
-        // `--print-schema` parses on its own (still under the fixed `--json` form)
-        // and combines freely with the `--require-*` flags at the parse level —
-        // whether it actually skips their evaluation is `src/probe.rs`'s concern,
-        // not the CLI layer's.
+        // `--print-schema` parses on its own (still under the fixed `--json` form).
         let cli = Cli::try_parse_from(["processkit-cli", "probe", "--json", "--print-schema"])
             .expect("a valid probe --print-schema invocation");
         let Command::Probe(args) = cli.command else {
             panic!("expected the probe subcommand");
         };
         assert!(args.print_schema);
+    }
+
+    /// `--print-schema` conflicts with every `--require-*` flag at the clap level:
+    /// combining them is an ordinary usage error, never a silent skip of the
+    /// requested checks (R-01 — a probe that were asked to verify expectations
+    /// must never report a false "ok").
+    #[test]
+    fn print_schema_conflicts_with_every_require_flag() {
+        assert!(
+            Cli::try_parse_from([
+                "processkit-cli",
+                "probe",
+                "--json",
+                "--print-schema",
+                "--require-schema-version",
+                "1",
+            ])
+            .is_err(),
+            "--print-schema + --require-schema-version must be rejected, not silently accepted"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "processkit-cli",
+                "probe",
+                "--json",
+                "--print-schema",
+                "--require-exit-code-band",
+                "100-119",
+            ])
+            .is_err(),
+            "--print-schema + --require-exit-code-band must be rejected"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "processkit-cli",
+                "probe",
+                "--json",
+                "--print-schema",
+                "--require-surface",
+                "probe",
+            ])
+            .is_err(),
+            "--print-schema + --require-surface must be rejected"
+        );
     }
 
     #[test]

@@ -65,6 +65,16 @@ uncontained-launch hazard this project exists to prevent. See
 [`src/probe.rs`](../src/probe.rs) and the normative exit-code table in
 [`docs/exit-codes.md`](exit-codes.md).
 
+`probe --print-schema` is a separate, simpler mode on the same subcommand: it
+prints this binary's embedded JSONL event-schema document instead of the
+report above and exits `0`, so an adapter that only needs the schema for its
+own version — no clone, no tag to match — can fetch it offline without a
+compatibility check. It **cannot be combined with any `--require-*` flag**:
+that combination is rejected as an ordinary `USAGE` (100) parse error, never a
+silent skip of the requested checks, so it can never produce a false "ok" on
+an invocation that also asked `probe` to verify expectations. See
+[`docs/schema.md`](schema.md), "Getting the schema without a git checkout".
+
 ## 2. Launching a run
 
 The recommended invocation for an adapter:

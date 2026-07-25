@@ -39,8 +39,12 @@ alternatives avoid that:
   embedded into that specific binary at build time (`src/probe.rs`'s
   `SCHEMA_JSON`, via `include_str!` — the file above stays the single source
   of truth, this is a verbatim, byte-for-byte copy of it, never a
-  hand-maintained second one). It replaces the usual probe report; any
-  `--require-*` flags on the same invocation are not evaluated. `--print-schema`
+  hand-maintained second one). It replaces the usual probe report, and
+  **cannot be combined with any `--require-*` flag**: that combination is
+  rejected at parse time as an ordinary usage error (exit `100`), not silently
+  accepted with the requested checks skipped — a `probe` invocation that asks
+  for expectations to be verified must never exit `0` without verifying them
+  (see `docs/integration.md`, "Fail-closed preflight: `probe`"). `--print-schema`
   itself is an ordinary, additive CLI surface token
   (`probe:--print-schema`) like any other `probe` flag.
 - Every release archive (`.github/workflows/release.yml`) bundles a `schema/`

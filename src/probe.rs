@@ -14,6 +14,15 @@
 //! JSON line and, when the consumer passes `--require-*` expectations, *verifies*
 //! them and fails closed with [`exit::PROBE_INCOMPATIBLE`] (110) on any mismatch.
 //!
+//! `probe --print-schema` is a second, separate mode on the same subcommand: it
+//! prints the embedded [`SCHEMA_JSON`] document instead of the compatibility
+//! report and always exits `0`. It cannot be combined with any `--require-*`
+//! flag — clap rejects that combination as an ordinary `USAGE` (100) parse
+//! error, never a silent skip of the requested checks, so this mode can never
+//! produce the false "ok" the rest of this module is built to prevent (see
+//! [`crate::cli::ProbeArgs::print_schema`] and `docs/schema.md`, "Getting the
+//! schema without a git checkout").
+//!
 //! ## No side effects — never a real contained process
 //!
 //! A probe is pure: it reads compile-time constants ([`events::SCHEMA_VERSION`],
@@ -110,21 +119,33 @@ pub struct ProbeReport {
     pub mismatches: Vec<String>,
 }
 
-/// Run the preflight probe: build the report, verify any `--require-*` expectations,
-/// print the report as one JSON line to **stdout** (in *both* the compatible and the
-/// incompatible case, so the consumer always has a parseable result), and return the
-/// fail-closed verdict. A satisfied (or unrequested) surface is `Ok(())` (exit `0`);
-/// any unmet expectation is [`exit::PROBE_INCOMPATIBLE`] (110) with the mismatches
-/// echoed on stderr by the caller.
+/// Run the preflight probe. In the ordinary case (`args.print_schema` unset): build
+/// the report, verify any `--require-*` expectations, print the report as one JSON
+/// line to **stdout** (in *both* the compatible and the incompatible case, so the
+/// consumer always has a parseable result), and return the fail-closed verdict. A
+/// satisfied (or unrequested) surface is `Ok(())` (exit `0`); any unmet expectation
+/// is [`exit::PROBE_INCOMPATIBLE`] (110) with the mismatches echoed on stderr by the
+/// caller.
+///
+/// When `args.print_schema` **is** set, this is a different, simpler contract: no
+/// report is built or printed, no `--require-*` expectation is evaluated (clap
+/// already refuses that combination as a `USAGE` (100) parse error before `run` runs
+/// at all — see `ProbeArgs::print_schema` in `src/cli.rs`), and this prints the
+/// embedded [`SCHEMA_JSON`] document instead, always returning `Ok(())`.
 pub fn run(args: &ProbeArgs) -> Result<(), RunnerError> {
     // `--print-schema` short-circuits the rest of `probe`: it prints the
     // embedded schema document (not a compatibility report) and returns
     // immediately, so it never evaluates `--require-*` and never builds a
     // `ProbeReport` — a deliberately simpler contract than composing with the
     // report (see `docs/schema.md`, "Getting the schema without a git
-    // checkout"). `print!`, not `println!`: `SCHEMA_JSON` already carries the
-    // fixture's own trailing newline, so this stays byte-for-byte identical to
-    // `fixtures/schema/v1/schema.json` on disk.
+    // checkout"). This is safe to do unconditionally, with no ceremony about
+    // `--require-*`: `ProbeArgs::print_schema` (`src/cli.rs`) declares
+    // `conflicts_with_all` every `--require-*` flag, so clap already rejects
+    // that combination as a `USAGE` (100) parse error before `run` is ever
+    // called — this branch can never silently skip a requested check and
+    // report a false "ok" (R-01). `print!`, not `println!`: `SCHEMA_JSON`
+    // already carries the fixture's own trailing newline, so this stays
+    // byte-for-byte identical to `fixtures/schema/v1/schema.json` on disk.
     if args.print_schema {
         print!("{SCHEMA_JSON}");
         return Ok(());

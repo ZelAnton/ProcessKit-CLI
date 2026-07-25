@@ -84,7 +84,10 @@ hand-maintained copy of the flags to fall out of sync, and (unlike a
 own runtime surface, so the fail-closed `probe --require-surface` preflight
 (see "Command interface" below) never sees it. `cargo install`/`cargo build`
 from source produce the same two directories under `target/assets/` — see
-`build.rs`'s module doc for the full mechanism.
+`build.rs`'s module doc for the full mechanism. (The release archive ships a
+third directory too, `schema/` — see "JSONL event schema" below; `cargo
+install`/`cargo build` do not produce it, since it is a static copy of a
+tracked fixture, not `build.rs` output.)
 
 Install the completion script for your shell, e.g.:
 
