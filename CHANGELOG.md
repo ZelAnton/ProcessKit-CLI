@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [0.3.0] - 2026-07-25
+
+### Added
 - **New `run --detach` flag: start a run and let go.** The call re-spawns the CLI
   detached — a new session on Unix (`setsid`), `DETACHED_PROCESS` on Windows, `null`
   stdio either way — and returns as soon as that copy has *provably* started the run,
@@ -510,7 +521,8 @@ to a dated version section.
   inheriting the registry's full path, so deeply nested macOS CI/workspace paths
   cannot exceed `sockaddr_un::sun_path` and silently disable `inspect`.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.1.0...v0.2.0
