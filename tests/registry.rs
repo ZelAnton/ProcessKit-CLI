@@ -1252,3 +1252,148 @@ fn prune_reaps_an_orphaned_lock_file_alongside_a_stale_pair_and_a_live_run() {
     let _ = child.wait();
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Run `prune --dry-run [--json]` against `registry` and wait for it to finish.
+fn prune_dry_run(registry: &Path, json: bool) -> Output {
+    let mut cmd = Command::new(bin());
+    cmd.args(["prune", "--dry-run"]);
+    if json {
+        cmd.arg("--json");
+    }
+    cmd.env("PROCESSKIT_CLI_REGISTRY_DIR", registry)
+        .output()
+        .expect("spawn the prune --dry-run client")
+}
+
+/// T-199, end to end through the real binary: `prune --dry-run --json` over the
+/// same mixed fixture as `prune_reaps_an_orphaned_lock_file_alongside_a_stale_pair_
+/// and_a_live_run` (a confirmed-stale paired entry, a confirmed-stale orphaned lock,
+/// and a live run) previews exactly what a following real `prune --json` pass
+/// reaps — same aggregate counts, same candidates — while deleting nothing itself.
+#[test]
+fn prune_dry_run_previews_without_deleting_and_matches_a_real_prune() {
+    let dir = scratch("prune-dry-run");
+    let registry = registry_dir(&dir);
+
+    // A hand-written, confirmed-stale entry (record + unlocked lock file).
+    write_stale_entry(&registry, "run-stale-0000");
+
+    // A lone, unlocked `.lock` file with no `.json` sibling, backdated past the
+    // registry's `ORPHAN_LOCK_MIN_AGE` ([R-01]) so it reads as a confirmed orphan.
+    let orphan_lock = registry.join("orphan-0000.lock");
+    fs::write(&orphan_lock, b"").expect("write the orphaned lock file");
+    backdate(&orphan_lock, Duration::from_secs(30));
+
+    // A real, live run alongside them both.
+    let mut child = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "live-run"],
+        long_child(),
+    )
+    .spawn()
+    .expect("spawn the runner");
+
+    wait_until(|| record_count(&registry) == 2, Duration::from_secs(10));
+
+    let dry_out = prune_dry_run(&registry, true);
+    assert_eq!(
+        dry_out.status.code(),
+        Some(0),
+        "prune --dry-run succeeds; stderr: {}",
+        String::from_utf8_lossy(&dry_out.stderr)
+    );
+    let dry_report: serde_json::Value = serde_json::from_slice(&dry_out.stdout)
+        .expect("prune --dry-run --json prints one JSON object");
+    assert_eq!(
+        dry_report["pruned"], 1,
+        "the confirmed-stale pair would be reaped: {dry_report}"
+    );
+    assert_eq!(
+        dry_report["live"], 1,
+        "the live entry would be kept, not reaped: {dry_report}"
+    );
+    assert_eq!(
+        dry_report["orphaned_locks"], 1,
+        "the lone orphaned lock file would be reaped too: {dry_report}"
+    );
+    assert_eq!(
+        dry_report["unprobed"], 0,
+        "nothing is unprobeable in this fixture: {dry_report}"
+    );
+    let candidates = dry_report["candidates"]
+        .as_array()
+        .expect("dry-run --json carries a candidates array");
+    assert_eq!(
+        candidates.len(),
+        2,
+        "one paired entry plus one orphaned lock: {dry_report}"
+    );
+    assert!(
+        candidates.iter().any(
+            |candidate| candidate["kind"] == "entry" && candidate["run_id"] == "run-stale-0000"
+        ),
+        "the stale paired entry appears as a candidate: {dry_report}"
+    );
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate["kind"] == "orphaned_lock"
+                && candidate["lock_file_name"] == "orphan-0000.lock"),
+        "the orphaned lock file appears as a candidate: {dry_report}"
+    );
+
+    // Nothing was actually deleted: the stale pair, the orphaned lock, and the live
+    // pair all still stand.
+    assert!(
+        registry.join("run-stale-0000.json").exists()
+            && registry.join("run-stale-0000.lock").exists(),
+        "prune --dry-run must not delete the stale pair"
+    );
+    assert!(
+        orphan_lock.exists(),
+        "prune --dry-run must not delete the orphaned lock file"
+    );
+    assert_eq!(
+        record_count(&registry),
+        2,
+        "prune --dry-run must not touch any record file"
+    );
+
+    // A following real prune reaps exactly what the dry run predicted.
+    let real_out = prune(&registry, true);
+    assert_eq!(
+        real_out.status.code(),
+        Some(0),
+        "the real prune following the dry run succeeds; stderr: {}",
+        String::from_utf8_lossy(&real_out.stderr)
+    );
+    let real_report: serde_json::Value =
+        serde_json::from_slice(&real_out.stdout).expect("prune --json prints one JSON object");
+    assert_eq!(
+        real_report["pruned"], dry_report["pruned"],
+        "the real prune's tally matches the dry run's prediction: {real_report}"
+    );
+    assert_eq!(
+        real_report["live"], dry_report["live"],
+        "the real prune's tally matches the dry run's prediction: {real_report}"
+    );
+    assert_eq!(
+        real_report["unprobed"], dry_report["unprobed"],
+        "the real prune's tally matches the dry run's prediction: {real_report}"
+    );
+    assert_eq!(
+        real_report["orphaned_locks"], dry_report["orphaned_locks"],
+        "the real prune's tally matches the dry run's prediction: {real_report}"
+    );
+    assert!(
+        !registry.join("run-stale-0000.json").exists()
+            && !registry.join("run-stale-0000.lock").exists()
+            && !orphan_lock.exists(),
+        "the real prune reaps exactly what the dry run predicted"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_dir_all(&dir);
+}

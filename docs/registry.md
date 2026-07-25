@@ -315,6 +315,51 @@ a no-op that exits `0`.
   lock alike), and `orphaned_locks` (lone `.lock` files with no `.json` sibling that
   were reaped).
 
+### Previewing a reap — `prune --dry-run`
+
+`processkit-cli prune --dry-run [--json]` (T-199) answers "what would `prune` reap
+right now?" without reaping anything. It is [`Registry::preview_prune`]
+(`src/registry.rs`), the non-destructive sibling of [`Registry::prune`]: the exact
+same two-pass scan (paired records via `Registry::scan`, then orphaned locks via
+`Registry::orphaned_lock_paths`) classified through the exact same
+[`probe_for_prune`] three-way probe described in "The reaping safety invariant"
+above, so a candidate here is confirmed stale by precisely the same rule a real
+`prune` would use to reap it. The only thing that differs is the action taken on a
+confirmed-stale (`Reapable`) verdict: instead of deleting the entry's files while
+holding the probe-acquired lock, `preview_prune` releases that lock immediately —
+there is nothing to reclaim it for, since nothing is being reaped — and records the
+candidate instead. `Live` and probe-`Err` verdicts are handled identically to
+`prune`. The result is that `preview_prune`'s aggregate tally is exactly what a
+following, untouched `prune` pass over the same on-disk registry state would
+report, and the preview itself never calls `fs::remove_file` on anything, so the
+registry is left byte-for-byte as it was.
+
+Because a paired record carries `run_id`/`started_at` but an orphaned `.lock` file
+has no record to pull identifying fields from at all, each candidate is described
+differently:
+
+- a confirmed-stale **paired entry** is identified by its `run_id` and
+  `started_at`, the same fields `list` already prints for it;
+- a confirmed-stale **orphaned lock** is identified by its lock file name (there is
+  no `run_id`/`started_at` to report).
+
+- **No `--json`** lists each confirmed-stale candidate on its own line — a paired
+  entry as `run_id=<id> started_at=<ts>`, an orphaned lock by its file name — then
+  the same summary-line shape `prune`'s human-readable output uses, prefixed
+  `would` throughout since nothing is actually reaped (`no stale entries to prune
+  (dry run)` when there is nothing to preview).
+- **`--json`** prints a single JSON object with the exact same aggregate fields
+  `prune --json` reports (`pruned`/`live`/`unprobed`/`orphaned_locks`), plus an
+  additional `candidates` array: one object per confirmed-stale candidate, internally
+  tagged `"kind":"entry"` (with `run_id`/`started_at`) or
+  `"kind":"orphaned_lock"` (with `lock_file_name`).
+- `prune` without `--dry-run` is **unchanged**: its human-readable and `--json`
+  output, and its exit codes, are identical to before this flag existed.
+- Like `prune`, `--dry-run` opens the registry through `Registry::open_read_only`,
+  so previewing never creates the registry directory or touches its permissions,
+  and an empty or missing registry previews an all-zero tally with an empty
+  `candidates` list rather than erroring.
+
 ## Waiting — `wait`
 
 `processkit-cli wait --run-id <id> [--timeout <duration>]` is the *lifetime*

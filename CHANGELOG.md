@@ -213,6 +213,22 @@ to a dated version section.
   automatically (`run:--no-echo`). See README.md, "Standard I/O" and "Bounded
   output capture".
 
+- **New `prune --dry-run` flag: preview a reap without deleting anything.**
+  `Registry::preview_prune` (`src/registry.rs`) runs the exact same two-pass scan and
+  the exact same `probe_for_prune` liveness classification a real `prune` uses, but
+  never calls `fs::remove_file` — a confirmed-stale verdict releases its
+  probe-acquired lock immediately (there is nothing to reclaim it for) and records
+  the candidate instead of reaping it, so the aggregate tally it returns is exactly
+  what a following, untouched `prune` pass over the same registry state would
+  report. Without `--json` it lists each confirmed-stale candidate (a paired entry's
+  `run_id`/`started_at`, or an orphaned lock's file name) followed by a "would
+  prune …" summary line; with `--json` it prints the same
+  `pruned`/`live`/`unprobed`/`orphaned_locks` fields `prune --json` already does,
+  plus an additional `candidates` array tagged `"kind":"entry"` or
+  `"kind":"orphaned_lock"`. `prune` without `--dry-run` is byte-for-byte unchanged.
+  Appears in the `probe` surface tokens automatically (`prune:--dry-run`). See
+  README.md, "Command interface", and docs/registry.md, "Reaping — `prune`".
+
 ### Changed
 - `run --timeout 0` and `run --idle-timeout 0` are now rejected at parse time
   (`USAGE`, exit `100`) instead of arming an already-elapsed deadline that tore

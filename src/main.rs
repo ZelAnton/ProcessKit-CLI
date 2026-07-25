@@ -40,7 +40,7 @@ fn main() -> ExitCode {
         Command::Kill(args) => report(control::kill(&args.run_id)),
         Command::Wait(args) => report(wait::run(&args.run_id, args.timeout)),
         Command::List(args) => report(list::run(args.json)),
-        Command::Prune(args) => report(prune::run(args.json)),
+        Command::Prune(args) => report(prune::run(args.json, args.dry_run)),
         Command::Probe(args) => report(probe::run(&args)),
     }
 }

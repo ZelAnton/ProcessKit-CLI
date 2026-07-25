@@ -185,6 +185,46 @@ pub struct PruneOutcome {
     pub orphaned_locks: usize,
 }
 
+/// The result of a non-destructive [`Registry::preview_prune`] pass (`prune
+/// --dry-run`, T-199): the same aggregate tally a following [`Registry::prune`]
+/// pass over the identical, untouched registry state would report, plus every
+/// confirmed-stale candidate that tally counts — what that following prune would
+/// actually reap. [`Registry::preview_prune`] never calls `fs::remove_file`, so
+/// producing this costs nothing but the scan and the liveness probes themselves.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PrunePreview {
+    /// The same tally shape [`Registry::prune`] returns, computed the identical way
+    /// — see [`Registry::preview_prune`] for why the two are guaranteed to agree.
+    pub outcome: PruneOutcome,
+    /// Every confirmed-stale (`Reapable`) candidate the tally above counts, in scan
+    /// order: paired records first (the [`Registry::scan`] pass), then orphaned lock
+    /// files (the [`Registry::orphaned_lock_paths`] pass) — the same two passes
+    /// [`Registry::prune`] makes, in the same order.
+    pub candidates: Vec<PruneCandidate>,
+}
+
+/// One confirmed-stale prune candidate a [`Registry::preview_prune`] pass found —
+/// identifying the same on-disk entry a following [`Registry::prune`] pass would
+/// reap, in the same vocabulary `list`/`prune --json` already use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PruneCandidate {
+    /// A paired `.json`/`.lock` record: the `run_id`/`started_at` fields a caller
+    /// would otherwise have to open its [`Record`] to find.
+    Entry {
+        /// The record's `run_id`.
+        run_id: String,
+        /// The record's `started_at`, RFC 3339 UTC with millisecond precision.
+        started_at: String,
+    },
+    /// A lone `.lock` file with no `.json` sibling — there is no record to pull
+    /// `run_id`/`started_at` from, so it is identified by its file name instead.
+    OrphanedLock {
+        /// The lock file's name (no directory component — resolved against the
+        /// registry directory, exactly like [`Liveness::lock_file`]).
+        lock_file_name: String,
+    },
+}
+
 /// What one [`Registry::probe_run`] pass concluded about a single `run_id` — the
 /// question `wait` (see [`crate::wait`]) asks the registry over and over: *is this
 /// run still going?*
@@ -465,6 +505,69 @@ impl Registry {
         }
 
         Ok(outcome)
+    }
+
+    /// Non-destructive counterpart to [`Registry::prune`] (`prune --dry-run`,
+    /// T-199): the exact same two passes — the paired-record scan
+    /// ([`Registry::scan`]) then the orphaned-lock scan
+    /// ([`Registry::orphaned_lock_paths`]) — classified through the exact same
+    /// [`probe_for_prune`] three-way probe, but never calling `fs::remove_file` on
+    /// anything, regardless of what a candidate classifies as. Only the *action* on
+    /// a confirmed-stale (`Reapable`) verdict differs from `prune`: instead of
+    /// deleting files while the probe-acquired lock is held, this releases that lock
+    /// at once (there is nothing to reclaim it for — a preview reaps nothing) and
+    /// records a [`PruneCandidate`] describing the entry instead. The `Live`/`Err`
+    /// arms are handled identically to `prune`, so the returned tally
+    /// ([`PrunePreview::outcome`]) is exactly what a following, untouched `prune`
+    /// pass over the same on-disk state would report — see this module's
+    /// `preview_prune_matches_a_real_prune_over_identical_state` test.
+    pub fn preview_prune(&self) -> io::Result<PrunePreview> {
+        let mut outcome = PruneOutcome::default();
+        let mut candidates = Vec::new();
+
+        for ScannedRecord {
+            record, lock_path, ..
+        } in self.scan()?
+        {
+            match probe_for_prune(&lock_path) {
+                // Confirmed stale: unlike `prune`, nothing is reclaimed under the
+                // lock — release it immediately and record the candidate instead of
+                // deleting anything.
+                Ok(PruneProbe::Reapable(held_lock)) => {
+                    drop(held_lock);
+                    candidates.push(PruneCandidate::Entry {
+                        run_id: record.run_id,
+                        started_at: record.started_at,
+                    });
+                    outcome.pruned += 1;
+                }
+                // A live runner holds the lock — same "never touch" verdict `prune`
+                // reaches, just nothing to touch here either way.
+                Ok(PruneProbe::Live) => outcome.live += 1,
+                // The probe could not be performed: liveness is unknown, counted
+                // exactly as `prune` counts it.
+                Err(_) => outcome.unprobed += 1,
+            }
+        }
+
+        for lock_path in self.orphaned_lock_paths()? {
+            match probe_for_prune(&lock_path) {
+                Ok(PruneProbe::Reapable(held_lock)) => {
+                    drop(held_lock);
+                    candidates.push(PruneCandidate::OrphanedLock {
+                        lock_file_name: file_name(&lock_path),
+                    });
+                    outcome.orphaned_locks += 1;
+                }
+                Ok(PruneProbe::Live) => outcome.live += 1,
+                Err(_) => outcome.unprobed += 1,
+            }
+        }
+
+        Ok(PrunePreview {
+            outcome,
+            candidates,
+        })
     }
 
     /// Ask the registry, in one pass, whether the run named `run_id` is still going —
@@ -2819,6 +2922,224 @@ mod tests {
         assert!(
             !missing.exists(),
             "pruning a missing registry must not create its directory"
+        );
+    }
+
+    /// Build the mixed fixture `preview_prune`'s equivalence/non-mutation tests
+    /// share: a live pair (kept alive by the returned [`Registration`], which the
+    /// caller must hold for the test's duration), a confirmed-stale pair (released
+    /// lock, both files left behind), an unprobeable pair (its lock name resolves to
+    /// a directory, the [K-014] trick), and a confirmed-stale orphaned `.lock` file
+    /// with no `.json` sibling, backdated past [`ORPHAN_LOCK_MIN_AGE`] so it reads as
+    /// a genuine orphan rather than a fresh, not-yet-locked reservation.
+    fn mixed_prune_fixture(dir: &Path, registry: &Registry) -> Registration {
+        let live = registry
+            .register("alive", None, SystemTime::now())
+            .expect("register the live run");
+        let doomed = registry
+            .register("dead", None, SystemTime::now())
+            .expect("register the doomed run");
+        doomed.simulate_abrupt_death();
+
+        let broken_lock_dir = dir.join("broken.lock");
+        fs::create_dir(&broken_lock_dir)
+            .expect("create the directory the unprobeable lock name resolves to");
+        write_record(dir, "broken", "broken", "broken.lock");
+
+        let orphan_lock = dir.join("orphan.lock");
+        fs::write(&orphan_lock, b"").expect("write the orphaned lock file");
+        backdate(&orphan_lock, ORPHAN_LOCK_MIN_AGE + Duration::from_secs(1));
+
+        live
+    }
+
+    /// T-199, the heart of `prune --dry-run`'s safety claim: `preview_prune`'s
+    /// aggregate tally must exactly match what a following, real `prune` pass over
+    /// the identical, untouched registry state reports. Run over a fixture that
+    /// exercises every classification at once (live, confirmed-stale, unprobeable,
+    /// orphaned lock) — a match on this mix is a much stronger claim than a match on
+    /// any single case.
+    #[test]
+    fn preview_prune_matches_a_real_prune_over_identical_state() {
+        let dir = scratch("preview-equivalence");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+        let live = mixed_prune_fixture(&dir, &registry);
+
+        let expected = PruneOutcome {
+            pruned: 1,
+            live: 1,
+            unprobed: 1,
+            orphaned_locks: 1,
+        };
+
+        let preview = registry
+            .preview_prune()
+            .expect("preview_prune must not fail");
+        assert_eq!(
+            preview.outcome, expected,
+            "sanity: the mixed fixture must exercise every classification"
+        );
+
+        // The preview must not have touched anything: a real prune run right after it
+        // reaps exactly the same tally from the exact same on-disk state.
+        let real_outcome = registry.prune().expect("prune must not fail");
+        assert_eq!(
+            preview.outcome, real_outcome,
+            "a dry-run preview's aggregate tally must equal a real prune's tally over \
+             the identical registry state"
+        );
+
+        live.remove();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// One [`snapshot_dir`] entry: name, whether it is a directory, its byte length,
+    /// a regular non-`.lock` file's exact byte contents (`None` for a directory or a
+    /// `.lock` file — see [`snapshot_dir`]'s docs), and its mtime.
+    type DirSnapshotEntry = (String, bool, u64, Option<Vec<u8>>, SystemTime);
+
+    /// A snapshot of every entry directly inside `dir` — see [`DirSnapshotEntry`] for
+    /// the fields — sorted for a deterministic comparison. Used to confirm
+    /// `preview_prune` mutates nothing: a snapshot taken before and after a preview
+    /// pass must compare equal.
+    ///
+    /// A `.lock` file's content is deliberately **not** read here (`None`, like a
+    /// directory): [`platform::try_lock_exclusive`] on Windows takes a whole-file
+    /// **mandatory** byte-range lock via `LockFileEx` (unlike POSIX `flock`, which
+    /// stays purely advisory and never blocks a plain read), so `fs::read`-ing a
+    /// still-live entry's lock file — e.g. this fixture's held `alive` registration —
+    /// would spuriously fail with a sharing violation, which is a Windows locking
+    /// artifact, not evidence `preview_prune` touched anything. Every `.lock` file in
+    /// this codebase is (and only is ever) an empty marker with no meaningful
+    /// content, so its length is enough to prove nothing was written to it; its
+    /// mtime and the directory listing itself already prove nothing was deleted,
+    /// created, or renamed.
+    fn snapshot_dir(dir: &Path) -> Vec<DirSnapshotEntry> {
+        let mut entries: Vec<DirSnapshotEntry> = fs::read_dir(dir)
+            .expect("read the scratch registry directory")
+            .filter_map(Result::ok)
+            .map(|dir_entry| {
+                let name = dir_entry.file_name().to_string_lossy().into_owned();
+                let path = dir_entry.path();
+                let metadata = dir_entry.metadata().expect("read fixture metadata");
+                let is_dir = metadata.is_dir();
+                let is_lock = path.extension().and_then(|ext| ext.to_str()) == Some("lock");
+                let contents = if is_dir || is_lock {
+                    None
+                } else {
+                    Some(fs::read(&path).expect("read a fixture file's contents"))
+                };
+                let modified = metadata.modified().expect("read fixture mtime");
+                (name, is_dir, metadata.len(), contents, modified)
+            })
+            .collect();
+        entries.sort_by(|(a, ..), (b, ..)| a.cmp(b));
+        entries
+    }
+
+    /// T-199: `preview_prune` must never delete, create, or otherwise modify
+    /// anything — the same mixed fixture as
+    /// `preview_prune_matches_a_real_prune_over_identical_state`, but here the proof
+    /// is a byte-for-byte directory snapshot taken before and after the preview pass,
+    /// rather than only the aggregate counts.
+    #[test]
+    fn preview_prune_leaves_the_registry_byte_for_byte_untouched() {
+        let dir = scratch("preview-untouched");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+        let live = mixed_prune_fixture(&dir, &registry);
+
+        let before = snapshot_dir(&dir);
+        let preview = registry
+            .preview_prune()
+            .expect("preview_prune must not fail");
+        let after = snapshot_dir(&dir);
+
+        assert_eq!(
+            before, after,
+            "preview_prune must leave the registry directory byte-for-byte untouched"
+        );
+        assert_eq!(
+            preview.outcome,
+            PruneOutcome {
+                pruned: 1,
+                live: 1,
+                unprobed: 1,
+                orphaned_locks: 1,
+            },
+            "sanity: the mixed fixture must exercise every classification"
+        );
+
+        live.remove();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `preview_prune`'s candidate list identifies exactly the two confirmed-stale
+    /// entries the mixed fixture contains — a paired record by `run_id`/`started_at`,
+    /// an orphaned lock by its file name — and none of the live or unprobeable ones.
+    #[test]
+    fn preview_prune_candidates_identify_the_confirmed_stale_entries() {
+        let dir = scratch("preview-candidates");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+        let live = mixed_prune_fixture(&dir, &registry);
+
+        let preview = registry
+            .preview_prune()
+            .expect("preview_prune must not fail");
+        assert_eq!(
+            preview.candidates.len(),
+            2,
+            "exactly the confirmed-stale pair and the orphaned lock are candidates: \
+             {:?}",
+            preview.candidates
+        );
+        assert!(
+            preview.candidates.iter().any(|candidate| matches!(
+                candidate,
+                PruneCandidate::Entry { run_id, .. } if run_id == "dead"
+            )),
+            "the confirmed-stale paired entry is a candidate: {:?}",
+            preview.candidates
+        );
+        assert!(
+            preview.candidates.iter().any(|candidate| matches!(
+                candidate,
+                PruneCandidate::OrphanedLock { lock_file_name } if lock_file_name == "orphan.lock"
+            )),
+            "the orphaned lock file is a candidate: {:?}",
+            preview.candidates
+        );
+
+        live.remove();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `preview_prune` over an empty or missing registry is a no-op that returns an
+    /// all-zero tally and no candidates, exactly like `prune` — the dry-run
+    /// counterpart to `prune_over_a_clean_or_missing_registry_is_a_no_op`.
+    #[test]
+    fn preview_prune_over_a_clean_or_missing_registry_is_a_no_op() {
+        let dir = scratch("preview-clean");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+        assert_eq!(
+            registry.preview_prune().expect("preview an empty registry"),
+            PrunePreview::default(),
+            "an empty registry has nothing to preview"
+        );
+        let _ = fs::remove_dir_all(&dir);
+
+        let missing = scratch("preview-missing");
+        assert!(!missing.exists(), "the scratch fixture starts absent");
+        let read_only = Registry::open_read_only_in(missing.clone());
+        assert_eq!(
+            read_only
+                .preview_prune()
+                .expect("preview a missing registry"),
+            PrunePreview::default(),
+            "a missing registry reads back as empty and previews nothing"
+        );
+        assert!(
+            !missing.exists(),
+            "previewing a missing registry must not create its directory"
         );
     }
 

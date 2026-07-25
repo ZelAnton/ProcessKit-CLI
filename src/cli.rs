@@ -332,7 +332,7 @@ pub struct ListArgs {
     pub json: bool,
 }
 
-/// `prune [--json]`
+/// `prune [--json] [--dry-run]`
 ///
 /// Scans the per-user registry ([`crate::registry::Registry::prune`]) and reaps every
 /// entry it can **confirm** is stale — a leftover `.json`/`.lock` pair from a runner
@@ -346,9 +346,17 @@ pub struct ListArgs {
 pub struct PruneArgs {
     /// Emit the prune tally as a single JSON object instead of a human-readable
     /// summary line. Optional, mirroring `list` — prune has a human-readable form of
-    /// its own.
+    /// its own. Combines with `--dry-run`.
     #[arg(long)]
     pub json: bool,
+    /// Preview what a real prune pass would reap without deleting anything:
+    /// [`crate::registry::Registry::preview_prune`] runs the exact same scan and the
+    /// exact same liveness classification as a real prune, but never deletes a
+    /// file — it reports the same aggregate tally a following real prune would
+    /// produce, plus the confirmed-stale candidates it would reap. Combines with
+    /// `--json`.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// `probe --json [--require-schema-version <N>] [--require-exit-code-band <s>-<e>]
@@ -739,6 +747,37 @@ mod tests {
             panic!("expected the prune subcommand");
         };
         assert!(args.json);
+    }
+
+    /// T-199: `--dry-run` defaults to off, is accepted on its own, and combines
+    /// freely with `--json` — mirroring `prune_defaults_to_no_json_and_accepts_the_flag`
+    /// for the new flag.
+    #[test]
+    fn prune_dry_run_defaults_to_off_and_combines_with_json() {
+        let cli = Cli::try_parse_from(["processkit-cli", "prune"]).expect("a bare prune");
+        let Command::Prune(args) = cli.command else {
+            panic!("expected the prune subcommand");
+        };
+        assert!(
+            !args.dry_run,
+            "--dry-run is optional and defaults to off for prune"
+        );
+
+        let cli =
+            Cli::try_parse_from(["processkit-cli", "prune", "--dry-run"]).expect("prune --dry-run");
+        let Command::Prune(args) = cli.command else {
+            panic!("expected the prune subcommand");
+        };
+        assert!(args.dry_run);
+        assert!(!args.json, "--dry-run alone must not imply --json");
+
+        let cli = Cli::try_parse_from(["processkit-cli", "prune", "--dry-run", "--json"])
+            .expect("prune --dry-run --json");
+        let Command::Prune(args) = cli.command else {
+            panic!("expected the prune subcommand");
+        };
+        assert!(args.dry_run);
+        assert!(args.json, "--dry-run combines with --json");
     }
 
     #[test]

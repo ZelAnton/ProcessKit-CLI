@@ -175,7 +175,7 @@ processkit-cli cancel  --run-id <id>
 processkit-cli kill    --run-id <id>
 processkit-cli wait    --run-id <id> [--timeout <duration>]
 processkit-cli list    [--json]
-processkit-cli prune   [--json]
+processkit-cli prune   [--json] [--dry-run]
 processkit-cli probe   --json [--require-schema-version <N>]
                        [--require-exit-code-band <start>-<end>]
                        [--require-surface <token>]...
@@ -318,6 +318,18 @@ prune` when there was nothing to do); with `--json` it prints a single JSON obje
 registry is not an error — `prune` reports a zero tally and exits `0`, and pruning a
 missing registry does not create it. See [`docs/registry.md`](docs/registry.md),
 "Reaping — `prune`".
+
+`prune --dry-run` previews that same reap without deleting anything: the identical
+scan and the identical liveness classification, just never a `fs::remove_file`, so an
+operator can see what a real `prune` would do before committing to it. Its aggregate
+counts are exactly what a following real `prune` over the same, untouched registry
+state would report. Without `--json` it lists each confirmed-stale candidate (a paired
+entry's `run_id`/`started_at`, or an orphaned lock's file name) followed by a "would
+prune …" summary line; with `--json` (`prune --dry-run --json`) it prints the same
+`pruned`/`live`/`unprobed`/`orphaned_locks` fields plus an additional `candidates`
+array of the same candidates, each tagged `"kind":"entry"` or
+`"kind":"orphaned_lock"`. `prune` without `--dry-run` is byte-for-byte unchanged. See
+[`docs/registry.md`](docs/registry.md), "Reaping — `prune`".
 
 ## Detached runs
 
