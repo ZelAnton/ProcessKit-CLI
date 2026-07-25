@@ -47,6 +47,8 @@ pub mod cli;
 #[doc(hidden)]
 pub mod control;
 #[doc(hidden)]
+pub mod duration_fmt;
+#[doc(hidden)]
 pub mod events;
 #[doc(hidden)]
 pub mod exit;

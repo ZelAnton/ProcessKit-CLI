@@ -63,6 +63,11 @@ to a dated version section.
   names the unprobeable one `unprobed`, so cross-checking a refusal against `list`
   (as `docs/troubleshooting.md` advises) agrees instead of conflicting. Only
   free-text stderr changed; no exit code, event, or CLI surface did.
+- `wait --timeout`'s give-up message now renders the deadline the same way `run`'s
+  timeout/grace diagnostics do (e.g. `1500ms`), instead of `Duration`'s `{:?}` Debug
+  form (`1.5s` for the same value) — the two subcommands' stderr no longer disagree
+  on how to print an identical duration. Only free-text stderr changed; no exit
+  code, event, or CLI surface did.
 
 ## [0.3.0] - 2026-07-25
 
