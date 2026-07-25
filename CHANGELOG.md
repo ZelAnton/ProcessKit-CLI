@@ -33,6 +33,13 @@ to a dated version section.
   when the underlying container-member read itself failed, so a `0`/empty fallback
   is never indistinguishable from a confirmed empty tree or a confirmed-clean
   teardown (mirrors `output_captured`'s `write_error`). See "Fixed" below.
+- `probe --print-schema`: prints this binary's embedded JSONL event-schema
+  document (`fixtures/schema/v1/schema.json`, embedded at build time via
+  `include_str!`) and exits, so a consumer holding only an installed binary or
+  an unpacked release archive can fetch the exact machine-readable schema its
+  own version emits, entirely offline. New release archives also bundle
+  `schema/schema.json` and `schema/events.jsonl` alongside the binary,
+  completions, and man pages.
 
 ### Changed
 -

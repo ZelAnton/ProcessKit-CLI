@@ -687,6 +687,14 @@ report them (nullable per-field on platforms/members it can't).
   [`fixtures/schema/v1/events.jsonl`](fixtures/schema/v1/events.jsonl).
 - Machine-readable JSON Schema (draft 2020-12) for the same contract:
   [`fixtures/schema/v1/schema.json`](fixtures/schema/v1/schema.json).
+- **Getting the schema without a git checkout.** A consumer holding only an
+  installed binary or an unpacked release archive — no clone, no tag to match —
+  has two offline ways to get the exact schema its own version emits: run
+  `processkit-cli probe --json --print-schema`, which prints the schema document
+  embedded in that binary at build time (byte-for-byte identical to the
+  `schema.json` above), or unpack the release archive and read the bundled
+  `schema/schema.json` and `schema/events.jsonl` it ships alongside the binary
+  and the shell completions/man pages.
 
 ## Status
 
@@ -713,8 +721,10 @@ run is no longer live, for a supervisor that is not the runner's parent, boundin
 itself with `--timeout` and its own reserved exit code (`112`). `probe` reports and
 verifies the binary's compatibility surface for a consumer's fail-closed launcher
 preflight, with no side effects, exiting `PROBE_INCOMPATIBLE` (110) on an
-incompatible candidate. See [the roadmap](docs/ROADMAP.md) for delivery status
-and the remaining ProcessKit-rs dependencies.
+incompatible candidate; `probe --print-schema` instead prints the binary's
+embedded JSONL event-schema document and exits (see "JSONL event schema"). See
+[the roadmap](docs/ROADMAP.md) for delivery status and the remaining
+ProcessKit-rs dependencies.
 
 ## Development
 

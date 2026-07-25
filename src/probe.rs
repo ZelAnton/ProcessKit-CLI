@@ -52,6 +52,20 @@ use crate::exit::{self, RUNNER_RANGE_END, RUNNER_RANGE_START, RunnerError};
 /// Bump it only on a breaking change to the report's shape.
 pub const PROBE_VERSION: u32 = 1;
 
+/// The machine-readable JSON Schema (draft 2020-12) for the JSONL event stream
+/// this binary emits, embedded **verbatim** at build time from
+/// `fixtures/schema/v1/schema.json` via `include_str!` — the single source of
+/// truth for the schema stays that one file; this constant is never hand-edited.
+/// Printed as-is (byte-for-byte, including its own trailing newline) by
+/// `probe --print-schema`, so a consumer holding only an installed binary or an
+/// unpacked release archive — no git checkout, no tag to match — can fetch the
+/// exact schema its own version emits, entirely offline (see `docs/schema.md`
+/// and README's "JSONL event schema"). A future breaking schema change moves
+/// both this `include_str!` path and the fixture together to a new
+/// `fixtures/schema/vN/` directory (see `docs/schema.md`, "Versioning") — never
+/// one without the other.
+pub const SCHEMA_JSON: &str = include_str!("../fixtures/schema/v1/schema.json");
+
 /// The reserved runner exit-code band, as reported by a probe. A consumer pins this
 /// so a child exit that happens to fall in the band is never confused with a runner
 /// failure (see `docs/exit-codes.md`).
@@ -103,6 +117,19 @@ pub struct ProbeReport {
 /// any unmet expectation is [`exit::PROBE_INCOMPATIBLE`] (110) with the mismatches
 /// echoed on stderr by the caller.
 pub fn run(args: &ProbeArgs) -> Result<(), RunnerError> {
+    // `--print-schema` short-circuits the rest of `probe`: it prints the
+    // embedded schema document (not a compatibility report) and returns
+    // immediately, so it never evaluates `--require-*` and never builds a
+    // `ProbeReport` — a deliberately simpler contract than composing with the
+    // report (see `docs/schema.md`, "Getting the schema without a git
+    // checkout"). `print!`, not `println!`: `SCHEMA_JSON` already carries the
+    // fixture's own trailing newline, so this stays byte-for-byte identical to
+    // `fixtures/schema/v1/schema.json` on disk.
+    if args.print_schema {
+        print!("{SCHEMA_JSON}");
+        return Ok(());
+    }
+
     let mismatches = evaluate(args);
     let compatible = mismatches.is_empty();
     let report = ProbeReport {
@@ -324,6 +351,7 @@ mod tests {
             "probe:--require-schema-version",
             "probe:--require-exit-code-band",
             "probe:--require-surface",
+            "probe:--print-schema",
         ] {
             assert!(
                 surface.iter().any(|t| t == expected),
@@ -430,6 +458,24 @@ mod tests {
             mismatches.len(),
             3,
             "all three expectations are unmet: {mismatches:?}"
+        );
+    }
+
+    /// The build-time-embedded [`SCHEMA_JSON`] never drifts from the fixture it
+    /// is embedded from: this reads `fixtures/schema/v1/schema.json` off disk
+    /// again at **test run time** (independently of the `include_str!` above,
+    /// which resolves at compile time) and compares byte-for-byte, so a future
+    /// edit to one without the other fails this test rather than silently
+    /// shipping a stale embedded copy.
+    #[test]
+    fn embedded_schema_matches_the_fixture_file_on_disk() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/schema/v1/schema.json");
+        let on_disk = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        assert_eq!(
+            SCHEMA_JSON, on_disk,
+            "the embedded schema must match fixtures/schema/v1/schema.json byte-for-byte"
         );
     }
 }

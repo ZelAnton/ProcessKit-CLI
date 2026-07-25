@@ -362,7 +362,7 @@ pub struct PruneArgs {
 }
 
 /// `probe --json [--require-schema-version <N>] [--require-exit-code-band <s>-<e>]
-/// [--require-surface <token>]...`
+/// [--require-surface <token>]... [--print-schema]`
 ///
 /// The **preflight** reports — and, when asked, *verifies* — this binary's
 /// compatibility surface (the JSONL `schema_version`, the reserved exit-code band,
@@ -371,7 +371,10 @@ pub struct PruneArgs {
 /// it is a pure self-report, so running it has no side effects. The `--require-*`
 /// flags are the machine-checkable half — each one a consumer expectation; any that
 /// this binary cannot meet makes `probe` fail closed with
-/// [`crate::exit::PROBE_INCOMPATIBLE`] (110) instead of a false "ok".
+/// [`crate::exit::PROBE_INCOMPATIBLE`] (110) instead of a false "ok". `--print-schema`
+/// is a separate, simpler contract on the same subcommand: it prints the embedded
+/// schema document instead of the report and skips `--require-*` evaluation
+/// entirely (see its own doc comment below).
 #[derive(Debug, Args)]
 pub struct ProbeArgs {
     /// Emit the report as JSON. Required to match the fixed form (JSON is the only
@@ -398,6 +401,19 @@ pub struct ProbeArgs {
     /// incompatibility, so a consumer can assert the exact flags it will use exist.
     #[arg(long = "require-surface", value_name = "token")]
     pub require_surface: Vec<String>,
+
+    /// Print this binary's embedded JSONL event-schema document
+    /// (`fixtures/schema/v1/schema.json`, embedded at build time via
+    /// `include_str!`, see [`crate::probe::SCHEMA_JSON`]) to stdout, byte-for-byte
+    /// identical to that fixture file, and exit successfully — **instead of**
+    /// evaluating or printing the usual probe report. Any `--require-*` flags on
+    /// the same invocation are ignored when this flag is set. This lets a
+    /// consumer holding only an installed binary or an unpacked release archive
+    /// (no git checkout, no tag to match) fetch the exact machine-readable schema
+    /// its own version emits, entirely offline (see `docs/schema.md` and
+    /// README's "JSONL event schema").
+    #[arg(long)]
+    pub print_schema: bool,
 }
 
 /// Parse a human duration for `--grace` (a zero-length duration is legal there —
@@ -1347,6 +1363,21 @@ mod tests {
         assert_eq!(args.require_schema_version, Some(1));
         assert_eq!(args.require_exit_code_band, Some((100, 119)));
         assert_eq!(args.require_surface, vec!["probe", "run:--jsonl"]);
+        assert!(
+            !args.print_schema,
+            "--print-schema is opt-in, off by default"
+        );
+
+        // `--print-schema` parses on its own (still under the fixed `--json` form)
+        // and combines freely with the `--require-*` flags at the parse level —
+        // whether it actually skips their evaluation is `src/probe.rs`'s concern,
+        // not the CLI layer's.
+        let cli = Cli::try_parse_from(["processkit-cli", "probe", "--json", "--print-schema"])
+            .expect("a valid probe --print-schema invocation");
+        let Command::Probe(args) = cli.command else {
+            panic!("expected the probe subcommand");
+        };
+        assert!(args.print_schema);
     }
 
     #[test]
