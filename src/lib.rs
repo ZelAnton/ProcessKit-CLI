@@ -30,7 +30,7 @@
 //! it — a graceful soft-stop → grace → hard-kill for `cancel`, an immediate hard
 //! kill for `kill` — each a distinguishable outcome in the JSONL stream and by
 //! exit code. [`list`] is the discovery counterpart: it scans the same registry
-//! and prints every entry, live or stale, for a caller that has lost (or never
+//! and prints every entry, whatever its health (live/stale/unprobed), for a caller that has lost (or never
 //! had) a `run_id`; [`prune`] is the cleanup counterpart, reaping the
 //! confirmed-stale leftovers of runners that died abruptly while never touching a
 //! live entry; and [`wait`] is the *lifetime* counterpart, blocking on the same

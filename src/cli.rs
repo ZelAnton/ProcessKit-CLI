@@ -36,7 +36,8 @@ pub enum Command {
     Kill(TargetArgs),
     /// Block until a run recorded in the per-user registry has finished.
     Wait(WaitArgs),
-    /// List every run recorded in the per-user registry, live and stale alike.
+    /// List every run recorded in the per-user registry, whatever its health
+    /// (live/stale/unprobed).
     List(ListArgs),
     /// Reap the registry's confirmed-stale entries — the leftover records of runners
     /// that died abruptly — while never touching a live run's entry.
@@ -317,7 +318,7 @@ pub struct WaitArgs {
 /// `list [--json]`
 ///
 /// Scans the per-user registry ([`crate::registry::Registry::entries`]) and prints
-/// every entry it finds, live or stale — the discovery counterpart to the
+/// every entry it finds, whatever its health (live/stale/unprobed) — the discovery counterpart to the
 /// by-`run-id` commands above, for an operator or orchestrator that has lost (or
 /// never had) a `run_id`. An empty registry is not an error: it prints an empty
 /// result and exits `0`, and a single unreadable/corrupt record never blinds the
