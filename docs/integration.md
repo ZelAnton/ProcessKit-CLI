@@ -172,7 +172,7 @@ check, no parsing needed) and the terminal `runner_exit` event's `source` and
 | --- | --- | --- |
 | `child_exit` | the child's own code (`child_code`, echoed in `code` too) | The child ran to completion on its own. |
 | `timeout` | `106` | A runner deadline elapsed and the runner tore the tree down — the whole-run `--timeout` or the `--idle-timeout` (child silent past the idle window). The preceding `timeout` event's `reason` (`overall` / `idle`) says which; both reuse this one source and code. |
-| `cancelled` | `107` | A local stop signal cancelled the run: a `Ctrl-C`, or on Unix a `SIGTERM`/`SIGHUP` (an external `kill`/`systemctl stop`/cancelled CI job, or a hung-up terminal). The preceding `cancelled` event's `source` (`ctrl_c` / `sigterm` / `sighup`) says which; all reuse this one source and code. |
+| `cancelled` | `107` | A local stop signal cancelled the run: a `Ctrl-C`, on Unix a `SIGTERM`/`SIGHUP` (an external `kill`/`systemctl stop`/cancelled CI job, or a hung-up terminal), or on Windows a `Ctrl-Break`/console close/logoff/system shutdown. The preceding `cancelled` event's `source` (`ctrl_c` / `sigterm` / `sighup` / `ctrl_break` / `ctrl_close` / `ctrl_logoff` / `ctrl_shutdown`) says which; all reuse this one source and code. |
 | `control_cancel` | `108` | A control-plane `cancel` (§4) cancelled the run. |
 | `control_kill` | `109` | A control-plane `kill` (§4) force-killed the run. |
 | `spawn_error` | `101` | The child never started (`spawn_failed` precedes it). |
@@ -253,11 +253,12 @@ carries the "could not reach the target run" failure modes of §4.
   this *before* connecting and report it as a `CONTROL` (103) failure with an
   explanatory message on stderr — never a hang, and never silently treated as
   live. `list` still shows the entry (marked `stale`); `prune` is what removes
-  it. An ordinary Unix `SIGTERM`/`SIGHUP` is **not** in this class: the runner
-  catches those signals and runs the full cancel teardown (a `cancelled` event,
+  it. An ordinary Unix `SIGTERM`/`SIGHUP`, or a Windows `Ctrl-Break`/console
+  close/logoff/system shutdown, is **not** in this class: the runner catches
+  those signals/events and runs the full cancel teardown (a `cancelled` event,
   the cleanup pair, `runner_exit` `cancelled`/`107`, and removal of the registry
-  entry), so stopping a run with `kill <pid>` leaves neither a stale entry nor a
-  surviving descendant.
+  entry), so stopping a run with `kill <pid>` (Unix) or a closed console
+  (Windows) leaves neither a stale entry nor a surviving descendant.
 - **Died mid-conversation.** The registry entry read as live, but the runner
   exited between the liveness check and the reply reaching the client — the
   connect fails, or the connection closes before a complete response. Also a

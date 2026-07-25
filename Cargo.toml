@@ -74,7 +74,8 @@ processkit = { version = "2", features = ["limits"] }
 # Async runtime that drives the tokio-based `processkit` API. A small
 # current-thread runtime hosts the run; `io-std` provides the async stdout/stderr
 # sinks the child's output is teed to. `time` arms the `--timeout` deadline timer
-# and the `--grace` window, `signal` the `Ctrl-C` listener, and `macros` the
+# and the `--grace` window, `signal` the `Ctrl-C` listener (plus, on Unix, SIGTERM/
+# SIGHUP, and on Windows Ctrl-Break/console-close/logoff/shutdown), and `macros` the
 # `select!` that races them against the child's own exit. `net` provides the local
 # control-plane transport (unix domain socket / Windows named pipe, see
 # `src/control.rs`) and `io-util` its line-oriented request/response codec. `sync`

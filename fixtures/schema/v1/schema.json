@@ -239,10 +239,10 @@
         "event": { "const": "cancelled" },
         "source": {
           "type": "string",
-          "enum": ["ctrl_c", "sigterm", "sighup", "control_cancel"],
-          "description": "ctrl_c for a local interactive Ctrl-C; sigterm/sighup (Unix) for the stop signals the runner catches - an external kill/systemctl stop/cancelled CI job, or a hung-up controlling terminal; control_cancel for a control-plane cancel. The three local signals share the CANCELLED (107) terminal code; control_cancel takes CONTROL_CANCELLED (108)."
+          "enum": ["ctrl_c", "sigterm", "sighup", "ctrl_break", "ctrl_close", "ctrl_logoff", "ctrl_shutdown", "control_cancel"],
+          "description": "ctrl_c for a local interactive Ctrl-C; sigterm/sighup (Unix) for the stop signals the runner catches - an external kill/systemctl stop/cancelled CI job, or a hung-up controlling terminal; ctrl_break/ctrl_close/ctrl_logoff/ctrl_shutdown (Windows) for the console-control events the runner catches; control_cancel for a control-plane cancel. The local signals/events share the CANCELLED (107) terminal code; control_cancel takes CONTROL_CANCELLED (108)."
         },
-        "grace_ms": { "$ref": "#/$defs/u64OrNull", "description": "The --grace window, ms; null if unset." }
+        "grace_ms": { "$ref": "#/$defs/u64OrNull", "description": "The effective --grace window, ms; null if unset. For a Windows ctrl_close this may be less than the requested --grace, capped to fit the OS's own termination window; every other trigger echoes the request unchanged." }
       },
       "required": ["schema_version", "time", "event", "source", "grace_ms"],
       "additionalProperties": false

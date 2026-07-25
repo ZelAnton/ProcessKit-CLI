@@ -1,7 +1,8 @@
 //! The `run` subcommand: launch one shell-free program inside a ProcessKit
 //! container, route its output live, forward its exit code faithfully, and bound
-//! the run with a hard `--timeout` and a local stop-signal cancel (`Ctrl-C`, and on
-//! Unix `SIGTERM`/`SIGHUP`).
+//! the run with a hard `--timeout` and a local stop-signal cancel (`Ctrl-C`, on
+//! Unix `SIGTERM`/`SIGHUP`, and on Windows `Ctrl-Break`/console close/logoff/
+//! system shutdown).
 //!
 //! This is the first executable path of the runner (see `docs/ROADMAP.md`,
 //! "Runnable containment shell"). It builds strictly on the public `processkit`
@@ -24,8 +25,9 @@
 //! - **Exit-code fidelity, with distinguishable runner-imposed endings.** On a
 //!   completed run the process exits with the child's *exact* code (full width,
 //!   never clamped). When the runner instead *ends* the run — the `--timeout`
-//!   deadline elapsed, a local stop signal arrived (`Ctrl-C`, or on Unix `SIGTERM` /
-//!   `SIGHUP`), or a control-plane
+//!   deadline elapsed, a local stop signal arrived (`Ctrl-C`, on Unix `SIGTERM` /
+//!   `SIGHUP`, or on Windows `Ctrl-Break`/console close/logoff/system shutdown),
+//!   or a control-plane
 //!   `cancel`/`kill` command reached the live runner — the child did not choose to
 //!   stop, so its code is not forwarded: the run reports a reserved-band code
 //!   ([`exit::TIMEOUT`] / [`exit::CANCELLED`] / [`exit::CONTROL_CANCELLED`] /
@@ -89,7 +91,8 @@ pub fn execute(args: RunArgs) -> ExitCode {
 fn run_inner(args: RunArgs) -> Result<i32, RunnerError> {
     // A small current-thread runtime is enough: the run is one child plus its
     // output pumps, a deadline timer, and the stop-signal listeners (`Ctrl-C`, plus
-    // `SIGTERM`/`SIGHUP` on Unix). The shared helper's
+    // `SIGTERM`/`SIGHUP` on Unix, plus `Ctrl-Break`/console close/logoff/system
+    // shutdown on Windows). The shared helper's
     // `enable_all` arms the I/O, time, and signal drivers those need — the
     // child-pipe I/O driver is compiled in through `processkit`'s own tokio
     // `process`/`net` features, and the `time`/`signal` features this crate now
@@ -132,6 +135,12 @@ impl TimeoutTrigger {
 /// existing string field is an **additive** schema change (no `schema_version` bump,
 /// see `docs/schema.md`, "Versioning"), so the cost is one enum entry per echo site.
 ///
+/// **Decision (T-195): the Windows console-control events get the same additive
+/// treatment** (`ctrl_break` / `ctrl_close` / `ctrl_logoff` / `ctrl_shutdown`), for
+/// the identical reason — each is a distinguishable *external* trigger, not a
+/// keyboard interrupt, and a consumer that only knows `ctrl_c` still sees a
+/// well-formed `cancelled` event.
+///
 /// The exit code is *not* split the same way: every local-signal cancel keeps
 /// [`exit::CANCELLED`] (107) and the `cancelled` terminal `runner_exit` source,
 /// because it is the same class of ending (a local signal ended the run) and the more
@@ -153,6 +162,26 @@ enum CancelSignal {
     /// and the default disposition would kill it outright anyway.
     #[cfg(unix)]
     Hup,
+    /// Windows `CTRL_BREAK_EVENT`: the operator (or a script) sent a break to the
+    /// console process group. Unlike the other three Windows events below, this one
+    /// carries no OS-imposed termination deadline — a process that ignores it simply
+    /// keeps running — so it needs no grace clamp.
+    #[cfg(windows)]
+    CtrlBreak,
+    /// Windows `CTRL_CLOSE_EVENT`: the console window is being closed (its "X"
+    /// button, or an equivalent). The OS gives the handler only a short window
+    /// (documented at [`CTRL_CLOSE_WINDOW`]) before terminating the process
+    /// regardless — see [`effective_grace_for`] for how that bounds this trigger's
+    /// effective `--grace`.
+    #[cfg(windows)]
+    CtrlClose,
+    /// Windows `CTRL_LOGOFF_EVENT`: the user is logging off. Not delivered to a
+    /// process outside the logging-off user's own session.
+    #[cfg(windows)]
+    CtrlLogoff,
+    /// Windows `CTRL_SHUTDOWN_EVENT`: the system is shutting down.
+    #[cfg(windows)]
+    CtrlShutdown,
 }
 
 impl CancelSignal {
@@ -165,6 +194,14 @@ impl CancelSignal {
             CancelSignal::Term => "sigterm",
             #[cfg(unix)]
             CancelSignal::Hup => "sighup",
+            #[cfg(windows)]
+            CancelSignal::CtrlBreak => "ctrl_break",
+            #[cfg(windows)]
+            CancelSignal::CtrlClose => "ctrl_close",
+            #[cfg(windows)]
+            CancelSignal::CtrlLogoff => "ctrl_logoff",
+            #[cfg(windows)]
+            CancelSignal::CtrlShutdown => "ctrl_shutdown",
         }
     }
 
@@ -176,6 +213,14 @@ impl CancelSignal {
             CancelSignal::Term => "SIGTERM",
             #[cfg(unix)]
             CancelSignal::Hup => "SIGHUP",
+            #[cfg(windows)]
+            CancelSignal::CtrlBreak => "Ctrl-Break",
+            #[cfg(windows)]
+            CancelSignal::CtrlClose => "console close",
+            #[cfg(windows)]
+            CancelSignal::CtrlLogoff => "logoff",
+            #[cfg(windows)]
+            CancelSignal::CtrlShutdown => "system shutdown",
         }
     }
 }
@@ -188,8 +233,9 @@ enum Ending {
     /// `--timeout` ([`TimeoutTrigger::Overall`]) or the `--idle-timeout`
     /// ([`TimeoutTrigger::Idle`]). Both take the same teardown and terminal code.
     TimedOut(TimeoutTrigger),
-    /// A local stop signal reached the runner — `Ctrl-C`, or (Unix) `SIGTERM` /
-    /// `SIGHUP`. All take the same teardown and terminal code; the carried
+    /// A local stop signal reached the runner — `Ctrl-C`, (Unix) `SIGTERM` /
+    /// `SIGHUP`, or (Windows) `Ctrl-Break`/console close/logoff/system shutdown.
+    /// All take the same teardown and terminal code; the carried
     /// [`CancelSignal`] is what tells them apart on the wire.
     Cancelled(CancelSignal),
     /// A control-plane `cancel` command reached the live runner: the same soft-stop →
@@ -209,8 +255,9 @@ enum Termination {
         limit: Duration,
         trigger: TimeoutTrigger,
     },
-    /// The run was cancelled by a local stop signal: `Ctrl-C`, or (Unix) `SIGTERM` /
-    /// `SIGHUP`. The carried [`CancelSignal`] names which, so the message stays honest.
+    /// The run was cancelled by a local stop signal: `Ctrl-C`, (Unix) `SIGTERM` /
+    /// `SIGHUP`, or (Windows) `Ctrl-Break`/console close/logoff/system shutdown.
+    /// The carried [`CancelSignal`] names which, so the message stays honest.
     Cancelled(CancelSignal),
     /// The run was cancelled by a control-plane `cancel` command.
     ControlCancelled,
@@ -591,9 +638,10 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     //
     // `biased` order — local stop signal, natural exit, control command, overall
     // deadline, idle deadline, then the control server — makes the tie-breaks
-    // deliberate: a cancel signal (`Ctrl-C`, or Unix `SIGTERM`/`SIGHUP`)
-    // always wins, and a child that exits in the very poll a deadline or a control
-    // command fires is reported as its own exit rather than a runner-imposed ending
+    // deliberate: a cancel signal (`Ctrl-C`, Unix `SIGTERM`/`SIGHUP`, or Windows
+    // `Ctrl-Break`/console close/logoff/system shutdown) always wins, and a child
+    // that exits in the very poll a deadline or a control command fires is reported
+    // as its own exit rather than a runner-imposed ending
     // (natural exit is polled before all of them). The new `--idle-timeout` arm sits
     // right after the overall `--timeout` arm: both are runner-imposed deadlines, so
     // they share the same low tie-break priority (behind the child's own exit and a
@@ -713,11 +761,19 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             Err(finish(&mut emitter, "timeout", None, error))
         }
         Ending::Cancelled(signal) => {
-            // Every local stop signal — `Ctrl-C`, and on Unix `SIGTERM`/`SIGHUP` —
-            // resolves here and shares everything but the `source`: the reserved
-            // `CANCELLED` (107) code, the `cancelled` runner-exit source, and the
-            // soft-stop → grace → hard-kill teardown. Which signal it was is recorded
-            // honestly rather than flattened onto `ctrl_c` (see `CancelSignal`).
+            // Every local stop signal — `Ctrl-C`, on Unix `SIGTERM`/`SIGHUP`, and on
+            // Windows `Ctrl-Break`/console-close/logoff/shutdown — resolves here and
+            // shares everything but the `source`: the reserved `CANCELLED` (107) code,
+            // the `cancelled` runner-exit source, and the soft-stop → grace →
+            // hard-kill teardown. Which signal it was is recorded honestly rather
+            // than flattened onto `ctrl_c` (see `CancelSignal`). `grace` is resolved
+            // through `effective_grace_for` — identical to the requested `--grace`
+            // for every trigger except Windows `CtrlClose`, whose OS-imposed
+            // termination deadline it must fit within (see that function and
+            // `CTRL_CLOSE_WINDOW`) — and the *effective* value is what gets reported,
+            // waited, and echoed, so the JSONL stream and the stderr line never claim
+            // a wait that could not actually happen.
+            let grace = effective_grace_for(signal, grace);
             emitter.emit(&Event::Cancelled {
                 source: signal.source(),
                 grace_ms: grace.map(duration_ms),
@@ -1360,15 +1416,43 @@ async fn idle_deadline(idle: Option<Duration>, clock: &IdleClock) {
 /// way a supervisor stops this runner into the same clean, fully-reported teardown a
 /// `Ctrl-C` already got.
 ///
-/// Windows keeps the single `Ctrl-C` listener: its console-close/logoff/shutdown
-/// half is a separate, differently-shaped problem (a console control handler with an
-/// OS-imposed deadline) and is deliberately out of scope here.
+/// On Windows that is four events, not one: `Ctrl-Break` (the console break, no
+/// termination deadline), and the three the console sends when it is about to end
+/// the process regardless of what the runner does — console close, logoff, and
+/// shutdown (`CTRL_CLOSE_EVENT`/`CTRL_LOGOFF_EVENT`/`CTRL_SHUTDOWN_EVENT`, delivered
+/// via `SetConsoleCtrlHandler`, the same mechanism `Ctrl-C` already used). Their
+/// default handling likewise terminates the runner outright, skipping teardown —
+/// the terminal JSONL events, the registry-entry removal — for exactly the reasons
+/// above, even though the tree itself is not left orphaned: on Windows the
+/// abrupt-owner-death reap covers the *whole* tree (K-005; closing the runner's
+/// last Job Object handle), unlike Linux's direct-child-only reap. The value of
+/// catching these events is turning that invisible-but-contained ending into a
+/// reported, ordinary one. `CtrlClose` carries an OS-imposed deadline (`--grace`'s
+/// effective value is bounded by [`effective_grace_for`], see [`CTRL_CLOSE_WINDOW`]);
+/// `CtrlLogoff`/`CtrlShutdown` are deliberately left uncapped (see that function's
+/// doc for why).
 ///
 /// A handler that cannot be installed degrades to "this signal is not handled" — that
 /// arm never resolves, after an honest warning — rather than aborting an otherwise
 /// healthy run; the remaining arms keep working. A signal the environment has already
 /// neutralized (`SIG_IGN`, as `nohup` does for `SIGHUP`) is left alone rather than
 /// un-ignored behind the operator's back — see [`wait_for_unix_signal`].
+///
+/// **Decision (T-195): a repeat console-control event mid-teardown is *not* absorbed
+/// on Windows, unlike a repeat Unix signal.** This future's listeners are dropped the
+/// instant the race resolves (teardown begins), same as every other arm. On Unix that
+/// is harmless — the signal disposition stays installed at the OS level for the rest
+/// of the process regardless of listener lifetime, so a second signal is silently
+/// absorbed. On Windows the console-control handler routes through a per-listener
+/// channel; once this future's receivers are gone, a repeat event is reported
+/// *unhandled* and the OS falls through to its default disposition, which terminates
+/// the process outright — mid-teardown, before the terminal JSONL events are written.
+/// Keeping listeners alive for the whole teardown (not just the race) was considered
+/// and rejected: it would mean threading persistent listener state through
+/// `run_async` well past this function's boundary for the sake of an operator
+/// double-press edge case. Documented here, and in `README.md`/`docs/schema.md`
+/// ("Timeouts, cancel, and grace"), as an accepted trade-off, not a silent bug — see
+/// the `#[cfg(windows)]` arm below for the full reasoning.
 async fn wait_for_cancel_signal() -> CancelSignal {
     #[cfg(unix)]
     {
@@ -1387,7 +1471,49 @@ async fn wait_for_cancel_signal() -> CancelSignal {
             () = wait_for_unix_signal(libc::SIGHUP, "SIGHUP") => CancelSignal::Hup,
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // **Decision (T-195): documented asymmetry, not the Unix arm's "absorb a
+        // repeat" guarantee.** On Unix, tokio installs the `sigaction` once, globally,
+        // for the life of the process — dropping this future's listeners after the
+        // race resolves only stops *this* future from being notified, it does not
+        // restore the default disposition, so a second signal mid-teardown is
+        // silently absorbed at the OS level (see the Unix arm above). Windows'
+        // `SetConsoleCtrlHandler` model is different: tokio's handler routes each
+        // event to a `watch::Sender`, and once every receiver for that signal has
+        // been dropped (which happens here, together with this whole future, the
+        // instant the outer `select!` in `run_async` resolves to *any* winning arm)
+        // `Sender::send` returns `Err`, the handler reports the event as
+        // *unhandled*, and the OS falls through to the next handler and ultimately
+        // its own default disposition — which **terminates the process**. So: a
+        // second console-control event that arrives after this race has already
+        // resolved (i.e. during the soft-stop/`--grace`/hard-kill teardown below,
+        // not during this race itself) is not absorbed — it kills the runner
+        // mid-teardown, before `cleanup_finished`/`runner_exit` are written, the
+        // exact invisible ending this feature exists to prevent for the *first*
+        // event. This is a known, accepted trade-off (re-installing and holding
+        // listeners alive for the whole teardown was rejected as unwarranted
+        // complexity for an operator-repeat-keypress edge case), documented here and
+        // in `README.md`/`docs/schema.md`, "Timeouts, cancel, and grace" — not a
+        // silent bug.
+        tokio::select! {
+            biased;
+            () = wait_for_ctrl_c() => CancelSignal::CtrlC,
+            () = wait_for_windows_ctrl_event(tokio::signal::windows::ctrl_break, "Ctrl-Break") => {
+                CancelSignal::CtrlBreak
+            }
+            () = wait_for_windows_ctrl_event(tokio::signal::windows::ctrl_close, "console close") => {
+                CancelSignal::CtrlClose
+            }
+            () = wait_for_windows_ctrl_event(tokio::signal::windows::ctrl_logoff, "logoff") => {
+                CancelSignal::CtrlLogoff
+            }
+            () = wait_for_windows_ctrl_event(tokio::signal::windows::ctrl_shutdown, "system shutdown") => {
+                CancelSignal::CtrlShutdown
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         wait_for_ctrl_c().await;
         CancelSignal::CtrlC
@@ -1464,6 +1590,147 @@ fn signal_is_ignored(number: libc::c_int) -> bool {
         libc::sigaction(number, std::ptr::null(), &mut current) == 0
             && current.sa_sigaction == libc::SIG_IGN
     }
+}
+
+/// Adapts the four distinctly-typed Windows console-control listeners
+/// (`tokio::signal::windows::{CtrlBreak,CtrlClose,CtrlLogoff,CtrlShutdown}`) to one
+/// shape so [`wait_for_windows_ctrl_event`] can drive any of them generically. They
+/// are otherwise unrelated structs (tokio gives each its own type, with no shared
+/// public trait) even though every one wraps the identical
+/// `SetConsoleCtrlHandler`-backed listener and exposes the same `recv` shape.
+#[cfg(windows)]
+trait WindowsCtrlListener {
+    async fn wait_one(&mut self) -> Option<()>;
+}
+
+#[cfg(windows)]
+impl WindowsCtrlListener for tokio::signal::windows::CtrlBreak {
+    async fn wait_one(&mut self) -> Option<()> {
+        self.recv().await
+    }
+}
+
+#[cfg(windows)]
+impl WindowsCtrlListener for tokio::signal::windows::CtrlClose {
+    async fn wait_one(&mut self) -> Option<()> {
+        self.recv().await
+    }
+}
+
+#[cfg(windows)]
+impl WindowsCtrlListener for tokio::signal::windows::CtrlLogoff {
+    async fn wait_one(&mut self) -> Option<()> {
+        self.recv().await
+    }
+}
+
+#[cfg(windows)]
+impl WindowsCtrlListener for tokio::signal::windows::CtrlShutdown {
+    async fn wait_one(&mut self) -> Option<()> {
+        self.recv().await
+    }
+}
+
+/// Resolve when one delivery of a Windows console-control event arrives — `make`
+/// installs the listener (e.g. [`tokio::signal::windows::ctrl_break`]), `name` is
+/// only for the degradation warning below. Degrades exactly like
+/// [`wait_for_unix_signal`]: a handler that cannot be installed warns once and then
+/// parks forever, so this arm simply never wins the race and the run continues
+/// unaffected — installing a console-control handler is a lightweight, ordinary
+/// operation (unlike `SIGHUP`'s inherited-`SIG_IGN` case on Unix), so there is no
+/// disposition to preserve here.
+#[cfg(windows)]
+async fn wait_for_windows_ctrl_event<T, F>(make: F, name: &str)
+where
+    F: FnOnce() -> std::io::Result<T>,
+    T: WindowsCtrlListener,
+{
+    let mut listener = match make() {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("processkit-cli: warning: {name} handling is unavailable: {err}");
+            return std::future::pending().await;
+        }
+    };
+    // `recv()` on every one of these listeners never actually yields `None` (see
+    // their doc comments in `tokio::signal::windows`) — this mirrors the honest,
+    // never-report-a-cancel-nothing-triggered shape of `wait_for_unix_signal` rather
+    // than assume that guarantee holds forever.
+    if listener.wait_one().await.is_none() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// The approximate window Windows gives a process that caught `CTRL_CLOSE_EVENT`
+/// (the console window's close button) to clean up before terminating it
+/// regardless of what the handler is doing — see [`effective_grace_for`].
+#[cfg(windows)]
+const CTRL_CLOSE_WINDOW: Duration = Duration::from_secs(5);
+
+/// Headroom subtracted from [`CTRL_CLOSE_WINDOW`] to get [`CTRL_CLOSE_GRACE_BUDGET`]:
+/// the trivial JSONL-event-write/hard-kill overhead that already shares the OS's
+/// window, plus scheduling jitter under load.
+#[cfg(windows)]
+const CTRL_CLOSE_SAFETY_MARGIN: Duration = Duration::from_secs(2);
+
+/// The effective upper bound this runner allows `--grace` to reach for a
+/// [`CancelSignal::CtrlClose`] ending: [`CTRL_CLOSE_WINDOW`] minus
+/// [`CTRL_CLOSE_SAFETY_MARGIN`], computed rather than an independent constant so
+/// the two can never silently drift apart.
+#[cfg(windows)]
+const CTRL_CLOSE_GRACE_BUDGET: Duration =
+    Duration::from_secs(CTRL_CLOSE_WINDOW.as_secs() - CTRL_CLOSE_SAFETY_MARGIN.as_secs());
+
+/// **Decision (T-195): the `CTRL_CLOSE` OS deadline caps the *effective* grace for
+/// that one trigger only.** Windows gives a process that caught `CTRL_CLOSE_EVENT`
+/// only [`CTRL_CLOSE_WINDOW`] (about 5 seconds) to clean up before terminating it
+/// regardless — a stricter deadline than the operator's own `--grace` was ever
+/// assumed to fit inside. If a requested `--grace` — plus the (normally trivial)
+/// event-write and hard-kill overhead that already shares that window — did not
+/// fit, the OS could kill the runner *mid-wait*, before `cleanup_finished`/
+/// `runner_exit` are even written: the worst possible outcome for this feature, an
+/// *invisible* teardown, exactly what catching the event exists to prevent. So for
+/// `CtrlClose` specifically the effective grace is capped to
+/// [`CTRL_CLOSE_GRACE_BUDGET`]: a `--grace` that does not fit degrades to the
+/// shorter, honest wait rather than risking the OS's own unreported kill. The
+/// *reported* `grace_ms` (the `cancelled` event, and the stderr headline) is this
+/// same effective value, never the raw request, so the stream never claims a wait
+/// that could not actually happen.
+///
+/// `CtrlBreak` needs no cap: it carries no forced-termination deadline (a process
+/// that ignores it simply keeps running).
+///
+/// `CtrlLogoff` and `CtrlShutdown` are deliberately left **uncapped**: their real
+/// deadline is the system-wide `WaitToKillAppTimeout` shutdown policy (itself
+/// further extendable per-process via `ShutdownBlockReasonCreate`, which this
+/// runner does not call) — neither a fixed constant nor reliably discoverable at
+/// run time, unlike `CTRL_CLOSE_EVENT`'s well-documented ~5s window. Hardcoding a
+/// matching cap here would be guessing, not honesty. A long `--grace` combined with
+/// an imminent forced logoff/shutdown can still lose the terminal events; that is a
+/// known, documented trade-off for those two triggers, not a silent bug.
+///
+/// Every other [`CancelSignal`] (`Ctrl-C`, the Unix signals, `CtrlBreak`,
+/// `CtrlLogoff`, `CtrlShutdown`) passes `grace` through unchanged.
+///
+/// Split by `#[cfg(windows)]` rather than a single `match` with a `CtrlClose`
+/// arm gated behind `#[cfg(windows)]` and a catch-all `_`: on a non-Windows
+/// target that single arm vanishes before the linter ever sees it, leaving a
+/// match with exactly one reachable arm — `clippy::match_single_binding`, which
+/// this crate's CI runs with `-D warnings`. The non-Windows body below never even
+/// mentions `signal`, so a leading `let _ = signal;` keeps it from tripping
+/// `unused_variables` instead.
+#[cfg(windows)]
+fn effective_grace_for(signal: CancelSignal, grace: Option<Duration>) -> Option<Duration> {
+    match signal {
+        CancelSignal::CtrlClose => grace.map(|grace| grace.min(CTRL_CLOSE_GRACE_BUDGET)),
+        _ => grace,
+    }
+}
+
+#[cfg(not(windows))]
+fn effective_grace_for(signal: CancelSignal, grace: Option<Duration>) -> Option<Duration> {
+    let _ = signal;
+    grace
 }
 
 /// The shared teardown path for both runner-imposed endings: try a soft stop,
@@ -1870,6 +2137,144 @@ mod tests {
         assert_eq!(CancelSignal::CtrlC.source(), "ctrl_c");
         assert_eq!(CancelSignal::Term.source(), "sigterm");
         assert_eq!(CancelSignal::Hup.source(), "sighup");
+    }
+
+    /// The Windows sibling of the Unix proof above: every console-control event
+    /// shares the reserved `CANCELLED` code (the same class of ending) but keeps a
+    /// distinct, honest `source`/stderr headline — a console close is never
+    /// reported as a keyboard interrupt, a logoff, or a shutdown.
+    #[cfg(windows)]
+    #[test]
+    fn windows_ctrl_events_share_the_cancel_code_but_report_themselves_honestly() {
+        let for_signal = |signal| {
+            termination_error(
+                Termination::Cancelled(signal),
+                SoftTerminate::Unsupported,
+                Some(Duration::from_secs(2)),
+            )
+        };
+        let ctrl_c = for_signal(CancelSignal::CtrlC);
+        let ctrl_break = for_signal(CancelSignal::CtrlBreak);
+        let ctrl_close = for_signal(CancelSignal::CtrlClose);
+        let ctrl_logoff = for_signal(CancelSignal::CtrlLogoff);
+        let ctrl_shutdown = for_signal(CancelSignal::CtrlShutdown);
+
+        // One class of ending, one reserved code.
+        for err in [
+            &ctrl_c,
+            &ctrl_break,
+            &ctrl_close,
+            &ctrl_logoff,
+            &ctrl_shutdown,
+        ] {
+            assert_eq!(err.code(), exit::CANCELLED);
+        }
+
+        // Distinct, honest headlines.
+        let ctrl_break_msg = ctrl_break.to_string();
+        let ctrl_close_msg = ctrl_close.to_string();
+        let ctrl_logoff_msg = ctrl_logoff.to_string();
+        let ctrl_shutdown_msg = ctrl_shutdown.to_string();
+        assert!(
+            ctrl_break_msg.contains("run cancelled (Ctrl-Break)"),
+            "the message must name Ctrl-Break: {ctrl_break_msg}"
+        );
+        assert!(
+            ctrl_close_msg.contains("run cancelled (console close)"),
+            "the message must name console close: {ctrl_close_msg}"
+        );
+        assert!(
+            ctrl_logoff_msg.contains("run cancelled (logoff)"),
+            "the message must name logoff: {ctrl_logoff_msg}"
+        );
+        assert!(
+            ctrl_shutdown_msg.contains("run cancelled (system shutdown)"),
+            "the message must name system shutdown: {ctrl_shutdown_msg}"
+        );
+        let messages = [
+            ctrl_c.to_string(),
+            ctrl_break_msg,
+            ctrl_close_msg,
+            ctrl_logoff_msg,
+            ctrl_shutdown_msg,
+        ];
+        for (i, a) in messages.iter().enumerate() {
+            for b in &messages[i + 1..] {
+                assert_ne!(a, b, "two distinct triggers produced the same message");
+            }
+        }
+
+        // And the machine-readable `source`/human `phrase` values.
+        assert_eq!(CancelSignal::CtrlBreak.source(), "ctrl_break");
+        assert_eq!(CancelSignal::CtrlBreak.phrase(), "Ctrl-Break");
+        assert_eq!(CancelSignal::CtrlClose.source(), "ctrl_close");
+        assert_eq!(CancelSignal::CtrlClose.phrase(), "console close");
+        assert_eq!(CancelSignal::CtrlLogoff.source(), "ctrl_logoff");
+        assert_eq!(CancelSignal::CtrlLogoff.phrase(), "logoff");
+        assert_eq!(CancelSignal::CtrlShutdown.source(), "ctrl_shutdown");
+        assert_eq!(CancelSignal::CtrlShutdown.phrase(), "system shutdown");
+    }
+
+    /// `effective_grace_for` is the identity for every ordinary trigger — proved here
+    /// with the always-present `CtrlC` so the passthrough path is covered on every
+    /// platform, not only Windows (where [`CancelSignal::CtrlClose`] is the one
+    /// exception, proved separately below).
+    #[test]
+    fn effective_grace_passes_through_unchanged_for_ordinary_triggers() {
+        assert_eq!(
+            effective_grace_for(CancelSignal::CtrlC, Some(Duration::from_secs(30))),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(effective_grace_for(CancelSignal::CtrlC, None), None);
+    }
+
+    /// **T-195's CTRL_CLOSE decision, proved directly**: a `--grace` that would not
+    /// fit inside the OS's own termination window is clamped down to
+    /// [`CTRL_CLOSE_GRACE_BUDGET`] for `CtrlClose` alone — a request that already
+    /// fits, or no `--grace` at all, is left unchanged — while the sibling Windows
+    /// triggers (`CtrlBreak`/`CtrlLogoff`/`CtrlShutdown`), which carry no matching
+    /// OS deadline this runner can honestly bound, are deliberately left uncapped.
+    #[cfg(windows)]
+    #[test]
+    fn ctrl_close_grace_is_clamped_to_the_os_window_budget_but_sibling_triggers_are_not() {
+        assert_eq!(
+            effective_grace_for(CancelSignal::CtrlClose, Some(Duration::from_secs(30))),
+            Some(CTRL_CLOSE_GRACE_BUDGET),
+            "a --grace that does not fit the OS window must degrade to the budget"
+        );
+        assert_eq!(
+            effective_grace_for(CancelSignal::CtrlClose, Some(Duration::from_secs(1))),
+            Some(Duration::from_secs(1)),
+            "a --grace that already fits must pass through unchanged"
+        );
+        assert_eq!(
+            effective_grace_for(CancelSignal::CtrlClose, None),
+            None,
+            "no --grace at all stays unset (no wait is attempted either way)"
+        );
+        for signal in [
+            CancelSignal::CtrlBreak,
+            CancelSignal::CtrlLogoff,
+            CancelSignal::CtrlShutdown,
+        ] {
+            assert_eq!(
+                effective_grace_for(signal, Some(Duration::from_secs(30))),
+                Some(Duration::from_secs(30)),
+                "{signal:?} must not be clamped like CtrlClose"
+            );
+        }
+    }
+
+    /// A sanity check on the constants themselves: the budget this runner allows
+    /// must actually leave headroom under the OS's own window, else the whole
+    /// decision above would be a no-op.
+    #[cfg(windows)]
+    #[test]
+    fn ctrl_close_grace_budget_leaves_headroom_under_the_os_window() {
+        assert!(
+            CTRL_CLOSE_GRACE_BUDGET < CTRL_CLOSE_WINDOW,
+            "the grace budget must leave headroom under the OS's own termination window"
+        );
     }
 
     #[test]

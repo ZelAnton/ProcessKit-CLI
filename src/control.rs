@@ -540,7 +540,8 @@ fn serialize_ack(ack: &ControlAck) -> String {
 /// drivers each caller's body needs (Cargo unifies every caller's feature set into
 /// the one tokio build), so one small runtime is enough for each — a run is one
 /// child plus its output pumps, a deadline timer, and the stop-signal listeners
-/// (`Ctrl-C`, plus `SIGTERM`/`SIGHUP` on Unix); a control
+/// (`Ctrl-C`, plus `SIGTERM`/`SIGHUP` on Unix, plus `Ctrl-Break`/console
+/// close/logoff/system shutdown on Windows); a control
 /// client is one connection under a deadline.
 pub fn current_thread_runtime() -> Result<tokio::runtime::Runtime, RunnerError> {
     tokio::runtime::Builder::new_current_thread()

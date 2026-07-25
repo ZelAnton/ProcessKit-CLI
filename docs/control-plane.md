@@ -191,7 +191,8 @@ outcome to its JSONL stream (`--jsonl`), so an **external** observer reading the
 file — not the control client — still sees that the run ended by an outside command:
 
 - **`cancel`** writes a `cancelled` event with `source` **`control_cancel`** (told
-  apart from the local stop signals, which are `ctrl_c` / `sigterm` / `sighup`), the
+  apart from the local stop signals, which are `ctrl_c` / `sigterm` / `sighup` (Unix)
+  / `ctrl_break` / `ctrl_close` / `ctrl_logoff` / `ctrl_shutdown` (Windows)), the
   `cleanup_started` / `cleanup_finished`
   teardown pair, and a terminal `runner_exit` with `source` `control_cancel` and code
   `108`.
