@@ -377,3 +377,6 @@ carries the "could not reach the target run" failure modes of §4.
   format, and staleness/reaping rules.
 - [`docs/architecture.md`](architecture.md) — the map of this repository's own
   modules, for a contributor rather than a consumer.
+- [`docs/troubleshooting.md`](troubleshooting.md) — symptom-to-cause diagnosis
+  for an operator, organized by what you observe rather than by call
+  sequence.
