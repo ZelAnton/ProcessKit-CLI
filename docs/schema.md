@@ -247,14 +247,25 @@ well-formed `cancelled` event with the same fields.
 Catching `SIGTERM`/`SIGHUP` (Unix) and `CTRL_BREAK`/`CTRL_CLOSE`/`CTRL_LOGOFF`/
 `CTRL_SHUTDOWN` (Windows) is what makes this teardown happen at all on those paths:
 their default disposition terminates the runner outright, which would skip the
-`cancelled` / `cleanup_started` / `cleanup_finished` / `runner_exit` events, leave the
-run's registry entry behind, and — the guarantee that matters — never explicitly kill
-the container, whose abrupt-owner-death reap covers only the direct child on Linux and
-nothing at all on Windows/macOS/BSD (see `cleanup_finished` and `docs/registry.md`).
+`cancelled` / `cleanup_started` / `cleanup_finished` / `runner_exit` events and leave the
+run's registry entry behind stale until `prune` — the ending would go unreported to
+any observer of the event stream or registry, even though the tree itself is not left
+orphaned on every platform: the abrupt-owner-death reap covers only the direct child
+on Linux, nothing at all on macOS/BSD, and the *whole* tree on Windows (closing the
+runner's last Job Object handle; see `cleanup_finished` and `docs/registry.md`).
 One exception, deliberate: a Unix signal whose disposition is already `SIG_IGN` when
 the runner starts (what `nohup` does to `SIGHUP`) is left ignored rather than
 un-ignored behind the operator's back, so no `cancelled` event is produced for it —
 and none is owed, since an ignored signal would not have ended the run either.
+
+**Known limitation, Windows only:** a *repeat* Unix signal arriving mid-teardown is
+silently absorbed (the OS keeps the disposition installed for the process's whole
+lifetime, independent of listener state), but a *second* Windows console-control
+event arriving after teardown has already begun is not — it falls through to the
+OS's default handling and terminates the runner outright, before the terminal
+events above are written. See `README.md`, "Timeouts, cancel, and grace", and the
+`#[cfg(windows)]` arm of `wait_for_cancel_signal` in `src/run.rs` for the full
+reasoning behind this accepted trade-off.
 
 | Field      | Type              | Notes                                                        |
 |------------|-------------------|--------------------------------------------------------------|

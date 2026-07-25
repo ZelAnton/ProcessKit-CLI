@@ -22,10 +22,12 @@ to a dated version section.
   `cleanup_started`, `cleanup_finished`, `runner_exit`), the same registry-entry
   removal, and the same reserved `CANCELLED` (107) exit. Previously the OS's default
   handling terminated the runner outright on all four: the events were never
-  written, the registry entry was left behind stale, and — the guarantee that
-  matters — the container was never explicitly killed, so on Windows *nothing* of
-  the tree was reaped by the abrupt-owner-death path (unlike Linux, where the direct
-  child at least gets `PDEATHSIG`). Which event arrived is reported honestly rather
+  written, the registry entry was left behind stale, and the container was never
+  explicitly killed — the ending went unreported to any observer of the event stream
+  or registry, even though the tree itself was not left orphaned: Windows already
+  reaps the *whole* tree on abrupt owner death (`abrupt_cleanup: whole_tree`, closing
+  the runner's last Job Object handle), unlike Linux's direct-child-only `PDEATHSIG`
+  reap. Which event arrived is reported honestly rather
   than flattened onto a keyboard interrupt: the `cancelled` event's `source` gained
   the additive values **`ctrl_break`**, **`ctrl_close`**, **`ctrl_logoff`**, and
   **`ctrl_shutdown`** alongside `ctrl_c` (`schema_version` unchanged — a new value

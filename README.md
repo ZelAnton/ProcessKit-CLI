@@ -151,7 +151,8 @@ in force rather than papering over the difference:
 Every `run_started` event reports this separate abrupt-owner-death contract as
 `abrupt_cleanup`: `whole_tree` on Windows, `direct_child_only` on Linux, and
 `none` on macOS/other Unix. Normal completion, timeout, and a cancel signal — a
-`Ctrl-C`, or on Unix a `SIGTERM`/`SIGHUP`, all of which the runner catches — still run
+`Ctrl-C`, on Unix a `SIGTERM`/`SIGHUP`, or on Windows a `Ctrl-Break`/console
+close/logoff/system shutdown, all of which the runner catches — still run
 the owned container's ordinary teardown path on every supported platform; this
 tri-state applies only where the runner never gets to run it at all (a crash, a
 `SIGKILL`, an outer Job Object terminate).
@@ -286,8 +287,9 @@ missing registry does not create it. See [`docs/registry.md`](docs/registry.md),
 
 The runner's exit code **is** the child's exit code; the runner's own failures
 (bad arguments, spawn failure, backend error) and the four runner-*imposed*
-endings — a `--timeout` (`106`), a local stop-signal cancel (`107`: `Ctrl-C`, or on
-Unix `SIGTERM`/`SIGHUP`), a control-plane `cancel`
+endings — a `--timeout` (`106`), a local stop-signal cancel (`107`: `Ctrl-C`, on
+Unix `SIGTERM`/`SIGHUP`, or on Windows `Ctrl-Break`/console close/logoff/system
+shutdown), a control-plane `cancel`
 (`108`), and a control-plane `kill` (`109`) — use a distinct, reserved code band so
 they can never be mistaken for a child result, and so each ending is tellable from the
 others by code alone. This is part of the project's compatibility surface — see
@@ -334,17 +336,30 @@ or external) — and all of them end in the **same** teardown path:
 - **`Ctrl-Break`, console close, logoff, and system shutdown (Windows)** are caught
   too, through the same console-control-handler mechanism `Ctrl-C` already used, and
   take the *same* path. Uncaught, their default handling would likewise skip
-  teardown entirely — and on Windows the abrupt-owner-death reap covers *nothing*
-  (unlike Linux, where it at least reaps the direct child), so an uncaught console
-  close would orphan the whole tree behind it. The console-close event carries an
-  OS-imposed deadline: Windows gives the handler only about 5 seconds before
-  terminating the process regardless, so the runner caps the *effective* `--grace`
+  teardown entirely: the terminal JSONL events (`cancelled`, `cleanup_started`,
+  `cleanup_finished`, `runner_exit`) would never be written and the run's registry
+  entry would be left behind stale until `prune` — the run would go dark to any
+  observer of the event stream or registry, even though the tree itself is not left
+  orphaned: closing the runner's last Job Object handle still reaps it (`whole_tree`
+  on Windows, the `abrupt_cleanup` tri-state under [Platform matrix](#platform-matrix)).
+  Catching these events turns that invisible-but-contained ending into a reported,
+  ordinary one. The console-close event carries an OS-imposed deadline: Windows
+  gives the handler only about 5 seconds before terminating the process regardless,
+  so the runner caps the *effective* `--grace`
   for that one trigger to a budget comfortably under that window — a longer request
   degrades to the shorter, honest wait rather than risking the OS killing the runner
   before it even finishes reporting the teardown. Logoff and shutdown are left
   uncapped, since their real deadline is a system-wide policy this runner cannot
   reliably discover (see the `wait_for_cancel_signal`/`effective_grace_for` doc
-  comments in `src/run.rs` for the full reasoning).
+  comments in `src/run.rs` for the full reasoning). **Known limitation:** unlike a
+  repeat Unix `SIGTERM`/`SIGHUP`/`Ctrl-C` mid-teardown (silently absorbed — the OS
+  keeps the disposition installed for the process's lifetime regardless of listener
+  state), a *second* Windows console-control event that arrives after teardown has
+  already begun is **not** absorbed: it falls through to the OS's default handling
+  and terminates the runner outright, mid-teardown, before the terminal JSONL events
+  are written. This is an accepted trade-off, not a bug — see the `#[cfg(windows)]`
+  arm of `wait_for_cancel_signal` in `src/run.rs` for why keeping listeners alive for
+  the whole teardown was rejected.
 
 All of the signals/events above share the `CANCELLED` code (`107`); which one
 arrived is recorded in the JSONL `cancelled` event's `source` field (`ctrl_c` /
@@ -546,7 +561,8 @@ report them (nullable per-field on platforms/members it can't).
 owns, echoes the child's output live by default or directly inherits all three
 standard handles with `--inherit-stdio`, forwards the child's exit code exactly,
 enforces `--timeout`, `--grace`, and stop-signal cancellation (`Ctrl-C`, plus
-`SIGTERM`/`SIGHUP` on Unix) with a guaranteed
+`SIGTERM`/`SIGHUP` on Unix, plus `Ctrl-Break`/console close/logoff/system shutdown
+on Windows) with a guaranteed
 teardown of the whole tree (see "Timeouts, cancel, and grace"), and writes the
 versioned JSONL event stream to `--jsonl` (see "JSONL event schema"). `--run-id`
 and `--argv-raw` are consumed by that stream, and `--capture-dir` records a bounded

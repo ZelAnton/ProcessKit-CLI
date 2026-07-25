@@ -1213,8 +1213,8 @@ fn cancel_via_sighup_is_reported_as_its_own_source() {
 /// A real `CTRL_BREAK_EVENT` — generated for the runner's own console process
 /// group via `GenerateConsoleCtrlEvent`, not merely simulated — must be a
 /// first-class cancel: the reserved `CANCELLED` code, the `cancelled` event's
-/// `source` `ctrl_break`, the honest stderr headline, and the full teardown of
-/// the process tree (T-195, the Windows sibling of the Unix `SIGTERM`/`SIGHUP`
+/// `source` `ctrl_break`, the honest stderr headline, and the full terminal
+/// JSONL sequence (T-195, the Windows sibling of the Unix `SIGTERM`/`SIGHUP`
 /// proofs above).
 ///
 /// `GenerateConsoleCtrlEvent` can target a *single* process (group) only for
@@ -1223,6 +1223,34 @@ fn cancel_via_sighup_is_reported_as_its_own_source() {
 /// event broadcasts to every process sharing this test's console, including the
 /// test harness itself. So the runner is spawned with that flag and the event is
 /// generated against its pid alone, leaving this test process unaffected.
+///
+/// **What the heartbeat check below does and does not prove.** The grandchild is
+/// started (via `start /b`) *inside* the runner's own process group — it has no
+/// `CREATE_NEW_PROCESS_GROUP` of its own — so the same `CTRL_BREAK` broadcast that
+/// reaches the runner also reaches the grandchild directly. A stopped heartbeat is
+/// therefore not, by itself, proof that the *runner's* teardown reaped it; it is
+/// kept as a coarse regression guard (a teardown that never ran at all would leave
+/// the grandchild heartbeating past the runner's return, which this still catches).
+/// The real proof that the cancel path — not the OS event alone — ran is the
+/// terminal code/`source`/JSONL-sequence assertions above.
+///
+/// **What the terminal `source` assertion below also guards against.** If the
+/// whole tree happened to die from the `CTRL_BREAK` broadcast itself faster than
+/// the runner could observe and report the signal, the race in `run_async` could
+/// in principle resolve as a plain child exit instead of a cancel. `terminal["source"]
+/// == "cancelled"` (not `"child_exit"`) catches that as a hard assertion failure,
+/// not a silent flake — if this ever becomes flaky, that is the race to look at.
+///
+/// **Console requirement.** `GenerateConsoleCtrlEvent` only works when this test
+/// process itself is attached to a console shared with the target process group —
+/// true when `cargo test` runs interactively, not guaranteed in every CI
+/// environment (see `allocate_fresh_console` in `src/bin/e2e_helper.rs` for the
+/// same "may inherit a console locally and no console in CI" caveat). Rather than
+/// fail the build over a test-harness limitation with no console to deliver
+/// through, this test degrades to an honest skip with a diagnostic in that case —
+/// real CTRL_BREAK-delivery coverage is then whatever the environment happens to
+/// provide; the CLOSE/LOGOFF/SHUTDOWN unit coverage elsewhere in this crate still
+/// exercises the branch-selection/mapping/grace-clamp logic without needing one.
 #[cfg(windows)]
 #[test]
 fn cancel_via_ctrl_break_reports_the_cancel_code_and_tears_down_the_tree() {
@@ -1245,7 +1273,7 @@ fn cancel_via_ctrl_break_reports_the_cancel_code_and_tears_down_the_tree() {
         vec!["cmd".to_string(), "/c".to_string(), path_arg(&root)],
     );
     cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
-    let child = cmd
+    let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1262,10 +1290,22 @@ fn cancel_via_ctrl_break_reports_the_cancel_code_and_tears_down_the_tree() {
     // with `CREATE_NEW_PROCESS_GROUP`, so its own pid *is* the group id — so only
     // the runner receives this event, not this test process.
     let generated = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) };
-    assert_ne!(
-        generated, 0,
-        "failed to generate CTRL_BREAK_EVENT for the runner"
-    );
+    if generated == 0 {
+        // This test process has no console attached to deliver the event through
+        // (see the doc comment above) — an environment limitation, not a runner
+        // defect. Tear down the still-running child honestly instead of leaking
+        // it, and skip rather than fail the build.
+        eprintln!(
+            "skipping cancel_via_ctrl_break_reports_the_cancel_code_and_tears_down_the_tree: \
+             GenerateConsoleCtrlEvent failed ({}) — this test process has no console to \
+             deliver CTRL_BREAK through",
+            std::io::Error::last_os_error()
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
 
     let out = child.wait_with_output().expect("runner did not exit");
     assert_eq!(

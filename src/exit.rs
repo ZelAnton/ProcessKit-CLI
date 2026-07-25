@@ -56,14 +56,16 @@ pub const NOT_IMPLEMENTED: u8 = 105;
 /// child did not choose to stop — so it takes a reserved-band code rather than a
 /// forwarded child code. Distinct from [`CANCELLED`] and from any child result.
 pub const TIMEOUT: u8 = 106;
-/// The run was cancelled by a **local stop signal** — an interactive `Ctrl-C`, or on
+/// The run was cancelled by a **local stop signal** — an interactive `Ctrl-C`, on
 /// Unix a `SIGTERM` / `SIGHUP` (a `kill`, a `systemctl stop`, a cancelled CI job, a
-/// hung-up terminal) — and the runner tore the process tree down. Like [`TIMEOUT`]
-/// this is a runner-imposed outcome, kept in the reserved band so it is never
-/// mistaken for a child's own exit — and distinct from a timeout, so a caller can
-/// tell "it was stopped" from "it ran too long". The signals share this one code
-/// (they are the same class of ending); *which* signal arrived is reported one event
-/// earlier, by the `cancelled` event's `source` (`ctrl_c` / `sigterm` / `sighup`).
+/// hung-up terminal), or on Windows a `Ctrl-Break` / console close / logoff / system
+/// shutdown — and the runner tore the process tree down. Like [`TIMEOUT`] this is a
+/// runner-imposed outcome, kept in the reserved band so it is never mistaken for a
+/// child's own exit — and distinct from a timeout, so a caller can tell "it was
+/// stopped" from "it ran too long". The signals share this one code (they are the
+/// same class of ending); *which* signal arrived is reported one event earlier, by
+/// the `cancelled` event's `source` (`ctrl_c` / `sigterm` / `sighup` / `ctrl_break` /
+/// `ctrl_close` / `ctrl_logoff` / `ctrl_shutdown`).
 pub const CANCELLED: u8 = 107;
 /// The run was cancelled by a control-plane `cancel` command: a client reached the
 /// live runner over its local control channel and asked it to end the run, so the

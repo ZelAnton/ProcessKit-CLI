@@ -253,11 +253,12 @@ carries the "could not reach the target run" failure modes of §4.
   this *before* connecting and report it as a `CONTROL` (103) failure with an
   explanatory message on stderr — never a hang, and never silently treated as
   live. `list` still shows the entry (marked `stale`); `prune` is what removes
-  it. An ordinary Unix `SIGTERM`/`SIGHUP` is **not** in this class: the runner
-  catches those signals and runs the full cancel teardown (a `cancelled` event,
+  it. An ordinary Unix `SIGTERM`/`SIGHUP`, or a Windows `Ctrl-Break`/console
+  close/logoff/system shutdown, is **not** in this class: the runner catches
+  those signals/events and runs the full cancel teardown (a `cancelled` event,
   the cleanup pair, `runner_exit` `cancelled`/`107`, and removal of the registry
-  entry), so stopping a run with `kill <pid>` leaves neither a stale entry nor a
-  surviving descendant.
+  entry), so stopping a run with `kill <pid>` (Unix) or a closed console
+  (Windows) leaves neither a stale entry nor a surviving descendant.
 - **Died mid-conversation.** The registry entry read as live, but the runner
   exited between the liveness check and the reply reaching the client — the
   connect fails, or the connection closes before a complete response. Also a
