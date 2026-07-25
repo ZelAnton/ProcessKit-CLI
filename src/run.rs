@@ -481,9 +481,9 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
 
     // `--inherit-stdio` gives the child the runner's actual output handles. No
     // pump, decoding, or tee sits between a terminal and the child, so terminal
-    // status and full-screen behavior are preserved. Capture — and `--idle-timeout`,
-    // which has no output pump to observe under inheritance — both conflict with it
-    // at parse time.
+    // status and full-screen behavior are preserved. Capture, `--no-echo` — there
+    // is no echo to suppress under inheritance — and `--idle-timeout`, which has no
+    // output pump to observe under inheritance, all conflict with it at parse time.
     //
     // Otherwise pipe + echo remains the compatibility default: ProcessKit's pump
     // reads each stream and tees it to the corresponding runner stream. With
@@ -491,7 +491,11 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     // `--idle-timeout` is armed, an [`IdleClock`] tee wraps the *outermost* sink on
     // whichever of those two paths is active, so every observed chunk re-arms the
     // idle window regardless of capture mode; without it the sinks are exactly as
-    // before.
+    // before. `--no-echo` swaps only the innermost echo sink
+    // (`tokio::io::stdout()`/`stderr()`) for a discarding [`tokio::io::sink()`] —
+    // the pipe, the pump, the `--capture-dir` tee, and the `IdleClock` re-arm all
+    // stay wired exactly as without it (K-050, K-007). Every branch below that does
+    // *not* test `args.no_echo` is byte-for-byte the pre-`--no-echo` code.
     command = if args.inherit_stdio {
         command
             .stdout(StdioMode::Inherit)
@@ -501,18 +505,38 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             OutputBufferPolicy::bounded(0).with_max_bytes(CAPTURE_INFLIGHT_MAX_BYTES),
         );
         if idle_timeout.is_some() {
+            if args.no_echo {
+                command
+                    .stdout_tee(idle_clock.tee(capture.stdout_tee(tokio::io::sink())))
+                    .stderr_tee(idle_clock.tee(capture.stderr_tee(tokio::io::sink())))
+            } else {
+                command
+                    .stdout_tee(idle_clock.tee(capture.stdout_tee(tokio::io::stdout())))
+                    .stderr_tee(idle_clock.tee(capture.stderr_tee(tokio::io::stderr())))
+            }
+        } else if args.no_echo {
             command
-                .stdout_tee(idle_clock.tee(capture.stdout_tee(tokio::io::stdout())))
-                .stderr_tee(idle_clock.tee(capture.stderr_tee(tokio::io::stderr())))
+                .stdout_tee(capture.stdout_tee(tokio::io::sink()))
+                .stderr_tee(capture.stderr_tee(tokio::io::sink()))
         } else {
             command
                 .stdout_tee(capture.stdout_tee(tokio::io::stdout()))
                 .stderr_tee(capture.stderr_tee(tokio::io::stderr()))
         }
     } else if idle_timeout.is_some() {
+        if args.no_echo {
+            command
+                .stdout_tee(idle_clock.tee(tokio::io::sink()))
+                .stderr_tee(idle_clock.tee(tokio::io::sink()))
+        } else {
+            command
+                .stdout_tee(idle_clock.tee(tokio::io::stdout()))
+                .stderr_tee(idle_clock.tee(tokio::io::stderr()))
+        }
+    } else if args.no_echo {
         command
-            .stdout_tee(idle_clock.tee(tokio::io::stdout()))
-            .stderr_tee(idle_clock.tee(tokio::io::stderr()))
+            .stdout_tee(tokio::io::sink())
+            .stderr_tee(tokio::io::sink())
     } else {
         command
             .stdout_tee(tokio::io::stdout())

@@ -301,6 +301,9 @@ mod tests {
             "run:--inherit-stdin",
             "run:--stdin-file",
             "run:--timeout",
+            // `--no-echo` (T-196) appears in the surface automatically too — same
+            // live-derivation as every other `run` flag above.
+            "run:--no-echo",
             // The resource-limit flags (T-180) appear in the surface automatically —
             // they are derived from the live clap tree, not a hand-maintained list.
             "run:--max-memory",

@@ -47,7 +47,7 @@ pub enum Command {
 /// `run [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl> [--create-no-window]
 /// [--timeout <duration>] [--idle-timeout <duration>] [--grace <duration>]
 /// [--max-memory <size>] [--max-processes <n>] [--cpu-quota <cores>]
-/// [--capture-dir <dir>] [--capture-max-bytes <size>] [--argv-raw]
+/// [--capture-dir <dir>] [--capture-max-bytes <size>] [--no-echo] [--argv-raw]
 /// [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
 /// -- <program> <args...>`
 //
@@ -55,8 +55,9 @@ pub enum Command {
 // `idle_timeout`, `grace`, `max_memory`, `max_processes`, `cpu_quota` — the
 // whole-tree ProcessKit resource caps (see `src/run.rs`) — `command`, `jsonl`,
 // `run_id`, `argv_raw`, `capture_dir`/`capture_max_bytes` — bounded stdout/stderr
-// capture to files (see `src/capture.rs`) — `env_clear`, `env_remove`, `env`, and
-// `inherit_stdio`/`inherit_stdin`/`stdin_file`.
+// capture to files (see `src/capture.rs`) — `no_echo` — suppress the live echo
+// while capture/idle-timeout keep observing the same bytes (see `src/run.rs`) —
+// `env_clear`, `env_remove`, `env`, and `inherit_stdio`/`inherit_stdin`/`stdin_file`.
 #[derive(Debug, Args)]
 pub struct RunArgs {
     /// Identifier for this run; a value is generated when omitted.
@@ -169,10 +170,23 @@ pub struct RunArgs {
             "create_no_window",
             "idle_timeout",
             "inherit_stdin",
-            "stdin_file"
+            "stdin_file",
+            "no_echo"
         ]
     )]
     pub inherit_stdio: bool,
+
+    /// Suppress the child's live stdout/stderr echo on the runner's own stdout/
+    /// stderr. The pipe + pump stay wired up exactly as without the flag — only
+    /// the runner-side echo write is skipped — so `--capture-dir` still receives
+    /// the child's bytes in full and `--idle-timeout` still re-arms on every
+    /// observed chunk; only the live retransmission to the runner's own stdout/
+    /// stderr is dropped. Meant for an embedding orchestrator that reads results
+    /// from `--jsonl`/`--capture-dir` and finds the child's output, interleaved
+    /// with its own, pure noise. Cannot be combined with `--inherit-stdio`, which
+    /// runs no pump to suppress in the first place.
+    #[arg(long, conflicts_with = "inherit_stdio")]
+    pub no_echo: bool,
 
     /// Give the child the runner's own stdin (terminal, file, or pipe). This does
     /// not create a PTY and cannot be combined with `--stdin-file`.
@@ -1012,6 +1026,7 @@ mod tests {
             "--stdin-file",
             "--capture-dir",
             "--idle-timeout",
+            "--no-echo",
         ] {
             let mut argv = vec![
                 "processkit-cli",

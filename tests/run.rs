@@ -547,6 +547,171 @@ fn custom_capture_max_bytes_clips_the_stream_at_the_configured_ceiling() {
     );
 }
 
+/// `--no-echo` (T-196) suppresses only the runner's live retransmission of the
+/// child's stdout/stderr on the runner's own stdout/stderr — the pipe, the pump,
+/// `--capture-dir`, and the JSONL event stream are all otherwise unaffected.
+/// Proven by running the exact same inline script twice — once plain, once with
+/// `--no-echo` added — and comparing: the plain run's own stdout/stderr carry the
+/// child's output as usual (see `passes_child_streams_through_without_mixing`);
+/// the `--no-echo` run's carry none of it; both runs' `--capture-dir` files hold
+/// the exact same bytes; and both runs' JSONL streams are identical once the
+/// fields expected to vary between two separate invocations of the same script
+/// (timestamps, PIDs, and the per-run `--capture-dir` file path) are stripped —
+/// the inline (rather than per-scratch-dir script file) program keeps argv, and
+/// so `command.argv_sha256`, identical between the two runs as well.
+#[test]
+fn no_echo_suppresses_the_live_relay_but_leaves_capture_and_events_whole() {
+    let script = if cfg!(windows) {
+        "echo NO_ECHO_OUT&echo NO_ECHO_ERR 1>&2"
+    } else {
+        "echo NO_ECHO_OUT; echo NO_ECHO_ERR 1>&2"
+    };
+
+    // Baseline: the same script and a --capture-dir, without --no-echo.
+    let baseline_dir = scratch("no-echo-baseline");
+    let baseline_capture = baseline_dir.join("capture");
+    let baseline_capture_flag = path_arg(&baseline_capture);
+    let baseline_out = run_with_flags(
+        &baseline_dir,
+        &[],
+        &[
+            "--capture-dir",
+            &baseline_capture_flag,
+            "--run-id",
+            "no-echo-fixture",
+        ],
+        shell_inline(script),
+    );
+    assert_eq!(
+        baseline_out.status.code(),
+        Some(0),
+        "baseline child exits cleanly"
+    );
+    let baseline_stdout = String::from_utf8_lossy(&baseline_out.stdout).into_owned();
+    let baseline_stderr = String::from_utf8_lossy(&baseline_out.stderr).into_owned();
+    assert!(
+        baseline_stdout.contains("NO_ECHO_OUT"),
+        "baseline echoes the child's stdout: {baseline_stdout:?}"
+    );
+    assert!(
+        baseline_stderr.contains("NO_ECHO_ERR"),
+        "baseline echoes the child's stderr: {baseline_stderr:?}"
+    );
+
+    // The flag under test: same script and capture shape, plus --no-echo.
+    let no_echo_dir = scratch("no-echo-flag");
+    let no_echo_capture = no_echo_dir.join("capture");
+    let no_echo_capture_flag = path_arg(&no_echo_capture);
+    let no_echo_out = run_with_flags(
+        &no_echo_dir,
+        &[],
+        &[
+            "--capture-dir",
+            &no_echo_capture_flag,
+            "--run-id",
+            "no-echo-fixture",
+            "--no-echo",
+        ],
+        shell_inline(script),
+    );
+    assert_eq!(
+        no_echo_out.status.code(),
+        Some(0),
+        "--no-echo child exits cleanly"
+    );
+    let no_echo_stdout = String::from_utf8_lossy(&no_echo_out.stdout).into_owned();
+    let no_echo_stderr = String::from_utf8_lossy(&no_echo_out.stderr).into_owned();
+    assert!(
+        !no_echo_stdout.contains("NO_ECHO_OUT") && !no_echo_stdout.contains("NO_ECHO_ERR"),
+        "--no-echo must suppress the live stdout relay: {no_echo_stdout:?}"
+    );
+    assert!(
+        !no_echo_stderr.contains("NO_ECHO_OUT") && !no_echo_stderr.contains("NO_ECHO_ERR"),
+        "--no-echo must suppress the live stderr relay: {no_echo_stderr:?}"
+    );
+
+    // `--capture-dir` still receives every byte, identical to the baseline run.
+    let baseline_stdout_log =
+        std::fs::read(baseline_capture.join("stdout.log")).expect("baseline stdout.log exists");
+    let baseline_stderr_log =
+        std::fs::read(baseline_capture.join("stderr.log")).expect("baseline stderr.log exists");
+    let no_echo_stdout_log =
+        std::fs::read(no_echo_capture.join("stdout.log")).expect("--no-echo stdout.log exists");
+    let no_echo_stderr_log =
+        std::fs::read(no_echo_capture.join("stderr.log")).expect("--no-echo stderr.log exists");
+    assert_eq!(
+        baseline_stdout_log, no_echo_stdout_log,
+        "--no-echo must not change what --capture-dir records on stdout"
+    );
+    assert_eq!(
+        baseline_stderr_log, no_echo_stderr_log,
+        "--no-echo must not change what --capture-dir records on stderr"
+    );
+    assert!(
+        String::from_utf8_lossy(&no_echo_stdout_log).contains("NO_ECHO_OUT"),
+        "the capture file is full even with the live echo suppressed"
+    );
+
+    // The JSONL stream is identical once the fields expected to vary between two
+    // separate invocations (timestamps, PIDs, the per-run capture file path) are
+    // stripped.
+    let baseline_events = normalized_run_events(&baseline_dir);
+    let no_echo_events = normalized_run_events(&no_echo_dir);
+    assert_eq!(
+        baseline_events, no_echo_events,
+        "the JSONL stream must be unaffected by --no-echo once variable fields are stripped"
+    );
+
+    let _ = std::fs::remove_dir_all(&baseline_dir);
+    let _ = std::fs::remove_dir_all(&no_echo_dir);
+}
+
+/// `read_run_events`, with every field expected to vary between two otherwise
+/// identical invocations of the same script — wall-clock time, PIDs, and the
+/// per-run `--capture-dir` file path — stripped out, so two separate runs'
+/// streams can be compared byte-for-byte on everything else (used by
+/// `no_echo_suppresses_the_live_relay_but_leaves_capture_and_events_whole`).
+fn normalized_run_events(dir: &Path) -> Vec<Value> {
+    let mut events = read_run_events(dir);
+    for event in &mut events {
+        strip_variable_fields(event);
+    }
+    events
+}
+
+/// Recursively remove JSON object keys whose value is expected to vary between
+/// two separate invocations of the same script: `time` (wall clock), `root_pid`/
+/// `pid`/`ppid`/`start_time` (process identity/lifetime), `remaining_pids` (a
+/// post-teardown PID snapshot), and `path` (the `output_captured` capture-file
+/// path, which embeds the per-run scratch directory).
+fn strip_variable_fields(value: &mut Value) {
+    const VARIABLE_KEYS: &[&str] = &[
+        "time",
+        "root_pid",
+        "pid",
+        "ppid",
+        "start_time",
+        "remaining_pids",
+        "path",
+    ];
+    match value {
+        Value::Object(map) => {
+            for key in VARIABLE_KEYS {
+                map.remove(*key);
+            }
+            for v in map.values_mut() {
+                strip_variable_fields(v);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                strip_variable_fields(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// A script that writes well over 50 bytes to stdout (repeated fixed-width
 /// lines), so any small `--capture-max-bytes` ceiling well below that is
 /// guaranteed to clip it. The exact per-platform byte count is not load-bearing

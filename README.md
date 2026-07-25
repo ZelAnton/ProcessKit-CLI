@@ -166,7 +166,7 @@ processkit-cli run     [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl>
                        [--grace <duration>] [--max-memory <size>]
                        [--max-processes <n>] [--cpu-quota <cores>]
                        [--capture-dir <dir>] [--capture-max-bytes <size>]
-                       [--argv-raw]
+                       [--no-echo] [--argv-raw]
                        [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
                        [--env-clear] [--env-remove <KEY>]... [--env <KEY=VALUE>]...
                        -- <program> <args...>
@@ -224,6 +224,17 @@ change the standard-I/O path:
 The two input-only modes leave stdout/stderr on the default pipe-and-echo path and
 do not create a PTY. Their `Ctrl-C` behavior remains runner-owned cancellation with
 the documented `cancelled` event and exit code `107`.
+
+`--no-echo` suppresses only the runner's own live retransmission of the child's
+stdout/stderr — the pipe and the output pump stay exactly as they are otherwise:
+`--capture-dir` still receives every byte through the same tee, `--idle-timeout`
+still re-arms on every observed chunk, and the JSONL event stream is unaffected.
+It is meant for an embedding orchestrator that reads results from `--jsonl`/
+`--capture-dir` and finds the child's raw output — interleaved with the runner's
+own — pure noise. It conflicts with `--inherit-stdio`, which runs no pump to
+suppress in the first place (a parse-time error, like `--capture-dir` and
+`--idle-timeout`). `probe --json` advertises the capability as `run:--no-echo`.
+Without `--no-echo`, nothing changes: the live echo behaves exactly as before.
 
 `--inherit-stdio` preserves native terminal signal delivery instead of pretending
 to mediate it. On Windows and containment mechanisms that keep child and runner in
@@ -463,6 +474,12 @@ JSONL event (see [the schema](docs/schema.md)):
 
 Without `--capture-dir`, nothing changes: no capture files, no `output_captured`
 event, and the event stream is byte-for-byte identical to a plain run.
+
+`--capture-dir` is independent of `--no-echo`: capture is fed by the same tee
+regardless of whether the live echo is suppressed, so a run with both flags
+records exactly the same `stdout.log`/`stderr.log` bytes and `output_captured`
+event as one with `--capture-dir` alone — only the runner's own stdout/stderr
+retransmission is affected by `--no-echo` (see [Standard I/O](#standard-io)).
 
 The per-stream ceiling defaults to 8 MiB and is configurable with
 `--capture-max-bytes <size>`, only meaningful together with `--capture-dir`.

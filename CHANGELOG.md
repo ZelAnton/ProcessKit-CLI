@@ -131,6 +131,20 @@ to a dated version section.
   `src/capture.rs`). Appears in the `probe` surface tokens automatically. See
   README.md, "Bounded output capture".
 
+- `run` gained `--no-echo`, an opt-in that suppresses only the runner's own live
+  retransmission of the child's stdout/stderr onto its own stdout/stderr. The pipe
+  and the output pump stay wired exactly as without the flag: `--capture-dir`
+  still receives the child's bytes in full through the same tee, `--idle-timeout`
+  still re-arms on every observed chunk, and the JSONL event stream is unaffected
+  — only the live echo write is skipped. Meant for an embedding orchestrator that
+  reads results from `--jsonl`/`--capture-dir` and finds the child's raw output,
+  interleaved with its own, pure noise. Conflicts with `--inherit-stdio` at parse
+  time (like `--capture-dir` and `--idle-timeout`), since that mode runs no pump
+  to suppress in the first place. Without `--no-echo`, nothing changes: the live
+  echo behaves exactly as before. Appears in the `probe` surface tokens
+  automatically (`run:--no-echo`). See README.md, "Standard I/O" and "Bounded
+  output capture".
+
 ### Changed
 - `run --timeout 0` and `run --idle-timeout 0` are now rejected at parse time
   (`USAGE`, exit `100`) instead of arming an already-elapsed deadline that tore
