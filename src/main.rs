@@ -25,7 +25,10 @@ fn main() -> ExitCode {
     };
 
     // `run` owns the process's exit path: on a completed container it hard-exits
-    // with the child's exact (full-width) code, so it never returns here. Every
+    // with the child's exact (full-width) code, so it never returns here. The one
+    // exception is `run --detach`, which never becomes the runner at all — it
+    // returns an ordinary `ExitCode` reporting whether the run *started* (see
+    // `run::execute` and `docs/exit-codes.md`, "Detached runs"). Every
     // other subcommand either reaches a live runner over the control plane
     // (`inspect`/`cancel`/`kill`), reads the per-user registry without contacting
     // any runner (`wait`/`list`/`prune`), or is entirely self-contained (`probe`) —

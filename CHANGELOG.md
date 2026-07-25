@@ -12,6 +12,38 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- **New `run --detach` flag: start a run and let go.** The call re-spawns the CLI
+  detached — a new session on Unix (`setsid`), `DETACHED_PROCESS` on Windows, `null`
+  stdio either way — and returns as soon as that copy has *provably* started the run,
+  instead of staying the runner's parent for its whole duration. "Provably" is an
+  observation, not an assumption: the call waits until the detached runner's
+  `run_started` event is readable in `--jsonl`, which it writes only after creating the
+  container, publishing the registry record, and spawning the child — so on return the
+  run is already discoverable with `list`, reachable with `inspect`/`cancel`/`kill`,
+  and waitable with `wait` (and the run id is readable from the events file even when
+  the runner generated it). The detached copy runs the ordinary `run` path unchanged —
+  same container, same teardown, same JSONL stream — so detaching adds a spawn and a
+  handshake, not a second lifecycle. A caller that *captures* the launch command's
+  output sees end-of-file when the call returns rather than when the run ends — the
+  detached runner is left holding none of the caller's pipes (on Windows this needed
+  an explicit `HANDLE_FLAG_INHERIT` clear, since `CreateProcess`'s handle inheritance
+  is all-or-nothing). **The exit code changes meaning under this flag,
+  and only under it:** it reports whether the run *started* — `0` once it has, never
+  the child's own code, which stays in the terminal `runner_exit` event where a
+  detached caller can still observe it. A start that fails is never reported as
+  success: the detached runner's own reserved-band code is passed through unchanged
+  (a missing program is still `SPAWN` 101, an unusable container still `BACKEND` 102,
+  an unwritable `--jsonl` still `SETUP` 111 — reported here before anything is
+  spawned), so **no new exit code was minted** and `113`–`119` stay reserved. There is
+  no live echo while detached — the detached runner reuses `--no-echo`'s discarding
+  sinks rather than a second suppression path — while `--capture-dir`,
+  `--idle-timeout`, and the JSONL stream keep observing the child exactly as in the
+  foreground, and `--jsonl` stays required. It conflicts at parse time with
+  `--inherit-stdio` and `--inherit-stdin` (nothing interactive survives detaching).
+  On Windows, pair it with `--create-no-window` for a console child: the detached
+  runner has no console to lend, so the OS gives the child a fresh one. `probe --json`
+  advertises the new surface automatically (`run:--detach`). See README.md, "Detached
+  runs", docs/exit-codes.md, "Detached runs", and docs/integration.md, §2.
 - **New `wait --run-id <id> [--timeout <duration>]` subcommand**: block until a run
   recorded in the per-user registry is no longer live. It closes the one supervision
   gap the control plane left open — a supervisor that did *not* start the run (an

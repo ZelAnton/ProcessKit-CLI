@@ -328,6 +328,13 @@ not be opened — and carries the reserved `SETUP` code (111), distinct from `in
 (a genuine runner fault) so a consumer never reads a bad path as a runner bug (see
 `docs/exit-codes.md`).
 
+The "runner process" here is always the process that *ran* the child. Under
+`run --detach` that is the detached copy, not the invocation the caller waited on:
+the caller's own exit code reports only whether the run started, which is exactly
+why this event — unchanged in shape, `source`, or meaning for a detached run — is
+where a detached caller reads the child's real result (see `docs/exit-codes.md`,
+"Detached runs").
+
 ### `output_captured`
 
 Bounded stdout/stderr capture finished. Emitted **only** when `run` was given

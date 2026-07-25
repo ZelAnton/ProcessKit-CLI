@@ -304,6 +304,9 @@ mod tests {
             // `--no-echo` (T-196) appears in the surface automatically too — same
             // live-derivation as every other `run` flag above.
             "run:--no-echo",
+            // Likewise `--detach` (T-198): declaring the flag in `src/cli.rs` is the
+            // whole change; this module's derivation picked it up untouched.
+            "run:--detach",
             // The resource-limit flags (T-180) appear in the surface automatically —
             // they are derived from the live clap tree, not a hand-maintained list.
             "run:--max-memory",

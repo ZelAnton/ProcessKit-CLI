@@ -117,6 +117,9 @@ fn probe_reports_a_consistent_compatible_surface() {
         "wait",
         "wait:--run-id",
         "wait:--timeout",
+        // Same story for the `run --detach` flag (T-198): a new flag on an existing
+        // subcommand enters the advertised surface with no production-code edit.
+        "run:--detach",
     ] {
         assert!(
             surface.contains(&token),

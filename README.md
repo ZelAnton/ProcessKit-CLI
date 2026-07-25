@@ -166,7 +166,7 @@ processkit-cli run     [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl>
                        [--grace <duration>] [--max-memory <size>]
                        [--max-processes <n>] [--cpu-quota <cores>]
                        [--capture-dir <dir>] [--capture-max-bytes <size>]
-                       [--no-echo] [--argv-raw]
+                       [--no-echo] [--detach] [--argv-raw]
                        [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
                        [--env-clear] [--env-remove <KEY>]... [--env <KEY=VALUE>]...
                        -- <program> <args...>
@@ -211,8 +211,9 @@ change the standard-I/O path:
   directly. There is no output pump, echo, tee, or transcript capture in this mode;
   the child writes to the inherited destinations itself. JSONL events still go only
   to `--jsonl`, and runner diagnostics still avoid stdout. This mode conflicts with
-  `--capture-dir`, `--create-no-window`, `--inherit-stdin`, `--stdin-file`, and
-  `--no-echo` (there is no pump to suppress in this mode).
+  `--capture-dir`, `--create-no-window`, `--inherit-stdin`, `--stdin-file`,
+  `--no-echo` (there is no pump to suppress in this mode), and `--detach` (a
+  detached run has no terminal to hand over).
   `probe --json` advertises the capability as `run:--inherit-stdio`.
 
 - `--inherit-stdin` gives the child the runner's own stdin handle. It can read from
@@ -237,6 +238,9 @@ own — pure noise. It conflicts with `--inherit-stdio`, which runs no pump to
 suppress in the first place (a parse-time error, like `--capture-dir` and
 `--idle-timeout`). `probe --json` advertises the capability as `run:--no-echo`.
 Without `--no-echo`, nothing changes: the live echo behaves exactly as before.
+[`--detach`](#detached-runs) reuses this exact path rather than suppressing output
+its own way: the detached runner is started with `--no-echo`, so a detached run's
+echo behavior is this one, described once.
 
 `--inherit-stdio` preserves native terminal signal delivery instead of pretending
 to mediate it. On Windows and containment mechanisms that keep child and runner in
@@ -315,6 +319,64 @@ registry is not an error — `prune` reports a zero tally and exits `0`, and pru
 missing registry does not create it. See [`docs/registry.md`](docs/registry.md),
 "Reaping — `prune`".
 
+## Detached runs
+
+`--detach` hands the run to a **detached copy of this binary** and returns as soon
+as that copy has provably started it, instead of keeping the caller as the runner's
+parent for the whole run. The copy is re-spawned on the caller's own command line
+(minus `--detach`): on Unix in a new session (`setsid`), so a terminal hang-up or a
+`Ctrl-C` in the caller's session no longer reaches it; on Windows with
+`DETACHED_PROCESS`, so it holds no console handle. Everything else about the run is
+unchanged — same container, same registry entry, same control transport, same JSONL
+stream, same teardown — because the detached copy runs the very same code path a
+foreground `run` does.
+
+```sh
+processkit-cli run --detach --run-id build-42 --jsonl build-42.jsonl -- cargo build
+# returns as soon as the run has started; supervise it from anywhere:
+processkit-cli inspect --run-id build-42 --json
+processkit-cli wait --run-id build-42
+```
+
+- **"Started" is an observation, not an assumption.** The call returns only once the
+  detached runner's `run_started` event is readable in `--jsonl`, which it writes
+  *after* creating the container, publishing the registry record, and spawning the
+  child — so on return the run is already discoverable by `list`, reachable by
+  `inspect`/`cancel`/`kill`, and waitable by `wait`. That also means the run id is
+  always readable from the events file on return, so a caller that let the runner
+  generate one can still find it. The call's own streams end with it, too: a caller
+  that *captures* output (a shell pipeline, `subprocess.run(capture_output=True)`)
+  sees end-of-file when the call returns, not when the run ends — the detached runner
+  is left holding none of the caller's handles.
+- **The exit code reports the start, and only the start.** This is the one mode in
+  which the runner's exit code is *not* the child's: a confirmed start is `0` even
+  for a child that later fails, and a start that failed keeps the same reserved-band
+  code the run would have reported in the foreground — a missing program is still
+  `SPAWN` (`101`), an unusable container still `BACKEND` (`102`), an unwritable
+  `--jsonl` still `SETUP` (`111`). A failed start is never reported as success. The
+  child's real exit code is not lost, it simply moves to where a detached caller can
+  observe it: the terminal `runner_exit` event in `--jsonl` (see
+  [the exit-code contract](docs/exit-codes.md), "Detached runs").
+- **No live echo.** The detached runner runs with `--no-echo`'s discarding sinks —
+  there is nobody left to echo to — while `--capture-dir`, `--idle-timeout`, and the
+  JSONL stream keep observing the child's output exactly as in the foreground.
+  `--jsonl` stays required, and is the only channel a detached caller has left.
+- **Not for interactive runs.** `--detach` conflicts with `--inherit-stdio` and
+  `--inherit-stdin` at parse time: a detached run has no terminal to hand over. The
+  detached copy's own stdin/stdout/stderr are `null`, so it can neither read from nor
+  write into a caller's terminal or pipe after that caller is gone.
+- **Windows:** because the detached runner has no console of its own, a console child
+  gets a fresh one from the OS — a stray console window unless `--create-no-window`
+  is passed as well, which is exactly what that flag is for (see
+  [Windows console](#windows-console)). A detached process also stays in any Job
+  Object the caller belongs to, so a caller inside a kill-on-close job cannot detach
+  a run out of it.
+- **Unix:** the detached copy is this process's direct child only until this process
+  exits moments later; `init` adopts it from there. If the start never completes
+  within its startup budget, the detached copy is killed rather than left behind
+  unreported — with the same reach an abrupt runner death has on this platform (the
+  `abrupt_cleanup` tri-state above).
+
 ## Exit codes
 
 The runner's exit code **is** the child's exit code; the runner's own failures
@@ -331,6 +393,12 @@ candidate, and `wait` adds one more — `WAIT_TIMEOUT` (`112`) — for its own d
 elapsing while the run it was watching is still live. That last one describes the
 *waiting client*, not the run: nothing was stopped, so it is deliberately distinct
 from the run's own `TIMEOUT` (`106`).
+
+`run --detach` is the single exception to the first sentence, and it mints no code
+of its own: with the run handed to a detached copy there is no child left for this
+process to forward a code from, so the code reports whether the run *started* — `0`
+once it has, otherwise the very same reserved code the failed start would have
+reported in the foreground. See [Detached runs](#detached-runs) above.
 
 ## Timeouts, cancel, and grace
 
@@ -449,6 +517,11 @@ Windows deployments that want to suppress a stray `conhost` window for the child
 pass `--create-no-window` explicitly. It cannot be combined with
 `--inherit-stdio`: suppressing the child's console and promising to preserve the
 caller's terminal are contradictory requests.
+
+A [detached run](#detached-runs) is the case where passing it matters most: the
+detached runner is created without a console at all, so a console child cannot
+inherit one and Windows gives it a fresh console of its own — visible unless
+`--create-no-window` says otherwise.
 
 ## Environment
 

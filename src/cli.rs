@@ -49,8 +49,8 @@ pub enum Command {
 /// `run [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl> [--create-no-window]
 /// [--timeout <duration>] [--idle-timeout <duration>] [--grace <duration>]
 /// [--max-memory <size>] [--max-processes <n>] [--cpu-quota <cores>]
-/// [--capture-dir <dir>] [--capture-max-bytes <size>] [--no-echo] [--argv-raw]
-/// [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
+/// [--capture-dir <dir>] [--capture-max-bytes <size>] [--no-echo] [--detach]
+/// [--argv-raw] [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
 /// -- <program> <args...>`
 //
 // `run` consumes every field: `cwd`, `create_no_window`, `timeout`,
@@ -59,6 +59,8 @@ pub enum Command {
 // `run_id`, `argv_raw`, `capture_dir`/`capture_max_bytes` — bounded stdout/stderr
 // capture to files (see `src/capture.rs`) — `no_echo` — suppress the live echo
 // while capture/idle-timeout keep observing the same bytes (see `src/run.rs`) —
+// `detach` — hand the whole run to a re-spawned, detached copy of this binary and
+// return as soon as it has provably started (see `src/run.rs`, "Detached runs") —
 // `env_clear`, `env_remove`, `env`, and `inherit_stdio`/`inherit_stdin`/`stdin_file`.
 #[derive(Debug, Args)]
 pub struct RunArgs {
@@ -189,6 +191,32 @@ pub struct RunArgs {
     /// runs no pump to suppress in the first place.
     #[arg(long, conflicts_with = "inherit_stdio")]
     pub no_echo: bool,
+
+    /// Start the run **detached** from this invocation and return as soon as it has
+    /// provably started, instead of staying the runner's parent for the whole run.
+    /// The command re-spawns this binary — in a new session on Unix, with
+    /// `DETACHED_PROCESS` on Windows — to do the actual run, waits until that copy
+    /// has registered the run and written its `run_started` event to `--jsonl`, and
+    /// then exits. From that point the run is supervised out of band, exactly like
+    /// any other run: `--jsonl` for its events, `inspect`/`cancel`/`kill` for its
+    /// control plane, `list` for discovery, and `wait` for its end.
+    ///
+    /// **The exit code changes meaning under this flag**, and only under it: it
+    /// reports whether the run *started*, never how the child finished. A successful
+    /// start is `0` even for a child that later fails, and a start that failed keeps
+    /// the same reserved-band code the run itself would have reported. The child's
+    /// real code stays fully available where a detached caller can actually observe
+    /// it — the terminal `runner_exit` event in `--jsonl` (see
+    /// `docs/exit-codes.md`, "Detached runs").
+    ///
+    /// Cannot be combined with the interactive stdio modes (`--inherit-stdio`,
+    /// `--inherit-stdin`): a detached run has no terminal to hand over and nobody
+    /// left to type at it. There is no live echo either — the detached runner runs
+    /// with `--no-echo`'s discarding sinks — while `--jsonl` (still required),
+    /// `--capture-dir`, and `--idle-timeout` all keep observing the child's output
+    /// exactly as they do in the foreground.
+    #[arg(long, conflicts_with_all = ["inherit_stdio", "inherit_stdin"])]
+    pub detach: bool,
 
     /// Give the child the runner's own stdin (terminal, file, or pipe). This does
     /// not create a PTY and cannot be combined with `--stdin-file`.
@@ -1153,6 +1181,95 @@ mod tests {
             ])
             .is_err(),
             "--inherit-stdio requires a usable Windows console when one exists"
+        );
+    }
+
+    #[test]
+    fn run_parses_detach_and_rejects_the_interactive_stdio_modes() {
+        // The flag is off by default, so a run that does not ask for it keeps the
+        // foreground contract (this invocation stays the runner).
+        let plain = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--",
+            "true",
+        ])
+        .expect("a valid run invocation");
+        let Command::Run(args) = plain.command else {
+            panic!("expected the run subcommand");
+        };
+        assert!(!args.detach, "--detach is opt-in, never the default");
+
+        let detached = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--detach",
+            "--",
+            "true",
+        ])
+        .expect("--detach is a valid opt-in");
+        let Command::Run(args) = detached.command else {
+            panic!("expected the run subcommand");
+        };
+        assert!(args.detach);
+
+        // The interactive stdio modes are contradictory with detaching — there is no
+        // terminal to hand over and no interactive caller left — so the conflict is
+        // caught at parse time, not discovered mid-run.
+        for incompatible in ["--inherit-stdio", "--inherit-stdin"] {
+            assert!(
+                Cli::try_parse_from([
+                    "processkit-cli",
+                    "run",
+                    "--jsonl",
+                    "events.jsonl",
+                    "--detach",
+                    incompatible,
+                    "--",
+                    "true",
+                ])
+                .is_err(),
+                "--detach must reject {incompatible}"
+            );
+        }
+
+        // Everything a detached run *can* still observe the child with stays legal
+        // alongside it — including `--no-echo`, whose sinks the detached runner
+        // reuses, so passing it explicitly is never a conflict.
+        let combined = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--detach",
+            "--no-echo",
+            "--capture-dir",
+            "capture",
+            "--idle-timeout",
+            "5s",
+            "--stdin-file",
+            "input.txt",
+            "--",
+            "true",
+        ])
+        .expect("--detach composes with capture, idle-timeout, no-echo, and stdin-file");
+        let Command::Run(args) = combined.command else {
+            panic!("expected the run subcommand");
+        };
+        assert!(args.detach && args.no_echo);
+        assert_eq!(args.capture_dir, Some(PathBuf::from("capture")));
+        assert_eq!(args.idle_timeout, Some(Duration::from_secs(5)));
+        assert_eq!(args.stdin_file, Some(PathBuf::from("input.txt")));
+
+        // `--jsonl` stays required under `--detach`: it is the only channel a
+        // detached caller has left to observe the run's outcome on.
+        assert!(
+            Cli::try_parse_from(["processkit-cli", "run", "--detach", "--", "true"]).is_err(),
+            "--detach does not make the required --jsonl optional"
         );
     }
 

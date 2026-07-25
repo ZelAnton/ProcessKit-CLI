@@ -18,6 +18,10 @@ child's `0`, its `1`, or its `137`. This is what makes the CLI a faithful,
 transparent wrapper: a caller can branch on the child's status exactly as if it
 had launched the child directly.
 
+The one invocation this does not describe is `run --detach`, which by definition
+stops being the child's parent: it reports whether the run *started* and leaves the
+child's own code to the run's `runner_exit` event. See "Detached runs" below.
+
 ## Runner-own failures
 
 When the **runner itself** fails — before, around, or instead of running the
@@ -132,7 +136,10 @@ caller which one happened:
   build; a required `--jsonl` events file, `--capture-dir`, or `--stdin-file` the
   operator asked for but that cannot be opened or created (an unwritable path, a missing
   parent, denied permissions); and a
-  `probe` / `inspect` / control (`cancel`/`kill`) reply that cannot be serialized. In every
+  `probe` / `inspect` / control (`cancel`/`kill`) reply that cannot be serialized. It also
+  covers the two failures that belong to `--detach`'s wrapper rather than to the run — the
+  detached runner could not be spawned, or it never reported a started run before the
+  startup budget elapsed (see "Detached runs" below). In every
   case the runner's own run-tracking logic is intact — a peripheral support step just
   failed — so reporting it as an `INTERNAL` "runner bug" would mislead the consumer. A
   `SETUP` failure before the child is spawned takes the `SETUP` code and (where a `--jsonl`
@@ -170,6 +177,53 @@ code to be only a best-effort hint (see "Why a band is not enough on its own"
 below). A nonsensical value (`--max-memory 0`, a non-positive/non-finite
 `--cpu-quota`) is instead a `USAGE` (100) argument error, rejected at parse time
 before any container is touched. No reserved-band slot was spent on it.
+
+## Detached runs: the code reports the start
+
+`run --detach` is the one invocation where "the runner's exit code is the child's exit
+code" does not apply, and it is not an exception carved out of the rule so much as a
+consequence of the mode: the run is handed to a **detached copy** of the binary, so the
+process the caller is waiting on has no child of its own to forward a code from. It
+reports the only thing it can honestly report — whether the run *started*:
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | The run started: the detached runner registered it and wrote `run_started` to `--jsonl`. It is now discoverable (`list`), reachable (`inspect`/`cancel`/`kill`), and waitable (`wait`). Says nothing about how the child will finish. |
+| a reserved-band code | The run did **not** start, and the code is the same one the failure would have produced in the foreground. |
+
+**No new code was minted for this.** A start can fail in exactly the ways a foreground
+run can fail before it begins — a program that is not there (`SPAWN` 101), a container
+that cannot be created or a limit that cannot be applied (`BACKEND` 102), an unwritable
+`--jsonl`/`--capture-dir` (`SETUP` 111) — and the detached copy exits with precisely
+that code, which the caller then relays unchanged. A caller therefore reads `run
+--detach`'s failures with the same table as `run`'s, and the reserved range `113`–`119`
+stays free. Two failures belong to the detach wrapper itself rather than to the run, and
+both take `SETUP` (111): the detached copy could not be spawned at all (a support step
+failed; blaming `SPAWN` would point at the caller's program, which was never reached),
+and the detached copy was alive but had not reported a started run before the startup
+budget elapsed (it is killed rather than left running unreported). An exit status that
+is *not* a reserved-band code — including a `0` — is likewise reported as `SETUP` and
+never relayed, because no run path can exit successfully without having written
+`run_started` first.
+
+**What the events file holds after a failed start.** Whatever the detached copy managed
+to write, and nothing invented on its behalf. A copy that started and *then* failed
+records the failure itself — a `spawn_failed`/`container_failed` and a terminal
+`runner_exit` with the matching `source`, exactly as a foreground run would — so the
+stream explains the code the caller saw. The two wrapper failures above never reach that
+point: the caller's own stderr and exit code are the entire account, and the events file
+is left empty (or, if the copy was killed mid-startup, without a terminal `runner_exit`).
+A stream with no `runner_exit` therefore means "no run started here", never "a run whose
+ending was lost".
+
+**Where the child's code went.** Nowhere: it is in the terminal `runner_exit` event of
+the run's own `--jsonl` stream, with `code`, `source`, and `child_code` exactly as for
+any other run. That is the whole trade of detaching — the caller gave up being the
+runner's parent, so the process-exit channel for the child's result went with it, and
+the event stream (which the `0` above guarantees exists and has begun) is the channel
+that remains. `wait --run-id <id>` blocks until such a run is over, but it too reports
+only *that* it ended, never with what code; the `runner_exit` event is the single source
+for that.
 
 ## Why a band is not enough on its own
 

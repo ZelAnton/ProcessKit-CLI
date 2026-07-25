@@ -102,6 +102,28 @@ processkit-cli run \
   output. The pipe, `--capture-dir`, and the JSONL stream are all unaffected;
   it conflicts with `--inherit-stdio`, which runs no pump to suppress in the
   first place.
+- **`--detach`** returns as soon as the run has provably started instead of
+  blocking for its whole duration — the "launch and let go" shape, for an
+  adapter that supervises out of band (§4) rather than by staying the runner's
+  parent. It re-spawns the CLI detached (a new session on Unix, a
+  `DETACHED_PROCESS` on Windows) and waits only until that copy has registered
+  the run and written `run_started` to `--jsonl`, so on return the run is
+  already visible to `list`/`inspect`/`wait`. An adapter that captures the
+  launch command's output (`subprocess.run(..., capture_output=True)`) gets
+  end-of-file when the call returns, not when the run ends: the detached runner
+  keeps none of the caller's pipes open. **The exit code changes meaning
+  under this flag and only under it**: it reports the *start* — `0` once the run
+  started, or the same reserved code the failure would have produced in the
+  foreground (a missing program is still `SPAWN` 101) — never the child's own
+  code, which stays in the terminal `runner_exit` event (§3). Adapters that need
+  the child's result must read it there, or via `wait` plus the event stream.
+  It conflicts with `--inherit-stdio`/`--inherit-stdin` (nothing interactive
+  survives detaching) and implies `--no-echo`'s discarding sinks, while
+  `--jsonl`, `--capture-dir`, and `--idle-timeout` behave exactly as they do in
+  the foreground. On Windows, pair it with `--create-no-window` for a console
+  child: the detached runner has no console to lend it, so the OS gives the
+  child one of its own. See [`docs/exit-codes.md`](exit-codes.md), "Detached
+  runs".
 - **`--env-clear` / `--env-remove <KEY>` / `--env <KEY=VALUE>`** give the
   adapter control over the child's environment, applied in that fixed order —
   clear, then remove, then set — regardless of flag order on the command line,
@@ -197,7 +219,10 @@ source means the child's own exit code was never produced or is not what
 Once a run has started (its `run_id` is known — supplied at launch, per §2),
 an adapter can query, steer, and wait for it while it is still live. Every
 command resolves the target purely by `run_id` through the per-user registry —
-never by PID:
+never by PID. This is also the whole supervision story for a run launched with
+`--detach` (§2): a detached run is an ordinary run in the registry, and these
+four commands are how an adapter that is no longer its parent watches and steers
+it:
 
 ```sh
 processkit-cli inspect --run-id build-42 --json
@@ -324,6 +349,15 @@ carries the "could not reach the target run" failure modes of §4.
   from the run's own process exit and its `runner_exit` event. The same
   separation applies to `WAIT_TIMEOUT` (112): it is the *waiting client*
   giving up, never the run being stopped (§4).
+- **A `--detach` exit code is not a run outcome either.** `run --detach`'s `0`
+  means "the run started", not "the child succeeded", and its non-zero codes
+  mean "the run never started" — carrying the same reserved code the failure
+  would have produced in the foreground. An adapter that branches on a detached
+  launch's exit code as if it were the child's result will read every
+  long-running failure as a success; the child's outcome is in the terminal
+  `runner_exit` event (§3), reached after `wait` (§4). See
+  [`docs/exit-codes.md`](exit-codes.md#detached-runs-the-code-reports-the-start),
+  "Detached runs".
 - **`SETUP` (111) vs. `INTERNAL` (104).** A `run` that could not write its
   `--jsonl`/`--capture-dir`, or open a `--stdin-file`, fails closed with
   `SETUP` (111) — an ordinary, usually-actionable environment problem (bad

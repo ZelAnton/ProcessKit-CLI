@@ -22,7 +22,7 @@ Responsibilities, in the order data flows through a `run`:
 | [`src/lib.rs`](../src/lib.rs) | The internal library crate root: declares every `src/*.rs` module and re-exports nothing publicly-supported. It carries the "not a stable public API" disclaimer and marks each module `#[doc(hidden)]`, so the library is only a foundation for the crate's own tooling — never a semver-stable Rust surface. |
 | [`src/main.rs`](../src/main.rs) | The thin binary entry point. Parses `Cli`, dispatches into the library's subcommand module, and maps the result onto a process exit code: `run` owns its own exit path (it hard-exits with the child's code and never returns here); every other subcommand's `Result<(), RunnerError>` is mapped through `RunnerError::code()`, and a clap parse failure is mapped onto the runner's own `USAGE` code rather than clap's default. |
 | [`src/cli.rs`](../src/cli.rs) | The CLI-flags half of the compatibility surface: the clap-derived `Cli`/`Command` types for `run`, `inspect`, `cancel`, `kill`, `wait`, `list`, `prune`, and `probe`. Parsing and shape validation only — each subcommand's behavior lives in its own module. |
-| [`src/run.rs`](../src/run.rs) | The `run` subcommand itself: spawns the child into a `processkit::ProcessGroup` this module owns, selects either default pipe-and-echo I/O or direct inherited stdio, temporarily hands a POSIX terminal to a separate child process group when required, races the child's exit against `--timeout`/`--idle-timeout`/a local stop signal (`Ctrl-C`, on Unix `SIGTERM`/`SIGHUP`, and on Windows `Ctrl-Break`/console close/logoff/system shutdown)/a control-plane command, and drives the shared teardown tiers — the graceful soft stop → grace → hard kill for `timeout` (whole-run or idle)/a signal cancel/`cancel`, and the immediate hard kill (no soft stop, no grace) for a control-plane `kill`. Exit-code fidelity — the child's exact code on a normal completion, a reserved-band code for every runner-imposed ending — is enforced here. |
+| [`src/run.rs`](../src/run.rs) | The `run` subcommand itself: spawns the child into a `processkit::ProcessGroup` this module owns, selects either default pipe-and-echo I/O or direct inherited stdio, temporarily hands a POSIX terminal to a separate child process group when required, races the child's exit against `--timeout`/`--idle-timeout`/a local stop signal (`Ctrl-C`, on Unix `SIGTERM`/`SIGHUP`, and on Windows `Ctrl-Break`/console close/logoff/system shutdown)/a control-plane command, and drives the shared teardown tiers — the graceful soft stop → grace → hard kill for `timeout` (whole-run or idle)/a signal cancel/`cancel`, and the immediate hard kill (no soft stop, no grace) for a control-plane `kill`. Exit-code fidelity — the child's exact code on a normal completion, a reserved-band code for every runner-imposed ending — is enforced here. Also home to the `--detach` wrapper (`start_detached`), which re-spawns this binary detached and returns once the run has provably started, without duplicating any of the above. |
 | [`src/events.rs`](../src/events.rs) | The versioned JSONL lifecycle-event schema and its emitter — this repository's normative, golden-tested public event contract (see [`docs/schema.md`](schema.md)). Also owns argv redaction: the default SHA-256 `argv_sha256` fingerprint and the `HINT_RULES` worker-shape classifier. |
 | [`src/capture.rs`](../src/capture.rs) | `--capture-dir` bounded per-stream stdout/stderr capture to files, riding the same tee `run` already echoes through (no second output-reading path). Records, per stream, a full byte counter, a SHA-256 of the bytes written, and independent explicit `truncated`/`write_error` flags, surfaced in the `output_captured` event. |
 | [`src/hash.rs`](../src/hash.rs) | The one hand-rolled incremental/one-shot SHA-256 (FIPS 180-4) both `events` (argv fingerprint) and `capture` (streamed transcript hashing) build on, so the project has a single digest primitive and rendering style. |
@@ -78,6 +78,15 @@ themselves (T-186, T-187) are documented in `CONTRIBUTING.md` ("Fuzzing") and
 A `processkit-cli run` moves through the same sequence on every platform,
 implemented in `run::execute`/`run::run_async` (`src/run.rs`):
 
+0. **(`--detach` only) Hand the run to a detached copy.** `run::start_detached`
+   re-spawns *this binary* on the caller's own argv with `--detach` removed (plus
+   `--run-id`/`--no-echo` where the caller left them out) — in a new session on
+   Unix (`setsid`), as a `DETACHED_PROCESS` on Windows, with `null` stdio either
+   way — then waits until that copy's `run_started` line is readable in `--jsonl`
+   and exits, reporting only whether the run started (see
+   [`docs/exit-codes.md`](exit-codes.md), "Detached runs"). The detached copy
+   enters step 1 below and runs every subsequent step unchanged: detaching is a
+   wrapper around this sequence, never a second implementation of it.
 1. **Spawn.** The child is built from `processkit::Command` and spawned into a
    `ProcessGroup` this process owns — not a shared or global one — so the
    group's kernel-backed kill-on-drop (Windows Job Object, Linux
@@ -102,9 +111,12 @@ implemented in `run::execute`/`run::run_async` (`src/run.rs`):
    of `tokio::io::stdout()`/`stderr()`); the pump, the `--capture-dir` tee, and
    the `--idle-timeout` clock's re-arming on every observed chunk are all
    unaffected — see `src/run.rs`'s sink-selection block and K-050.
+   `--detach` reuses that same swap rather than adding a second suppression path:
+   the detached copy is started with `--no-echo` (step 0).
    `--inherit-stdio` instead gives the child the runner's three handles directly;
    it conflicts with capture (and with `--no-echo`, which has no pump to act on
-   in this mode), so there is no pump or tee. When ProcessKit selects
+   in this mode, and with `--detach`, which has no terminal to hand over), so
+   there is no pump or tee. When ProcessKit selects
    POSIX process-group containment and stdin is a terminal, `run` temporarily
    assigns the terminal's foreground group to the child and restores the original
    group during cleanup. A `members_snapshot` event records the container's

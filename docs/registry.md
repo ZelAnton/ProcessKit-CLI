@@ -329,6 +329,13 @@ not disturbed, not ended, and not even aware of the waiter. A run whose transpor
 came up (a `null` `endpoint`, see "Record format" above) is still perfectly waitable —
 `wait` needs no endpoint.
 
+A run started with `run --detach` is the case this was written for: that call returns
+once the run has started and is *never* the runner's parent, so `wait` (plus the run's
+`--jsonl` stream for the outcome itself) is how its caller learns the run is over. A
+detached run publishes an ordinary record here — nothing about the entry, its liveness
+lock, or its removal on a clean exit differs — so `list`, `prune`, and `wait` treat it
+exactly like any other.
+
 **How it waits.** Liveness is the advisory lock described under "Staleness" above, and
 that lock offers no event, notification, or wakeup a third process could subscribe to.
 Waiting on it is therefore honest *periodic probing* — one scan plus one non-blocking

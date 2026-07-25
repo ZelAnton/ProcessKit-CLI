@@ -10,8 +10,8 @@
 mod common;
 
 use std::io::Write;
-use std::path::Path;
-use std::process::Stdio;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -907,6 +907,525 @@ fn no_echo_still_lets_idle_timeout_reap_a_silent_child_but_spares_a_chatty_one()
          even under --no-echo: {chatty_events:?}"
     );
     let _ = std::fs::remove_dir_all(&chatty_dir);
+}
+
+// ---------------------------------------------------------------------------
+// `--detach` (T-198)
+//
+// Every test below pins its own registry directory (`PROCESSKIT_CLI_REGISTRY_DIR`),
+// because a detached run outlives the call that started it: without the override it
+// would publish into the developer's real per-user registry and could collide with
+// a concurrently running test's `run_id`.
+// ---------------------------------------------------------------------------
+
+/// How long the detach fixtures' child works before finishing. Long enough that a
+/// call returning "immediately" is unmistakably distinguishable from one that waited
+/// for the child, short enough to keep the suite quick. The margin is deliberately
+/// generous — a detached start is two process spawns, and a loaded CI runner (or a
+/// Windows host scanning each new executable) can make those cost real time; a tighter
+/// window would turn a slow machine into a failing feature (K-058).
+const DETACH_CHILD_WORK: Duration = Duration::from_secs(5);
+
+/// How long a detach test will wait for something the *detached* run must do on its
+/// own (finish its child, close its stream). Generous: it bounds a failure, never a
+/// healthy path.
+const DETACH_OBSERVE_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// The registry-directory override for one detach scenario, as the `envs` pair the
+/// fixtures take. The detached copy inherits it from the call that spawns it, so the
+/// whole chain — caller, detached runner, and the `list`/`inspect`/`cancel` clients
+/// below — agrees on one throwaway registry.
+fn detach_registry(dir: &Path) -> PathBuf {
+    dir.join("registry")
+}
+
+/// Invoke a non-`run` subcommand of the binary against `registry` and wait for it.
+fn cli_against(registry: &Path, args: &[&str]) -> Output {
+    Command::new(bin())
+        .args(args)
+        .env("PROCESSKIT_CLI_REGISTRY_DIR", registry)
+        .output()
+        .expect("spawn the runner binary")
+}
+
+/// Parse the events written **so far** by a run that may still be going, skipping a
+/// trailing line that is still being written. `read_run_events` deliberately panics
+/// on a malformed line (a finished stream must be well-formed); a live stream is the
+/// one case where an incomplete last line is normal rather than a contract violation.
+fn read_events_so_far(dir: &Path) -> Vec<Value> {
+    let text = std::fs::read_to_string(events_path(dir)).unwrap_or_default();
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect()
+}
+
+/// Whether the run's stream has been closed by its terminal `runner_exit`.
+fn run_is_over(dir: &Path) -> bool {
+    read_events_so_far(dir)
+        .last()
+        .is_some_and(|event| event["event"] == "runner_exit")
+}
+
+/// A child that works for [`DETACH_CHILD_WORK`] and only then creates the file named
+/// by the `MARKER` environment variable. The marker is what makes "the call returned
+/// before the child finished" an observation rather than a stopwatch reading: at the
+/// moment a detached call returns, the file must not exist yet.
+fn write_marker_after_work_script(dir: &Path) -> PathBuf {
+    let seconds = DETACH_CHILD_WORK.as_secs();
+    if cfg!(windows) {
+        let path = dir.join("marker_after_work.bat");
+        // `ping -n N` waits N-1 seconds between echo requests.
+        let body = format!(
+            "@echo off\r\n\
+             ping -n {} 127.0.0.1 >nul\r\n\
+             echo done>\"%MARKER%\"\r\n",
+            seconds + 1
+        );
+        std::fs::write(&path, body).expect("write marker_after_work.bat");
+        path
+    } else {
+        let path = dir.join("marker_after_work.sh");
+        let body = format!("#!/bin/sh\nsleep {seconds}\nprintf done > \"$MARKER\"\n");
+        std::fs::write(&path, body).expect("write marker_after_work.sh");
+        path
+    }
+}
+
+/// The platform invocation for one of the scripts above.
+fn script_program(path: &Path) -> Vec<String> {
+    if cfg!(windows) {
+        vec!["cmd".into(), "/c".into(), path_arg(path)]
+    } else {
+        vec!["/bin/sh".into(), path_arg(path)]
+    }
+}
+
+/// The headline contract of `--detach`: the call returns once the run has *started*,
+/// not once the child has *finished* — and it returns `0` for the start, whatever the
+/// child later does.
+///
+/// Proven differentially rather than by a stopwatch alone (K-059): the same script,
+/// which creates a marker file only after working for [`DETACH_CHILD_WORK`], is run
+/// twice. Without `--detach` the call returns only after the marker exists (that is
+/// what "foreground" means, and it is what makes the flagged run below meaningful);
+/// with `--detach` the call returns while the marker still does not exist, the run's
+/// stream already carries `run_started` but no terminal `runner_exit`, and both the
+/// marker and that terminal event appear afterwards — the run kept going without its
+/// caller.
+#[test]
+fn detach_returns_once_the_run_has_started_while_a_foreground_run_waits_for_the_child() {
+    // Baseline: no --detach. The call must outlast the child's work.
+    let baseline_dir = scratch("detach-baseline");
+    let baseline_registry = detach_registry(&baseline_dir);
+    let baseline_marker = baseline_dir.join("finished.marker");
+    let baseline_script = write_marker_after_work_script(&baseline_dir);
+    let baseline_started = Instant::now();
+    let baseline = run_with_flags(
+        &baseline_dir,
+        &[
+            ("PROCESSKIT_CLI_REGISTRY_DIR", baseline_registry.as_path()),
+            ("MARKER", baseline_marker.as_path()),
+        ],
+        &["--run-id", "detach-baseline"],
+        script_program(&baseline_script),
+    );
+    let baseline_elapsed = baseline_started.elapsed();
+    assert_eq!(
+        baseline.status.code(),
+        Some(0),
+        "the baseline child exits cleanly; stderr: {}",
+        String::from_utf8_lossy(&baseline.stderr)
+    );
+    assert!(
+        baseline_marker.exists(),
+        "a foreground run returns only after its child is done — without this the \
+         detached comparison below would prove nothing"
+    );
+    assert!(
+        baseline_elapsed >= DETACH_CHILD_WORK,
+        "a foreground run waits out the child's work ({baseline_elapsed:?})"
+    );
+
+    // The flag under test: same script, same shape, plus --detach.
+    let dir = scratch("detach-fast");
+    let registry = detach_registry(&dir);
+    let marker = dir.join("finished.marker");
+    let script = write_marker_after_work_script(&dir);
+    let started = Instant::now();
+    let out = run_with_flags(
+        &dir,
+        &[
+            ("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path()),
+            ("MARKER", marker.as_path()),
+        ],
+        &["--run-id", "detach-fast", "--detach"],
+        script_program(&script),
+    );
+    let elapsed = started.elapsed();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a started detached run exits 0 for the start; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "--detach must return before the child finishes its work"
+    );
+    assert!(
+        elapsed < baseline_elapsed,
+        "--detach returned in {elapsed:?}, no sooner than the foreground run's \
+         {baseline_elapsed:?}"
+    );
+
+    // The handshake's promise, checked at the moment of return: the run has provably
+    // started (its `run_started` is already durable in --jsonl) and has provably not
+    // ended (no terminal event yet).
+    let at_return = read_events_so_far(&dir);
+    assert!(
+        at_return
+            .iter()
+            .any(|e| e["event"] == "run_started" && e["run_id"] == "detach-fast"),
+        "--detach returns only after the run's own run_started is readable: {at_return:?}"
+    );
+    assert!(
+        at_return.iter().all(|e| e["event"] != "runner_exit"),
+        "the run must still be live when --detach returns: {at_return:?}"
+    );
+
+    // And it finishes on its own, with the child's real outcome recorded where a
+    // detached caller can read it.
+    wait_until(|| marker.exists(), DETACH_OBSERVE_TIMEOUT);
+    wait_until(|| run_is_over(&dir), DETACH_OBSERVE_TIMEOUT);
+    let events = read_run_events(&dir);
+    let runner_exit = events.last().expect("a terminal event");
+    assert_eq!(runner_exit["event"], "runner_exit");
+    assert_eq!(
+        runner_exit["source"], "child_exit",
+        "the detached run ended on its child's own exit: {runner_exit}"
+    );
+    assert_eq!(
+        runner_exit["child_code"], 0,
+        "the child's real exit code lives in runner_exit, not in the detached call's \
+         own exit code: {runner_exit}"
+    );
+
+    let _ = std::fs::remove_dir_all(&baseline_dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A detached run is an ordinary run to everything that supervises runs: it is
+/// registered (so `list` finds it and `inspect` reaches it over the control plane)
+/// and it is steerable (so `cancel` ends it), and its stream closes with the terminal
+/// `runner_exit` naming that ending. This is the whole point of returning only after
+/// the registry record exists — the caller can hand the `run_id` straight to the
+/// supervision commands without polling for the run to appear.
+#[test]
+fn a_detached_run_is_discoverable_inspectable_and_cancellable() {
+    let dir = scratch("detach-supervised");
+    let registry = detach_registry(&dir);
+    // A child that would run far longer than this test: whatever ends it, it is not
+    // the child finishing on its own.
+    let long_lived = if cfg!(windows) {
+        shell_inline("ping -n 300 127.0.0.1 >nul")
+    } else {
+        shell_inline("sleep 300")
+    };
+    let out = run_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "detach-supervised", "--detach"],
+        long_lived,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the detached run started; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The ordering this test depends on, asserted rather than assumed: the run had
+    // already reported itself started when the call returned, which is why the
+    // supervision commands below can use the `run_id` straight away instead of
+    // polling for the run to show up.
+    assert!(
+        read_events_so_far(&dir)
+            .iter()
+            .any(|e| e["event"] == "run_started" && e["run_id"] == "detach-supervised"),
+        "--detach returns only after the run has started, so supervision needs no \
+         warm-up poll"
+    );
+
+    // Discovery: the entry is already there, and live, the moment the call returns.
+    let listed = cli_against(&registry, &["list", "--json"]);
+    assert_eq!(listed.status.code(), Some(0), "list succeeds");
+    let listed_out = String::from_utf8_lossy(&listed.stdout).into_owned();
+    let entry: Value = listed_out
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|entry| entry["run_id"] == "detach-supervised")
+        .unwrap_or_else(|| panic!("the detached run is registered: {listed_out:?}"));
+    assert_eq!(
+        entry["health"], "live",
+        "the detached run is live, not a stale leftover: {entry}"
+    );
+
+    // Control plane: `inspect` reaches the detached runner itself.
+    let inspected = cli_against(
+        &registry,
+        &["inspect", "--run-id", "detach-supervised", "--json"],
+    );
+    assert_eq!(
+        inspected.status.code(),
+        Some(0),
+        "inspect reaches the detached runner; stderr: {}",
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+    let snapshot: Value = serde_json::from_slice(&inspected.stdout).expect("inspect prints JSON");
+    assert_eq!(snapshot["run_id"], "detach-supervised");
+    assert!(
+        snapshot["root_pid"].as_u64().is_some(),
+        "the snapshot names the detached run's root child: {snapshot}"
+    );
+
+    // The run is still live at this point — so the cancel below is what ends it,
+    // rather than the test observing a child that had already exited.
+    assert!(
+        !run_is_over(&dir),
+        "the detached run must still be live before it is cancelled: {:?}",
+        read_events_so_far(&dir)
+    );
+
+    // Steering: `cancel` ends the detached run through the ordinary teardown.
+    let cancelled = cli_against(&registry, &["cancel", "--run-id", "detach-supervised"]);
+    assert_eq!(
+        cancelled.status.code(),
+        Some(0),
+        "cancel is accepted; stderr: {}",
+        String::from_utf8_lossy(&cancelled.stderr)
+    );
+
+    wait_until(|| run_is_over(&dir), DETACH_OBSERVE_TIMEOUT);
+    let events = read_run_events(&dir);
+    let cancel_event = events
+        .iter()
+        .find(|e| e["event"] == "cancelled")
+        .unwrap_or_else(|| panic!("the cancel is recorded in the run's stream: {events:?}"));
+    assert_eq!(cancel_event["source"], "control_cancel");
+    let runner_exit = events.last().expect("a terminal event");
+    assert_eq!(runner_exit["event"], "runner_exit");
+    assert_eq!(runner_exit["source"], "control_cancel");
+    assert_eq!(
+        runner_exit["code"], 108,
+        "a detached run ends with the same reserved code a foreground one would: \
+         {runner_exit}"
+    );
+
+    // The entry goes with the run: a cancelled detached run leaves no registry
+    // leftovers behind for the next caller to trip over.
+    let listed_after = cli_against(&registry, &["list", "--json"]);
+    let listed_after_out = String::from_utf8_lossy(&listed_after.stdout).into_owned();
+    assert!(
+        !listed_after_out.contains("detach-supervised"),
+        "the cancelled detached run removed its own registry entry: {listed_after_out:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A detached run relays none of the child's output to the caller — there is nobody
+/// left to relay it to — while everything that *records* the output keeps working.
+///
+/// Differential, not an absence-only assertion (K-059): the same marker-writing child
+/// runs twice. Without `--detach` both markers reach the call's own stdout/stderr,
+/// which is what proves they would otherwise be relayed; with `--detach` neither
+/// does, and the `--capture-dir` transcript of the detached run holds those very
+/// bytes — so the output was produced and observed, just not echoed at the caller.
+#[test]
+fn detach_relays_no_child_output_that_a_foreground_run_would_echo() {
+    let script = if cfg!(windows) {
+        "echo DETACH_OUT&echo DETACH_ERR 1>&2"
+    } else {
+        "echo DETACH_OUT; echo DETACH_ERR 1>&2"
+    };
+
+    // Baseline: same script, no --detach — the markers must reach the call's own
+    // streams, or the flagged run below would prove nothing.
+    let baseline_dir = scratch("detach-echo-baseline");
+    let baseline_registry = detach_registry(&baseline_dir);
+    let baseline = run_with_flags(
+        &baseline_dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", baseline_registry.as_path())],
+        &["--run-id", "detach-echo-baseline"],
+        shell_inline(script),
+    );
+    assert_eq!(
+        baseline.status.code(),
+        Some(0),
+        "the baseline child exits cleanly"
+    );
+    let baseline_stdout = String::from_utf8_lossy(&baseline.stdout).into_owned();
+    let baseline_stderr = String::from_utf8_lossy(&baseline.stderr).into_owned();
+    assert!(
+        baseline_stdout.contains("DETACH_OUT"),
+        "the foreground run echoes the child's stdout: {baseline_stdout:?}"
+    );
+    assert!(
+        baseline_stderr.contains("DETACH_ERR"),
+        "the foreground run echoes the child's stderr: {baseline_stderr:?}"
+    );
+
+    // The flag under test, with a transcript so the bytes are still provably observed.
+    let dir = scratch("detach-echo");
+    let registry = detach_registry(&dir);
+    let capture = dir.join("capture");
+    let capture_flag = path_arg(&capture);
+    let out = run_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &[
+            "--run-id",
+            "detach-echo",
+            "--detach",
+            "--capture-dir",
+            &capture_flag,
+        ],
+        shell_inline(script),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the detached run started; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        !stdout.contains("DETACH_OUT") && !stdout.contains("DETACH_ERR"),
+        "a detached run relays nothing to the caller's stdout: {stdout:?}"
+    );
+    assert!(
+        !stderr.contains("DETACH_OUT") && !stderr.contains("DETACH_ERR"),
+        "a detached run relays nothing to the caller's stderr: {stderr:?}"
+    );
+
+    // ...but the run did observe every byte: the transcript holds both markers.
+    wait_until(|| run_is_over(&dir), DETACH_OBSERVE_TIMEOUT);
+    let captured_stdout =
+        std::fs::read_to_string(capture.join("stdout.log")).expect("the transcript exists");
+    let captured_stderr =
+        std::fs::read_to_string(capture.join("stderr.log")).expect("the transcript exists");
+    assert!(
+        captured_stdout.contains("DETACH_OUT"),
+        "the detached run captured the child's stdout: {captured_stdout:?}"
+    );
+    assert!(
+        captured_stderr.contains("DETACH_ERR"),
+        "the detached run captured the child's stderr: {captured_stderr:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&baseline_dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A start that fails is never reported as a started run, and the code the caller
+/// sees is the same one the failure produces in the foreground — `--detach` mints no
+/// code of its own (K-047).
+///
+/// Differential on the code itself: each failure is run twice, once with `--detach`
+/// and once without, and the two exit codes must match. A missing program fails
+/// inside the detached copy (which reports it in the run's own stream before dying);
+/// an uncreatable `--jsonl` fails in the caller, before anything is spawned.
+#[test]
+fn a_detached_start_failure_reports_the_same_code_the_foreground_would() {
+    // The child program does not exist: `SPAWN` (101), from the detached copy.
+    let dir = scratch("detach-spawn-failure");
+    let registry = detach_registry(&dir);
+    let missing = ["definitely-not-a-real-program-t198"];
+    let foreground = run_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "detach-spawn-foreground"],
+        missing,
+    );
+    assert_eq!(
+        foreground.status.code(),
+        Some(101),
+        "a missing program is a SPAWN failure in the foreground; stderr: {}",
+        String::from_utf8_lossy(&foreground.stderr)
+    );
+
+    let detached_dir = scratch("detach-spawn-failure-detached");
+    let detached_registry = detach_registry(&detached_dir);
+    let detached = run_with_flags(
+        &detached_dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", detached_registry.as_path())],
+        &["--run-id", "detach-spawn-detached", "--detach"],
+        missing,
+    );
+    assert_eq!(
+        detached.status.code(),
+        foreground.status.code(),
+        "a failed detached start reports the very code the foreground run reports, \
+         never a silent success; stderr: {}",
+        String::from_utf8_lossy(&detached.stderr)
+    );
+    let detached_stderr = String::from_utf8_lossy(&detached.stderr).into_owned();
+    assert!(
+        detached_stderr.contains("did not start"),
+        "the failure says the run never started: {detached_stderr:?}"
+    );
+    // The detached copy's own account of the failure survives in the run's stream.
+    let events = read_run_events(&detached_dir);
+    assert!(
+        events.iter().any(|e| e["event"] == "spawn_failed"),
+        "the detached copy recorded why it could not start: {events:?}"
+    );
+    let terminal = events.last().expect("a terminal event");
+    assert_eq!(terminal["event"], "runner_exit");
+    assert_eq!(terminal["source"], "spawn_error");
+
+    // An events file that cannot be created: `SETUP` (111), from the caller itself —
+    // there is nowhere for a detached copy to report it, so it is never spawned.
+    let jsonl_dir = scratch("detach-setup-failure");
+    let unwritable = jsonl_dir.join("missing-parent").join("events.jsonl");
+    let unwritable_flag = path_arg(&unwritable);
+    let trivial = shell_inline("exit 0");
+    let mut foreground_setup = Command::new(bin());
+    foreground_setup
+        .arg("run")
+        .arg("--jsonl")
+        .arg(&unwritable_flag)
+        .arg("--")
+        .args(&trivial);
+    let foreground_setup = foreground_setup.output().expect("spawn the runner binary");
+    assert_eq!(
+        foreground_setup.status.code(),
+        Some(111),
+        "an uncreatable --jsonl is a SETUP failure in the foreground; stderr: {}",
+        String::from_utf8_lossy(&foreground_setup.stderr)
+    );
+
+    let mut detached_setup = Command::new(bin());
+    detached_setup
+        .arg("run")
+        .arg("--jsonl")
+        .arg(&unwritable_flag)
+        .arg("--detach")
+        .arg("--")
+        .args(&trivial);
+    let detached_setup = detached_setup.output().expect("spawn the runner binary");
+    assert_eq!(
+        detached_setup.status.code(),
+        foreground_setup.status.code(),
+        "--detach reports an uncreatable --jsonl exactly as the foreground does; \
+         stderr: {}",
+        String::from_utf8_lossy(&detached_setup.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&detached_dir);
+    let _ = std::fs::remove_dir_all(&jsonl_dir);
 }
 
 /// A script that writes well over 50 bytes to stdout (repeated fixed-width
