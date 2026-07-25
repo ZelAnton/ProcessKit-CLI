@@ -738,6 +738,66 @@ fn list_reports_a_live_run() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// T-206, end to end through the real binary: an entry whose liveness could not be
+/// probed at all (its lock file resolves to a directory — see
+/// [`write_unprobeable_entry`]) must print as `"unprobed"`, in both `--json` and the
+/// human-readable table — never the confirmed-dead `"stale"`, which the probe never
+/// actually established. A confirmed-stale sibling in the same registry still prints
+/// `"stale"` as before, proving the two are not conflated in either direction.
+#[test]
+fn list_reports_an_unprobeable_entry_as_unprobed_not_stale() {
+    let dir = scratch("list-unprobed");
+    let registry = registry_dir(&dir);
+
+    write_unprobeable_entry(&registry, "run-unprobed-0000");
+    write_stale_entry(&registry, "run-stale-0000");
+
+    let out = list(&registry, true);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "listing a registry with an unprobeable entry still succeeds; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(lines.len(), 2, "both entries are listed: {stdout}");
+
+    let entries: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|line| serde_json::from_str(line).expect("list --json prints valid JSON per entry"))
+        .collect();
+    let unprobed = entries
+        .iter()
+        .find(|entry| entry["run_id"] == "run-unprobed-0000")
+        .expect("the unprobeable entry is listed, not dropped");
+    assert_eq!(
+        unprobed["health"], "unprobed",
+        "an unprobeable entry must never print as the confirmed-dead 'stale': {unprobed}"
+    );
+    let stale = entries
+        .iter()
+        .find(|entry| entry["run_id"] == "run-stale-0000")
+        .expect("the confirmed-stale entry is listed too");
+    assert_eq!(
+        stale["health"], "stale",
+        "a confirmed-stale entry still prints 'stale', unaffected by the unprobed sibling: {stale}"
+    );
+
+    // The human-readable table renders the same distinct value, not "stale".
+    let out = list(&registry, false);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("run-unprobed-0000") && stdout.contains("unprobed"),
+        "the human-readable form names the unprobeable run and its distinct health: {stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// `list` is documented as read-only and must never mutate registry state just to
 /// scan it: listing an empty (never-yet-created) registry must leave the registry
 /// directory absent, not create it as a side effect of the scan.
@@ -797,6 +857,28 @@ fn write_stale_entry(registry: &Path, stem: &str) {
     // An unlocked lock file: present on disk, but held by no one, so the prune probe
     // takes its exclusive lock and confirms the entry stale.
     fs::write(registry.join(&lock_name), b"").expect("write the unlocked lock file");
+}
+
+/// Hand-write an **unprobeable** entry into `registry` (T-206): a well-formed record
+/// whose `lock_file` name resolves to a *directory* rather than a regular file. The
+/// liveness probe's write-open then fails with a semantic "is a directory" error
+/// (`EISDIR` on Unix) for any user, including root — the cross-platform trick from
+/// [K-014] (`chmod 0o000` is unreliable under a privileged/`CAP_DAC_OVERRIDE` CI
+/// runner) — so this is a record whose health is neither confirmed live nor
+/// confirmed stale, only unknown.
+fn write_unprobeable_entry(registry: &Path, stem: &str) {
+    fs::create_dir_all(registry).expect("create the registry directory");
+    let lock_name = format!("{stem}.lock");
+    let record = format!(
+        "{{\"registry_version\":1,\"run_id\":\"{stem}\",\"endpoint\":null,\
+         \"started_at\":\"2026-07-22T00:00:00.000Z\",\
+         \"liveness\":{{\"kind\":\"advisory_lock\",\"lock_file\":\"{lock_name}\"}}}}"
+    );
+    fs::write(registry.join(format!("{stem}.json")), record).expect("write the record");
+    // A directory in the lock file's place: the probe's write-open fails with a
+    // semantic error, never NotFound, so the entry cannot be classified `Stale`.
+    fs::create_dir(registry.join(&lock_name))
+        .expect("create the directory the lock name resolves to");
 }
 
 /// Spawn `wait --run-id <id> [--timeout <duration>]` against `registry` **without**

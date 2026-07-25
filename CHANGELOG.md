@@ -18,7 +18,14 @@ to a dated version section.
 -
 
 ### Fixed
--
+- `list` (`--json` and the human-readable table) no longer prints a registry entry
+  whose liveness lock could not even be *probed* (permission denied, a rejected
+  symlink/reparse point, an unexpected non-regular file in its place) as `"stale"` —
+  a positive, unconfirmed claim that the runner is dead. It now reports a distinct
+  `"unprobed"` health value, matching the three-way vocabulary `prune --json`'s
+  `unprobed` tally and `wait` already use for the identical case. Additive change to
+  `list --json`'s `health` field; `inspect`/`cancel`/`kill`, which act only on a
+  confirmed-live entry, are unaffected.
 
 ## [0.3.0] - 2026-07-25
 

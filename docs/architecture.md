@@ -160,10 +160,14 @@ implemented in `run::execute`/`run::run_async` (`src/run.rs`):
 by PID; they resolve it through the run registry (`src/registry.rs`):
 
 1. **Registry scan.** `registry::Registry::entries` lists every record in the
-   per-user registry directory and classifies each as live or
-   [`registry::Health::Stale`] by probing the record's advisory liveness
-   lock — a dead runner's leftover record is detected this way, not by mere
-   file existence (see [`docs/registry.md`](registry.md)).
+   per-user registry directory and classifies each by probing the record's
+   advisory liveness lock — a dead runner's leftover record is detected this
+   way, not by mere file existence — as [`registry::Health::Live`],
+   confirmed-dead [`registry::Health::Stale`], or (when the probe itself could
+   not run, e.g. permission denied) [`registry::Health::Unprobed`]; this
+   control-plane contour only ever acts on `Live`, so `Stale` and `Unprobed`
+   are equivalent here (see [`docs/registry.md`](registry.md); `list` is the
+   consumer that tells the latter two apart).
 2. **Endpoint resolution.** `control::resolve_live_endpoint` matches the
    requested `run_id` against the live entries only. More than one live match
    is an **ambiguous run id** — a hard `CONTROL` (103) failure for every verb,

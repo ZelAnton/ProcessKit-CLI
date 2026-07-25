@@ -188,11 +188,11 @@ wrong-target action. See
 [`Registry::open_read_only`] (`src/registry.rs`) — **not** the mutating
 [`Registry::open`] `run` uses, so listing never creates the registry directory and
 never touches its permissions — and scans it with [`Registry::entries`], the same
-scan every other client shares, printing every entry it finds, live and stale alike:
-`run_id`, health (`live`/`stale`), `started_at`, and `endpoint`. It is deliberately
-**read-only** and never connects to any runner's control transport, so it carries
-none of the "could not reach the target run" failure modes `inspect`/`cancel`/`kill`
-do — it has no single target to fail to reach.
+scan every other client shares, printing every entry it finds, whatever its health:
+`run_id`, health (`live`/`stale`/`unprobed`), `started_at`, and `endpoint`. It is
+deliberately **read-only** and never connects to any runner's control transport, so
+it carries none of the "could not reach the target run" failure modes
+`inspect`/`cancel`/`kill` do — it has no single target to fail to reach.
 
 - **No `--json`** prints a human-readable table (or `no runs registered` for an
   empty registry).
@@ -204,11 +204,23 @@ do — it has no single target to fail to reach.
 - An **empty registry is not an error**: `list` prints an empty result (or the
   `no runs registered` notice) and exits `0`, exactly like scanning any other
   registry state.
-- A **stale entry is listed, not hidden** — unlike `inspect`/`cancel`/`kill`, which
-  treat a stale match as an unreachable-run failure, `list`'s whole purpose is
-  discovery, so a stale leftover (evidence of a runner that died abruptly without
-  cleaning up) is exactly the kind of thing an operator wants to see, e.g. before
-  reaping it.
+- A **stale (or unprobed) entry is listed, not hidden** — unlike
+  `inspect`/`cancel`/`kill`, which treat anything other than a confirmed-live match
+  as an unreachable-run failure, `list`'s whole purpose is discovery, so a stale
+  leftover (evidence of a runner that died abruptly without cleaning up) is exactly
+  the kind of thing an operator wants to see, e.g. before reaping it.
+- **`unprobed` is a distinct value, never folded into `stale` (T-206).** A record
+  whose liveness lock could not even be opened (permission denied, a rejected
+  symlink/reparse point, or an unexpected non-regular file in its place) is health
+  `unprobed`: the probe could not run, so nothing is confirmed — printing it as
+  `stale` would assert a confirmed death the probe never established, which could
+  lead an operator to hand-delete a record that may still belong to a live run. This
+  is the same three-way vocabulary `prune --json`'s `unprobed` tally and `wait`'s
+  `RunStatus::Unprobed` already use for the identical case (see "The reaping safety
+  invariant" and "Liveness it cannot confirm" below) — `list`'s health field is
+  additive: existing `--json` consumers that already treat any non-`"live"` value as
+  "not live" need no change, only ones that matched exhaustively on exactly
+  `"live"`/`"stale"`.
 - A single corrupt or unreadable record is skipped by `Registry::entries` itself
   (see "Staleness" and the per-record degradation documented there) and never
   blinds `list` to the other, healthy entries — including a record whose
@@ -271,12 +283,18 @@ kept strictly apart — and this is the load-bearing distinction:
 - **Probe failed ⇒ left in place.** The probe could not even be performed — the lock
   file would not open (a directory in its place, a permission error, a rejected
   symlink/reparse point) or the lock call itself errored. Liveness is *unknown*, not
-  confirmed stale, so the entry is **kept**, on every repeated prune. This is the case
-  the `list`/`inspect` read path deliberately collapses into `stale` (its
-  "could not confirm liveness ⇒ treat as not live" degradation): prune must **not**
-  reuse that collapsed verdict — a probe-failed record is not a confirmed-dead one —
-  so it probes on its own path that keeps the failure distinct, and errs toward
-  keeping a record it is unsure about.
+  confirmed stale, so the entry is **kept**, on every repeated prune. This is the
+  same case `Registry::entries` reports as [`Health::Unprobed`] (T-206) — never
+  folded into `Stale` — so the read path `list`/`inspect` share already keeps it
+  apart from a confirmed-dead entry too, at the `Health` level; `inspect`/`cancel`/
+  `kill` still treat it exactly like `Stale` because they act only on
+  [`Health::Live`] (a probe-failed record is not that, whichever of the two
+  non-live values it carries). Prune, though, cannot simply reuse `Entry::health`
+  here even now that it distinguishes the case: reaping needs the probe's acquired
+  lock held across the two deletions below, and a pure liveness query like
+  `entries()` already released it — so prune probes on its **own** path that keeps
+  the failure distinct *and* keeps the lock, and errs toward keeping a record it is
+  unsure about.
 
 Two further guarantees hold, mirroring the rest of the registry:
 
@@ -434,9 +452,14 @@ fact must establish it separately — it launched the run itself, or it saw the 
 One case is neither live nor confirmed over: a matching record whose lock file cannot be
 probed at all (a directory in its place, a permission error, a rejected reparse point —
 the same "probe failed" case "The reaping safety invariant" above keeps apart from
-"confirmed stale"). `Registry::entries` collapses that failure into `stale`, which is
-right for `list`/`inspect`, whose worst case is showing or refusing; it is wrong for
-`wait`, whose `0` is a positive claim about a run's lifetime.
+"confirmed stale"). `Registry::entries` reports that case as its own
+[`Health::Unprobed`] value (T-206), never folded into `Stale` — right for `list`,
+whose whole purpose is showing the operator exactly what was and was not confirmed,
+and functionally unchanged for `inspect`/`cancel`/`kill`, which act only on
+[`Health::Live`] and so treat `Unprobed` exactly as they treated the old collapsed
+`Stale`. Minting a *positive* "finished" from that same unconfirmed case would still
+be wrong for `wait`, whose `0` is a positive claim about a run's lifetime — so `wait`
+does not read `Entry::health` at all here, live or otherwise.
 
 So `wait` probes on its own path and **keeps waiting** on an unconfirmable entry rather
 than announcing a completion it never observed. A bounded caller still gets a definite

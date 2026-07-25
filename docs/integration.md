@@ -298,15 +298,19 @@ clean up after abrupt failures — see the normative "Discovery" and "Reaping"
 sections of [`docs/registry.md`](registry.md).
 
 ```sh
-processkit-cli list  --json   # every registered run, live and stale
+processkit-cli list  --json   # every registered run, whatever its health
 processkit-cli prune --json   # reap only the confirmed-stale entries
 ```
 
 - **`list --json`** prints one JSON object per registry entry (`run_id`,
-  `live`/`stale` health, `started_at`, `endpoint`), sorted deterministically.
-  Both live and stale entries are listed — a stale entry (a leftover from a
-  runner that died abruptly) is exactly what an operator or adapter wants
-  visible here, not hidden.
+  health, `started_at`, `endpoint`), sorted deterministically. Health is
+  `live`, `stale` (**confirmed** dead — no live holder found), or `unprobed`
+  (the liveness lock could not even be opened, e.g. permission denied — a
+  distinct, additive value: liveness is *unknown*, never printed as the
+  confirmed-dead `stale`). All three are listed, never hidden — a stale entry
+  (a leftover from a runner that died abruptly) is exactly what an operator or
+  adapter wants visible here, and an unprobed one is exactly the case where
+  guessing would mislead.
 - **`prune --json`** deletes only entries it can *confirm* are stale, printing
   a tally: `{"pruned":N,"live":N,"unprobed":N,"orphaned_locks":N}`. A live run
   is never touched, and an entry whose liveness could not even be probed is
