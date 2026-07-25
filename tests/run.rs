@@ -755,21 +755,52 @@ fn assert_output_captured_matches(baseline: &[Value], no_echo: &[Value]) {
 /// (README/CHANGELOG advertise it for an embedding orchestrator that reads the
 /// result from `--jsonl` alone): the runner's own stdout/stderr carry none of
 /// the child's output, while `root_exited`/`runner_exit` still report the
-/// child's real outcome unchanged.
+/// child's real outcome unchanged. The child actually writes marker bytes on
+/// both streams (a silent `exit 0` child can't distinguish a working
+/// suppression from a relay that was never wired up in the first place — see
+/// R-03), and a baseline run of the same script *without* `--no-echo` proves
+/// those markers do reach the runner's streams absent the flag.
 #[test]
 fn bare_no_echo_suppresses_the_relay_without_capture_dir() {
-    let dir = scratch("no-echo-bare");
-    let out = run_with_flags(&dir, &[], &["--no-echo"], shell_inline("exit 0"));
-    assert_eq!(out.status.code(), Some(0), "the child exits cleanly");
+    let script = if cfg!(windows) {
+        "echo NO_ECHO_BARE_OUT&echo NO_ECHO_BARE_ERR 1>&2"
+    } else {
+        "echo NO_ECHO_BARE_OUT; echo NO_ECHO_BARE_ERR 1>&2"
+    };
+
+    // Baseline: same script, no --no-echo — the markers must reach the
+    // runner's own stdout/stderr, or the flagged run below would prove
+    // nothing.
+    let baseline_dir = scratch("no-echo-bare-baseline");
+    let baseline_out = run_with_flags(&baseline_dir, &[], &[], shell_inline(script));
+    assert_eq!(
+        baseline_out.status.code(),
+        Some(0),
+        "baseline child exits cleanly"
+    );
+    let baseline_stdout = String::from_utf8_lossy(&baseline_out.stdout).into_owned();
+    let baseline_stderr = String::from_utf8_lossy(&baseline_out.stderr).into_owned();
     assert!(
-        out.stdout.is_empty(),
-        "--no-echo without --capture-dir must still suppress the runner's stdout relay: {:?}",
-        String::from_utf8_lossy(&out.stdout)
+        baseline_stdout.contains("NO_ECHO_BARE_OUT"),
+        "baseline (no --no-echo) echoes the child's stdout: {baseline_stdout:?}"
     );
     assert!(
-        out.stderr.is_empty(),
-        "--no-echo without --capture-dir must still suppress the runner's stderr relay: {:?}",
-        String::from_utf8_lossy(&out.stderr)
+        baseline_stderr.contains("NO_ECHO_BARE_ERR"),
+        "baseline (no --no-echo) echoes the child's stderr: {baseline_stderr:?}"
+    );
+
+    let dir = scratch("no-echo-bare");
+    let out = run_with_flags(&dir, &[], &["--no-echo"], shell_inline(script));
+    assert_eq!(out.status.code(), Some(0), "the child exits cleanly");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        !stdout.contains("NO_ECHO_BARE_OUT") && !stdout.contains("NO_ECHO_BARE_ERR"),
+        "--no-echo without --capture-dir must still suppress the runner's stdout relay: {stdout:?}"
+    );
+    assert!(
+        !stderr.contains("NO_ECHO_BARE_OUT") && !stderr.contains("NO_ECHO_BARE_ERR"),
+        "--no-echo without --capture-dir must still suppress the runner's stderr relay: {stderr:?}"
     );
 
     let events = read_run_events(&dir);
@@ -786,6 +817,7 @@ fn bare_no_echo_suppresses_the_relay_without_capture_dir() {
     assert_eq!(runner_exit["source"], "child_exit");
 
     let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&baseline_dir);
 }
 
 /// `--no-echo` combined with `--idle-timeout` (K-050): the `IdleClock` must stay
