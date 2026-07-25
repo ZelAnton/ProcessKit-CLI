@@ -19,11 +19,22 @@ with the `processkit` crate.
   this only matters if you adopt a newer language or `std` feature — bump
   `rust-version` and the `msrv` job's toolchain together if you do.
 - Optionally, [`just`](https://github.com/casey/just#installation) — the repo
-  ships a [`justfile`](justfile) with one target per CI job (`just test`,
-  `just lint`, …), kept in sync with what CI actually runs so local and CI
-  checks never drift apart. Every command below has an equivalent `just`
-  target; both are documented here, but `just <target>` is the shorter path.
-  Before either, `just check-env` (or `bash scripts/check-env.sh` /
+  ships a [`justfile`](justfile) covering the main dev-lanes (`just test`,
+  `just lint`, …); each target mirrors the exact command its CI counterpart
+  runs, so it never drifts from what CI actually does. Coverage is not
+  complete, though: three **gating** `ci.yml` jobs have no `just` equivalent —
+  `yaml-lint` (`yamllint .`), `msrv` (`cargo check --all-targets` on the
+  toolchain the `msrv` job pins, with `rust-toolchain.toml` removed first —
+  see the job for why), and `target-check` (`cargo check --all-targets
+  --target <triplet>` for three release triplets, most of which need a cross
+  toolchain this machine likely lacks) — so a clean run of every `just`
+  target does not by itself guarantee a green CI run; run those three
+  directly, or rely on CI, before merging or publishing. `cargo test <name>`,
+  the various `cargo install …`/`rustup …` setup commands below, and
+  `cargo +nightly fuzz build` also have no dedicated target. Both the `just`
+  and plain-`cargo` forms are documented in the sections below; where a `just`
+  target exists, `just <target>` is the shorter path. Before any of the
+  above, `just check-env` (or `bash scripts/check-env.sh` /
   `pwsh scripts/check-env.ps1` directly) confirms a stable Rust toolchain is
   on `PATH`.
 
