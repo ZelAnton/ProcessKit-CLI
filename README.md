@@ -267,8 +267,10 @@ same local IPC control plane, addressing it by `run_id` through the per-user reg
 `--json` it prints the snapshot as a single JSON line, unchanged. `cancel` ends the
 run through the *same* soft-stop → grace → hard-kill teardown a `Ctrl-C` uses
 (exiting the run with the reserved code `108`), and `kill` hard-kills the whole tree
-immediately with no grace (code `109`). The scope of a cancel/kill is only the
-target run's ProcessKit container — never processes matched by executable name. Both
+immediately with no grace (code `109`). By `--run-id`, the scope of a cancel/kill is
+only the target run's ProcessKit container (the `--all` form below widens this to
+every confirmed-live registry entry, still **never** processes matched by executable
+name — that boundary holds for both forms). Both
 outcomes are also written to the run's JSONL stream (a `cancelled` / `killed` event
 and a terminal `runner_exit`), so an external observer reading the event file sees
 the command too, not just the control client. If the runner has already died, the

@@ -268,6 +268,20 @@ Both mutating verbs' outcomes are also written to the *target run's own*
 an adapter watching that stream sees the command take effect even without
 reading the `cancel`/`kill` client's own ack.
 
+**Tearing down everything at once: `--all` (T-217).** `cancel --all` / `kill
+--all` (mutually exclusive with `--run-id`, one of the two required) are the
+aggregate counterpart to the by-`run_id` form above: instead of one named run
+they act on every run confirmed live in a snapshot taken when the invocation
+starts, applying the identical per-run mutation to each, and print a single
+JSON array on stdout — one `{"run_id":...,"accepted":...}` entry per snapshot
+target — instead of one ack. An adapter driving a full environment teardown
+(e.g. before shutting down its own process) typically issues `cancel --all`
+in place of a loop over individually-known `run_id`s, then `wait --all` /
+`list --json` / `prune` to confirm the fleet is actually gone. See
+[`docs/control-plane.md`](control-plane.md), "`cancel --all` / `kill --all`",
+for the exit-code and report contract — it differs from the by-`run_id` form's
+`103` in the note right below.
+
 **Waiting for a run an adapter did not launch.** The typical shape — cancel a
 run, then confirm it is really gone before releasing the resources it held:
 
@@ -297,9 +311,12 @@ esac
 - Without `--timeout`, `wait` blocks indefinitely. Prefer an explicit deadline
   in an adapter, so a supervisor never inherits an unbounded wait.
 
-**`CONTROL` (103)** is the one exit code all four of these clients can return,
-for the same underlying reason: the command could not be resolved to *the*
-single target run. See §6 for the concrete situations that produce it.
+**`CONTROL` (103)** is the one exit code all four of these clients' by-`run_id`
+form can return, for the same underlying reason: the command could not be
+resolved to *the* single target run. See §6 for the concrete situations that
+produce it. `cancel --all` / `kill --all` reuse the same code for a different
+reason — one or more snapshot targets failed, not "no single target run" — see
+the `--all` paragraph above and `docs/control-plane.md`.
 
 ## 5. Housekeeping: `list` / `prune`
 
@@ -377,14 +394,17 @@ carries the "could not reach the target run" failure modes of §4.
   rather than guessing which entry the scan happened to return first. Keep
   `run_id`s unique among an adapter's own concurrently-live runs (§2) to avoid
   this entirely.
-- **`CONTROL`-class exit codes are not run outcomes.** A `103` from
-  `inspect`/`cancel`/`kill`/`wait` describes the *client's* inability to
-  resolve or reach a single target — it says nothing about how the target run
-  itself ended (or is still running). Do not conflate it with the run-outcome
-  codes in §3's table (`106`–`109`, or the child's own code); those come only
-  from the run's own process exit and its `runner_exit` event. The same
-  separation applies to `WAIT_TIMEOUT` (112): it is the *waiting client*
-  giving up, never the run being stopped (§4).
+- **`CONTROL`-class exit codes are not run outcomes.** A `103` from the
+  by-`run_id` form of `inspect`/`cancel`/`kill`/`wait` describes the *client's*
+  inability to resolve or reach a single target — it says nothing about how
+  the target run itself ended (or is still running). Do not conflate it with
+  the run-outcome codes in §3's table (`106`–`109`, or the child's own code);
+  those come only from the run's own process exit and its `runner_exit`
+  event. The same separation applies to `WAIT_TIMEOUT` (112): it is the
+  *waiting client* giving up, never the run being stopped (§4).
+  `cancel --all` / `kill --all`'s own `103` is the one exception where the
+  code *can* coincide with some targets having genuinely been acted on — see
+  the `--all` paragraph in §4.
 - **A `--detach` exit code is not a run outcome either.** `run --detach`'s `0`
   means "the run started", not "the child succeeded", and its non-zero codes
   mean "the run never started" — carrying the same reserved code the failure

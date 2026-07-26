@@ -672,6 +672,194 @@ fn control_clients_do_not_create_the_registry_directory() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Run a mutating aggregate control verb (`cancel --all` / `kill --all`) against the
+/// scratch registry and wait for it to finish.
+fn control_all_client(registry: &Path, verb: &str) -> Output {
+    Command::new(bin())
+        .args([verb, "--all"])
+        .env("PROCESSKIT_CLI_REGISTRY_DIR", registry)
+        .output()
+        .expect("spawn the --all control client")
+}
+
+/// `cancel --all` against a snapshot mixing one resolvable run with a pair of runs
+/// sharing a duplicate `run_id` — a deterministic way to exercise the *aggregate
+/// failure* path (`mutate_all_async`'s `if failed > 0`) in the default (non-`e2e`)
+/// tier, since the ambiguity itself never needs a live control-plane round trip to
+/// fail: the resolvable run is genuinely ended over the control plane exactly like
+/// the single-run form, the ambiguous pair is rejected by the identical
+/// `resolve_in_registry` "ambiguous run id" check, and the aggregate exit code plus
+/// the stderr tally must reflect the partial failure — none of which the `e2e`-only,
+/// full-success `control_plane_cancel_all_reaps_every_live_run` exercises (R-01, see
+/// `.work/tasks/T-217/review.md`).
+#[test]
+fn cancel_all_reports_a_partial_failure_for_an_ambiguous_snapshot_entry() {
+    let dir = scratch("control-all-partial-failure");
+    let registry = registry_dir(&dir);
+
+    let mut solo = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "solo-run"],
+        long_child(),
+    )
+    .spawn()
+    .expect("spawn the resolvable runner");
+    let mut dup_first = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "dup-target"],
+        long_child(),
+    )
+    .spawn()
+    .expect("spawn the first duplicate runner");
+    let mut dup_second = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "dup-target"],
+        long_child(),
+    )
+    .spawn()
+    .expect("spawn the second duplicate runner");
+
+    // All three entries are live and reachable before the aggregate verb runs.
+    wait_until(|| record_count(&registry) == 3, Duration::from_secs(10));
+
+    let out = control_all_client(&registry, "cancel");
+    assert_eq!(
+        out.status.code(),
+        Some(103),
+        "a partial failure surfaces the aggregate CONTROL code, never a silent 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("cancel --all prints a JSON report array");
+    let outcomes = report.as_array().expect("the report is a JSON array");
+    assert_eq!(
+        outcomes.len(),
+        3,
+        "the report names every snapshot target: {report}"
+    );
+
+    let solo_outcome = outcomes
+        .iter()
+        .find(|entry| entry["run_id"] == "solo-run")
+        .unwrap_or_else(|| panic!("the report names `solo-run`: {report}"));
+    assert_eq!(
+        solo_outcome["accepted"], true,
+        "the resolvable target is accepted: {report}"
+    );
+    assert!(
+        solo_outcome.get("error").is_none() || solo_outcome["error"].is_null(),
+        "a successful outcome carries no error: {report}"
+    );
+
+    let dup_outcomes: Vec<&serde_json::Value> = outcomes
+        .iter()
+        .filter(|entry| entry["run_id"] == "dup-target")
+        .collect();
+    assert_eq!(
+        dup_outcomes.len(),
+        2,
+        "both duplicate-id entries are individually named in the report: {report}"
+    );
+    for outcome in &dup_outcomes {
+        assert_eq!(
+            outcome["accepted"], false,
+            "an ambiguous target is not accepted: {report}"
+        );
+        let error = outcome["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a failed outcome carries an error string: {report}"));
+        assert!(
+            error.contains("ambiguous"),
+            "the failure reason names the ambiguity: {error}"
+        );
+    }
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("2 of 3"),
+        "stderr names the failure tally so an oncall reader does not need the JSON: {stderr}"
+    );
+
+    // The resolvable run really was cancelled over the control plane…
+    let status = solo.wait().expect("the resolvable runner exits");
+    assert_eq!(
+        status.code(),
+        Some(108),
+        "the resolvable target still receives the real control-plane cancel, not a no-op"
+    );
+    // …while the rejected ambiguous pair was never touched: both stay live.
+    assert_eq!(
+        record_count(&registry),
+        2,
+        "the rejected ambiguous pair must not be torn down by the partial failure"
+    );
+
+    let _ = dup_first.kill();
+    let _ = dup_first.wait();
+    let _ = dup_second.kill();
+    let _ = dup_second.wait();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `cancel --all` / `kill --all` against a registry with no confirmed-live entries —
+/// an absent directory, or one holding only a confirmed-stale leftover — is not an
+/// error: an empty snapshot means nothing to act on, mirroring `prune` exactly as the
+/// criteria in `.work/tasks/T-217/task.md` require, and the same "empty target set is
+/// not a failure" contract `wait_all_returns_at_once_with_no_live_runs` already proves
+/// for `wait --all` (R-01).
+#[test]
+fn cancel_all_and_kill_all_return_at_once_with_no_live_runs() {
+    for verb in ["cancel", "kill"] {
+        let dir = scratch(&format!("control-all-empty-{verb}"));
+        let registry = registry_dir(&dir);
+
+        // A never-created registry: no live runs, trivially.
+        let out = control_all_client(&registry, verb);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "an empty (missing) registry has nothing for {verb} --all to act on; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "[]",
+            "{verb} --all prints an empty report array, not nothing and not an error"
+        );
+        assert_eq!(
+            record_count(&registry),
+            0,
+            "{verb} --all against an empty registry must not create the registry directory"
+        );
+
+        // A registry with only a confirmed-stale leftover is likewise nothing to act on.
+        write_stale_entry(&registry, "run-stale-0000");
+        let out = control_all_client(&registry, verb);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "a registry with only stale entries has nothing live for {verb} --all; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "[]",
+            "{verb} --all against an all-stale registry prints an empty report array"
+        );
+        assert_eq!(
+            record_count(&registry),
+            1,
+            "{verb} --all must not touch a stale entry it never acts on"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
 /// Run `list [--json]` against `registry` and wait for it to finish.
 fn list(registry: &Path, json: bool) -> Output {
     let mut cmd = Command::new(bin());
