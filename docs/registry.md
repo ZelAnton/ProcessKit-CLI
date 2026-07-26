@@ -558,10 +558,10 @@ could not probe.
   registry is control-plane *discovery* infrastructure, and losing it must never cost
   the child its faithfully forwarded exit code (`AGENTS.md`, "Exit-code fidelity").
 - **Remove.** On a clean exit the entry is removed from the **same teardown site as
-  the container reap** in `src/run.rs`, on **every decided ending** — a normal child
-  exit, a `--timeout`, a local stop-signal cancel (`Ctrl-C`, on Unix a
-  `SIGTERM`/`SIGHUP`, or on Windows a `Ctrl-Break`/console close/logoff/system
-  shutdown, all of which the runner catches), or a control-plane
+  the container reap** (`clear_registration` in `src/run/teardown.rs`), on **every
+  decided ending** — a normal child exit, a `--timeout`, a local stop-signal cancel
+  (`Ctrl-C`, on Unix a `SIGTERM`/`SIGHUP`, or on Windows a `Ctrl-Break`/console
+  close/logoff/system shutdown, all of which the runner catches), or a control-plane
   `cancel`/`kill` — not just the happy path.
 - **Leak → stale.** An abrupt death skips that removal by definition, leaving the
   record on disk — and, on unix, the control socket that record published (see
