@@ -59,3 +59,20 @@ primitive, the CLI reports `direct_child_only` or `none` in `run_started` and
 does not claim the Windows guarantee on those platforms. Any stronger contract
 requires additive, identity-safe ProcessKit-rs support and cross-platform
 abrupt-death proof.
+
+Runtime resource-limit attribution is also a core dependency. `limit_hit`
+(see [`docs/schema.md`](schema.md#limit_hit)) today covers only the pre-spawn
+"could not be applied" branch — a requested cap the platform has no container
+for, or a Linux cgroup v2 whose controllers can't be enabled. It does not, and
+currently cannot, cover a cap that *was* applied and then actually fired during
+the run (a Linux cgroup OOM-kill or `pids` fork refusal, a Windows Job Object
+memory/active-process limit): ProcessKit's public API exposes no portable
+post-spawn evidence primitive for that case (no `memory.events`/`pids.events`-
+style readback, no Job Object notification/query), so a live limit kill is
+today indistinguishable from the child failing on its own. A cross-repo
+request for an additive, identity-safe post-spawn evidence primitive has been
+sent to ProcessKit-rs (`msg-send-401e87d4625e22218e50a11de4a7f122`). Until it
+ships, publishing that attribution in the JSONL stream — an additive schema
+change, exact shape (a `limit_hit` discriminator field vs. a separate event)
+to be decided when it is planned — remains a future roadmap item with no
+committed timeline.
