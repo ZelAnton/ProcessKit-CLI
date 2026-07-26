@@ -6,7 +6,7 @@
 //! strictly separated"; the task's "don't break live echo"). Capture rides
 //! ProcessKit's existing per-stream tee — a [`CaptureTee`] wraps whatever sink
 //! `run`'s sink-selection block already tees to (`tokio::io::stdout()`/`stderr()`
-//! by default, or `tokio::io::sink()` under `--no-echo` — see `src/run.rs` and
+//! by default, or `tokio::io::sink()` under `--no-echo` — see `src/run/launch.rs` and
 //! K-050) and mirrors every byte the pump observes into a bounded capture file —
 //! so no second output-reading path is invented and the child's back-pressure is
 //! exactly the echo sink's (the tee is awaited on ProcessKit's line pump).
@@ -49,7 +49,7 @@ use crate::hash::Sha256;
 /// but not written, and the stream's `truncated` flag is set. Bounds the on-disk
 /// transcript so a runaway child cannot fill the disk through the capture files;
 /// the live echo is never bounded. `pub` so `src/cli.rs`'s `--capture-max-bytes`
-/// docstring and `src/run.rs`'s default-resolution call site can both cite this
+/// docstring and `src/run/launch.rs`'s default-resolution call site can both cite this
 /// single constant instead of duplicating the value (T-181).
 pub const CAPTURE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -192,7 +192,7 @@ impl Capture {
     /// silently dropped.
     ///
     /// Callers pass [`CAPTURE_MAX_BYTES`] unless `run`'s `--capture-max-bytes`
-    /// overrode it (see `src/run.rs`), so a bare `run --capture-dir` (no
+    /// overrode it (see `src/run/launch.rs`), so a bare `run --capture-dir` (no
     /// `--capture-max-bytes`) is byte-for-byte the same ceiling as before T-181.
     pub fn create(dir: &Path, max_bytes: u64) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
@@ -347,7 +347,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CaptureTee<W> {
 ///
 /// Every output chunk the runner sees a child produce re-arms the idle window by
 /// stamping this clock with the current instant (see [`IdleActivityTee`]); the
-/// idle-deadline future in `src/run.rs` reads it to decide whether a *full* idle
+/// idle-deadline future in `src/run/signals.rs` reads it to decide whether a *full* idle
 /// window has elapsed with **no** output. There is exactly one clock per run, so
 /// both output paths — the default echo and the `--capture-dir` tee — re-arm the
 /// same timer rather than two independent ones (a requirement of T-182: an idle
@@ -409,7 +409,7 @@ impl IdleClock {
 
     /// Wrap `inner` so every chunk written through it re-arms this clock. Used to
     /// wrap the outermost output sink on both the default-echo and `--capture-dir`
-    /// tee paths (see `src/run.rs`).
+    /// tee paths (see `src/run/launch.rs`).
     pub(crate) fn tee<W>(&self, inner: W) -> IdleActivityTee<W> {
         IdleActivityTee {
             inner,

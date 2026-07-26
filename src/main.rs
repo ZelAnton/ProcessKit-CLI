@@ -35,7 +35,7 @@ fn main() -> ExitCode {
     // and each reports through the shared runner-error path below.
     match cli.command {
         Command::Run(args) => run::execute(*args),
-        Command::Inspect(args) => report(control::inspect(&args.run_id)),
+        Command::Inspect(args) => report(control::inspect(&args.run_id, args.json)),
         Command::Cancel(args) => report(control::cancel(&args.run_id)),
         Command::Kill(args) => report(control::kill(&args.run_id)),
         Command::Wait(args) => report(wait::run(&args.run_id, args.timeout)),

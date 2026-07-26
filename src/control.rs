@@ -614,18 +614,21 @@ pub fn current_thread_runtime() -> Result<tokio::runtime::Runtime, RunnerError> 
         })
 }
 
-/// Client entry for `inspect --run-id <id> --json`: find the live runner through the
-/// registry, ask it for a snapshot, and print it. Runs on its own small current-thread
-/// runtime (the transport client is async). A run that cannot be reached — no such id,
-/// a stale entry, an unprobeable one, a dead-mid-conversation runner — returns a
-/// [`exit::CONTROL`] error naming which of those applied (see `no_live_entry`).
-pub fn inspect(run_id: &str) -> Result<(), RunnerError> {
+/// Client entry for `inspect --run-id <id> [--json]`: find the live runner through
+/// the registry, ask it for a snapshot, and print it — as a single JSON line with
+/// `--json` (unchanged, byte-for-byte, from before `--json` became optional), or as a
+/// human-readable rendering by default (see [`render_snapshot_human`]). Runs on its
+/// own small current-thread runtime (the transport client is async). A run that
+/// cannot be reached — no such id, a stale entry, an unprobeable one, a
+/// dead-mid-conversation runner — returns a [`exit::CONTROL`] error naming which of
+/// those applied (see `no_live_entry`), regardless of the output format.
+pub fn inspect(run_id: &str, json: bool) -> Result<(), RunnerError> {
     let runtime = current_thread_runtime()?;
-    runtime.block_on(inspect_async(run_id))
+    runtime.block_on(inspect_async(run_id, json))
 }
 
 /// The async body of [`inspect`]: registry lookup, connect, converse, print.
-async fn inspect_async(run_id: &str) -> Result<(), RunnerError> {
+async fn inspect_async(run_id: &str, json: bool) -> Result<(), RunnerError> {
     let endpoint = resolve_live_endpoint("inspect", run_id).await?;
 
     // Connect under a deadline: a runner that died between the liveness probe and now
@@ -637,14 +640,122 @@ async fn inspect_async(run_id: &str) -> Result<(), RunnerError> {
     let snapshot: Snapshot =
         converse_under_deadline(stream, INSPECT_REQUEST, "inspect", run_id).await?;
 
-    let json = serde_json::to_string(&snapshot).map_err(|err| {
-        RunnerError::new(
-            exit::SETUP,
-            format!("could not render the inspect snapshot: {err}"),
-        )
-    })?;
-    println!("{json}");
+    for line in snapshot_output_lines(&snapshot, json)? {
+        println!("{line}");
+    }
     Ok(())
+}
+
+/// Choose `inspect`'s output form: a single JSON line with `json` (unchanged,
+/// byte-for-byte, from before `--json` became optional), or a human-readable
+/// rendering by default (see [`render_snapshot_human`]). Split out from
+/// [`inspect_async`] purely so this `if json` branch itself — not just the two
+/// renderings it picks between — is directly unit-testable: [`inspect_async`] only
+/// prints whatever this returns.
+fn snapshot_output_lines(snapshot: &Snapshot, json: bool) -> Result<Vec<String>, RunnerError> {
+    if json {
+        let line = serde_json::to_string(snapshot).map_err(|err| {
+            RunnerError::new(
+                exit::SETUP,
+                format!("could not render the inspect snapshot: {err}"),
+            )
+        })?;
+        Ok(vec![line])
+    } else {
+        Ok(render_snapshot_human(snapshot))
+    }
+}
+
+/// Render a [`Snapshot`] as the human-readable form `inspect` prints without
+/// `--json` — the single-snapshot counterpart to `list`'s
+/// [`crate::list`]-style table, in the same "column-aligned, header included"
+/// spirit but shaped for one record's fields rather than one row per entry: a small
+/// key/value block for the run's own facts (every [`Snapshot`] field, symmetric with
+/// the JSON form — T-214's own review flagged an earlier version of this rendering
+/// for silently dropping `snapshot_version`), then a member table (mirroring `list`'s
+/// column-aligned rendering) for `members`, since a live run's container can hold
+/// several. Split out from [`inspect_async`] so alignment can be asserted directly in
+/// tests, exactly like `list`'s `render_table_lines`.
+///
+/// Destructures `snapshot` field-by-field without `..` so a future field added to
+/// [`Snapshot`] fails this function to compile instead of silently staying invisible
+/// in the human form while still showing up in the JSON one (`list::health_str`,
+/// `src/list.rs`, is the same "no wildcard arm" discipline applied to an enum).
+fn render_snapshot_human(snapshot: &Snapshot) -> Vec<String> {
+    let Snapshot {
+        snapshot_version,
+        run_id,
+        mechanism,
+        root_pid,
+        started_at,
+        members,
+    } = snapshot;
+
+    const LABEL_WIDTH: usize = 19;
+    let mut lines = vec![
+        format!("{:<LABEL_WIDTH$}{snapshot_version}", "snapshot_version:"),
+        format!("{:<LABEL_WIDTH$}{run_id}", "run_id:"),
+        format!("{:<LABEL_WIDTH$}{mechanism}", "mechanism:"),
+        format!(
+            "{:<LABEL_WIDTH$}{}",
+            "root_pid:",
+            root_pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        ),
+        format!("{:<LABEL_WIDTH$}{started_at}", "started_at:"),
+    ];
+
+    if members.is_empty() {
+        lines.push(format!("{:<LABEL_WIDTH$}(none)", "members:"));
+        return lines;
+    }
+    lines.push(format!("{:<LABEL_WIDTH$}{}", "members:", members.len()));
+
+    const HEADERS: [&str; 4] = ["PID", "PPID", "NAME", "START_TIME"];
+    let cells: Vec<[String; 4]> = members
+        .iter()
+        .map(|member| {
+            [
+                member.pid.to_string(),
+                member
+                    .ppid
+                    .map(|ppid| ppid.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                member.name.clone().unwrap_or_else(|| "-".to_string()),
+                member.start_time.clone().unwrap_or_else(|| "-".to_string()),
+            ]
+        })
+        .collect();
+    let mut widths = HEADERS.map(str::len);
+    for row in &cells {
+        for (width, cell) in widths.iter_mut().zip(row.iter()) {
+            *width = (*width).max(cell.len());
+        }
+    }
+    lines.push(format!(
+        "  {:w0$}  {:w1$}  {:w2$}  {}",
+        HEADERS[0],
+        HEADERS[1],
+        HEADERS[2],
+        HEADERS[3],
+        w0 = widths[0],
+        w1 = widths[1],
+        w2 = widths[2],
+    ));
+    for row in &cells {
+        lines.push(format!(
+            "  {:w0$}  {:w1$}  {:w2$}  {}",
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            w0 = widths[0],
+            w1 = widths[1],
+            w2 = widths[2],
+        ));
+    }
+    lines
 }
 
 /// Client entry for `cancel --run-id <id>`: reach the live runner through the
@@ -1451,6 +1562,138 @@ mod tests {
         // explicitly null, not omitted.
         assert_eq!(parsed.members[1].pid, 4243);
         assert!(parsed.members[1].ppid.is_none());
+    }
+
+    /// T-214 regression: `inspect --json`'s wire/stdout shape is pinned byte-for-byte
+    /// against a fixed snapshot. This goes through [`snapshot_output_lines`] — the
+    /// same function `inspect_async`'s `--json` branch calls — not a reimplementation,
+    /// so a change to the client's actual print path (not just `Snapshot`'s serde
+    /// shape, which [`serialize_snapshot`]'s own round-trip test above separately
+    /// covers) fails this test too. A field added/renamed/reordered, or a whitespace
+    /// change, fails this test.
+    #[test]
+    fn json_output_is_byte_for_byte_pinned() {
+        let snapshot = Snapshot {
+            snapshot_version: SNAPSHOT_VERSION,
+            run_id: "build-42".to_string(),
+            mechanism: "job_object".to_string(),
+            root_pid: Some(4242),
+            started_at: "2026-07-20T21:00:00.000Z".to_string(),
+            members: vec![Member {
+                pid: 4242,
+                ppid: Some(4200),
+                name: Some("build.exe".to_string()),
+                start_time: Some("133456789000000000".to_string()),
+            }],
+        };
+        let lines =
+            snapshot_output_lines(&snapshot, true).expect("a plain Snapshot always serializes");
+        assert_eq!(
+            lines,
+            vec![format!(
+                "{{\"snapshot_version\":{SNAPSHOT_VERSION},\"run_id\":\"build-42\",\"mechanism\":\
+                 \"job_object\",\"root_pid\":4242,\"started_at\":\"2026-07-20T21:00:00.000Z\",\
+                 \"members\":[{{\"pid\":4242,\"ppid\":4200,\"name\":\"build.exe\",\"start_time\":\
+                 \"133456789000000000\"}}]}}"
+            )],
+            "inspect --json's output shape must stay byte-for-byte unchanged"
+        );
+    }
+
+    /// The other half of the `if json` branch [`json_output_is_byte_for_byte_pinned`]
+    /// covers: with `json = false`, [`snapshot_output_lines`] must return the
+    /// human-readable rendering, not the JSON line — so a mutation flipping the
+    /// condition (or collapsing it to a constant) is caught here, not just by a
+    /// difference in the two tests' expected literals.
+    #[test]
+    fn snapshot_output_lines_without_json_is_the_human_rendering() {
+        let snapshot = Snapshot {
+            snapshot_version: SNAPSHOT_VERSION,
+            run_id: "run-1".to_string(),
+            mechanism: "process_group".to_string(),
+            root_pid: None,
+            started_at: "2026-07-20T21:00:00.000Z".to_string(),
+            members: vec![],
+        };
+        let lines = snapshot_output_lines(&snapshot, false)
+            .expect("a plain Snapshot always renders human-readably");
+        assert_eq!(
+            lines,
+            render_snapshot_human(&snapshot),
+            "json = false must take the human-readable path, not the JSON one"
+        );
+        assert!(
+            !lines[0].starts_with('{'),
+            "the human-readable form must not look like the JSON line: {lines:?}"
+        );
+    }
+
+    /// The human-readable rendering (`inspect` without `--json`) shows every field a
+    /// JSON snapshot carries — including `snapshot_version`, not just the five
+    /// operator-facing ones — plus the member table, column-aligned the same way
+    /// `list`'s table is. This test asserts the exact line set, so it would fail (not
+    /// just look incomplete) if a field silently dropped out of the rendering again.
+    #[test]
+    fn render_snapshot_human_shows_every_snapshot_field() {
+        let snapshot = Snapshot {
+            snapshot_version: SNAPSHOT_VERSION,
+            run_id: "build-42".to_string(),
+            mechanism: "job_object".to_string(),
+            root_pid: Some(4242),
+            started_at: "2026-07-20T21:00:00.000Z".to_string(),
+            members: vec![
+                Member {
+                    pid: 4242,
+                    ppid: Some(4200),
+                    name: Some("build.exe".to_string()),
+                    start_time: Some("133456789000000000".to_string()),
+                },
+                Member::from_pid(99),
+            ],
+        };
+        let lines = render_snapshot_human(&snapshot);
+        assert_eq!(
+            lines,
+            vec![
+                "snapshot_version:  1".to_string(),
+                "run_id:            build-42".to_string(),
+                "mechanism:         job_object".to_string(),
+                "root_pid:          4242".to_string(),
+                "started_at:        2026-07-20T21:00:00.000Z".to_string(),
+                "members:           2".to_string(),
+                "  PID   PPID  NAME       START_TIME".to_string(),
+                "  4242  4200  build.exe  133456789000000000".to_string(),
+                "  99    -     -          -".to_string(),
+            ]
+        );
+    }
+
+    /// A `null` `root_pid` and an empty `members` list — both real, documented
+    /// snapshot shapes (a backend that exposed no root pid; a container queried
+    /// before any member exists) — render as an explicit placeholder, never a blank
+    /// or missing line.
+    #[test]
+    fn render_snapshot_human_handles_absent_root_pid_and_no_members() {
+        let snapshot = Snapshot {
+            snapshot_version: SNAPSHOT_VERSION,
+            run_id: "run-1".to_string(),
+            mechanism: "process_group".to_string(),
+            root_pid: None,
+            started_at: "2026-07-20T21:00:00.000Z".to_string(),
+            members: vec![],
+        };
+        let lines = render_snapshot_human(&snapshot);
+        assert_eq!(
+            lines,
+            vec![
+                "snapshot_version:  1".to_string(),
+                "run_id:            run-1".to_string(),
+                "mechanism:         process_group".to_string(),
+                "root_pid:          -".to_string(),
+                "started_at:        2026-07-20T21:00:00.000Z".to_string(),
+                "members:           (none)".to_string(),
+            ]
+        );
     }
 
     /// The source builds a snapshot from its facts and queries members live each time.

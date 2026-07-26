@@ -57,12 +57,12 @@ pub enum Command {
 //
 // `run` consumes every field: `cwd`, `create_no_window`, `timeout`,
 // `idle_timeout`, `grace`, `max_memory`, `max_processes`, `cpu_quota` — the
-// whole-tree ProcessKit resource caps (see `src/run.rs`) — `command`, `jsonl`,
+// whole-tree ProcessKit resource caps (see `src/run/launch.rs`) — `command`, `jsonl`,
 // `run_id`, `argv_raw`, `capture_dir`/`capture_max_bytes` — bounded stdout/stderr
 // capture to files (see `src/capture.rs`) — `no_echo` — suppress the live echo
-// while capture/idle-timeout keep observing the same bytes (see `src/run.rs`) —
+// while capture/idle-timeout keep observing the same bytes (see `src/run/launch.rs`) —
 // `detach` — hand the whole run to a re-spawned, detached copy of this binary and
-// return as soon as it has provably started (see `src/run.rs`, "Detached runs") —
+// return as soon as it has provably started (see `src/run/detach.rs`) —
 // `env_clear`, `env_remove`, `env`, and `inherit_stdio`/`inherit_stdin`/`stdin_file`.
 #[derive(Debug, Args)]
 pub struct RunArgs {
@@ -260,18 +260,17 @@ pub struct RunArgs {
     pub command: Vec<OsString>,
 }
 
-/// `inspect --run-id <id> --json`
+/// `inspect --run-id <id> [--json]`
 #[derive(Debug, Args)]
 pub struct InspectArgs {
     /// The run to inspect.
     #[arg(long, value_name = "id")]
     pub run_id: String,
 
-    /// Emit the snapshot as JSON. Required to match the fixed form; JSON is
-    /// currently the only supported output format, so the flag is not branched on —
-    /// clap enforces its presence and `inspect` always prints JSON.
-    #[allow(dead_code)] // Part of the fixed CLI form; enforced by clap, never read.
-    #[arg(long, required = true)]
+    /// Emit the snapshot as JSON instead of a human-readable rendering. Optional,
+    /// mirroring `list`/`prune` — `inspect` has a human-readable form of its own
+    /// (see `src/control.rs::render_snapshot_human`).
+    #[arg(long)]
     pub json: bool,
 }
 
@@ -378,9 +377,10 @@ pub struct PruneArgs {
 /// their evaluation (see its own doc comment below).
 #[derive(Debug, Args)]
 pub struct ProbeArgs {
-    /// Emit the report as JSON. Required to match the fixed form (JSON is the only
-    /// supported output format, as for `inspect`); clap enforces its presence and
-    /// `probe` always prints JSON.
+    /// Emit the report as JSON. Required because `probe` is a machine-readable
+    /// preflight contract with a single fixed output shape — unlike `inspect`, whose
+    /// `--json` is optional (T-214) since it also has a human-readable form. clap
+    /// enforces this flag's presence and `probe` always prints JSON.
     #[allow(dead_code)] // Part of the fixed CLI form; enforced by clap, never read.
     #[arg(long, required = true)]
     pub json: bool,
@@ -729,14 +729,22 @@ mod tests {
     }
 
     #[test]
-    fn inspect_requires_run_id_and_json() {
+    fn inspect_requires_run_id_but_json_is_optional() {
         assert!(
             Cli::try_parse_from(["processkit-cli", "inspect", "--run-id", "r1", "--json"]).is_ok()
         );
+
+        let cli = Cli::try_parse_from(["processkit-cli", "inspect", "--run-id", "r1"])
+            .expect("--json is optional and defaults to off for inspect");
+        let Command::Inspect(args) = cli.command else {
+            panic!("expected the inspect subcommand");
+        };
+        assert_eq!(args.run_id, "r1");
         assert!(
-            Cli::try_parse_from(["processkit-cli", "inspect", "--run-id", "r1"]).is_err(),
-            "--json is part of the fixed form"
+            !args.json,
+            "--json is optional and defaults to off for inspect"
         );
+
         assert!(
             Cli::try_parse_from(["processkit-cli", "inspect", "--json"]).is_err(),
             "--run-id is required"
@@ -1344,7 +1352,8 @@ mod tests {
 
     #[test]
     fn probe_requires_json_and_accepts_the_require_flags() {
-        // The fixed form mirrors `inspect`: `--json` is mandatory.
+        // `probe` keeps a fixed form where `--json` is mandatory, unlike `inspect`,
+        // where `--json` became optional (T-214).
         assert!(
             Cli::try_parse_from(["processkit-cli", "probe", "--json"]).is_ok(),
             "a bare `probe --json` is the minimal valid form"

@@ -304,7 +304,7 @@ lifetime, independent of listener state), but a *second* Windows console-control
 event arriving after teardown has already begun is not — it falls through to the
 OS's default handling and terminates the runner outright, before the terminal
 events above are written. See `README.md`, "Timeouts, cancel, and grace", and the
-`#[cfg(windows)]` arm of `wait_for_cancel_signal` in `src/run.rs` for the full
+`#[cfg(windows)]` arm of `wait_for_cancel_signal` in `src/run/signals.rs` for the full
 reasoning behind this accepted trade-off.
 
 | Field      | Type              | Notes                                                        |

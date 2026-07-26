@@ -136,7 +136,7 @@ libc = "0.2"
 # liveness lock. Only the security, file-locking, token, and memory surfaces are
 # enabled. windows-sys is already in the tree transitively (tokio/processkit).
 #
-# `Win32_System_Threading` additionally backs `run --detach` (src/run.rs): the
+# `Win32_System_Threading` additionally backs `run --detach` (src/run/detach.rs): the
 # `DETACHED_PROCESS` creation flag the re-spawned runner is created with.
 #
 # `Win32_System_JobObjects` is enabled solely for the e2e tier's test-support worker
@@ -149,7 +149,7 @@ libc = "0.2"
 # `--inherit-stdio` (it allocates fresh console handles, then proves the contained
 # child still identifies all three inherited streams as a terminal), and — in the
 # library proper — `run --detach`, which reads `GetStdHandle` to stop this process's
-# standard handles from being inherited by the detached runner (src/run.rs,
+# standard handles from being inherited by the detached runner (src/run/detach.rs,
 # `disinherit_std_handles`).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

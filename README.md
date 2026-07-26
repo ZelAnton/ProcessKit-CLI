@@ -176,7 +176,7 @@ processkit-cli run     [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl>
                        [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
                        [--env-clear] [--env-remove <KEY>]... [--env <KEY=VALUE>]...
                        -- <program> <args...>
-processkit-cli inspect --run-id <id> --json
+processkit-cli inspect --run-id <id> [--json]
 processkit-cli cancel  --run-id <id>
 processkit-cli kill    --run-id <id>
 processkit-cli wait    --run-id <id> [--timeout <duration>]
@@ -261,16 +261,20 @@ runner-owned cancellation outcome should use the control-plane `cancel` command.
 
 `inspect`, `cancel`, and `kill` all communicate with a live `run` process over the
 same local IPC control plane, addressing it by `run_id` through the per-user registry
-— never by PID. `inspect` is read-only; `cancel` ends the run through the *same*
-soft-stop → grace → hard-kill teardown a `Ctrl-C` uses (exiting the run with the
-reserved code `108`), and `kill` hard-kills the whole tree immediately with no grace
-(code `109`). The scope of a cancel/kill is only the target run's ProcessKit
-container — never processes matched by executable name. Both outcomes are also written
-to the run's JSONL stream (a `cancelled` / `killed` event and a terminal
-`runner_exit`), so an external observer reading the event file sees the command too,
-not just the control client. If the runner has already died, the registry entry is
-stale rather than an invitation to address processes by PID, and a cancel/kill against
-it is a bounded `CONTROL` (103) failure — never a hang. Cleanup after an abrupt runner
+— never by PID. `inspect` is read-only and, like `list`/`prune`, has an optional
+`--json`: without it, `inspect` prints a human-readable rendering of the snapshot
+(snapshot version, run id, mechanism, root pid, start time, and a member table); with
+`--json` it prints the snapshot as a single JSON line, unchanged. `cancel` ends the
+run through the *same* soft-stop → grace → hard-kill teardown a `Ctrl-C` uses
+(exiting the run with the reserved code `108`), and `kill` hard-kills the whole tree
+immediately with no grace (code `109`). The scope of a cancel/kill is only the
+target run's ProcessKit container — never processes matched by executable name. Both
+outcomes are also written to the run's JSONL stream (a `cancelled` / `killed` event
+and a terminal `runner_exit`), so an external observer reading the event file sees
+the command too, not just the control client. If the runner has already died, the
+registry entry is stale rather than an invitation to address processes by PID, and a
+cancel/kill against it is a bounded `CONTROL` (103) failure — never a hang. Cleanup
+after an abrupt runner
 death follows the platform-specific `abrupt_cleanup` guarantee above; only Windows
 currently guarantees the whole tree.
 
@@ -490,15 +494,15 @@ or external) — and all of them end in the **same** teardown path:
   before it even finishes reporting the teardown. Logoff and shutdown are left
   uncapped, since their real deadline is a system-wide policy this runner cannot
   reliably discover (see the `wait_for_cancel_signal`/`effective_grace_for` doc
-  comments in `src/run.rs` for the full reasoning). **Known limitation:** unlike a
+  comments in `src/run/signals.rs` for the full reasoning). **Known limitation:** unlike a
   repeat Unix `SIGTERM`/`SIGHUP`/`Ctrl-C` mid-teardown (silently absorbed — the OS
   keeps the disposition installed for the process's lifetime regardless of listener
   state), a *second* Windows console-control event that arrives after teardown has
   already begun is **not** absorbed: it falls through to the OS's default handling
   and terminates the runner outright, mid-teardown, before the terminal JSONL events
   are written. This is an accepted trade-off, not a bug — see the `#[cfg(windows)]`
-  arm of `wait_for_cancel_signal` in `src/run.rs` for why keeping listeners alive for
-  the whole teardown was rejected.
+  arm of `wait_for_cancel_signal` in `src/run/signals.rs` for why keeping listeners
+  alive for the whole teardown was rejected.
 
 All of the signals/events above share the `CANCELLED` code (`107`); which one
 arrived is recorded in the JSONL `cancelled` event's `source` field (`ctrl_c` /
