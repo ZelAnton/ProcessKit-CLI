@@ -295,9 +295,18 @@ immediately, and `wait`'s `0` must never be read as proof the run existed. See
 
 `list` is the discovery counterpart to `inspect`/`cancel`/`kill`: it scans the same
 per-user registry and prints every entry it finds — `run_id`, health (`live`/
-`stale`/`unprobed`), `started_at`, and `endpoint` — for an operator or orchestrator
+`stale`/`unprobed`), `started_at`, the run's worker-shape `hint` and one-way argv
+fingerprint `argv_sha256`, and `endpoint` — for an operator or orchestrator
 that has lost (or never had) a `run_id`. It is read-only and never connects to any
 runner's control transport, so it has none of their unreachable-run failure modes.
+The two command fields are what make several live runs distinguishable without
+disclosing a command line: the fingerprint is equal for two entries exactly when
+they are running the same command, and the hint names a recognized worker shape
+(`msbuild_node_reuse`, …) or is `null`. They are the same pair the JSONL
+`run_started` event carries, from the same implementation; the raw argv is never
+written to a registry record under any flag, `--argv-raw` included. The table
+abbreviates the fingerprint to its first 12 hex characters, `--json` carries the
+full digest.
 Without `--json` it prints a human-readable table (`no runs registered` for an
 empty registry); with `--json` it prints one JSON object per entry, one per line. An
 empty registry is not an error — `list` exits `0` either way — and a stale entry is

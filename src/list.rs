@@ -28,6 +28,21 @@
 //! same vocabulary `prune --json`'s tallies and `wait`'s `RunStatus::Unprobed`
 //! already use for the identical case (`docs/registry.md`). This is additive to
 //! `list --json`'s existing `"live"`/`"stale"` contract.
+//!
+//! **Which run is which (T-215).** Discovery is only half-done if every row looks
+//! alike: an operator with three live runs used to see three ids, three timestamps,
+//! and three endpoints, with nothing saying *what* any of them was running — so
+//! choosing the one to `inspect`/`cancel`/`kill` meant guessing. Each entry now also
+//! carries the two **redaction-safe** command fields the registry record publishes
+//! (see [`registry::Record::argv_sha256`], [`registry::Record::hint`]): a one-way
+//! argv fingerprint and a categorical worker-shape hint, the same pair the JSONL
+//! `run_started` event carries, derived from the same code. Neither can disclose a
+//! command line — that is exactly why they can be shown here — yet together they
+//! answer the operator's actual question: which of these rows are the same command,
+//! and which is the build worker. Both are additive: `--json` gains two fields
+//! (`null` on a record that carries neither, e.g. one written before they existed),
+//! and the table gains two columns, the fingerprint abbreviated (see
+//! [`abbreviated_argv_sha256`]) with the full digest reserved for `--json`.
 
 use std::path::PathBuf;
 
@@ -62,6 +77,24 @@ struct ListEntry {
     /// Run start time, RFC 3339 UTC with millisecond precision (the same
     /// formatter every other timestamp in this binary uses).
     started_at: String,
+    /// The run's worker-shape category (`msbuild_node_reuse`, …), or `None` when
+    /// the run's command matched no known shape — the common case. Straight from
+    /// [`registry::Record::hint`], which is the same classifier catalog the JSONL
+    /// `run_started` event uses (`docs/schema.md`, "Hint classifier"). A fixed
+    /// category label, never command-line content.
+    hint: Option<String>,
+    /// The run's one-way argv fingerprint — lowercase-hex SHA-256, in **full**
+    /// here, so a caller can compare it against the `argv_sha256` of the same
+    /// run's `run_started` event byte for byte (the human-readable table
+    /// abbreviates it instead, see [`abbreviated_argv_sha256`]). `None` for a
+    /// record written before the field existed, or one whose value did not survive
+    /// the registry's read-side shape guard.
+    ///
+    /// This plus `hint` are what make `list` usable as the discovery step it is
+    /// meant to be (T-215): several live runs are no longer an undifferentiated
+    /// list of ids and timestamps — the fingerprint says which of them are running
+    /// the *same* command, without disclosing that command to anyone.
+    argv_sha256: Option<String>,
     /// The run's local control-transport endpoint, or `None` when the transport
     /// was never stood up (best-effort degradation — see
     /// [`registry::Record::endpoint`]) — never populated for a stale entry's
@@ -104,6 +137,8 @@ pub fn run(json: bool) -> Result<(), RunnerError> {
                 run_id: entry.record.run_id,
                 health: health_str(entry.health),
                 started_at: entry.record.started_at,
+                hint: entry.record.hint,
+                argv_sha256: entry.record.argv_sha256,
                 endpoint: entry.record.endpoint,
             };
             (path, list_entry)
@@ -169,21 +204,76 @@ fn print_table(rows: &[ListEntry]) {
     }
 }
 
+/// How many leading hex characters of an `argv_sha256` the human-readable table
+/// shows. The full digest is 64 characters — six times the width of every other
+/// column put together — and printing it would push `ENDPOINT` off the far right of
+/// any ordinary terminal for a field an operator reads *comparatively* ("these two
+/// rows are the same command, that one is not"), not character by character. Twelve
+/// hex characters are 48 bits: two distinct commands among a handful of live runs
+/// colliding on them is not a case worth widening every row for, and the exact,
+/// full-length value is one `--json` away — which is where a caller that means to
+/// *match* a fingerprint against the run's `run_started` event should read it from
+/// anyway.
+const ARGV_SHA256_TABLE_CHARS: usize = 12;
+
+/// The marker appended to an abbreviated fingerprint in the table, so a truncated
+/// value can never be mistaken for a whole digest (and copied somewhere as one).
+const ABBREVIATION_MARKER: &str = "...";
+
+/// The cell shown for a field the record does not carry — a record written before
+/// the field existed, one whose value failed the registry's read-side shape guard,
+/// or, for `hint`, the ordinary case of a command matching no known worker shape.
+/// The same `-` `ENDPOINT` has always used for its own absent value.
+const ABSENT_CELL: &str = "-";
+
+/// The table's rendering of an `argv_sha256`: its first [`ARGV_SHA256_TABLE_CHARS`]
+/// hex characters plus [`ABBREVIATION_MARKER`], or [`ABSENT_CELL`] when the record
+/// carries none.
+///
+/// Sliced on **characters, not bytes**, so a value that is somehow not the ASCII hex
+/// the registry's guard admits (impossible through [`registry::Registry::entries`],
+/// which sanitizes it, but this function is also reachable in tests and by any future
+/// caller) truncates on a character boundary instead of panicking. A value shorter
+/// than the abbreviation is printed whole, unmarked — there is nothing hidden to
+/// warn about.
+fn abbreviated_argv_sha256(argv_sha256: Option<&str>) -> String {
+    let Some(value) = argv_sha256 else {
+        return ABSENT_CELL.to_string();
+    };
+    let mut chars = value.chars();
+    let abbreviated: String = chars.by_ref().take(ARGV_SHA256_TABLE_CHARS).collect();
+    if chars.next().is_none() {
+        // Nothing was left over, so nothing was hidden — print it unmarked.
+        abbreviated
+    } else {
+        format!("{abbreviated}{ABBREVIATION_MARKER}")
+    }
+}
+
 /// Build the lines `print_table` would print, without touching stdout —
 /// split out so alignment can be asserted directly in tests.
 fn render_table_lines(rows: &[ListEntry]) -> Vec<String> {
     if rows.is_empty() {
         return vec!["no runs registered".to_string()];
     }
-    const HEADERS: [&str; 4] = ["RUN_ID", "HEALTH", "STARTED_AT", "ENDPOINT"];
-    let cells: Vec<[String; 4]> = rows
+    const HEADERS: [&str; 6] = [
+        "RUN_ID",
+        "HEALTH",
+        "STARTED_AT",
+        "HINT",
+        "ARGV_SHA256",
+        "ENDPOINT",
+    ];
+    let cells: Vec<[String; 6]> = rows
         .iter()
         .map(|row| {
             [
                 row.run_id.clone(),
                 row.health.to_string(),
                 row.started_at.clone(),
-                row.endpoint.as_deref().unwrap_or("-").to_string(),
+                row.hint.as_deref().unwrap_or(ABSENT_CELL).to_string(),
+                abbreviated_argv_sha256(row.argv_sha256.as_deref()),
+                row.endpoint.as_deref().unwrap_or(ABSENT_CELL).to_string(),
             ]
         })
         .collect();
@@ -196,29 +286,33 @@ fn render_table_lines(rows: &[ListEntry]) -> Vec<String> {
     // The last column is left-aligned but not padded, so trailing whitespace
     // is never printed after the final value.
     let mut lines = Vec::with_capacity(cells.len() + 1);
-    lines.push(format!(
-        "{:w0$}  {:w1$}  {:w2$}  {}",
-        HEADERS[0],
-        HEADERS[1],
-        HEADERS[2],
-        HEADERS[3],
-        w0 = widths[0],
-        w1 = widths[1],
-        w2 = widths[2],
-    ));
+    lines.push(format_row(&HEADERS.map(str::to_string), &widths));
     for row in &cells {
-        lines.push(format!(
-            "{:w0$}  {:w1$}  {:w2$}  {}",
-            row[0],
-            row[1],
-            row[2],
-            row[3],
-            w0 = widths[0],
-            w1 = widths[1],
-            w2 = widths[2],
-        ));
+        lines.push(format_row(row, &widths));
     }
     lines
+}
+
+/// One table line: every column but the last padded to its column width, joined by
+/// two spaces. Split out of [`render_table_lines`] so the header and the data rows
+/// are laid out by the very same code — the alignment the table promises cannot
+/// drift between them — and so adding a column is one entry in `HEADERS`/`cells`
+/// rather than two hand-written, positionally-argumented `format!`s to keep in sync.
+fn format_row(cells: &[String; 6], widths: &[usize; 6]) -> String {
+    let mut line = String::new();
+    for (index, (cell, width)) in cells.iter().zip(widths.iter()).enumerate() {
+        if index > 0 {
+            line.push_str("  ");
+        }
+        if index + 1 == cells.len() {
+            // The final column is never padded: no trailing whitespace is printed
+            // after the last value on a line.
+            line.push_str(cell);
+        } else {
+            line.push_str(&format!("{cell:width$}"));
+        }
+    }
+    line
 }
 
 #[cfg(test)]
@@ -232,14 +326,22 @@ mod tests {
         assert_eq!(health_str(Health::Unprobed), "unprobed");
     }
 
+    /// The full-length fingerprint of a fixture entry — 64 lowercase hex
+    /// characters, the shape `registry::Record::argv_sha256` carries.
+    const FINGERPRINT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     /// A `ListEntry` round-trips through JSON with the exact field names a
-    /// consumer of `list --json` depends on.
+    /// consumer of `list --json` depends on — including the two redaction-safe
+    /// command fields (T-215), whose whole point is that a consumer can read them
+    /// machine-side at full precision.
     #[test]
     fn list_entry_serializes_the_documented_fields() {
         let entry = ListEntry {
             run_id: "run-1".to_string(),
             health: "live",
             started_at: "2026-07-22T00:00:00.000Z".to_string(),
+            hint: Some("msbuild_node_reuse".to_string()),
+            argv_sha256: Some(FINGERPRINT.to_string()),
             endpoint: Some("/tmp/pkc-x/c.sock".to_string()),
         };
         let json = serde_json::to_string(&entry).expect("a list entry serializes");
@@ -247,7 +349,67 @@ mod tests {
         assert_eq!(value["run_id"], "run-1");
         assert_eq!(value["health"], "live");
         assert_eq!(value["started_at"], "2026-07-22T00:00:00.000Z");
+        assert_eq!(value["hint"], "msbuild_node_reuse");
+        assert_eq!(
+            value["argv_sha256"], FINGERPRINT,
+            "--json carries the whole digest, never the table's abbreviation: {value}"
+        );
         assert_eq!(value["endpoint"], "/tmp/pkc-x/c.sock");
+    }
+
+    /// A record that carries neither command field — one written before they
+    /// existed, or one whose values failed the registry's read-side shape guard —
+    /// serializes them as JSON `null`, present and indexable, exactly as an absent
+    /// `endpoint` already does. A consumer never has to distinguish "absent field"
+    /// from "null field".
+    #[test]
+    fn list_entry_serializes_missing_command_fields_as_null() {
+        let entry = ListEntry {
+            run_id: "run-legacy".to_string(),
+            health: "stale",
+            started_at: "2026-07-22T00:00:00.000Z".to_string(),
+            hint: None,
+            argv_sha256: None,
+            endpoint: None,
+        };
+        let json = serde_json::to_string(&entry).expect("a list entry serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert!(value["hint"].is_null(), "an absent hint is null: {value}");
+        assert!(
+            value["argv_sha256"].is_null(),
+            "an absent fingerprint is null: {value}"
+        );
+    }
+
+    /// The table abbreviates a fingerprint to a fixed prefix plus an explicit
+    /// marker, so a truncated value is self-evidently truncated (never copied
+    /// somewhere as if it were a whole digest), and renders an absent one as `-`.
+    #[test]
+    fn abbreviated_argv_sha256_marks_what_it_truncates() {
+        assert_eq!(
+            abbreviated_argv_sha256(Some(FINGERPRINT)),
+            "0123456789ab...",
+            "a full digest shows its first {ARGV_SHA256_TABLE_CHARS} characters, marked as abbreviated"
+        );
+        assert_eq!(
+            abbreviated_argv_sha256(None),
+            "-",
+            "an absent fingerprint renders like an absent endpoint"
+        );
+        // Nothing was hidden, so nothing is marked: a value no longer than the
+        // abbreviation prints whole.
+        assert_eq!(abbreviated_argv_sha256(Some("abc")), "abc");
+        assert_eq!(
+            abbreviated_argv_sha256(Some("0123456789ab")),
+            "0123456789ab",
+            "a value exactly the abbreviation's length is not marked as truncated"
+        );
+        // Multi-byte input cannot make the character-wise slice panic (the registry
+        // guard never admits one, but this function must not depend on that).
+        assert_eq!(
+            abbreviated_argv_sha256(Some("ααααααααααααα")),
+            "αααααααααααα..."
+        );
     }
 
     /// Two entries sharing both `run_id` and `started_at` (a millisecond collision
@@ -260,6 +422,8 @@ mod tests {
             run_id: "same-run-id".to_string(),
             health: "live",
             started_at: "2026-07-22T00:00:00.000Z".to_string(),
+            hint: None,
+            argv_sha256: Some(FINGERPRINT.to_string()),
             endpoint: Some(format!("/tmp/pkc-{suffix}.sock")),
         };
         let path = |name: &str| PathBuf::from(name);
@@ -303,6 +467,8 @@ mod tests {
             run_id: "run-2".to_string(),
             health: "stale",
             started_at: "2026-07-22T00:00:00.000Z".to_string(),
+            hint: None,
+            argv_sha256: Some(FINGERPRINT.to_string()),
             endpoint: None,
         };
         let json = serde_json::to_string(&entry).expect("a list entry serializes");
@@ -326,12 +492,16 @@ mod tests {
                 run_id: "r1".to_string(),
                 health: "live",
                 started_at: "2026-07-22T00:00:00.000Z".to_string(),
+                hint: Some("msbuild_node_reuse".to_string()),
+                argv_sha256: Some(FINGERPRINT.to_string()),
                 endpoint: Some("/tmp/pkc-a.sock".to_string()),
             },
             ListEntry {
                 run_id: "much-longer-run-id".to_string(),
                 health: "stale",
                 started_at: "2026-07-22T00:00:00.000Z".to_string(),
+                hint: None,
+                argv_sha256: None,
                 endpoint: None,
             },
         ];
@@ -339,16 +509,88 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "RUN_ID              HEALTH  STARTED_AT                ENDPOINT",
-                "r1                  live    2026-07-22T00:00:00.000Z  /tmp/pkc-a.sock",
-                "much-longer-run-id  stale   2026-07-22T00:00:00.000Z  -",
+                "RUN_ID              HEALTH  STARTED_AT                HINT                ARGV_SHA256      ENDPOINT",
+                "r1                  live    2026-07-22T00:00:00.000Z  msbuild_node_reuse  0123456789ab...  /tmp/pkc-a.sock",
+                "much-longer-run-id  stale   2026-07-22T00:00:00.000Z  -                   -                -",
             ]
         );
-        // The actual alignment property: the HEALTH value starts at the same
-        // column in every row as the "HEALTH" header does, regardless of how
-        // long that row's `run_id` is.
+        // The actual alignment property: a value starts at the same column in every
+        // row as its header does, regardless of how long the values to its left are
+        // — asserted for the last padded column (ARGV_SHA256) as well as the first,
+        // so a column added in between cannot silently break the ones after it.
         let health_col = lines[0].find("HEALTH").unwrap();
         assert_eq!(lines[1][health_col..].find("live"), Some(0));
         assert_eq!(lines[2][health_col..].find("stale"), Some(0));
+        let fingerprint_col = lines[0].find("ARGV_SHA256").unwrap();
+        assert_eq!(lines[1][fingerprint_col..].find("0123456789ab..."), Some(0));
+        assert_eq!(lines[2][fingerprint_col..].find('-'), Some(0));
+        // No line ends in whitespace: the last column is deliberately unpadded.
+        for line in &lines {
+            assert_eq!(line.trim_end(), line, "no trailing whitespace: {line:?}");
+        }
+    }
+
+    /// The property T-215 exists for, at the surface an operator actually reads:
+    /// two *live* runs that differ only in their command are distinguishable in the
+    /// human-readable table — the one thing the pre-T-215 table could not do, since
+    /// `run_id`s can be opaque, health is identical for both, `started_at` can
+    /// collide at millisecond precision, and an endpoint is an address, not a
+    /// description. A third row running the *same* command as the first shows the
+    /// identical fingerprint, so the table answers "which of these are the same
+    /// command?" too, and none of it discloses a command line.
+    #[test]
+    fn render_table_lines_tells_two_live_runs_apart_by_their_command() {
+        let build_fingerprint = "aaaaaaaaaaaabbbbbbbbbbbbccccccccccccddddddddddddeeeeeeeeeeeeffff";
+        let other_fingerprint = "111111111111222222222222333333333333444444444444555555555555ffff";
+        let entry = |run_id: &str, hint: Option<&str>, fingerprint: &str| ListEntry {
+            run_id: run_id.to_string(),
+            health: "live",
+            // Deliberately identical across all three rows: neither health nor the
+            // start time can be what distinguishes them here.
+            started_at: "2026-07-22T00:00:00.000Z".to_string(),
+            hint: hint.map(str::to_string),
+            argv_sha256: Some(fingerprint.to_string()),
+            endpoint: None,
+        };
+        let rows = vec![
+            entry("run-a", Some("msbuild_node_reuse"), build_fingerprint),
+            entry("run-b", None, other_fingerprint),
+            entry("run-c", Some("msbuild_node_reuse"), build_fingerprint),
+        ];
+        let lines = render_table_lines(&rows);
+
+        let cell = |line: &str, header: &str| {
+            let column = lines[0].find(header).expect("the header names the column");
+            line[column..]
+                .split_whitespace()
+                .next()
+                .expect("the column has a value")
+                .to_string()
+        };
+        let (a, b, c) = (&lines[1], &lines[2], &lines[3]);
+        assert_ne!(
+            cell(a, "ARGV_SHA256"),
+            cell(b, "ARGV_SHA256"),
+            "two different commands must not print the same fingerprint"
+        );
+        assert_eq!(
+            cell(a, "ARGV_SHA256"),
+            cell(c, "ARGV_SHA256"),
+            "the same command must print the same fingerprint"
+        );
+        assert_eq!(cell(a, "HINT"), "msbuild_node_reuse");
+        assert_eq!(
+            cell(b, "HINT"),
+            "-",
+            "an unclassified run shows the absent-value cell, not an invented label"
+        );
+        // Whatever the rows show, it is never the command line itself: only a
+        // one-way digest and a fixed category label ever reach this table.
+        for line in &lines {
+            assert!(
+                !line.contains("MSBuild.dll") && !line.contains("/nodeReuse"),
+                "the table must never carry argv content: {line}"
+            );
+        }
     }
 }

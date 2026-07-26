@@ -1858,7 +1858,7 @@ mod tests {
         let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
 
         let first = registry
-            .register("dup-race", Some("endpoint-a"), SystemTime::now())
+            .register_plain("dup-race", Some("endpoint-a"), SystemTime::now())
             .expect("register the first run");
 
         let endpoint = resolve_in_registry(&registry, "kill", "dup-race")
@@ -1868,7 +1868,7 @@ mod tests {
         // The race: a second run registers under the same run_id in the window
         // between the client's initial resolve and its dispatch.
         let second = registry
-            .register("dup-race", Some("endpoint-b"), SystemTime::now())
+            .register_plain("dup-race", Some("endpoint-b"), SystemTime::now())
             .expect("register the second (racing) run");
 
         let err = reconfirm_target(&registry, "kill", "dup-race", &endpoint)
@@ -1895,10 +1895,10 @@ mod tests {
         let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
 
         let with_endpoint = registry
-            .register("dup-endpointless", Some("endpoint-a"), SystemTime::now())
+            .register_plain("dup-endpointless", Some("endpoint-a"), SystemTime::now())
             .expect("register the run that has an endpoint");
         let without_endpoint = registry
-            .register("dup-endpointless", None, SystemTime::now())
+            .register_plain("dup-endpointless", None, SystemTime::now())
             .expect("register the live run that never published an endpoint");
 
         let err = resolve_in_registry(&registry, "kill", "dup-endpointless")
@@ -2032,7 +2032,7 @@ mod tests {
         let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
 
         let first = registry
-            .register("solo-run", Some("endpoint-solo"), SystemTime::now())
+            .register_plain("solo-run", Some("endpoint-solo"), SystemTime::now())
             .expect("register the run");
 
         let endpoint = resolve_in_registry(&registry, "cancel", "solo-run")
@@ -2069,7 +2069,7 @@ mod tests {
         let (client_stream, server_stream) = tokio::io::duplex(1024);
 
         let first = registry
-            .register("dup-post-race", Some("endpoint-a"), SystemTime::now())
+            .register_plain("dup-post-race", Some("endpoint-a"), SystemTime::now())
             .expect("register the run the client is connected to");
 
         let endpoint = resolve_in_registry(&registry, "cancel", "dup-post-race")
@@ -2083,7 +2083,7 @@ mod tests {
         // test targets: a second run registers under the same run_id while the verb is
         // still in flight to the connection already established with run A.
         let second = registry
-            .register("dup-post-race", Some("endpoint-b"), SystemTime::now())
+            .register_plain("dup-post-race", Some("endpoint-b"), SystemTime::now())
             .expect("register the racing duplicate after the re-check passed");
 
         let members = || vec![Member::from_pid(1)];

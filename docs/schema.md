@@ -496,7 +496,12 @@ the first matching rule in catalog order wins.
 identify the shape) and mirror it as a row in the table above; no control-flow
 change is needed. Choose a stable, snake_case `hint` label: consumers may match on
 it, so an existing label is part of this contract (changing or removing one is a
-breaking change — see "Versioning").
+breaking change — see "Versioning"). Keep the label to ASCII lowercase letters,
+digits, and `_` — the per-user run registry publishes the same label in its records
+and validates that shape when reading one back
+([`docs/registry.md`](registry.md), "Reading a record"); a label outside it would be
+dropped there. An in-tree test asserts every catalog label satisfies this, so a rule
+that violates it fails the build rather than surfacing as an empty column in `list`.
 
 ## Enriched member fields
 

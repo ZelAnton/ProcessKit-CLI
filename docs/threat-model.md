@@ -73,7 +73,13 @@ code/docs it is implemented and described in.
   `hint` from a static classifier table, both derived from argv but unable to
   reveal it (`src/events.rs`, `argv_sha256_hex`, `classify_hint`/
   `HINT_RULES`). Recording the raw argv requires an explicit opt-in
-  (`--argv-raw`); it is never the default.
+  (`--argv-raw`); it is never the default. The per-user registry record
+  publishes that same one-way pair (and only it) so `list` can tell several
+  live runs apart — the raw argv is not even an input to the registry's
+  `register`, which takes an `events::CommandFingerprint`, so no flag
+  (`--argv-raw` included) can put a command line into a registry record. The
+  values are shape-checked when read back, like every other record field (see
+  [`docs/registry.md`](registry.md), "Reading a record").
 - **An unbounded or malformed control-plane wire line.** Both the server's
   request-line read and every client's reply-line read are capped at
   `MAX_LINE_BYTES` (64 KiB) via a shared bounded-read helper

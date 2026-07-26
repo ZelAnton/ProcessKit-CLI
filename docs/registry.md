@@ -66,6 +66,8 @@ file** (`<opaque-stem>.lock`). The record is a single JSON object:
   "run_id": "run-1234-...",
   "endpoint": "\\\\.\\pipe\\processkit-cli-1234-...",
   "started_at": "2026-07-20T21:00:00.000Z",
+  "argv_sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+  "hint": null,
   "liveness": {
     "kind": "advisory_lock",
     "lock_file": "run-000...-0000.lock"
@@ -79,7 +81,75 @@ file** (`<opaque-stem>.lock`). The record is a single JSON object:
 | `run_id`           | The run's identifier (`--run-id`, or a generated one). **This is the key** clients match on. |
 | `endpoint`         | The run's local control-transport connection address — a unix socket path, or a Windows named-pipe name (see [`docs/control-plane.md`](control-plane.md)). A live runner publishes it here so a client can reach it; `null` only when the transport could not be stood up (best-effort degradation — the run still works, it is just not inspectable). |
 | `started_at`       | Run start time, RFC 3339 UTC with millisecond precision. |
+| `argv_sha256`      | The run's one-way argv fingerprint — lowercase-hex SHA-256 of the canonical argv encoding, byte-identical to the `run_started` event's `command.argv_sha256` for the same run (`docs/schema.md`, "Fingerprint"). `null` on a record written before this field existed, or whose value failed the read-side shape check below. Never argv itself (see "Which run is which" below). |
+| `hint`             | The run's worker-shape category from the same classifier catalog the event stream uses (`docs/schema.md`, "Hint classifier") — e.g. `msbuild_node_reuse` — or `null` when the command matches no known shape (the common case) and on a record predating the field. A fixed category label, never argv content. |
 | `liveness`         | How to decide whether the record is live or stale (see below). |
+
+### Which run is which — and what a record never carries
+
+`argv_sha256` and `hint` exist so an operator (or an orchestrator) staring at
+several live entries can tell **which run is which** before picking one to
+`inspect`/`cancel`/`kill` — see "Discovery" below, where both are printed. They are
+the *redaction-safe* half of the run's command: the fingerprint says whether two
+entries are running the same command, the hint names a recognized worker shape, and
+neither can disclose a command line (`AGENTS.md`, "Argv is redacted by default").
+Both are produced by exactly the implementation the JSONL stream uses, so the same
+run never fingerprints differently in the two artifacts.
+
+**The raw argv is never written to a record, under any flag.** `--argv-raw` widens
+the `run_started` *event* only; the registry's `register` is handed a
+fingerprint-and-hint value, not the argv, so there is no code path — and no future
+flag — through which a command line can reach a registry record.
+
+Two further fields were considered for the same "tell runs apart" purpose and
+deliberately **left out**:
+
+- **`root_pid`** would put a reused-at-any-moment number in front of an operator
+  inside the one artifact whose entire design says a PID cannot identify a run (see
+  "No PID addressing" below) — an invitation to `kill` the process that inherited it.
+  The fingerprint distinguishes runs without that hazard.
+- **`cwd`** is raw, unredacted text with no redaction rule in this project's contract
+  (which covers argv only), and a working directory routinely spells out a customer,
+  ticket, branch, or user name. Persisting it verbatim into a long-lived per-user
+  file that every local client of this binary reads is a disclosure decision distinct
+  from the `run_started` event's — that stream is written only to a file the caller
+  explicitly asked for with `--jsonl`. It would also add a second untrusted *path* to
+  validate on read.
+
+### Reading a record: additive fields, and untrusted values
+
+Both fields are **optional on read**, and that is what makes adding them a
+non-breaking change to `registry_version` (still `1`):
+
+- A record written **before** they existed — or by any writer that publishes none —
+  reads back with them `null`. They are deserialized as optional/defaulted, so their
+  absence is never an error.
+- A record written by a **newer** writer, carrying fields this binary does not know,
+  is read as an ordinary record: unknown fields are ignored, not treated as
+  corruption. Both directions matter in the mixed registry a mid-upgrade user
+  actually has, where an older `list`/`prune` binary and a newer `run` share one
+  directory.
+
+A `registry_version` bump is reserved for the opposite kind of change: renaming,
+removing, or retyping an existing field, changing what a value means, or adding a
+field a reader must understand in order to behave correctly.
+
+Like every other field, both are **untrusted deserialized data** on the read side
+(the same stance `liveness.lock_file` and `endpoint` are held to) and are validated
+by shape: `argv_sha256` must be exactly 64 lowercase hex characters, and `hint` must
+be a non-empty, at-most-64-character label of ASCII lowercase letters, digits, and
+`_` — the `snake_case` shape the classifier catalog requires. `hint` is checked by
+*shape* rather than membership in this binary's own catalog on purpose, so a label
+minted by a newer runner is not silently dropped.
+
+A value failing its check is **dropped to `null`, and the record is kept** — unlike a
+malformed `started_at` or `lock_file`, which skip the whole record. The difference is
+what the value can do: those two steer an action (a path that gets opened, an
+ordering every client reasons about), while these two are reported and nothing more.
+Discarding a record over one of them would let a purely cosmetic field hide a *live*
+run from `list`, `wait`, and every control client at once — one hand-edited byte in a
+live entry's `hint` and `cancel`/`kill` could no longer find the run they are aimed
+at. Losing the field is strictly the smaller loss.
 
 ### No PID addressing
 
@@ -189,7 +259,8 @@ wrong-target action. See
 [`Registry::open`] `run` uses, so listing never creates the registry directory and
 never touches its permissions — and scans it with [`Registry::entries`], the same
 scan every other client shares, printing every entry it finds, whatever its health:
-`run_id`, health (`live`/`stale`/`unprobed`), `started_at`, and `endpoint`. It is
+`run_id`, health (`live`/`stale`/`unprobed`), `started_at`, `hint`, `argv_sha256`,
+and `endpoint`. It is
 deliberately **read-only** and never connects to any runner's control transport, so
 it carries none of the "could not reach the target run" failure modes
 `inspect`/`cancel`/`kill` do — it has no single target to fail to reach.
@@ -221,11 +292,29 @@ it carries none of the "could not reach the target run" failure modes
   additive: existing `--json` consumers that already treat any non-`"live"` value as
   "not live" need no change, only ones that matched exhaustively on exactly
   `"live"`/`"stale"`.
+- **Telling several live runs apart.** Health, `run_id`, and `started_at` cannot say
+  *what* a run is running, so a registry with three live entries used to leave an
+  operator guessing which one to act on. Each entry therefore also prints the two
+  redaction-safe command fields the record carries (see "Which run is which" above):
+  `hint` — the worker-shape label, or `-`/`null` when the command matches no known
+  shape — and `argv_sha256`, the one-way argv fingerprint, which is equal for two
+  entries exactly when they are running the same command. Neither discloses a command
+  line, which is why they can be printed at all.
+  - In the **table**, `ARGV_SHA256` is abbreviated to its first 12 hex characters
+    followed by `...` (a full digest is six times the width of every other column put
+    together, for a value read comparatively rather than character by character). An
+    absent value renders as `-`, exactly like an absent `ENDPOINT`.
+  - In **`--json`** both are full-precision fields — `argv_sha256` carries the whole
+    64-character digest, so it can be compared byte-for-byte against the same run's
+    `run_started` event — and both are always present, `null` when the record carries
+    no value. Additive: a consumer reading the fields it knows is unaffected.
 - A single corrupt or unreadable record is skipped by `Registry::entries` itself
   (see "Staleness" and the per-record degradation documented there) and never
   blinds `list` to the other, healthy entries — including a record whose
   `started_at` is not the well-formed `YYYY-MM-DDTHH:MM:SS.sssZ` shape a runner
-  actually writes.
+  actually writes. A malformed `hint`/`argv_sha256` is the one case that does *not*
+  skip the record: the offending field alone is dropped to `null` (see "Reading a
+  record" above), so a cosmetic value can never hide an entry from this listing.
 
 ## Reaping — `prune`
 

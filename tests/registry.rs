@@ -724,6 +724,24 @@ fn list_reports_a_live_run() {
         entry["endpoint"].is_string(),
         "a live run has published its control-transport endpoint: {entry}"
     );
+    // T-215, end to end through the real binary: `run` publishes the redaction-safe
+    // command fields into the record, and `list --json` reports them at full
+    // precision. This is the only place the whole producer→record→client chain is
+    // exercised as a user runs it; the unit tests cover each link on its own.
+    let fingerprint = entry["argv_sha256"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a live run's entry carries its argv fingerprint: {entry}"));
+    assert!(
+        fingerprint.len() == 64
+            && fingerprint
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        "the fingerprint is a full lowercase-hex SHA-256 digest: {fingerprint}"
+    );
+    assert!(
+        entry["hint"].is_null(),
+        "the test child is no recognized worker shape, so its hint is null: {entry}"
+    );
 
     // The human-readable form also names the run and its health.
     let out = list(&registry, false);
@@ -731,6 +749,23 @@ fn list_reports_a_live_run() {
     assert!(
         stdout.contains("list-me") && stdout.contains("live"),
         "the human-readable form names the run and its health: {stdout}"
+    );
+    // …and shows the fingerprint's leading characters under its own column, so an
+    // operator choosing between several live runs can tell them apart right here.
+    let header = stdout
+        .lines()
+        .find(|line| line.starts_with("RUN_ID"))
+        .unwrap_or_else(|| panic!("the human-readable table prints a header row: {stdout}"));
+    let fingerprint_col = header
+        .find("ARGV_SHA256")
+        .unwrap_or_else(|| panic!("the header names an ARGV_SHA256 column: {header}"));
+    let row = stdout
+        .lines()
+        .find(|line| line.contains("list-me"))
+        .unwrap_or_else(|| panic!("the table names the run: {stdout}"));
+    assert!(
+        row[fingerprint_col..].starts_with(&fingerprint[..12]),
+        "the run's ARGV_SHA256 cell abbreviates its own fingerprint: {row}"
     );
 
     // Let the run finish cleanly (removing its own entry).
@@ -786,6 +821,16 @@ fn list_reports_an_unprobeable_entry_as_unprobed_not_stale() {
         stale["health"], "stale",
         "a confirmed-stale entry still prints 'stale', unaffected by the unprobed sibling: {stale}"
     );
+    // Both fixtures are written in the pre-T-215 record shape — no `argv_sha256`,
+    // no `hint` key at all — so this doubles as the end-to-end backward-compatibility
+    // check: such a record is listed exactly as before, with the two additive fields
+    // reported as `null` rather than making the record unreadable.
+    for entry in &entries {
+        assert!(
+            entry["argv_sha256"].is_null() && entry["hint"].is_null(),
+            "a record written before the command fields existed lists them as null: {entry}"
+        );
+    }
 
     // The human-readable table renders the same distinct value, not "stale". Both
     // run_ids under test (`run-unprobed-0000`, `run-stale-0000`) contain the very

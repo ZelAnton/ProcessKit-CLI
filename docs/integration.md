@@ -313,7 +313,14 @@ processkit-cli prune --json   # reap only the confirmed-stale entries
 ```
 
 - **`list --json`** prints one JSON object per registry entry (`run_id`,
-  health, `started_at`, `endpoint`), sorted deterministically. Health is
+  health, `started_at`, `hint`, `argv_sha256`, `endpoint`), sorted
+  deterministically. `argv_sha256` and `hint` are the same redaction-safe
+  command identification the `run_started` event carries (§3) — the full
+  64-character digest here, so an adapter can join a registry entry to the
+  events of the run that wrote it, or group several live entries by "same
+  command" without ever handling a command line. Both are `null` on a record
+  written before those fields existed, and `hint` is `null` for the common
+  case of a command matching no known worker shape. Health is
   `live`, `stale` (**confirmed** dead — no live holder found), or `unprobed`
   (the liveness lock could not even be opened, e.g. permission denied — a
   distinct, additive value: liveness is *unknown*, never printed as the

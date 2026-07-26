@@ -50,6 +50,26 @@ use crate::events;
 /// [`schema_version`](crate::events::SCHEMA_VERSION): the registry is a private
 /// per-user contract between a runner and its own control-plane clients, not the
 /// public event stream, so it versions on its own axis.
+///
+/// **Why adding [`Record::argv_sha256`]/[`Record::hint`] (T-215) did not bump it.**
+/// A version exists to tell a reader "you cannot correctly interpret what follows",
+/// and neither direction of this change can mislead a reader:
+///
+/// - **New record, old reader.** `Record` has no `deny_unknown_fields`, so a reader
+///   built before these fields existed ignores them and reads every field it knows
+///   exactly as before — including in the mixed registry a mid-upgrade user really
+///   has, where an older `list`/`prune` binary and a newer `run` share one directory.
+/// - **Old record, new reader.** Both fields are `Option` + `#[serde(default)]`, so
+///   a record written before they existed reads back with them `None` — "not
+///   reported", the same value a run whose argv matched no hint rule writes today.
+///
+/// Nothing acts on either field either: no file is opened, no deletion gated, no run
+/// resolved through them (see [`parse_and_validate_record`]), so no reader can be led
+/// into a wrong *action* by a value it does not understand. That is exactly the
+/// additive case `docs/schema.md`'s own "Versioning" section describes for the event
+/// stream, applied on this axis. A bump would be required for the opposite kind of
+/// change: renaming/removing/retyping an existing field, changing what a value means,
+/// or adding a field a reader must understand to behave correctly.
 pub const REGISTRY_VERSION: u32 = 1;
 
 /// The only liveness mechanism today: an OS advisory lock held for the run's life.
@@ -84,6 +104,36 @@ const ORPHAN_LOCK_MIN_AGE: Duration = Duration::from_secs(5);
 /// `Serialize` + `Deserialize`: the runner writes it, future control-plane clients
 /// read it back. Deliberately carries **no PID** — a run is addressed by `run_id`,
 /// never by process id.
+///
+/// # What T-215 deliberately left out
+///
+/// The record gained the two *redaction-safe* command fields below so `list` can
+/// tell several live runs apart ([`Record::argv_sha256`], [`Record::hint`]). Two
+/// further candidates were considered and **refused**, as decisions rather than
+/// omissions:
+///
+/// - **`root_pid`.** The registry's second load-bearing property is that nothing
+///   here is addressed by, or identified with, a PID (`AGENTS.md`, "Nothing is
+///   addressed by PID, which is what makes PID reuse irrelevant"; `docs/registry.md`,
+///   "No PID addressing"). Publishing the root PID as a *display* field would not
+///   break how entries are found, but it would put a reused-at-any-moment number in
+///   front of an operator inside the one artifact whose whole design says "this
+///   number cannot identify a run" — an invitation to `kill <pid>` the process that
+///   inherited it. The value it would add (telling two runs apart) is exactly what
+///   the fingerprint below provides without that hazard.
+/// - **`cwd`.** It is a raw, unfingerprinted string with no redaction rule anywhere
+///   in this project's redaction contract, which covers argv only (`docs/schema.md`,
+///   "Command redaction"). A working directory routinely spells out a customer,
+///   ticket, branch, or user name, so persisting it verbatim into a long-lived
+///   registry file would put *unredacted* operational text into an artifact whose
+///   own module docs justify its owner-only permissions by the sensitivity of what it
+///   holds — for a discovery benefit the fingerprint already delivers. It would also
+///   add a second untrusted **path** to validate on read, the shape that has already
+///   produced one subtle defect here (a `Path::components()` validator silently
+///   normalizing `.` segments, [K-074]). The `run_started` JSONL event still carries
+///   `cwd`: that stream is written only to a file the caller explicitly asked for
+///   with `--jsonl`, which is a different disclosure decision than a per-user
+///   registry every local client of this binary reads by default.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
     /// Format version of this record ([`REGISTRY_VERSION`]).
@@ -104,6 +154,37 @@ pub struct Record {
     /// Run start time, RFC 3339 UTC with millisecond precision (same formatter as the
     /// JSONL events, see [`events::format_rfc3339_utc`]).
     pub started_at: String,
+    /// The run's **redaction-safe** command fingerprint: the lowercase-hex SHA-256 of
+    /// the canonical argv encoding `docs/schema.md` pins, exactly as the JSONL
+    /// `run_started` event's `command.argv_sha256` carries it (one shared
+    /// implementation — [`events::CommandFingerprint`]). It is what lets an operator
+    /// staring at several live entries tell *which run is which* without the command
+    /// line: two runs of the same command share a fingerprint, two different commands
+    /// do not.
+    ///
+    /// **Never argv, in any form.** The hash is one-way and is the only
+    /// command-derived value here besides [`Record::hint`]; `--argv-raw` does not
+    /// widen it, because raw argv is not an input to `register` at all (see
+    /// [`Registry::register`]). Added additively in T-215: `None` on a record written
+    /// before that (or by any writer that publishes none), which is why it
+    /// deserializes as optional.
+    ///
+    /// Untrusted deserialized data on the read side, like every other field a
+    /// corrupt or hand-edited file can carry — validated by shape in
+    /// [`parse_and_validate_record`], which drops a malformed value rather than
+    /// discarding the whole record (see [`is_valid_argv_sha256`]).
+    #[serde(default)]
+    pub argv_sha256: Option<String>,
+    /// The run's worker-shape category, from the same classifier the JSONL event uses
+    /// ([`events::classify_hint`] / its `HINT_RULES` catalog, mirrored in
+    /// `docs/schema.md`) — `None` when the argv matches no known shape, which is the
+    /// common case. A fixed category label, never argv content, so publishing it
+    /// weakens redaction no more than the fingerprint above does.
+    ///
+    /// Additive and optional for the same reason as [`Record::argv_sha256`], and
+    /// validated on read the same way (see [`is_valid_hint`]).
+    #[serde(default)]
+    pub hint: Option<String>,
     /// How a client decides whether this record is live or stale — never by the file
     /// merely existing.
     pub liveness: Liveness,
@@ -359,11 +440,20 @@ impl Registry {
     /// `endpoint` is the local transport address the runner published (a unix socket
     /// path / Windows pipe name), or `None` when no transport could be stood up.
     /// `started` is the run's start time.
+    ///
+    /// `command` is the run's **redaction-safe** identification — the argv
+    /// fingerprint and worker-shape hint an operator uses to tell several live
+    /// entries apart (T-215). It is deliberately an [`events::CommandFingerprint`]
+    /// rather than the argv itself: the raw command line is not an input to this
+    /// function at all, so no code path here — present or future, `--argv-raw` or not
+    /// — can put argv into a registry record. Redaction is a property of the
+    /// signature, not of remembering to apply it.
     pub fn register(
         &self,
         run_id: &str,
         endpoint: Option<&str>,
         started: SystemTime,
+        command: &events::CommandFingerprint,
     ) -> io::Result<Registration> {
         // Reserve a unique, opaque entry stem via the filesystem itself (create_new),
         // and take the live lock on the fresh lock file before publishing the record.
@@ -374,6 +464,8 @@ impl Registry {
             run_id: run_id.to_string(),
             endpoint: endpoint.map(str::to_string),
             started_at: events::format_rfc3339_utc(started),
+            argv_sha256: Some(command.argv_sha256.clone()),
+            hint: command.hint.map(str::to_string),
             liveness: Liveness {
                 kind: LIVENESS_ADVISORY_LOCK.to_string(),
                 lock_file: file_name(&reserved.lock_path),
@@ -395,6 +487,29 @@ impl Registry {
             lock: reserved.lock,
             removed: AtomicBool::new(false),
         })
+    }
+
+    /// Test-only [`Registry::register`] with a fixed, representative command
+    /// fingerprint — for the many tests (here and in [`crate::control`]) whose
+    /// subject is an entry's liveness, locking, scanning, or reaping behavior and
+    /// not the command metadata it publishes. It exists so those tests keep reading
+    /// as what they are about, while the production entry point above still takes
+    /// the fingerprint explicitly, with no default that could quietly publish
+    /// nothing. Tests that *are* about the published metadata call `register`
+    /// directly with their own fingerprint.
+    #[cfg(test)]
+    pub(crate) fn register_plain(
+        &self,
+        run_id: &str,
+        endpoint: Option<&str>,
+        started: SystemTime,
+    ) -> io::Result<Registration> {
+        self.register(
+            run_id,
+            endpoint,
+            started,
+            &events::CommandFingerprint::for_argv(["pkc-test-fixture", run_id]),
+        )
     }
 
     /// Scan every entry, classifying each as [`Health::Live`], [`Health::Stale`], or
@@ -1204,13 +1319,16 @@ fn probe_for_prune(lock_path: &Path) -> io::Result<PruneProbe> {
 /// ([`is_valid_rfc3339_millis_utc`]), and a simple in-directory `lock_file` name
 /// ([`is_simple_lock_file_name`]) — and returns `None` for anything that fails
 /// any of those guards, the same "corrupt record, skip it" verdict `scan` uses.
+/// The two redaction-safe command fields ([`Record::argv_sha256`]/[`Record::hint`])
+/// are guarded too, but by *sanitizing* rather than rejecting — see the comment at
+/// that step for why a field nothing acts on must not be able to hide a live run.
 /// Pure — it never touches the filesystem, unlike `scan` itself, which is what
 /// lets this double as the bytes → parse/validate target of the registry-record
 /// fuzz tier (`fuzz/fuzz_targets/registry_record.rs`, T-186) without spinning up
 /// a real registry directory.
 #[doc(hidden)]
 pub fn parse_and_validate_record(text: &str) -> Option<Record> {
-    let record = serde_json::from_str::<Record>(text).ok()?;
+    let mut record = serde_json::from_str::<Record>(text).ok()?;
     // `started_at` is untrusted deserialized data too: a record written by a
     // well-behaved runner always carries an [`events::format_rfc3339_utc`] value,
     // but a corrupted or hand-edited record could carry anything `serde_json`
@@ -1231,7 +1349,86 @@ pub fn parse_and_validate_record(text: &str) -> Option<Record> {
     if !is_simple_lock_file_name(&record.liveness.lock_file) {
         return None;
     }
+    // The two redaction-safe command fields (T-215) are untrusted deserialized data
+    // as well — but unlike the two guards above, a malformed value here **degrades
+    // the field, not the record**. The distinction is what the value can do:
+    //
+    // - `lock_file` is joined onto the registry directory and *opened*, and
+    //   `started_at` is what every client sorts, reports, and reasons about a run's
+    //   age by. A malformed value there steers an action, so the honest verdict is
+    //   "this file is not a record a runner wrote" — skip it entirely.
+    // - `argv_sha256`/`hint` steer nothing. Nothing is opened through them, no
+    //   deletion is gated on them, no run is resolved by them; they are reported to
+    //   an operator and nothing else. Discarding the whole record over one of them
+    //   would hand a purely cosmetic field the power to hide a **live** run from
+    //   `list`, `prune`, `wait`, and every control client at once — one hand-edited
+    //   byte in a live entry's `hint` and `cancel`/`kill` can no longer find the run
+    //   they are aimed at. That is a strictly worse failure than losing the field.
+    //
+    // So a value that is not the exact shape a runner writes is dropped to `None` —
+    // "not reported", precisely the value a pre-T-215 record already carries and
+    // every consumer already renders — and the record survives intact. A record a
+    // live runner wrote can never take this path: `register` publishes only
+    // `events::CommandFingerprint`'s own hex digest and catalog labels (see
+    // `hint_labels_from_the_real_catalog_pass_the_record_guard`).
+    record.argv_sha256 = record
+        .argv_sha256
+        .filter(|value| is_valid_argv_sha256(value));
+    record.hint = record.hint.filter(|value| is_valid_hint(value));
     Some(record)
+}
+
+/// The number of hex characters in a SHA-256 digest — the exact length
+/// [`crate::hash::sha256_hex`] produces, and therefore the only length
+/// [`is_valid_argv_sha256`] accepts.
+const SHA256_HEX_LEN: usize = 64;
+
+/// The longest [`Record::hint`] value accepted from disk. Every label the real
+/// catalog mints is far shorter (the seed entry is 18 characters); the cap exists
+/// only so a corrupt or hand-edited record cannot make `list` print an unbounded
+/// string it read off disk.
+const MAX_HINT_LEN: usize = 64;
+
+/// Validate a record's `argv_sha256` as exactly what [`crate::hash::sha256_hex`]
+/// emits: [`SHA256_HEX_LEN`] characters of **lowercase** hex, nothing else. Length
+/// is checked in bytes, which is equivalent to characters here because every byte is
+/// then required to be an ASCII hex digit (a multi-byte character fails that check
+/// and is rejected before the two could diverge).
+///
+/// Lowercase specifically, not "hex in either case": `docs/schema.md` pins the
+/// fingerprint's rendering as lowercase hex, so an uppercase digest is not a
+/// differently-spelled equal value — it is a value no writer of this format
+/// produces, and accepting it would let the same run appear under two spellings of
+/// one fingerprint, defeating the "same command ⇒ same string" comparison the field
+/// exists for.
+fn is_valid_argv_sha256(value: &str) -> bool {
+    value.len() == SHA256_HEX_LEN
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+/// Validate a record's `hint` as a plausible catalog label: non-empty, at most
+/// [`MAX_HINT_LEN`] bytes, and made only of ASCII lowercase letters, digits, and
+/// `_` — the `snake_case` shape `docs/schema.md` requires of every `hint` label
+/// ("Choose a stable, snake_case `hint` label").
+///
+/// Checked by **shape rather than membership** in the current
+/// [`events::classify_hint`] catalog on purpose: a record can legitimately be
+/// written by a *newer* runner sharing the same per-user registry directory, and a
+/// membership test would silently drop a label this binary simply has not heard of
+/// yet — the same forward-compatibility trap `docs/schema.md` warns consumers about
+/// for new event values. The shape check still removes everything that could make
+/// the value more than a category name: an embedded newline (which would forge an
+/// extra row in `list`'s table), an ANSI escape or other control character, a
+/// separator, whitespace, or an unbounded blob. An anti-drift test asserts every
+/// label the real catalog *can* emit passes this.
+fn is_valid_hint(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_HINT_LEN
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 /// Validate that `value` has the exact shape [`events::format_rfc3339_utc`]
@@ -2344,7 +2541,7 @@ mod tests {
         let registry = Registry::open_in(dir.clone()).expect("open registry");
         let started = UNIX_EPOCH + Duration::from_millis(1_700_000_000_123);
         let registration = registry
-            .register("run-42", None, started)
+            .register_plain("run-42", None, started)
             .expect("register run");
 
         let text = fs::read_to_string(registration.record_path()).expect("read record");
@@ -2365,6 +2562,144 @@ mod tests {
 
         registration.remove();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// T-215's producer side: a registered run publishes the two redaction-safe
+    /// command fields — the fingerprint the JSONL stream carries for the same run,
+    /// and the worker-shape hint — and publishes **nothing else** about the command.
+    /// The argv here is a recognized MSBuild worker shape carrying a secret-looking
+    /// token, so the test pins both at once: the classified hint is written, and no
+    /// fragment of the command line reaches the on-disk record.
+    #[test]
+    fn register_publishes_a_fingerprint_and_hint_but_never_argv() {
+        let dir = scratch("record-command");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+        let argv = [
+            "C:\\dotnet\\MSBuild.dll",
+            "/nodemode:1",
+            "/nodeReuse:true",
+            "/p:ApiKey=hunter2-do-not-log",
+        ];
+        let fingerprint = events::CommandFingerprint::for_argv(argv);
+        let registration = registry
+            .register("run-cmd", None, SystemTime::now(), &fingerprint)
+            .expect("register run");
+
+        let text = fs::read_to_string(registration.record_path()).expect("read record");
+        let record: Record = serde_json::from_str(&text).expect("parse record");
+        assert_eq!(
+            record.argv_sha256.as_deref(),
+            Some(fingerprint.argv_sha256.as_str()),
+            "the record carries the same fingerprint the run's events carry"
+        );
+        assert_eq!(
+            record.hint.as_deref(),
+            Some("msbuild_node_reuse"),
+            "a recognized worker shape is published as its catalog label"
+        );
+        for fragment in ["hunter2", "ApiKey", "MSBuild.dll", "nodeReuse"] {
+            assert!(
+                !text.contains(fragment),
+                "no argv content may reach a registry record ({fragment:?}): {text}"
+            );
+        }
+
+        registration.remove();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same fields, for the common case: an argv matching no catalog rule still
+    /// gets a fingerprint (it is derived from argv, so it always exists) but no hint
+    /// — `null`, not an invented label.
+    #[test]
+    fn register_publishes_no_hint_for_an_unrecognized_command() {
+        let dir = scratch("record-command-unclassified");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+        let registration = registry
+            .register(
+                "run-plain",
+                None,
+                SystemTime::now(),
+                &events::CommandFingerprint::for_argv(["cmd", "/c", "echo hi"]),
+            )
+            .expect("register run");
+
+        let record: Record =
+            serde_json::from_str(&fs::read_to_string(registration.record_path()).expect("read"))
+                .expect("parse record");
+        assert!(
+            record
+                .argv_sha256
+                .as_deref()
+                .is_some_and(is_valid_argv_sha256),
+            "every run publishes a well-formed fingerprint: {:?}",
+            record.argv_sha256
+        );
+        assert!(
+            record.hint.is_none(),
+            "an unrecognized shape publishes no hint: {:?}",
+            record.hint
+        );
+
+        registration.remove();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Backward compatibility, the read side of T-215's additive change: a record
+    /// written **before** these fields existed — no `argv_sha256`, no `hint` key at
+    /// all — still parses, with both fields simply absent. It is scanned, probed, and
+    /// listed exactly as it always was; nothing about the entry depends on the new
+    /// fields being there.
+    #[test]
+    fn a_record_without_the_command_fields_still_reads() {
+        let dir = scratch("record-legacy");
+        fs::create_dir_all(&dir).expect("create the registry directory");
+        // Byte-for-byte the record shape a pre-T-215 runner wrote.
+        let legacy = "{\"registry_version\":1,\"run_id\":\"legacy\",\"endpoint\":null,\
+             \"started_at\":\"2026-07-22T00:00:00.000Z\",\
+             \"liveness\":{\"kind\":\"advisory_lock\",\"lock_file\":\"legacy.lock\"}}";
+        let record = parse_and_validate_record(legacy).expect("a pre-T-215 record still parses");
+        assert_eq!(record.run_id, "legacy");
+        assert!(
+            record.argv_sha256.is_none() && record.hint.is_none(),
+            "absent fields read back as absent, never as an error or a fabricated value"
+        );
+
+        // …and the whole scan path agrees: the entry is found and probed as usual.
+        fs::write(dir.join("legacy.json"), legacy).expect("write the legacy record");
+        fs::write(dir.join("legacy.lock"), b"").expect("write an unlocked lock file");
+        let entries = Registry::open_read_only_in(dir.clone())
+            .entries()
+            .expect("scan");
+        assert_eq!(
+            entries.len(),
+            1,
+            "a legacy record is a perfectly good entry"
+        );
+        assert_eq!(entries[0].record.run_id, "legacy");
+        assert_eq!(
+            entries[0].health,
+            Health::Stale,
+            "its liveness is decided by its lock, exactly as before"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The other direction of the same compatibility claim (the one that makes
+    /// [`REGISTRY_VERSION`] not need a bump): a record written by a **newer** writer,
+    /// carrying a field this binary has never heard of, is read as an ordinary
+    /// record — the unknown field is ignored, not treated as corruption. Both
+    /// directions matter in the mixed registry a mid-upgrade user actually has.
+    #[test]
+    fn a_record_with_an_unknown_field_still_reads() {
+        let from_the_future = "{\"registry_version\":1,\"run_id\":\"future\",\"endpoint\":null,\
+             \"started_at\":\"2026-07-22T00:00:00.000Z\",\
+             \"argv_sha256\":null,\"hint\":null,\"some_future_field\":{\"a\":1},\
+             \"liveness\":{\"kind\":\"advisory_lock\",\"lock_file\":\"future.lock\"}}";
+        let record =
+            parse_and_validate_record(from_the_future).expect("an unknown field is not corruption");
+        assert_eq!(record.run_id, "future");
     }
 
     /// The Drop-backstop this task adds: a [`ReservedEntry`] that is dropped before
@@ -2403,7 +2738,7 @@ mod tests {
         let dir = scratch("remove");
         let registry = Registry::open_in(dir.clone()).expect("open registry");
         let registration = registry
-            .register("run-clean", None, SystemTime::now())
+            .register_plain("run-clean", None, SystemTime::now())
             .expect("register run");
         let record_path = registration.record_path().to_owned();
         let lock_path = registration.lock_path().to_owned();
@@ -2431,7 +2766,7 @@ mod tests {
         let dir = scratch("stale");
         let registry = Registry::open_in(dir.clone()).expect("open registry");
         let registration = registry
-            .register("run-victim", None, SystemTime::now())
+            .register_plain("run-victim", None, SystemTime::now())
             .expect("register run");
         let record_path = registration.record_path().to_owned();
         let lock_path = registration.lock_path().to_owned();
@@ -2467,8 +2802,12 @@ mod tests {
         let dir = scratch("concurrent");
         let registry = Registry::open_in(dir.clone()).expect("open registry");
         let now = SystemTime::now();
-        let first = registry.register("run-a", None, now).expect("register a");
-        let second = registry.register("run-b", None, now).expect("register b");
+        let first = registry
+            .register_plain("run-a", None, now)
+            .expect("register a");
+        let second = registry
+            .register_plain("run-b", None, now)
+            .expect("register b");
         assert_ne!(
             first.record_path(),
             second.record_path(),
@@ -2515,6 +2854,11 @@ mod tests {
             run_id: run_id.to_string(),
             endpoint: endpoint.map(str::to_string),
             started_at: events::format_rfc3339_utc(SystemTime::now()),
+            // These fixtures exist to exercise the `lock_file`/`endpoint` guards;
+            // publishing no command metadata keeps them focused (and keeps them
+            // covering the "record without it" shape every consumer must handle).
+            argv_sha256: None,
+            hint: None,
             liveness: Liveness {
                 kind: LIVENESS_ADVISORY_LOCK.to_string(),
                 lock_file: lock_file.to_string(),
@@ -2594,6 +2938,8 @@ mod tests {
             run_id: run_id.to_string(),
             endpoint: None,
             started_at: started_at.to_string(),
+            argv_sha256: None,
+            hint: None,
             liveness: Liveness {
                 kind: LIVENESS_ADVISORY_LOCK.to_string(),
                 lock_file: format!("{stem}.lock"),
@@ -2610,6 +2956,207 @@ mod tests {
         } else {
             "/tmp/escape.lock"
         }
+    }
+
+    /// A registry record's raw JSON with `argv_sha256`/`hint` set to arbitrary
+    /// (here deliberately malformed) values — the corrupt or hand-edited shape no
+    /// runner writes, for exercising the read-side guards on those two fields.
+    fn record_json_with_command_fields(run_id: &str, argv_sha256: &str, hint: &str) -> String {
+        // Built through `serde_json` rather than string-formatted so a value
+        // carrying quotes/newlines/control characters is escaped into *valid* JSON:
+        // the point of these fixtures is a well-formed file with a bad field value,
+        // not a broken file the JSON parser would reject before any guard ran.
+        serde_json::json!({
+            "registry_version": REGISTRY_VERSION,
+            "run_id": run_id,
+            "endpoint": serde_json::Value::Null,
+            "started_at": "2026-07-22T00:00:00.000Z",
+            "argv_sha256": argv_sha256,
+            "hint": hint,
+            "liveness": { "kind": LIVENESS_ADVISORY_LOCK, "lock_file": format!("{run_id}.lock") },
+        })
+        .to_string()
+    }
+
+    /// The read-side contract for the two new fields: a value that is not the exact
+    /// shape a runner writes is **dropped**, and the record itself survives. Every
+    /// other field keeps its value, so the entry stays fully usable — the field is
+    /// simply "not reported", the same state a record written before these fields
+    /// existed is in.
+    #[test]
+    fn a_malformed_command_field_is_dropped_not_the_record() {
+        let record = parse_and_validate_record(&record_json_with_command_fields(
+            "victim",
+            // Uppercase hex: a digest no writer of this format produces.
+            "0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef",
+            // A label carrying a newline — what would otherwise forge an extra row
+            // in `list`'s table — plus an ANSI escape.
+            "msbuild\n\u{1b}[31mFAKE-ROW",
+        ))
+        .expect("a malformed command field must not discard the record");
+        assert_eq!(record.run_id, "victim", "every other field is untouched");
+        assert_eq!(record.started_at, "2026-07-22T00:00:00.000Z");
+        assert!(
+            record.argv_sha256.is_none(),
+            "a malformed fingerprint is dropped: {:?}",
+            record.argv_sha256
+        );
+        assert!(
+            record.hint.is_none(),
+            "a malformed hint is dropped: {:?}",
+            record.hint
+        );
+    }
+
+    /// Why that is the right verdict, demonstrated where it actually bites: a
+    /// **live** run whose record has a corrupt `hint` (a hand-edited byte, a partial
+    /// write) stays visible to the scan every client shares. Discarding the record
+    /// over a field nothing acts on would hide a running run from `list`, and with it
+    /// from `wait` and from the `inspect`/`cancel`/`kill` resolution that matches on
+    /// `run_id` — a cosmetic field silently disarming the control plane.
+    #[test]
+    fn a_live_entry_with_a_corrupt_hint_is_still_found() {
+        let dir = scratch("corrupt-hint-live");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+        let registration = registry
+            .register_plain("still-running", None, SystemTime::now())
+            .expect("register run");
+
+        // Corrupt only the `hint` value of the published record, leaving the held
+        // liveness lock — and every other field, including the `lock_file` name that
+        // points at it — exactly as they were.
+        let corrupted = record_json_with_command_fields(
+            "still-running",
+            &crate::hash::sha256_hex(b"whatever"),
+            "not a valid label!",
+        )
+        .replace("still-running.lock", &file_name(registration.lock_path()));
+        fs::write(registration.record_path(), corrupted)
+            .expect("rewrite the record with a corrupt hint");
+
+        let entries = registry.entries().expect("scan");
+        assert_eq!(
+            entries.len(),
+            1,
+            "a corrupt cosmetic field must not hide a live run from the scan"
+        );
+        assert_eq!(entries[0].record.run_id, "still-running");
+        assert_eq!(
+            entries[0].health,
+            Health::Live,
+            "the run is still live, and still reported as such"
+        );
+        assert!(
+            entries[0].record.hint.is_none(),
+            "the unusable value itself is dropped: {:?}",
+            entries[0].record.hint
+        );
+
+        registration.remove();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// [`is_valid_argv_sha256`]'s boundary table. A hand-rolled validator is exactly
+    /// the kind that passes by inspection and fails on an edge case ([K-030]), so
+    /// every boundary is spelled out: the accepted length either side, the case of
+    /// the hex digits, a non-hex letter, and a multi-byte character that makes the
+    /// byte length "right" while the character length is not.
+    #[test]
+    fn argv_sha256_guard_accepts_only_a_full_lowercase_hex_digest() {
+        let real = crate::hash::sha256_hex(b"processkit-cli");
+        assert!(
+            is_valid_argv_sha256(&real),
+            "the digest this project actually produces must pass: {real}"
+        );
+        assert!(is_valid_argv_sha256(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
+
+        for rejected in [
+            // Empty, and the two lengths either side of 64.
+            "",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0",
+            // Uppercase hex — a spelling no writer of this format emits, and a
+            // second spelling of one fingerprint if accepted.
+            "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF",
+            // A non-hex letter, in the first and in the last position.
+            "g123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg",
+            // Surrounding or embedded whitespace, and a control character.
+            " 123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd\ne",
+            // 64 *bytes* but 63 characters: the length check alone would pass it,
+            // the per-byte hex check is what refuses it.
+            "α123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(
+                !is_valid_argv_sha256(rejected),
+                "not a lowercase-hex SHA-256 digest: {rejected:?}"
+            );
+        }
+    }
+
+    /// [`is_valid_hint`]'s boundary table, in the same [K-030] spirit: the label
+    /// shape `docs/schema.md` requires is accepted at both length boundaries, and
+    /// everything that would make the value more than a category name — a
+    /// separator, whitespace, a newline forging a table row, an ANSI escape, a NUL,
+    /// a non-ASCII character, or an unbounded blob — is refused.
+    #[test]
+    fn hint_guard_accepts_label_shapes_and_refuses_everything_else() {
+        for accepted in [
+            "msbuild_node_reuse",
+            "a",
+            "gradle_daemon_7",
+            "_leading_underscore",
+            &"x".repeat(MAX_HINT_LEN),
+        ] {
+            assert!(
+                is_valid_hint(accepted),
+                "a plain snake_case label must be accepted: {accepted:?}"
+            );
+        }
+
+        for rejected in [
+            "",
+            &"x".repeat(MAX_HINT_LEN + 1),
+            "MSBuild_Node_Reuse",
+            "msbuild node reuse",
+            "msbuild-node-reuse",
+            "msbuild.node.reuse",
+            "msbuild/node",
+            "msbuild\nnode",
+            "msbuild\u{1b}[31m",
+            "msbuild\0node",
+            "msbuildα",
+        ] {
+            assert!(
+                !is_valid_hint(rejected),
+                "not a category label: {rejected:?}"
+            );
+        }
+    }
+
+    /// Anti-drift, in both directions of the one contract that spans two modules:
+    /// every label the **real** classifier catalog can emit passes the record guard
+    /// that reads it back. A new `HINT_RULES` entry spelled in a shape this guard
+    /// refuses would otherwise publish a label that silently vanished at scan time —
+    /// visible nowhere except as a mysteriously empty column. Asserted against the
+    /// catalog itself ([`events::hint_labels`]), never a copy of it.
+    #[test]
+    fn hint_labels_from_the_real_catalog_pass_the_record_guard() {
+        let mut labels = 0usize;
+        for label in events::hint_labels() {
+            assert!(
+                is_valid_hint(label),
+                "the classifier can emit {label:?}, so the record guard must accept it"
+            );
+            labels += 1;
+        }
+        assert!(
+            labels > 0,
+            "the catalog is not empty, so this asserted something"
+        );
     }
 
     /// The names a live runner actually mints, plus benign edge cases that merely
@@ -2710,7 +3257,7 @@ mod tests {
 
         // A well-formed live entry alongside the corrupt ones.
         let good = registry
-            .register("good", None, SystemTime::now())
+            .register_plain("good", None, SystemTime::now())
             .expect("register the good run");
 
         let entries = registry.entries().expect("scan");
@@ -2805,7 +3352,7 @@ mod tests {
         write_record_with_started_at(&dir, "truncated", "truncated", "2026-07-22T00:00:00Z");
 
         let good = registry
-            .register("good", None, SystemTime::now())
+            .register_plain("good", None, SystemTime::now())
             .expect("register the good run");
 
         let entries = registry.entries().expect("scan");
@@ -2893,7 +3440,7 @@ mod tests {
 
         // A well-formed, live sibling entry alongside the unprobeable one.
         let good = registry
-            .register("good", None, SystemTime::now())
+            .register_plain("good", None, SystemTime::now())
             .expect("register the good run");
 
         let entries = registry.entries().expect("scan must not fail");
@@ -2966,7 +3513,7 @@ mod tests {
         let registry = Registry::open_in(dir.clone()).expect("open registry");
 
         let registration = registry
-            .register("victim", None, SystemTime::now())
+            .register_plain("victim", None, SystemTime::now())
             .expect("register run");
         let record_path = registration.record_path().to_owned();
         let lock_path = registration.lock_path().to_owned();
@@ -3015,10 +3562,10 @@ mod tests {
         let now = SystemTime::now();
 
         let live = registry
-            .register("alive", None, now)
+            .register_plain("alive", None, now)
             .expect("register the live run");
         let doomed = registry
-            .register("dead", None, now)
+            .register_plain("dead", None, now)
             .expect("register the doomed run");
         let live_record = live.record_path().to_owned();
         let live_lock = live.lock_path().to_owned();
@@ -3348,10 +3895,10 @@ mod tests {
     /// a genuine orphan rather than a fresh, not-yet-locked reservation.
     fn mixed_prune_fixture(dir: &Path, registry: &Registry) -> Registration {
         let live = registry
-            .register("alive", None, SystemTime::now())
+            .register_plain("alive", None, SystemTime::now())
             .expect("register the live run");
         let doomed = registry
-            .register("dead", None, SystemTime::now())
+            .register_plain("dead", None, SystemTime::now())
             .expect("register the doomed run");
         doomed.simulate_abrupt_death();
 
@@ -3702,7 +4249,7 @@ mod tests {
         let (socket_dir, endpoint) = socket_fixture("reap");
 
         let registration = registry
-            .register("victim", Some(&endpoint), SystemTime::now())
+            .register_plain("victim", Some(&endpoint), SystemTime::now())
             .expect("register run");
         let record_path = registration.record_path().to_owned();
         let lock_path = registration.lock_path().to_owned();
@@ -3754,7 +4301,7 @@ mod tests {
         let (socket_dir, endpoint) = socket_fixture("live");
 
         let live = registry
-            .register("alive", Some(&endpoint), SystemTime::now())
+            .register_plain("alive", Some(&endpoint), SystemTime::now())
             .expect("register the live run");
 
         let outcome = registry.prune().expect("prune must not fail");
@@ -4111,7 +4658,7 @@ mod tests {
         let dir = scratch("probe-run-lifecycle");
         let registry = Registry::open_in(dir.clone()).expect("open registry");
         let registration = registry
-            .register("waited", None, SystemTime::now())
+            .register_plain("waited", None, SystemTime::now())
             .expect("register run");
 
         assert_eq!(
@@ -4148,7 +4695,7 @@ mod tests {
         // The same answer with an unrelated live run in the registry: matching is by
         // `run_id`, so another run's liveness never leaks into this one's verdict.
         let other = registry
-            .register("someone-else", None, SystemTime::now())
+            .register_plain("someone-else", None, SystemTime::now())
             .expect("register an unrelated run");
         assert_eq!(
             registry.probe_run("never-registered").expect("probe"),
@@ -4169,7 +4716,7 @@ mod tests {
         let dir = scratch("probe-run-stale");
         let registry = Registry::open_in(dir.clone()).expect("open registry");
         let registration = registry
-            .register("crashed", None, SystemTime::now())
+            .register_plain("crashed", None, SystemTime::now())
             .expect("register run");
         let record_path = registration.record_path().to_owned();
         let lock_path = registration.lock_path().to_owned();
@@ -4206,10 +4753,10 @@ mod tests {
         let now = SystemTime::now();
 
         let with_endpoint = registry
-            .register("dup", Some("endpoint-a"), now)
+            .register_plain("dup", Some("endpoint-a"), now)
             .expect("register the first duplicate");
         let without_endpoint = registry
-            .register("dup", None, now)
+            .register_plain("dup", None, now)
             .expect("register the second duplicate");
 
         assert_eq!(
@@ -4266,7 +4813,7 @@ mod tests {
         // A confirmed-live record under the same id outranks the unknown one: there
         // is something definite to wait for.
         let live = registry
-            .register("opaque", None, SystemTime::now())
+            .register_plain("opaque", None, SystemTime::now())
             .expect("register a live run under the same id");
         assert_eq!(
             registry.probe_run("opaque").expect("probe"),

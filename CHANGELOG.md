@@ -12,6 +12,30 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- **`list` now says which run is which.** A registry entry used to carry only its
+  `run_id`, health, `started_at`, and control endpoint, so an operator with several
+  live runs saw rows that were indistinguishable in every way that mattered — nothing
+  hinted at *what* any of them was running before picking one to `inspect`/`cancel`/
+  `kill`. Each run now also publishes the two **redaction-safe** command fields its
+  JSONL stream already carried: `argv_sha256`, the one-way argv fingerprint (equal for
+  two entries exactly when they run the same command), and `hint`, the worker-shape
+  category (`msbuild_node_reuse`, …) or `null` when the command matches no known
+  shape. Both come from the very implementation the `run_started` event uses, so a run
+  never fingerprints differently in the two artifacts. `list --json` reports both at
+  full precision (the whole 64-character digest, joinable against the run's own
+  events); the human-readable table gains `HINT` and `ARGV_SHA256` columns, the latter
+  abbreviated to 12 hex characters plus `...`. **No command line is ever written to a
+  registry record** — `register` is handed the fingerprint and hint, not the argv, so
+  no flag (`--argv-raw` included) can put one there; `root_pid` and `cwd` were
+  considered for the same purpose and deliberately refused (see `docs/registry.md`,
+  "Which run is which"). The record format stays `registry_version` 1: both fields are
+  optional on read, so a record written before they existed still reads (reported as
+  `null`), and a record from a newer writer still reads on an older binary — the mixed
+  registry a mid-upgrade user really has. Their values are untrusted deserialized data
+  like every other field and are shape-checked on read; unlike a malformed
+  `started_at`/`lock_file`, a malformed one of these drops the field alone and keeps
+  the record, so a cosmetic value can never hide a live run from `list`, `wait`, or a
+  control client.
 - A concurrency stress test tier (`tests/stress.rs`, `stress` Cargo feature)
   covering the invariants that only break when many runs contend for the two
   resources every run shares — the per-user registry and the per-run control

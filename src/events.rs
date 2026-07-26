@@ -363,21 +363,85 @@ impl CommandInfo {
     {
         // Render argv once to the lossy-UTF-8 strings that `--argv-raw` would
         // record and the classifier inspects, then derive the fingerprint and hint
-        // from that single rendering. Only the raw array is gated behind the flag;
-        // the redaction-safe fields are computed unconditionally.
-        let strings: Vec<String> = argv
-            .into_iter()
-            .map(|a| a.as_ref().to_string_lossy().into_owned())
-            .collect();
-        let argv_sha256 = Some(argv_sha256_hex(&strings));
-        let hint = classify_hint(&strings).map(str::to_string);
+        // from that single rendering — through the very same
+        // [`CommandFingerprint`] the registry record publishes, so the two can
+        // never disagree about one run. Only the raw array is gated behind the
+        // flag; the redaction-safe fields are computed unconditionally.
+        let strings = render_argv(argv);
+        let fingerprint = CommandFingerprint::for_rendered_argv(&strings);
         Self {
             redacted: !argv_raw,
             argv: argv_raw.then_some(strings),
-            argv_sha256,
-            hint,
+            argv_sha256: Some(fingerprint.argv_sha256),
+            hint: fingerprint.hint.map(str::to_string),
         }
     }
+}
+
+/// The **redaction-safe** identification of a run's command: the one-way argv
+/// fingerprint and the categorical worker-shape hint, and nothing else — never the
+/// argv itself, in any form.
+///
+/// This is the whole of what a consumer may learn about a command without being
+/// shown it (`AGENTS.md`, "Argv is redacted by default"), factored out of
+/// [`CommandInfo`] so the two places that publish it — the JSONL `run_started`
+/// event and the per-user registry record ([`crate::registry::Record`], T-215) —
+/// derive it from **one** implementation rather than each growing its own. That
+/// matters twice over: a second fingerprint implementation could drift from the
+/// canonical encoding `docs/schema.md` pins (making the same run fingerprint
+/// differently in two artifacts), and a second classifier could emit a label
+/// outside the documented catalog.
+///
+/// It is also the *only* command-derived value the registry is ever handed: the
+/// registry's `register` takes this type, not an argv, so raw argv cannot reach a
+/// registry record even by mistake — the redaction guarantee there is structural,
+/// not a matter of remembering to redact. `--argv-raw` widens only
+/// [`CommandInfo::argv`]; it is not even an input here.
+#[derive(Debug, Clone)]
+pub struct CommandFingerprint {
+    /// The lowercase-hex SHA-256 argv fingerprint (see [`argv_sha256_hex`]).
+    /// Always present: it is derived from argv but cannot reveal it.
+    pub argv_sha256: String,
+    /// The worker-shape category from [`classify_hint`], or `None` when the argv
+    /// matches no known shape (the common case). Deliberately `&'static str`, not
+    /// `String`: a value here can only ever be one of [`HINT_RULES`]' fixed labels,
+    /// so no argv content can reach a consumer through this field even in
+    /// principle.
+    pub hint: Option<&'static str>,
+}
+
+impl CommandFingerprint {
+    /// The redaction-safe fingerprint of `argv` — the entry point for a caller
+    /// holding the raw argv (`run`, which hands the result to the registry).
+    pub fn for_argv<I, S>(argv: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        Self::for_rendered_argv(&render_argv(argv))
+    }
+
+    /// The same fingerprint from an argv already rendered to lossy-UTF-8 strings —
+    /// how [`CommandInfo::for_argv`] reuses this without rendering argv twice.
+    fn for_rendered_argv(argv: &[String]) -> Self {
+        Self {
+            argv_sha256: argv_sha256_hex(argv),
+            hint: classify_hint(argv),
+        }
+    }
+}
+
+/// Render argv to the lossy-UTF-8 strings both the fingerprint and the classifier
+/// (and `--argv-raw`'s recorded array) work on — one rendering, one place, so a
+/// platform's non-UTF-8 argument is lossily replaced identically everywhere.
+fn render_argv<I, S>(argv: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    argv.into_iter()
+        .map(|a| a.as_ref().to_string_lossy().into_owned())
+        .collect()
 }
 
 /// The hex SHA-256 fingerprint of a run's argv: the lossy-UTF-8 argv elements
@@ -416,6 +480,19 @@ static HINT_RULES: &[HintRule] = &[HintRule {
     hint: "msbuild_node_reuse",
     markers: &["MSBuild.dll", "/nodemode:1", "/nodeReuse:true"],
 }];
+
+/// Every `hint` label this catalog can emit — test-only, and `pub(crate)` only for
+/// that, so the catalog itself stays private. It exists so a *consumer* of the
+/// labels can assert against the real catalog instead of a hand-copied list: the
+/// registry's read-side `hint` validator (T-215, `crate::registry`) must accept
+/// every label a runner can actually write, and a new catalog entry that violated
+/// that shape would otherwise only surface as a silently dropped field at scan
+/// time. The same anti-drift discipline the control-socket naming contract uses
+/// (see [K-073]).
+#[cfg(test)]
+pub(crate) fn hint_labels() -> impl Iterator<Item = &'static str> {
+    HINT_RULES.iter().map(|rule| rule.hint)
+}
 
 /// Classify a run's argv against [`HINT_RULES`], returning the first matching
 /// rule's `hint` or `None` when no shape is recognized (the common case). Matching
@@ -922,6 +999,63 @@ mod tests {
             "the fingerprint does not depend on whether the raw argv is disclosed"
         );
         assert_eq!(raw.hint, redacted.hint);
+    }
+
+    /// The two artifacts that publish a run's redaction-safe identification — the
+    /// JSONL `run_started` event ([`CommandInfo`]) and the registry record, which is
+    /// handed a [`CommandFingerprint`] (T-215) — must never disagree about the same
+    /// run, or a consumer could not join one to the other. They share this module's
+    /// single implementation, and this pins that: for the same argv, with and without
+    /// `--argv-raw`, both values match field for field.
+    #[test]
+    fn the_registry_fingerprint_matches_the_event_command_for_the_same_argv() {
+        for argv in [
+            ["C:\\dotnet\\MSBuild.dll", "/nodemode:1", "/nodeReuse:true"],
+            ["cmd", "/c", "build"],
+        ] {
+            let fingerprint = CommandFingerprint::for_argv(argv);
+            for argv_raw in [false, true] {
+                let event = CommandInfo::for_argv(argv, argv_raw);
+                assert_eq!(
+                    event.argv_sha256.as_deref(),
+                    Some(fingerprint.argv_sha256.as_str()),
+                    "the record and the event must fingerprint {argv:?} identically"
+                );
+                assert_eq!(
+                    event.hint.as_deref(),
+                    fingerprint.hint,
+                    "the record and the event must classify {argv:?} identically"
+                );
+            }
+        }
+    }
+
+    /// A `CommandFingerprint` is the redaction boundary itself, so the type must not
+    /// be able to carry argv anywhere: its `hint` is a `&'static str` from the fixed
+    /// catalog, and its only other field is the one-way digest. Asserted through the
+    /// value's own `Debug` rendering — the shape any accidental logging of it would
+    /// produce — for an argv whose every element is a distinctive secret.
+    #[test]
+    fn a_command_fingerprint_carries_no_argv_content() {
+        let rendered = format!(
+            "{:?}",
+            CommandFingerprint::for_argv([
+                "C:\\dotnet\\MSBuild.dll",
+                "/nodemode:1",
+                "/nodeReuse:true",
+                "/p:Token=hunter2-do-not-log",
+            ])
+        );
+        for fragment in ["hunter2", "Token", "MSBuild.dll", "nodemode"] {
+            assert!(
+                !rendered.contains(fragment),
+                "no argv content may survive into the fingerprint ({fragment:?}): {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("msbuild_node_reuse"),
+            "the classified catalog label is what it carries instead: {rendered}"
+        );
     }
 
     /// The argv fingerprint is SHA-256 over the NUL-joined argv: a single-element

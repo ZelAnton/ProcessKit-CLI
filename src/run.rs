@@ -900,9 +900,22 @@ async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     let endpoint = control_server
         .as_ref()
         .map(|server| server.endpoint().to_string());
-    let registration = registry_handle
-        .as_ref()
-        .and_then(|registry| register_run(registry, &run_id, endpoint.as_deref(), started));
+    let registration = registry_handle.as_ref().and_then(|registry| {
+        register_run(
+            registry,
+            &run_id,
+            endpoint.as_deref(),
+            started,
+            // The redaction-safe identification of this run's command — a one-way
+            // argv fingerprint plus the worker-shape hint — from the same argv and
+            // the same code path the `run_started` event's `command` object uses, so
+            // the registry record and the JSONL stream can never disagree about which
+            // run is which. Raw argv is not part of it and never reaches the registry
+            // (see `register_run`). Derived here, where it is actually published, so
+            // a run whose registry could not be opened at all computes nothing.
+            &events::CommandFingerprint::for_argv(&args.command),
+        )
+    });
 
     let mut command = PkCommand::new(program).args(program_args);
     // Abrupt runner death skips ProcessGroup::drop. ProcessKit can still harden the
@@ -1745,16 +1758,25 @@ fn open_registry() -> Option<registry::Registry> {
 }
 
 /// Publish this run's registry record — its `run_id`, its transport `endpoint` (the
-/// address a client connects to, or `None` when no transport could be stood up), and
-/// the liveness lock the returned [`registry::Registration`] holds for the run.
-/// Best-effort, like [`open_registry`]: a failure warns and yields `None`.
+/// address a client connects to, or `None` when no transport could be stood up), the
+/// redaction-safe `command` fingerprint that lets `list` tell this run apart from the
+/// operator's other live ones (T-215), and the liveness lock the returned
+/// [`registry::Registration`] holds for the run. Best-effort, like [`open_registry`]:
+/// a failure warns and yields `None`.
+///
+/// `command` is an [`events::CommandFingerprint`], never the argv: the registry is
+/// handed the one-way fingerprint and the categorical hint only, so this run's
+/// command line cannot reach a registry record whether or not `--argv-raw` was
+/// passed (that flag widens the JSONL `run_started` event alone — see
+/// [`registry::Registry::register`]).
 fn register_run(
     registry: &registry::Registry,
     run_id: &str,
     endpoint: Option<&str>,
     started: SystemTime,
+    command: &events::CommandFingerprint,
 ) -> Option<registry::Registration> {
-    match registry.register(run_id, endpoint, started) {
+    match registry.register(run_id, endpoint, started, command) {
         Ok(registration) => Some(registration),
         Err(err) => {
             eprintln!("processkit-cli: warning: could not create the run registry entry: {err}");
