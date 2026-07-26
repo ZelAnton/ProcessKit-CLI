@@ -138,9 +138,11 @@ implemented in `run::execute` (`src/run/mod.rs`) and `run::launch::run_async`
    Unix a caught `SIGTERM`/`SIGHUP`, or on Windows a caught `Ctrl-Break`/
    console close/logoff/system shutdown), and a control-plane
    `cancel` reaching the live runner over `src/control.rs` all drive the
-   *same* graceful path: a soft stop (`SIGTERM` to the tree on Unix; no
-   soft-signal tier on Windows yet, so the grace window still elapses honestly
-   with no signal sent), a `--grace` wait, then the owning `ProcessGroup`'s
+   *same* graceful path: a soft stop (`SIGTERM` to the tree on Unix; on Windows,
+   which has no POSIX signal, a best-effort `WM_CLOSE` to any windowed member —
+   nothing at all for the ordinary console child, in which case the grace window
+   still elapses honestly with no soft stop delivered), a `--grace` wait, then
+   the owning `ProcessGroup`'s
    kernel-backed hard kill-on-drop. A control-plane **`kill`** is not part of
    that tier: it skips the soft stop and the grace window entirely and
    hard-kills the whole tree immediately via the same kill-on-drop mechanism —

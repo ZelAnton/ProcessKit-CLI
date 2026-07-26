@@ -167,11 +167,17 @@ leaves membership on exit, so it is empty after the kill; on the POSIX
 process-group fallback an unreaped just-exited child can still be listed until it
 is reaped. `soft_terminate` is one of:
 
-- `signalled` — a real soft signal (`SIGTERM`) was delivered to the tree (Unix).
-- `unsupported` — the platform has no soft-terminate tier yet (Windows); nothing
-  was sent, and the runner does not pretend otherwise. The grace window still
-  elapsed before the atomic Job Object kill.
-- `failed` — the soft signal could not be delivered; the hard kill ran regardless.
+- `signalled` — a soft stop really was delivered to the tree: on Unix a `SIGTERM`
+  broadcast; on Windows, where a Job Object has no POSIX signal, ProcessKit's
+  best-effort soft *close* — a `WM_CLOSE` to every top-level window owned by a live
+  member (plus a console `CTRL_BREAK` to a child opted into ProcessKit's
+  `windows_graceful_ctrl_break`, which this runner does not use).
+- `unsupported` — nothing in the tree could receive a soft stop, so none was sent
+  and the runner does not pretend otherwise. Windows-only in practice, and the
+  ordinary case there for a plain console child: no windowed member and no
+  console-CTRL leader means the soft tier has nothing to trigger. The grace window
+  still elapsed before the atomic Job Object kill.
+- `failed` — the soft stop could not be delivered; the hard kill ran regardless.
 
 **Honest degradation on a teardown read failure.** `members_before`/`remaining`/
 `remaining_pids` are read from the live container (`ProcessGroup::members()`),

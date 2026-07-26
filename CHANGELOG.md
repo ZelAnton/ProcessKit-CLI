@@ -91,6 +91,36 @@ to a dated version section.
   completions, and man pages.
 
 ### Changed
+- **Upgraded to `processkit` 3, and Windows soft-stop reporting is honest again.**
+  The dependency moves from `2` to `3` (`limits` feature unchanged; the declared MSRV
+  stays `1.88`, which is still `processkit`'s own floor). Two things in the major
+  release touch this runner. First, `processkit::Error` is now a pointer-sized
+  wrapper around a boxed `ErrorReason`, so the runner's two launch/teardown
+  classifications read the failure mode off `err.reason()` instead of matching the
+  error directly — the exit codes they select (`SPAWN` (101) for a not-found/spawn
+  failure, `BACKEND` (102) for every other backend failure) and every operator-facing
+  message are unchanged, since `Error`'s `Display` delegates to the reason's and adds
+  no envelope. Second, and user-visibly: on Windows `ProcessGroup::signal` is no
+  longer an unconditional refusal for a soft stop. A Job Object still has no POSIX
+  signal, but ProcessKit now makes a best-effort soft *close* — a `WM_CLOSE` to every
+  top-level window owned by a live member — and refuses only when the tree exposes
+  nothing such a close can reach. The runner therefore stops making the blanket claim
+  that Windows has no soft-terminate tier (true when `0.1.0` shipped, no longer true
+  here — that historical entry is left as the record of what `0.1.0` did): a Windows
+  `--timeout`/cancel whose tree owns a window now reports `soft_terminate:
+  "signalled"` and says a close was asked for, never that a signal was sent; the far
+  commoner windowless console child still reports `"unsupported"`, and its stderr line
+  now states *why* nothing was delivered (no windowed member, no console-CTRL leader)
+  instead of blaming the platform. Deliberately **not** adopted here: opting the
+  runner's own child into ProcessKit's `windows_graceful_ctrl_break`, and the new
+  `soft_stop_scope()`/`stop()` capability and teardown reports — those change the
+  teardown contract itself and stay a roadmap item (`docs/ROADMAP.md`). Verified
+  rather than assumed while upgrading: the release's switch to raw pipe-byte
+  accounting applies only to the fail-loud `OverflowMode::Error` ceiling and the
+  `*_bytes_seen` readbacks, neither of which this runner uses, so both of its own
+  ceilings (`--capture-max-bytes` and the in-flight line-assembly cap) are unaffected;
+  and the output-event-stream rename is likewise irrelevant here, since `run` streams
+  through `stdout_tee`/`stderr_tee` and never touches that stream.
 - **`inspect --json` is now optional**, mirroring `list`/`prune`: without it,
   `inspect` prints a human-readable rendering of the snapshot (snapshot version, run
   id, mechanism, root pid, start time, and a column-aligned member table) instead of

@@ -72,6 +72,20 @@ pub const CAPTURE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// and the reverse (a large `--capture-max-bytes` for a long build log) would
 /// otherwise inflate the in-flight buffer far past what any real line needs. Kept
 /// as its own constant instead.
+///
+/// **Byte accounting under ProcessKit 3 (verified, not assumed).** ProcessKit 3
+/// made its *cumulative* output-byte counter raw — the bytes read from the pipe,
+/// including line terminators and pre-decode invalid UTF-8. That counter feeds
+/// exactly two things, and this runner uses **neither**: the fail-loud
+/// `OverflowMode::Error` ceiling (`ErrorReason::OutputTooLarge`), and the
+/// `RunningProcess::stdout_bytes_seen`/`stderr_bytes_seen` readbacks. `run` hands
+/// the pump `OutputBufferPolicy::bounded(0)` — a *drop* mode — whose retention and
+/// per-line cap are still measured on decoded line content, and whose in-flight
+/// assembly cap (the one this constant sets) has always counted raw chunk bytes.
+/// So neither ceiling shifted with the upgrade and none of the runner's own
+/// counting had to move: [`CaptureTee`]'s per-stream `--capture-max-bytes` budget
+/// stays what it always was — the bytes this runner writes to the transcript file
+/// (see the module docs above), counted here, never read back off the kernel.
 pub const CAPTURE_INFLIGHT_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// One stream's capture file plus its running metadata. Behind an `Arc<Mutex<…>>`

@@ -548,13 +548,19 @@ unit) at parse time, the same "degenerate cap" treatment `--max-memory`,
 `--max-processes`, and `--cpu-quota` already give their own `0`. Omit either flag
 to leave that deadline unbounded instead.
 
-**Honest degradation on Windows.** The soft-stop tier is not yet implemented in the
-ProcessKit kernel on Windows (tracked in ProcessKit-rs's backlog). Until it lands,
-the runner sends **no** soft signal on Windows: the grace window still elapses, and
-then the Job Object is killed atomically. The runner never pretends a graceful
-soft-terminate happened when it could not — the stderr line for a Windows
-timeout/cancel says plainly that the tree was hard-killed via the Job Object after
-the grace delay. On Unix the soft stop is a real `SIGTERM` to the tree.
+**Honest degradation on Windows.** A Windows Job Object has no POSIX signal, so the
+soft stop there is not a signal at all: ProcessKit makes a best-effort soft *close*
+of whatever the tree exposes — a `WM_CLOSE` to every top-level window owned by a live
+member. A plain console child owns no window, so for the ordinary Windows run
+**nothing** is delivered: the grace window still elapses, and then the Job Object is
+killed atomically. The runner never pretends a graceful soft-terminate happened when
+it could not — the stderr line for such a timeout/cancel says plainly that nothing in
+the tree could receive a soft close and that it was hard-killed via the Job Object
+after the grace delay. When the tree *does* contain a windowed member, the close is
+delivered and reported as `signalled` (see the `cleanup_finished` event's
+`soft_terminate` field in
+[the JSONL event schema](#jsonl-event-schema)) — never as a signal, which Windows
+cannot send. On Unix the soft stop is a real `SIGTERM` to the tree.
 
 The machine-readable form of these outcomes is the `timeout` / `cancelled` event
 (and the terminal `runner_exit`) in the versioned JSONL stream written to

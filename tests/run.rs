@@ -1691,10 +1691,14 @@ fn timeout_reports_the_timeout_code_and_tears_down_the_tree() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Windows honesty: with no soft-terminate tier in the ProcessKit kernel yet, a
-/// timeout on Windows must *say so plainly* — it names the atomic Job Object kill
-/// and never claims a graceful soft-terminate was performed (`docs/ROADMAP.md`:
-/// "Windows cancellation must report its hard-kill fallback honestly").
+/// Windows honesty: a Job Object has no POSIX signal, and ProcessKit's Windows soft
+/// tier (a `WM_CLOSE` to a windowed member, or a `CTRL_BREAK` to an opted-in console
+/// leader) can reach nothing at all in a plain console child's tree — the ordinary
+/// case, and exactly what this child is. Such a timeout must *say so plainly*: it
+/// names the atomic Job Object kill, states that nothing in the tree could receive a
+/// soft close, and never claims a graceful soft-terminate was performed
+/// (`docs/ROADMAP.md`: "a Windows cancellation that reached nothing must keep
+/// reporting its hard-kill fallback honestly").
 #[cfg(windows)]
 #[test]
 fn windows_timeout_reports_the_hard_kill_fallback_honestly() {
@@ -1721,11 +1725,19 @@ fn windows_timeout_reports_the_hard_kill_fallback_honestly() {
     );
     assert!(
         stderr.contains("no soft-terminate"),
-        "honesty: no soft tier is stated: {stderr:?}"
+        "honesty: no soft stop was delivered: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("no windowed member") && stderr.contains("no console-CTRL leader"),
+        "honesty: the reason nothing was delivered is stated, not just the outcome: {stderr:?}"
     );
     assert!(
         !stderr.contains("sent SIGTERM"),
         "must not claim a soft signal was delivered on Windows: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("WM_CLOSE"),
+        "a console child owns no window, so nothing was closed either: {stderr:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

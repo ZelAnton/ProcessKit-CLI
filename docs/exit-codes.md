@@ -75,8 +75,9 @@ even reading the event stream.
 
 Alongside the code, the runner writes an explanatory line to **stderr** (never the
 child's stdout) that also states, truthfully, how the tree was torn down — including
-that on Windows there is no soft-terminate tier yet, so the grace window elapses and
-the Job Object is then killed atomically (see `README.md`, "Timeouts, cancel, and
+that on Windows a soft stop can only reach a windowed member, so for the ordinary
+console child no soft stop is delivered at all, the grace window elapses, and the Job
+Object is then killed atomically (see `README.md`, "Timeouts, cancel, and
 grace"). As with every runner-own code, the numeric value is a best-effort signal;
 the authoritative, machine-readable form of these outcomes is the `timeout` /
 `cancelled` / `killed` event (and the terminal `runner_exit`) in the versioned JSONL

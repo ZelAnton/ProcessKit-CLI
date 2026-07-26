@@ -44,12 +44,26 @@
 
 ## Remaining ProcessKit-rs dependencies
 
-The CLI will consume, rather than duplicate, the core's Windows graceful
-shutdown support once it ships; `ProcessGroup::members_info()` has already
-shipped and is consumed for `members_snapshot`/`inspect` member enrichment
-(see [`docs/schema.md`](schema.md), "Enriched member fields"). Until Windows
-graceful shutdown ships, Windows cancellation must report its hard-kill
-fallback honestly.
+The core's Windows graceful-shutdown support has now shipped (processkit 3):
+`ProcessGroup::signal(Signal::Term)` is no longer an unconditional refusal there
+but a best-effort soft *close* — a `WM_CLOSE` to any windowed member of the tree,
+plus a console `CTRL_BREAK` to a child opted in via
+`Command::windows_graceful_ctrl_break` — refusing only when the tree exposes
+neither. The CLI already consumes what that changes for free: the existing
+soft-stop tier now reports `signalled` when a windowed member really was asked to
+close, and `unsupported` otherwise, and every claim about the platform has been
+brought in line. What is **not** yet consumed is the deeper contract it enables —
+opting our own child into `windows_graceful_ctrl_break` so a console child becomes
+soft-stoppable at all, and the richer `ProcessGroup::soft_stop_scope()` /
+`ProcessGroup::stop()` reports (a capability probe read *before* attempting a stop,
+and a structured `ShutdownReport` of what a teardown actually observed). Adopting
+those means new operator-facing
+reporting and probably a new JSONL field, so it stays a future roadmap item with no
+committed timeline. `ProcessGroup::members_info()` likewise already shipped and is
+consumed for `members_snapshot`/`inspect` member enrichment (see
+[`docs/schema.md`](schema.md), "Enriched member fields"). Until the deeper contract
+is adopted, a Windows cancellation that reached nothing must keep reporting its
+hard-kill fallback honestly.
 
 Whole-tree cleanup after an abrupt runner death is also a core dependency on
 Unix. The current public primitive kills only the direct child on Linux and is a

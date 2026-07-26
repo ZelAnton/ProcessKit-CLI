@@ -18,7 +18,7 @@
 
 use std::time::Duration;
 
-use processkit::{Error as PkError, Outcome, ProcessGroup, Signal};
+use processkit::{Error as PkError, ErrorReason as PkErrorReason, Outcome, ProcessGroup, Signal};
 
 use crate::capture::Capture;
 use crate::duration_fmt::format_duration;
@@ -141,7 +141,7 @@ pub(super) fn clear_registration(registration: &Option<registry::Registration>) 
 /// can report them (`events::Member::from_info`) — and emit `members_snapshot`. A
 /// read failure is a diagnostics gap, not a run failure, so it warns and skips the
 /// event; it shares the same error contract as the bare-PID `members()` this
-/// replaced (`Error::Io` only — a single vanished member is skipped, not an
+/// replaced (`ErrorReason::Io` only — a single vanished member is skipped, not an
 /// error).
 pub(super) fn emit_members_snapshot(emitter: &mut Emitter, group: &ProcessGroup) {
     match group.members_info() {
@@ -291,25 +291,36 @@ pub(super) fn launch_failure_source(error: &RunnerError) -> &'static str {
 /// teardown is not done here — the caller drops the owning [`ProcessGroup`]
 /// afterwards, and its kernel-backed kill-on-drop is the single hard-kill path.
 ///
-/// On Unix the soft stop is a `SIGTERM` broadcast to the whole tree. On Windows
-/// [`ProcessGroup::signal`] supports only `Signal::Kill`, so a `SIGTERM` request
-/// returns [`PkError::Unsupported`]: no soft signal is delivered, and we record
-/// that faithfully instead of pretending. Either way the grace window still
-/// elapses (giving a child that *can* stop — e.g. one that received the console's
-/// own `Ctrl-C` on Windows — a chance to exit first) before the atomic kill — but
-/// only as an *upper bound*: [`wait_grace_or_empty`] cuts the wait short the
-/// moment the tree is observed empty, rather than always sleeping the whole
-/// window.
+/// On Unix the soft stop is a `SIGTERM` broadcast to the whole tree. A Windows
+/// Job Object still has no POSIX signal, but since ProcessKit 3
+/// [`ProcessGroup::signal`] no longer refuses a `Signal::Term` outright: it makes
+/// a **best-effort soft close** of whatever the tree exposes — a `WM_CLOSE` to
+/// every top-level window owned by a live member, plus a console `CTRL_BREAK` to
+/// any child spawned through ProcessKit's opt-in `windows_graceful_ctrl_break`
+/// (which this runner does not use, so only the windowed members are reachable
+/// here). It returns [`PkErrorReason::Unsupported`] only when the tree has
+/// *neither* — the ordinary case for the console children `run` usually contains
+/// — and that is recorded faithfully rather than dressed up as a soft stop that
+/// never happened. Either way the grace window still elapses (giving a child that
+/// *can* stop — e.g. one that received the console's own `Ctrl-C` on Windows — a
+/// chance to exit first) before the atomic kill — but only as an *upper bound*:
+/// [`wait_grace_or_empty`] cuts the wait short the moment the tree is observed
+/// empty, rather than always sleeping the whole window.
 pub(super) async fn soft_terminate_then_grace(
     group: &ProcessGroup,
     grace: Option<Duration>,
 ) -> SoftTerminate {
     let soft = match group.signal(Signal::Term) {
         Ok(()) => SoftTerminate::Signalled,
-        Err(PkError::Unsupported { .. }) => SoftTerminate::Unsupported,
-        // Best-effort: a delivery failure does not stop teardown — the group's
-        // kill-on-drop still reaps the tree — but it is reported honestly.
-        Err(_) => SoftTerminate::Failed,
+        // ProcessKit 3 carries the structured failure mode behind a pointer-sized
+        // `Error`, so the classification borrows the reason rather than matching
+        // the wrapper itself; the tiers it selects are unchanged.
+        Err(err) => match err.reason() {
+            PkErrorReason::Unsupported { .. } => SoftTerminate::Unsupported,
+            // Best-effort: a delivery failure does not stop teardown — the group's
+            // kill-on-drop still reaps the tree — but it is reported honestly.
+            _ => SoftTerminate::Failed,
+        },
     };
     if let Some(grace) = grace {
         wait_grace_or_empty(group, grace).await;
@@ -415,10 +426,37 @@ pub(super) fn control_kill_error() -> RunnerError {
     )
 }
 
+/// What a *delivered* soft stop actually was on this platform, as one honest
+/// phrase for [`describe_teardown`]. The two platforms use genuinely different
+/// mechanisms — a POSIX signal broadcast on Unix, a best-effort window close on a
+/// Windows Job Object (which has no POSIX signal at all) — so the operator
+/// message names the real one instead of a portable fiction.
+///
+/// Pure over an explicit `windows` flag rather than reading `cfg!` itself, so
+/// **both** wordings are unit-tested on every host instead of leaving one branch
+/// to whichever platform CI happens to run (K-059); the single call site passes
+/// `cfg!(windows)`, which also keeps both arms compiled and type-checked
+/// everywhere.
+fn soft_stop_mechanism(windows: bool) -> &'static str {
+    if windows {
+        // ProcessKit 3's Windows soft tier: `WM_CLOSE` to every top-level window
+        // owned by a live member (plus a console `CTRL_BREAK` to an opted-in
+        // leader, which this runner never registers). Deliberately not called a
+        // signal — a Job Object has none — and deliberately free of the word
+        // "grace", which belongs to the separate `--grace` wording this phrase is
+        // spliced in front of.
+        "asked the process tree to close (a WM_CLOSE to its windowed members — \
+         a Job Object has no POSIX signal to send)"
+    } else {
+        "sent SIGTERM to the process tree"
+    }
+}
+
 /// A truthful, human-readable description of the teardown that just happened —
 /// the load-bearing part of the "honest degradation" contract. It states whether
-/// a real soft signal was delivered, whether a grace window was waited, and that
-/// the hard kill is the container's kill-on-drop (a Windows Job Object terminate).
+/// a real soft stop was delivered (and by which mechanism, see
+/// [`soft_stop_mechanism`]), whether a grace window was waited, and that the hard
+/// kill is the container's kill-on-drop (a Windows Job Object terminate).
 fn describe_teardown(soft: SoftTerminate, grace: Option<Duration>) -> String {
     let waited = match grace {
         Some(grace) => format!("waited {} grace, then ", format_duration(grace)),
@@ -426,18 +464,25 @@ fn describe_teardown(soft: SoftTerminate, grace: Option<Duration>) -> String {
     };
     match soft {
         SoftTerminate::Signalled => format!(
-            "sent SIGTERM to the process tree, {waited}hard-killed it via the container's kill-on-drop"
+            "{}, {waited}hard-killed it via the container's kill-on-drop",
+            soft_stop_mechanism(cfg!(windows))
         ),
+        // Windows-only in practice: every Unix backend always has a real SIGTERM
+        // tier, so `Unsupported` can only come from a Job Object with nothing a
+        // soft close could reach. The *reason* is what changed in ProcessKit 3 —
+        // not "the platform has no soft tier" any more, but "this tree exposes
+        // nothing that tier can trigger" — and the message says exactly that.
         SoftTerminate::Unsupported => format!(
-            "Windows has no soft-terminate signal yet, so — after {}— the process tree was \
-             hard-killed atomically via the Job Object",
+            "Windows delivered no soft-terminate request to this process tree (it has no \
+             windowed member to close and no console-CTRL leader), so — after {}— the tree \
+             was hard-killed atomically via the Job Object",
             match grace {
                 Some(grace) => format!("a {} grace delay ", format_duration(grace)),
                 None => "no grace delay ".to_string(),
             }
         ),
         SoftTerminate::Failed => format!(
-            "the soft-terminate signal could not be delivered, so {waited}the process tree was \
+            "the soft-terminate request could not be delivered, so {waited}the process tree was \
              hard-killed via the container's kill-on-drop"
         ),
     }
@@ -448,9 +493,15 @@ fn describe_teardown(soft: SoftTerminate, grace: Option<Duration>) -> String {
 /// A locate/start failure is [`exit::SPAWN`] — the child never ran; every other
 /// backend/containment failure is [`exit::BACKEND`]. A child's own exit is never
 /// routed through here (it is an [`Outcome`], not an [`Err`]).
+///
+/// The failure mode is read off the borrowed [`PkErrorReason`] (ProcessKit 3
+/// boxes it behind the pointer-sized [`PkError`] wrapper). The wildcard arm's
+/// `{other}` renders exactly what `{err}` did before the migration:
+/// [`PkError`]'s own `Display` delegates to the reason's, adding no envelope of
+/// its own — so the operator-facing text is unchanged.
 pub(super) fn map_launch_error(err: &PkError) -> RunnerError {
-    match err {
-        PkError::NotFound { .. } | PkError::Spawn { .. } => {
+    match err.reason() {
+        PkErrorReason::NotFound { .. } | PkErrorReason::Spawn { .. } => {
             RunnerError::new(exit::SPAWN, format!("could not start the program: {err}"))
         }
         other => RunnerError::new(
@@ -528,10 +579,12 @@ mod tests {
         // `NotFound`/`Spawn` are `#[non_exhaustive]`, so they cannot be built
         // here; the SPAWN mapping is proved through the binary instead (running a
         // program that does not exist — see `tests/run.rs`). Every remaining
-        // launch failure lands on the BACKEND code.
-        let io = map_launch_error(&PkError::Io(std::io::Error::from(
+        // launch failure lands on the BACKEND code. `Io` is the one directly
+        // constructible reason (a plain tuple variant), wrapped into the
+        // pointer-sized `PkError` through its public `From<ErrorReason>`.
+        let io = map_launch_error(&PkError::from(PkErrorReason::Io(std::io::Error::from(
             std::io::ErrorKind::AddrInUse,
-        )));
+        ))));
         assert_eq!(io.code(), exit::BACKEND);
     }
 
@@ -821,7 +874,7 @@ mod tests {
             "a control cancel is not a Ctrl-C: {msg}"
         );
         assert!(
-            msg.contains("SIGTERM"),
+            msg.contains(soft_stop_mechanism(cfg!(windows))),
             "the shared teardown is described: {msg}"
         );
         assert!(msg.contains("2s"), "the grace is echoed: {msg}");
@@ -840,36 +893,83 @@ mod tests {
         assert!(msg.contains("hard-killed"), "the hard kill is named: {msg}");
     }
 
+    /// Both platform wordings of a *delivered* soft stop, exercised on every host
+    /// (the point of [`soft_stop_mechanism`] taking the flag rather than reading
+    /// `cfg!`): the Unix phrase names the real POSIX signal, and the Windows one
+    /// names what a Job Object can actually do — never a signal it has no way to
+    /// send.
     #[test]
-    fn unix_teardown_reports_a_real_soft_signal_and_the_grace() {
-        // Where the soft path exists, the message states the SIGTERM was sent and
-        // the grace was waited — no "Windows"/"Job Object" wording.
-        let msg = describe_teardown(SoftTerminate::Signalled, Some(Duration::from_secs(2)));
-        assert!(msg.contains("SIGTERM"), "{msg}");
-        assert!(msg.contains("2s"), "{msg}");
-        assert!(msg.contains("grace"), "{msg}");
-        assert!(!msg.contains("Windows"), "{msg}");
+    fn a_delivered_soft_stop_names_the_mechanism_the_platform_really_used() {
+        let unix = soft_stop_mechanism(false);
+        assert!(unix.contains("SIGTERM"), "{unix}");
+        assert!(!unix.contains("WM_CLOSE"), "{unix}");
+
+        let windows = soft_stop_mechanism(true);
+        assert!(
+            windows.contains("WM_CLOSE"),
+            "the Windows soft tier is a window close: {windows}"
+        );
+        assert!(
+            !windows.contains("SIGTERM"),
+            "a Job Object has no POSIX signal, so the message must not claim one: {windows}"
+        );
+        assert_ne!(
+            unix, windows,
+            "the two platforms do genuinely different things and must not share wording"
+        );
     }
 
     #[test]
-    fn windows_teardown_is_reported_honestly_without_pretending() {
-        // The "honest degradation" contract: when no soft signal could be sent,
+    fn teardown_reports_a_real_soft_stop_and_the_grace() {
+        // Where a soft stop was delivered, the message names this platform's real
+        // mechanism and states the grace was waited.
+        let msg = describe_teardown(SoftTerminate::Signalled, Some(Duration::from_secs(2)));
+        assert!(msg.contains(soft_stop_mechanism(cfg!(windows))), "{msg}");
+        assert!(msg.contains("2s"), "{msg}");
+        assert!(msg.contains("grace"), "{msg}");
+        assert!(msg.contains("hard-killed"), "{msg}");
+        assert!(
+            !msg.contains("could not be delivered"),
+            "a delivered soft stop is not a failure: {msg}"
+        );
+    }
+
+    #[test]
+    fn unsupported_teardown_is_reported_honestly_without_pretending() {
+        // The "honest degradation" contract: when no soft stop could be delivered,
         // the message says so plainly and names the atomic Job Object kill — it
-        // must never imply a graceful soft-terminate was performed.
+        // must never imply a graceful soft-terminate was performed. Since
+        // ProcessKit 3 the *reason* is that this particular tree exposes nothing a
+        // Windows soft close can reach (no window, no console-CTRL leader), not
+        // that the platform has no soft tier at all — so the message must state
+        // the tree-specific reason rather than the retired blanket claim.
         let msg = describe_teardown(SoftTerminate::Unsupported, Some(Duration::from_secs(2)));
         assert!(msg.contains("Windows"), "{msg}");
         assert!(msg.contains("Job Object"), "{msg}");
         assert!(msg.contains("no soft-terminate"), "{msg}");
         assert!(
+            msg.contains("no windowed member") && msg.contains("no console-CTRL leader"),
+            "the honest reason is that nothing in this tree could receive a soft close: {msg}"
+        );
+        assert!(
+            !msg.contains("has no soft-terminate signal yet"),
+            "ProcessKit 3 does have a Windows soft tier; the retired blanket claim \
+             must not survive: {msg}"
+        );
+        assert!(
             !msg.contains("sent SIGTERM"),
             "must not claim a soft signal was delivered: {msg}"
+        );
+        assert!(
+            !msg.contains("WM_CLOSE"),
+            "nothing was closed either — this is the reached-nothing branch: {msg}"
         );
     }
 
     #[test]
     fn teardown_without_grace_omits_the_grace_wording() {
         let msg = describe_teardown(SoftTerminate::Signalled, None);
-        assert!(msg.contains("SIGTERM"), "{msg}");
+        assert!(msg.contains(soft_stop_mechanism(cfg!(windows))), "{msg}");
         assert!(!msg.contains("grace"), "no grace was configured: {msg}");
     }
 
@@ -1088,7 +1188,9 @@ mod tests {
             "a successful read of an empty tree is a confirmed zero, unflagged — \
              distinct from the failure fallback below despite the same count"
         );
-        let simulated = PkError::Io(std::io::Error::other("simulated members() failure"));
+        let simulated = PkError::from(PkErrorReason::Io(std::io::Error::other(
+            "simulated members() failure",
+        )));
         assert_eq!(
             members_len_or_unknown(Err(simulated)),
             (0, true),
@@ -1114,7 +1216,9 @@ mod tests {
              unflagged — distinct from the failure fallback below despite the \
              same empty snapshot"
         );
-        let simulated = PkError::Io(std::io::Error::other("simulated members() failure"));
+        let simulated = PkError::from(PkErrorReason::Io(std::io::Error::other(
+            "simulated members() failure",
+        )));
         assert_eq!(
             remaining_pids_or_unknown(Err(simulated)),
             (Vec::new(), true),

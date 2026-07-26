@@ -7,7 +7,9 @@ license = "MIT"
 repository = "https://github.com/ZelAnton/ProcessKit-CLI"
 readme = "README.md"
 # Minimum Supported Rust Version. Edition 2024 needs >=1.85, but the `processkit`
-# dependency raises the real floor to 1.88, so that is the declared MSRV. Raise it
+# dependency raises the real floor to 1.88, so that is the declared MSRV. Rechecked
+# against the `processkit` 3 major bump: 3.0.x still declares `rust-version = "1.88"`
+# itself, so the real floor did not move and this value stands unchanged. Raise it
 # when you adopt a newer language/std feature or bump a dependency's floor. The
 # `msrv` CI job verifies it — keep the two in sync.
 rust-version = "1.88"
@@ -64,13 +66,13 @@ serde_json = "1"
 #
 # `features = ["limits"]` opts into the whole-tree resource caps
 # (`ProcessGroupOptions`/`ResourceLimits`, `ProcessGroup::with_options`, and
-# `Error::ResourceLimit`) that back `run`'s `--max-memory`/`--max-processes`/
+# `ErrorReason::ResourceLimit`) that back `run`'s `--max-memory`/`--max-processes`/
 # `--cpu-quota` flags — the enforcement primitive is a Windows Job Object or a
 # Linux cgroup v2, and the crate hides it behind this opt-in feature (it also
 # implies the crate's `stats` feature). Without a limit flag `run` still creates
 # the group through the plain `ProcessGroup::new()`, so a default run pulls none
 # of this at runtime.
-processkit = { version = "2", features = ["limits"] }
+processkit = { version = "3", features = ["limits"] }
 # Async runtime that drives the tokio-based `processkit` API. A small
 # current-thread runtime hosts the run; `io-std` provides the async stdout/stderr
 # sinks the child's output is teed to. `time` arms the `--timeout` deadline timer

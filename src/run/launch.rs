@@ -116,7 +116,7 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
         Ok(group) => group,
         Err(err) => {
             // A requested resource cap the active mechanism cannot honor surfaces as
-            // `Error::ResourceLimit`, *pre-spawn* (no child ran). Emit the
+            // `ErrorReason::ResourceLimit`, *pre-spawn* (no child ran). Emit the
             // resource-specific `limit_hit` first — the dedicated, machine-readable
             // signal that this creation failure was a limit, not a generic backend
             // fault — then take the *same* `container_failed{create}` →
@@ -831,7 +831,7 @@ fn set_terminal_foreground(fd: libc::c_int, pgrp: libc::pid_t) -> std::io::Resul
 /// cgroup v2 — is the crate's, never reimplemented here).
 ///
 /// **Exit-code decision (reserved runner band `100`–`119`).** When `with_options`
-/// cannot apply a requested cap it returns [`processkit::Error::ResourceLimit`], and it does
+/// cannot apply a requested cap it returns [`processkit::ErrorReason::ResourceLimit`], and it does
 /// so **pre-spawn** — the child never started, so no child code is ever at risk.
 /// Because the CLI parsers (`src/cli.rs`) already reject every nonsensical value as
 /// a `USAGE` (100) form error *before* we reach here, the only reasons that survive

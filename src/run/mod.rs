@@ -42,12 +42,14 @@
 //! - **One teardown path for every ending, honest per platform.** The deadline
 //!   and the cancel share a single termination path: attempt a *soft* stop
 //!   (`SIGTERM` to the whole tree on Unix), wait out `--grace`, then let the owning
-//!   group's kill-on-drop hard-tear-down the tree. On **Windows** there is no
-//!   soft-signal tier in the ProcessKit kernel yet (tracked in ProcessKit-rs's
-//!   backlog), so no soft signal is sent — the grace window still elapses and the
-//!   Job Object is then killed atomically. The runner never *pretends* a soft stop
-//!   happened when it could not: the stderr message states exactly what the
-//!   platform did (see [`teardown::describe_teardown`]).
+//!   group's kill-on-drop hard-tear-down the tree. On **Windows** a Job Object has
+//!   no POSIX signal, so the soft tier is ProcessKit's best-effort soft *close* —
+//!   a `WM_CLOSE` to any windowed member of the tree — which reaches nothing at
+//!   all for the ordinary console child, in which case the grace window still
+//!   elapses and the Job Object is then killed atomically. The runner never
+//!   *pretends* a soft stop happened when it could not, and never claims a signal
+//!   the platform cannot send: the stderr message states exactly what was done
+//!   (see [`teardown::describe_teardown`]).
 //! - **Detaching wraps the run; it never forks a second implementation of it.**
 //!   `--detach` re-spawns *this binary* on the very same argv (minus the flag) in
 //!   a new session (Unix) or as a `DETACHED_PROCESS` (Windows), waits until that
@@ -295,10 +297,15 @@ enum Termination {
 /// honestly rather than by assumption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SoftTerminate {
-    /// A real soft signal (`SIGTERM`) was delivered to the whole tree (Unix).
+    /// A soft stop really was delivered to the tree: a `SIGTERM` broadcast on
+    /// Unix, or — since ProcessKit 3 — a best-effort soft close on Windows (a
+    /// `WM_CLOSE` to a windowed member; a Job Object has no POSIX signal).
     Signalled,
-    /// The platform has no soft-terminate tier yet (Windows): nothing was sent,
-    /// and we do not claim otherwise.
+    /// Nothing in the tree could receive a soft stop, so none was delivered and
+    /// we do not claim otherwise. Windows-only in practice: a Job Object with no
+    /// windowed member and no opt-in console-CTRL leader has nothing ProcessKit's
+    /// soft tier can trigger. Every Unix backend always has a real `SIGTERM`
+    /// tier.
     Unsupported,
     /// The soft signal could not be delivered; the run falls through to the hard
     /// kill regardless.
