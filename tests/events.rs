@@ -216,8 +216,9 @@ fn run_started_reports_root_pid_mechanism_and_redacts_the_command() {
 }
 
 /// The binary resolves a relative `--cwd` exactly as child spawn does, but records
-/// the resulting absolute path so a JSONL consumer never needs the runner's ambient
-/// working directory to interpret `run_started.cwd`.
+/// an absolute path to the same directory so a JSONL consumer never needs the
+/// runner's ambient working directory to interpret `run_started.cwd`. The spelling
+/// need not preserve a platform path alias (`/var` and `/private/var` on macOS).
 #[test]
 fn run_started_normalizes_a_relative_cwd_to_absolute() {
     let dir = scratch("run-started-relative-cwd");
@@ -239,10 +240,15 @@ fn run_started_normalizes_a_relative_cwd_to_absolute() {
         .iter()
         .find(|event| event["event"] == "run_started")
         .expect("a run_started event");
+    let reported = started["cwd"]
+        .as_str()
+        .expect("run_started.cwd is a string when it resolves");
+    let reported = Path::new(reported);
+    assert!(reported.is_absolute(), "the event cwd is absolute");
     assert_eq!(
-        started["cwd"],
-        child_cwd.to_string_lossy().as_ref(),
-        "the event identifies the absolute directory the child actually used"
+        std::fs::canonicalize(reported).expect("resolve the reported cwd"),
+        std::fs::canonicalize(&child_cwd).expect("resolve the requested child cwd"),
+        "the event identifies the same filesystem directory the child used"
     );
 }
 
