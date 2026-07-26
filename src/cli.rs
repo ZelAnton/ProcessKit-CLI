@@ -57,12 +57,12 @@ pub enum Command {
 //
 // `run` consumes every field: `cwd`, `create_no_window`, `timeout`,
 // `idle_timeout`, `grace`, `max_memory`, `max_processes`, `cpu_quota` — the
-// whole-tree ProcessKit resource caps (see `src/run.rs`) — `command`, `jsonl`,
+// whole-tree ProcessKit resource caps (see `src/run/launch.rs`) — `command`, `jsonl`,
 // `run_id`, `argv_raw`, `capture_dir`/`capture_max_bytes` — bounded stdout/stderr
 // capture to files (see `src/capture.rs`) — `no_echo` — suppress the live echo
-// while capture/idle-timeout keep observing the same bytes (see `src/run.rs`) —
+// while capture/idle-timeout keep observing the same bytes (see `src/run/launch.rs`) —
 // `detach` — hand the whole run to a re-spawned, detached copy of this binary and
-// return as soon as it has provably started (see `src/run.rs`, "Detached runs") —
+// return as soon as it has provably started (see `src/run/detach.rs`) —
 // `env_clear`, `env_remove`, `env`, and `inherit_stdio`/`inherit_stdin`/`stdin_file`.
 #[derive(Debug, Args)]
 pub struct RunArgs {

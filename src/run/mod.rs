@@ -1,0 +1,306 @@
+//! The `run` subcommand: launch one shell-free program inside a ProcessKit
+//! container, route its output live, forward its exit code faithfully, and bound
+//! the run with a hard `--timeout` and a local stop-signal cancel (`Ctrl-C`, on
+//! Unix `SIGTERM`/`SIGHUP`, and on Windows `Ctrl-Break`/console close/logoff/
+//! system shutdown).
+//!
+//! This is the first executable path of the runner (see `docs/ROADMAP.md`,
+//! "Runnable containment shell"). It builds strictly on the public `processkit`
+//! API — the single source of truth for containment and teardown — and never
+//! reimplements any of it (`AGENTS.md`, "Build strictly on the public
+//! `processkit` API"). Five settled decisions are realized here:
+//!
+//! - **Own the group.** The child is spawned into a [`processkit::ProcessGroup`] this module
+//!   owns, not a shared/global one, so the group's kernel-backed kill-on-drop —
+//!   a Windows Job Object close, a Linux cgroup/POSIX-group teardown — reaps the
+//!   whole tree (including any leaked grandchild) when the group drops, on every
+//!   exit path. The teardown is the group's, never a hand-rolled wait/cleanup
+//!   loop on top of it. The group is dropped only *after* the outcome is decided.
+//! - **Output is pipe + echo by default, direct inheritance by opt-in.** The
+//!   default path uses processkit's line pump and therefore exposes no TTY to the
+//!   child. `--inherit-stdio` instead maps all three streams onto ProcessKit's
+//!   public inheritance modes, preserving the caller's terminal handles without
+//!   a runner-side pump. Streams stay strictly separated either way, and no runner
+//!   diagnostic is ever written to the child's stdout.
+//! - **Exit-code fidelity, with distinguishable runner-imposed endings.** On a
+//!   completed run the process exits with the child's *exact* code (full width,
+//!   never clamped). When the runner instead *ends* the run — the `--timeout`
+//!   deadline elapsed, a local stop signal arrived (`Ctrl-C`, on Unix `SIGTERM` /
+//!   `SIGHUP`, or on Windows `Ctrl-Break`/console close/logoff/system shutdown),
+//!   or a control-plane
+//!   `cancel`/`kill` command reached the live runner — the child did not choose to
+//!   stop, so its code is not forwarded: the run reports a reserved-band code
+//!   ([`crate::exit::TIMEOUT`] / [`crate::exit::CANCELLED`] /
+//!   [`crate::exit::CONTROL_CANCELLED`] / [`crate::exit::CONTROL_KILLED`]) and an
+//!   explanatory stderr line, kept distinct from
+//!   each other and from any child result. Their machine-readable JSONL form is the
+//!   `timeout` / `cancelled` / `killed` (plus terminal `runner_exit`) event written
+//!   to `--jsonl` (see [`crate::events`] and `docs/schema.md`). The control-plane
+//!   endings reuse the *same* teardown as the local ones — `cancel` runs the shared
+//!   soft-stop → grace → hard-kill path, `kill` hard-kills the tree at once — so a
+//!   remote command never invents a parallel termination mechanism.
+//! - **One teardown path for every ending, honest per platform.** The deadline
+//!   and the cancel share a single termination path: attempt a *soft* stop
+//!   (`SIGTERM` to the whole tree on Unix), wait out `--grace`, then let the owning
+//!   group's kill-on-drop hard-tear-down the tree. On **Windows** there is no
+//!   soft-signal tier in the ProcessKit kernel yet (tracked in ProcessKit-rs's
+//!   backlog), so no soft signal is sent — the grace window still elapses and the
+//!   Job Object is then killed atomically. The runner never *pretends* a soft stop
+//!   happened when it could not: the stderr message states exactly what the
+//!   platform did (see [`teardown::describe_teardown`]).
+//! - **Detaching wraps the run; it never forks a second implementation of it.**
+//!   `--detach` re-spawns *this binary* on the very same argv (minus the flag) in
+//!   a new session (Unix) or as a `DETACHED_PROCESS` (Windows), waits until that
+//!   copy has provably started the run, and returns. The detached copy then walks
+//!   the ordinary path above — same container, same race, same teardown, same
+//!   JSONL — so detaching adds a spawn plus a handshake and nothing else (see
+//!   [`start_detached`]).
+
+mod detach;
+mod launch;
+mod signals;
+mod teardown;
+
+use std::process::ExitCode;
+use std::time::Duration;
+
+use processkit::Outcome;
+
+use crate::cli::RunArgs;
+use crate::control;
+use crate::exit::RunnerError;
+
+use detach::start_detached;
+use launch::run_async;
+
+/// Execute the `run` subcommand and turn the result into a process exit code.
+///
+/// On a completed container the child's code is forwarded verbatim via
+/// [`std::process::exit`], which preserves the full 32-bit width (a Windows code
+/// such as `STATUS_CONTROL_C_EXIT` is not clamped to a `u8`). That hard exit
+/// skips destructors, which is *only* safe because the container has already been
+/// torn down inside [`run_inner`] — the owning [`processkit::ProcessGroup`] drops before this
+/// function regains control. A runner-own failure (including a `--timeout` or a
+/// `Ctrl-C` cancel) instead reports to stderr (never the child's stdout) and
+/// returns a code from the reserved band.
+///
+/// **`--detach` short-circuits all of that**, and is the one path where this
+/// process never becomes the runner at all: it hands the run to a detached copy of
+/// this binary and reports only whether that copy *started* — `0` on a confirmed
+/// start, the same reserved-band code the failed start reported otherwise. No child
+/// code is ever forwarded on this path (there is no child of ours to forward one
+/// from); it lives on in the detached run's own `runner_exit` event. See
+/// [`start_detached`].
+pub fn execute(args: RunArgs) -> ExitCode {
+    if args.detach {
+        return match start_detached(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("processkit-cli: {err}");
+                ExitCode::from(err.code())
+            }
+        };
+    }
+    match run_inner(args) {
+        Ok(child_code) => std::process::exit(child_code),
+        Err(err) => {
+            eprintln!("processkit-cli: {err}");
+            ExitCode::from(err.code())
+        }
+    }
+}
+
+/// Build the async runtime and drive one run to its exit code.
+///
+/// The runtime and the container both live for the duration of [`run_async`];
+/// when it returns the group has already dropped (teardown done), so the caller
+/// may hard-exit with the child's code.
+fn run_inner(args: RunArgs) -> Result<i32, RunnerError> {
+    // A small current-thread runtime is enough: the run is one child plus its
+    // output pumps, a deadline timer, and the stop-signal listeners (`Ctrl-C`, plus
+    // `SIGTERM`/`SIGHUP` on Unix, plus `Ctrl-Break`/console close/logoff/system
+    // shutdown on Windows). The shared helper's
+    // `enable_all` arms the I/O, time, and signal drivers those need — the
+    // child-pipe I/O driver is compiled in through `processkit`'s own tokio
+    // `process`/`net` features, and the `time`/`signal` features this crate now
+    // requests arm the rest (Cargo unifies them into the single tokio build).
+    let runtime = control::current_thread_runtime()?;
+    runtime.block_on(run_async(args))
+}
+
+/// Which runner deadline fired, for the shared timeout ending — the two share the
+/// reserved `TIMEOUT` (106) code and the same teardown, told apart only by this tag
+/// (surfaced as the `timeout` event's `reason` field, `docs/schema.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutTrigger {
+    /// The whole-run `--timeout` deadline elapsed.
+    Overall,
+    /// The `--idle-timeout` elapsed: the child produced no output for the idle window.
+    Idle,
+}
+
+impl TimeoutTrigger {
+    /// The `timeout` event's always-present `reason` value for this trigger.
+    fn reason(self) -> &'static str {
+        match self {
+            TimeoutTrigger::Overall => "overall",
+            TimeoutTrigger::Idle => "idle",
+        }
+    }
+}
+
+/// Which **local stop signal** asked the runner to end the run — the honest
+/// `source` of the `cancelled` JSONL event and the trigger the stderr line names.
+///
+/// **Decision (T-188): SIGTERM and SIGHUP get their own additive `source` values**
+/// (`sigterm` / `sighup`) rather than reusing `ctrl_c`. Reusing `ctrl_c` for a
+/// `systemd stop`, a cancelled CI job, or a plain `kill <pid>` would report a
+/// keyboard interrupt that never happened — the same lie the runner refuses to tell
+/// about a soft stop it could not deliver (see
+/// [`SoftTerminate`]/[`teardown::describe_teardown`]),
+/// and consumers do act on the difference: "the operator interrupted me" and "my
+/// supervisor is shutting me down" call for different handling. Adding values to an
+/// existing string field is an **additive** schema change (no `schema_version` bump,
+/// see `docs/schema.md`, "Versioning"), so the cost is one enum entry per echo site.
+///
+/// **Decision (T-195): the Windows console-control events get the same additive
+/// treatment** (`ctrl_break` / `ctrl_close` / `ctrl_logoff` / `ctrl_shutdown`), for
+/// the identical reason — each is a distinguishable *external* trigger, not a
+/// keyboard interrupt, and a consumer that only knows `ctrl_c` still sees a
+/// well-formed `cancelled` event.
+///
+/// The exit code is *not* split the same way: every local-signal cancel keeps
+/// [`crate::exit::CANCELLED`] (107) and the `cancelled` terminal `runner_exit` source,
+/// because it is the same class of ending (a local signal ended the run) and the more
+/// specific `cancelled.source` already disambiguates it one event earlier — the same
+/// reasoning that kept `--idle-timeout` on `TIMEOUT` (106) rather than minting a code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelSignal {
+    /// The operator pressed `Ctrl-C` (`SIGINT` on Unix, the console handler on
+    /// Windows).
+    CtrlC,
+    /// Unix `SIGTERM`: the standard *external* stop — `kill <pid>`, `systemctl stop`,
+    /// a cancelled CI job, a supervisor's shutdown timeout. Not an interactive
+    /// interrupt, and the most common way a runner is asked to go away.
+    #[cfg(unix)]
+    Term,
+    /// Unix `SIGHUP`: the controlling terminal went away (a closed terminal, a dropped
+    /// SSH session). Treated as a stop, not as the daemon "reload your config"
+    /// convention — this runner supervises exactly one child and has nothing to reload,
+    /// and the default disposition would kill it outright anyway.
+    #[cfg(unix)]
+    Hup,
+    /// Windows `CTRL_BREAK_EVENT`: the operator (or a script) sent a break to the
+    /// console process group. Unlike the other three Windows events below, this one
+    /// carries no OS-imposed termination deadline — a process that ignores it simply
+    /// keeps running — so it needs no grace clamp.
+    #[cfg(windows)]
+    CtrlBreak,
+    /// Windows `CTRL_CLOSE_EVENT`: the console window is being closed (its "X"
+    /// button, or an equivalent). The OS gives the handler only a short window
+    /// (documented at `signals::CTRL_CLOSE_WINDOW`) before terminating the process
+    /// regardless — see [`signals::effective_grace_for`] for how that bounds this trigger's
+    /// effective `--grace`.
+    #[cfg(windows)]
+    CtrlClose,
+    /// Windows `CTRL_LOGOFF_EVENT`: the user is logging off. Not delivered to a
+    /// process outside the logging-off user's own session.
+    #[cfg(windows)]
+    CtrlLogoff,
+    /// Windows `CTRL_SHUTDOWN_EVENT`: the system is shutting down.
+    #[cfg(windows)]
+    CtrlShutdown,
+}
+
+impl CancelSignal {
+    /// The `cancelled` event's `source` value for this trigger (`docs/schema.md`,
+    /// "cancelled").
+    fn source(self) -> &'static str {
+        match self {
+            CancelSignal::CtrlC => "ctrl_c",
+            #[cfg(unix)]
+            CancelSignal::Term => "sigterm",
+            #[cfg(unix)]
+            CancelSignal::Hup => "sighup",
+            #[cfg(windows)]
+            CancelSignal::CtrlBreak => "ctrl_break",
+            #[cfg(windows)]
+            CancelSignal::CtrlClose => "ctrl_close",
+            #[cfg(windows)]
+            CancelSignal::CtrlLogoff => "ctrl_logoff",
+            #[cfg(windows)]
+            CancelSignal::CtrlShutdown => "ctrl_shutdown",
+        }
+    }
+
+    /// How the stderr line names this trigger to a human.
+    fn phrase(self) -> &'static str {
+        match self {
+            CancelSignal::CtrlC => "Ctrl-C",
+            #[cfg(unix)]
+            CancelSignal::Term => "SIGTERM",
+            #[cfg(unix)]
+            CancelSignal::Hup => "SIGHUP",
+            #[cfg(windows)]
+            CancelSignal::CtrlBreak => "Ctrl-Break",
+            #[cfg(windows)]
+            CancelSignal::CtrlClose => "console close",
+            #[cfg(windows)]
+            CancelSignal::CtrlLogoff => "logoff",
+            #[cfg(windows)]
+            CancelSignal::CtrlShutdown => "system shutdown",
+        }
+    }
+}
+
+/// How a run ended — the decision the race in [`run_async`] resolves to.
+enum Ending {
+    /// The child exited on its own; carries the raw wait result.
+    Exited(processkit::Result<Outcome>),
+    /// A runner deadline elapsed while the child was still running: the whole-run
+    /// `--timeout` ([`TimeoutTrigger::Overall`]) or the `--idle-timeout`
+    /// ([`TimeoutTrigger::Idle`]). Both take the same teardown and terminal code.
+    TimedOut(TimeoutTrigger),
+    /// A local stop signal reached the runner — `Ctrl-C`, (Unix) `SIGTERM` /
+    /// `SIGHUP`, or (Windows) `Ctrl-Break`/console close/logoff/system shutdown.
+    /// All take the same teardown and terminal code; the carried
+    /// [`CancelSignal`] is what tells them apart on the wire.
+    Cancelled(CancelSignal),
+    /// A control-plane `cancel` command reached the live runner: the same soft-stop →
+    /// grace → hard-kill teardown as `Ctrl-C`, only triggered over the network.
+    ControlCancelled,
+    /// A control-plane `kill` command reached the live runner: an immediate hard kill
+    /// of the whole tree, no soft stop and no grace.
+    ControlKilled,
+}
+
+/// A runner-imposed ending that shares the soft-stop → grace → hard-kill teardown
+/// (the `kill` verb is *not* one — it hard-kills immediately, handled separately).
+enum Termination {
+    /// A runner deadline (the elapsed `limit`) was exceeded: `trigger` names which —
+    /// the whole-run `--timeout` or the `--idle-timeout`.
+    Timeout {
+        limit: Duration,
+        trigger: TimeoutTrigger,
+    },
+    /// The run was cancelled by a local stop signal: `Ctrl-C`, (Unix) `SIGTERM` /
+    /// `SIGHUP`, or (Windows) `Ctrl-Break`/console close/logoff/system shutdown.
+    /// The carried [`CancelSignal`] names which, so the message stays honest.
+    Cancelled(CancelSignal),
+    /// The run was cancelled by a control-plane `cancel` command.
+    ControlCancelled,
+}
+
+/// What the *soft* stop actually did, recorded so the outcome is reported
+/// honestly rather than by assumption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SoftTerminate {
+    /// A real soft signal (`SIGTERM`) was delivered to the whole tree (Unix).
+    Signalled,
+    /// The platform has no soft-terminate tier yet (Windows): nothing was sent,
+    /// and we do not claim otherwise.
+    Unsupported,
+    /// The soft signal could not be delivered; the run falls through to the hard
+    /// kill regardless.
+    Failed,
+}

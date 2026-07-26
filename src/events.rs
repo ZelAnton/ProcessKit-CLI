@@ -133,7 +133,7 @@ pub enum Event {
     /// contract — a whole-tree container that is `Unsupported` (macOS/BSD, the Linux
     /// process-group fallback) or `Unenforceable` (a Linux cgroup v2 whose
     /// controllers can't be enabled). It precedes the same `container_failed{create}`
-    /// → `runner_exit` tail every group-creation failure takes (see `src/run.rs`,
+    /// → `runner_exit` tail every group-creation failure takes (see `src/run/launch.rs`,
     /// `create_group`, and `docs/schema.md`, "limit_hit"). Nonsensical values
     /// (`--max-memory 0`, a non-positive `--cpu-quota`) are rejected earlier as a
     /// `USAGE` form error, so this event never carries ProcessKit's `Invalid` reason.

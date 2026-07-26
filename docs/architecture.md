@@ -22,7 +22,7 @@ Responsibilities, in the order data flows through a `run`:
 | [`src/lib.rs`](../src/lib.rs) | The internal library crate root: declares every `src/*.rs` module and re-exports nothing publicly-supported. It carries the "not a stable public API" disclaimer and marks each module `#[doc(hidden)]`, so the library is only a foundation for the crate's own tooling — never a semver-stable Rust surface. |
 | [`src/main.rs`](../src/main.rs) | The thin binary entry point. Parses `Cli`, dispatches into the library's subcommand module, and maps the result onto a process exit code: `run` owns its own exit path (it hard-exits with the child's code and never returns here); every other subcommand's `Result<(), RunnerError>` is mapped through `RunnerError::code()`, and a clap parse failure is mapped onto the runner's own `USAGE` code rather than clap's default. |
 | [`src/cli.rs`](../src/cli.rs) | The CLI-flags half of the compatibility surface: the clap-derived `Cli`/`Command` types for `run`, `inspect`, `cancel`, `kill`, `wait`, `list`, `prune`, and `probe`. Parsing and shape validation only — each subcommand's behavior lives in its own module. |
-| [`src/run.rs`](../src/run.rs) | The `run` subcommand itself: spawns the child into a `processkit::ProcessGroup` this module owns, selects either default pipe-and-echo I/O or direct inherited stdio, temporarily hands a POSIX terminal to a separate child process group when required, races the child's exit against `--timeout`/`--idle-timeout`/a local stop signal (`Ctrl-C`, on Unix `SIGTERM`/`SIGHUP`, and on Windows `Ctrl-Break`/console close/logoff/system shutdown)/a control-plane command, and drives the shared teardown tiers — the graceful soft stop → grace → hard kill for `timeout` (whole-run or idle)/a signal cancel/`cancel`, and the immediate hard kill (no soft stop, no grace) for a control-plane `kill`. Exit-code fidelity — the child's exact code on a normal completion, a reserved-band code for every runner-imposed ending — is enforced here. Also home to the `--detach` wrapper (`start_detached`), which re-spawns this binary detached and returns once the run has provably started, without duplicating any of the above. |
+| [`src/run/`](../src/run/mod.rs) | The `run` subcommand itself: spawns the child into a `processkit::ProcessGroup` this module owns, selects either default pipe-and-echo I/O or direct inherited stdio, temporarily hands a POSIX terminal to a separate child process group when required, races the child's exit against `--timeout`/`--idle-timeout`/a local stop signal (`Ctrl-C`, on Unix `SIGTERM`/`SIGHUP`, and on Windows `Ctrl-Break`/console close/logoff/system shutdown)/a control-plane command, and drives the shared teardown tiers — the graceful soft stop → grace → hard kill for `timeout` (whole-run or idle)/a signal cancel/`cancel`, and the immediate hard kill (no soft stop, no grace) for a control-plane `kill`. Exit-code fidelity — the child's exact code on a normal completion, a reserved-band code for every runner-imposed ending — is enforced here. A directory of four submodules under one entry point, split by responsibility rather than by size: [`mod.rs`](../src/run/mod.rs) is the entry point (`run::execute`) plus the shared ending vocabulary (`Ending`/`Termination`/`CancelSignal`/`TimeoutTrigger`/`SoftTerminate`); [`launch.rs`](../src/run/launch.rs) owns the run itself (`run_async`: container creation, spawn, I/O-mode selection, the terminal handoff, and the race); [`signals.rs`](../src/run/signals.rs) owns the runner-imposed deadlines and the platform stop-signal listeners (`wait_for_cancel_signal`, `effective_grace_for`); [`teardown.rs`](../src/run/teardown.rs) owns the two teardown tiers, the JSONL emitters, and the ending-to-exit-code mapping; and [`detach.rs`](../src/run/detach.rs) is the `--detach` wrapper (`start_detached`), which re-spawns this binary detached and returns once the run has provably started, without duplicating any of the above. |
 | [`src/events.rs`](../src/events.rs) | The versioned JSONL lifecycle-event schema and its emitter — this repository's normative, golden-tested public event contract (see [`docs/schema.md`](schema.md)). Also owns argv redaction: the default SHA-256 `argv_sha256` fingerprint and the `HINT_RULES` worker-shape classifier. |
 | [`src/capture.rs`](../src/capture.rs) | `--capture-dir` bounded per-stream stdout/stderr capture to files, riding the same tee `run` already echoes through (no second output-reading path). Records, per stream, a full byte counter, a SHA-256 of the bytes written, and independent explicit `truncated`/`write_error` flags, surfaced in the `output_captured` event. |
 | [`src/hash.rs`](../src/hash.rs) | The one hand-rolled incremental/one-shot SHA-256 (FIPS 180-4) both `events` (argv fingerprint) and `capture` (streamed transcript hashing) build on, so the project has a single digest primitive and rendering style. |
@@ -76,9 +76,10 @@ themselves (T-186, T-187) are documented in `CONTRIBUTING.md` ("Fuzzing") and
 ## Data flow of one `run`
 
 A `processkit-cli run` moves through the same sequence on every platform,
-implemented in `run::execute`/`run::run_async` (`src/run.rs`):
+implemented in `run::execute` (`src/run/mod.rs`) and `run::launch::run_async`
+(`src/run/launch.rs`):
 
-0. **(`--detach` only) Hand the run to a detached copy.** `run::start_detached`
+0. **(`--detach` only) Hand the run to a detached copy.** `run::detach::start_detached`
    re-spawns *this binary* on the caller's own argv with `--detach` removed (plus
    `--run-id`/`--no-echo` where the caller left them out) — in a new session on
    Unix (`setsid`), as a `DETACHED_PROCESS` on Windows, with `null` stdio either
@@ -105,12 +106,12 @@ implemented in `run::execute`/`run::run_async` (`src/run.rs`):
    abrupt-cleanup tri-state, working directory) opens the JSONL stream.
 2. **Select the I/O path.** By default, `processkit`'s line pump concurrently
    reads the child's stdout/stderr and drives two things off the same read: the
-   live echo to this process's own stdout/stderr (`src/run.rs`), and — when
+   live echo to this process's own stdout/stderr (`src/run/launch.rs`), and — when
    `--capture-dir` is set — the per-stream tee in `src/capture.rs`. `--no-echo`
    swaps only the echo sink for a discarding one (`tokio::io::sink()` in place
    of `tokio::io::stdout()`/`stderr()`); the pump, the `--capture-dir` tee, and
    the `--idle-timeout` clock's re-arming on every observed chunk are all
-   unaffected — see `src/run.rs`'s sink-selection block and K-050.
+   unaffected — see `src/run/launch.rs`'s sink-selection block and K-050.
    `--detach` reuses that same swap rather than adding a second suppression path:
    the detached copy is started with `--no-echo` (step 0).
    `--inherit-stdio` instead gives the child the runner's three handles directly;
@@ -232,9 +233,9 @@ offers, a shell mode, and PTY support (deferred in the core crate).
 
 Four tiers, increasing in weight and decreasing in how often they run:
 
-- **Unit.** Each `src/*.rs` module carries its own `#[cfg(test)] mod tests`
+- **Unit.** Each module under `src/` carries its own `#[cfg(test)] mod tests`
   (for example the SHA-256 vector tests in `src/hash.rs`, or the
-  `ProcessGroup`/`Emitter`-driven helper tests in `src/run.rs`). The modules now
+  `ProcessGroup`/`Emitter`-driven helper tests in `src/run/teardown.rs`). The modules now
   live in the library (`src/lib.rs`), so these run as its `--lib` tier under a
   plain `cargo test` — no `cargo test --bin processkit-cli` workaround, which the
   earlier bin-only layout needed to reach module-private helpers. Internal helpers

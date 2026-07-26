@@ -245,7 +245,7 @@ fn missing_program_uses_the_spawn_code() {
 /// tiers; mirrors the `dotnet`-availability skip in the e2e tier). The end-to-end
 /// wiring under test (the `limit_hit`+tail sequence, and its exit code) is proved
 /// on every host that cannot apply the cap; the container-free `limit`-string
-/// mapping is unit-tested cross-platform in `src/run.rs`.
+/// mapping is unit-tested cross-platform in `src/run/launch.rs`.
 #[test]
 fn resource_limit_that_cannot_be_applied_emits_limit_hit_and_the_backend_code() {
     let dir = scratch("limit");

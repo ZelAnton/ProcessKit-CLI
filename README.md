@@ -481,15 +481,15 @@ or external) — and all of them end in the **same** teardown path:
   before it even finishes reporting the teardown. Logoff and shutdown are left
   uncapped, since their real deadline is a system-wide policy this runner cannot
   reliably discover (see the `wait_for_cancel_signal`/`effective_grace_for` doc
-  comments in `src/run.rs` for the full reasoning). **Known limitation:** unlike a
+  comments in `src/run/signals.rs` for the full reasoning). **Known limitation:** unlike a
   repeat Unix `SIGTERM`/`SIGHUP`/`Ctrl-C` mid-teardown (silently absorbed — the OS
   keeps the disposition installed for the process's lifetime regardless of listener
   state), a *second* Windows console-control event that arrives after teardown has
   already begun is **not** absorbed: it falls through to the OS's default handling
   and terminates the runner outright, mid-teardown, before the terminal JSONL events
   are written. This is an accepted trade-off, not a bug — see the `#[cfg(windows)]`
-  arm of `wait_for_cancel_signal` in `src/run.rs` for why keeping listeners alive for
-  the whole teardown was rejected.
+  arm of `wait_for_cancel_signal` in `src/run/signals.rs` for why keeping listeners
+  alive for the whole teardown was rejected.
 
 All of the signals/events above share the `CANCELLED` code (`107`); which one
 arrived is recorded in the JSONL `cancelled` event's `source` field (`ctrl_c` /

@@ -208,7 +208,7 @@ impl Scenario {
     }
 
     /// Tear every still-live run down through the control plane, in parallel: a
-    /// `kill` verb reaps the whole tree on every platform (`src/run.rs`'s immediate
+    /// `kill` verb reaps the whole tree on every platform (`src/run/launch.rs`'s immediate
     /// hard-kill tier), unlike killing the runner process itself, which on
     /// macOS/BSD leaves the child behind (K-005). The owned handles below are the
     /// identity-safe backstop for anything that did not take the hint.
