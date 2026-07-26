@@ -698,8 +698,16 @@ fn render_snapshot_human(snapshot: &Snapshot) -> Vec<String> {
     const LABEL_WIDTH: usize = 19;
     let mut lines = vec![
         format!("{:<LABEL_WIDTH$}{snapshot_version}", "snapshot_version:"),
-        format!("{:<LABEL_WIDTH$}{run_id}", "run_id:"),
-        format!("{:<LABEL_WIDTH$}{mechanism}", "mechanism:"),
+        format!(
+            "{:<LABEL_WIDTH$}{}",
+            "run_id:",
+            crate::text::terminal_safe(run_id)
+        ),
+        format!(
+            "{:<LABEL_WIDTH$}{}",
+            "mechanism:",
+            crate::text::terminal_safe(mechanism)
+        ),
         format!(
             "{:<LABEL_WIDTH$}{}",
             "root_pid:",
@@ -707,7 +715,11 @@ fn render_snapshot_human(snapshot: &Snapshot) -> Vec<String> {
                 .map(|pid| pid.to_string())
                 .unwrap_or_else(|| "-".to_string())
         ),
-        format!("{:<LABEL_WIDTH$}{started_at}", "started_at:"),
+        format!(
+            "{:<LABEL_WIDTH$}{}",
+            "started_at:",
+            crate::text::terminal_safe(started_at)
+        ),
     ];
 
     if members.is_empty() {
@@ -726,8 +738,16 @@ fn render_snapshot_human(snapshot: &Snapshot) -> Vec<String> {
                     .ppid
                     .map(|ppid| ppid.to_string())
                     .unwrap_or_else(|| "-".to_string()),
-                member.name.clone().unwrap_or_else(|| "-".to_string()),
-                member.start_time.clone().unwrap_or_else(|| "-".to_string()),
+                member
+                    .name
+                    .as_deref()
+                    .map(crate::text::terminal_safe)
+                    .unwrap_or_else(|| "-".to_string()),
+                member
+                    .start_time
+                    .as_deref()
+                    .map(crate::text::terminal_safe)
+                    .unwrap_or_else(|| "-".to_string()),
             ]
         })
         .collect();
@@ -807,7 +827,7 @@ async fn mutate_one(run_id: &str, command: ControlCommand) -> Result<ControlAck,
     // A well-behaved runner acks the exact action; a rejected or mismatched reply is a
     // CONTROL failure, never a false success (the same parse-back discipline inspect
     // applies to its snapshot).
-    if !ack.accepted || ack.action != action {
+    if !ack_matches(&ack, action, run_id) {
         return Err(unreachable_run(
             action,
             run_id,
@@ -815,6 +835,14 @@ async fn mutate_one(run_id: &str, command: ControlCommand) -> Result<ControlAck,
         ));
     }
     Ok(ack)
+}
+
+/// Verify that a mutation reply belongs to the exact command and run the client
+/// addressed. Both the by-id and aggregate paths use this single contract so neither
+/// can accidentally accept an acknowledgement from a reused endpoint serving a
+/// different run.
+fn ack_matches(ack: &ControlAck, action: &str, run_id: &str) -> bool {
+    ack.accepted && ack.action == action && ack.run_id == run_id
 }
 
 /// Client entry for `cancel --all` (T-217): the aggregate counterpart to [`cancel`],
@@ -1046,7 +1074,7 @@ async fn mutate_snapshot_target(
             }
         };
 
-    if !ack.accepted || ack.action != action || ack.run_id != target.run_id {
+    if !ack_matches(&ack, action, &target.run_id) {
         return Err(unreachable_run(
             action,
             &target.run_id,
@@ -1977,6 +2005,38 @@ mod tests {
         );
     }
 
+    /// Human-readable inspect output is a terminal boundary. Snapshot strings can
+    /// originate in the registry, on the wire, or in OS process metadata, so control
+    /// bytes must be collapsed before either the key/value block or member table is
+    /// aligned. The JSON branch is separately pinned byte-for-byte above.
+    #[test]
+    fn render_snapshot_human_sanitizes_untrusted_strings() {
+        let snapshot = Snapshot {
+            snapshot_version: SNAPSHOT_VERSION,
+            run_id: "run\nnext\u{1b}[31m".to_string(),
+            mechanism: "job\tobject".to_string(),
+            root_pid: Some(7),
+            started_at: "time\rrewound".to_string(),
+            members: vec![Member {
+                pid: 7,
+                ppid: None,
+                name: Some("worker\nname\u{7}".to_string()),
+                start_time: Some("start\ttime".to_string()),
+            }],
+        };
+
+        let lines = render_snapshot_human(&snapshot);
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.chars().all(|character| !character.is_control())),
+            "no terminal control character survives inspect rendering: {lines:?}"
+        );
+        assert!(lines.iter().any(|line| line.contains("run next [31m")));
+        assert!(lines.iter().any(|line| line.contains("worker name ")));
+        assert!(lines.iter().any(|line| line.contains("start time")));
+    }
+
     /// The source builds a snapshot from its facts and queries members live each time.
     #[test]
     fn snapshot_source_queries_members_live() {
@@ -2017,6 +2077,27 @@ mod tests {
         assert!(parsed.accepted);
         assert_eq!(parsed.action, "kill");
         assert_eq!(parsed.run_id, "run-k");
+    }
+
+    /// Both mutation paths reject every independently malformed dimension of an
+    /// acknowledgement, including a valid-looking reply from a different run.
+    #[test]
+    fn ack_validation_requires_acceptance_action_and_run_id() {
+        let accepted = ControlAck {
+            accepted: true,
+            action: "cancel".to_string(),
+            run_id: "run-a".to_string(),
+        };
+        assert!(ack_matches(&accepted, "cancel", "run-a"));
+
+        let rejected = ControlAck {
+            accepted: false,
+            action: "cancel".to_string(),
+            run_id: "run-a".to_string(),
+        };
+        assert!(!ack_matches(&rejected, "cancel", "run-a"));
+        assert!(!ack_matches(&accepted, "kill", "run-a"));
+        assert!(!ack_matches(&accepted, "cancel", "run-b"));
     }
 
     #[test]

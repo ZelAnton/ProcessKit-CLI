@@ -1051,10 +1051,14 @@ impl Registry {
                 .open(&lock_path)
             {
                 Ok(lock) => {
+                    // Bundle the handle with cleanup at the first instant this call
+                    // owns a newly-created path. Field drop order closes the handle
+                    // before cleanup unlinks the path on every later `?` or retry.
+                    let created = CreatedLock::new(lock, lock_path.clone());
                     // A concurrent `prune` orphan-lock probe can legitimately hold
                     // this exact lock (see the doc above) — try a fresh stem instead
                     // of treating the denial as a real error.
-                    if !platform::try_lock_exclusive(&lock)? {
+                    if !platform::try_lock_exclusive(&created.lock)? {
                         continue;
                     }
                     // The lock is ours, but a concurrent `prune` could have already
@@ -1068,15 +1072,15 @@ impl Registry {
                     // (including the file simply being gone) means try again with a
                     // fresh stem rather than publish a record whose `lock_file` does
                     // not exist on disk.
-                    if !platform::lock_path_still_matches(&lock, &lock_path)? {
+                    if !platform::lock_path_still_matches(&created.lock, &lock_path)? {
                         continue;
                     }
                     let json_path = self.dir.join(format!("{stem}.json"));
                     return Ok(ReservedEntry {
                         json_path,
-                        cleanup: LockCleanupGuard::new(lock_path.clone()),
+                        cleanup: created.cleanup,
                         lock_path,
-                        lock,
+                        lock: created.lock,
                     });
                 }
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -1086,6 +1090,23 @@ impl Registry {
         Err(io::Error::other(
             "could not allocate a unique registry entry after many attempts",
         ))
+    }
+}
+
+/// A newly-created lock before it becomes a full [`ReservedEntry`]. Field order is
+/// load-bearing: Rust drops `lock` before `cleanup`, so Windows closes the handle
+/// before [`LockCleanupGuard`] attempts to unlink the path on an early return.
+struct CreatedLock {
+    lock: File,
+    cleanup: LockCleanupGuard,
+}
+
+impl CreatedLock {
+    fn new(lock: File, lock_path: PathBuf) -> Self {
+        Self {
+            lock,
+            cleanup: LockCleanupGuard::new(lock_path),
+        }
     }
 }
 
@@ -1114,11 +1135,12 @@ struct ReservedEntry {
 /// from creation until `register` explicitly [`disarm`](Self::disarm)s it right after
 /// the record write succeeds, and a still-armed guard's `Drop` deletes the lock file.
 ///
-/// The lock is still held by *this very process* at drop time — `reserve_entry`'s
-/// `create_new` guarantees no other caller could ever have opened this exact path —
-/// so deleting it here races with no concurrent holder; it is exactly the "reserved
-/// but never checked out" case, not the "abruptly killed while live" case `prune`
-/// otherwise reaps.
+/// On the successful reservation path, the lock is still held by this process at
+/// drop time. On an earlier retry or error, a racing orphan-lock probe may briefly
+/// hold or may already have removed the path. Cleanup is therefore deliberately
+/// best-effort: deleting our fresh path restores the pre-reservation state, while a
+/// sharing violation or an already-missing path is harmless and must not replace the
+/// original reservation result.
 ///
 /// Carved out as its own type, rather than an `impl Drop` directly on
 /// [`ReservedEntry`], because [`Registry::register`] constructs [`Registration`] by
@@ -2740,6 +2762,32 @@ mod tests {
         assert!(
             !lock_path.exists(),
             "dropping an unpublished reservation must remove its lock file"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// T-230 regression at the earlier boundary: cleanup is useful before a
+    /// [`ReservedEntry`] exists at all. `reserve_entry` now constructs the guard
+    /// immediately after `create_new`, so an error or retry in either lock probe
+    /// drops this exact shape and removes the path best-effort.
+    #[test]
+    fn early_reservation_cleanup_removes_the_new_lock_path() {
+        let dir = scratch("reserve-early-cleanup");
+        fs::create_dir_all(&dir).expect("create scratch registry directory");
+        let lock_path = dir.join("early.lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .expect("create the lock file");
+        let created = CreatedLock::new(lock, lock_path.clone());
+
+        drop(created);
+
+        assert!(
+            !lock_path.exists(),
+            "an armed guard removes the path even before ReservedEntry construction"
         );
         let _ = fs::remove_dir_all(&dir);
     }
