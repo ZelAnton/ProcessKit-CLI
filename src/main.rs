@@ -36,8 +36,27 @@ fn main() -> ExitCode {
     match cli.command {
         Command::Run(args) => run::execute(*args),
         Command::Inspect(args) => report(control::inspect(&args.run_id, args.json)),
-        Command::Cancel(args) => report(control::cancel(&args.run_id)),
-        Command::Kill(args) => report(control::kill(&args.run_id)),
+        Command::Cancel(args) => report(if args.all {
+            control::cancel_all()
+        } else {
+            // clap's `required_unless_present`/`conflicts_with` pair on `TargetArgs`
+            // guarantees exactly one of `run_id`/`all` is set, so this is never
+            // reached with `run_id` absent.
+            control::cancel(
+                args.run_id
+                    .as_deref()
+                    .expect("clap requires --run-id when --all is absent"),
+            )
+        }),
+        Command::Kill(args) => report(if args.all {
+            control::kill_all()
+        } else {
+            control::kill(
+                args.run_id
+                    .as_deref()
+                    .expect("clap requires --run-id when --all is absent"),
+            )
+        }),
         Command::Wait(args) => report(if args.all {
             wait::run_all(args.timeout)
         } else {

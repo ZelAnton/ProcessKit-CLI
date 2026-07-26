@@ -12,6 +12,30 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- **New `cancel --all` / `kill --all` flags: mass teardown of every live run, not
+  just one.** `cancel`/`kill` previously addressed exactly one `run_id`, so an
+  orchestrator's "cancel everything" step needed a hand-rolled loop over `list
+  --json`. `cancel --all` / `kill --all` (mutually exclusive with `--run-id`; exactly
+  one of the two is now required, `USAGE` (100) if neither is given — the same clap
+  shape `wait --all` established) close that gap: a **snapshot** of every registry
+  entry confirmed live is taken once, the moment the invocation starts (the same
+  snapshot discipline as `wait --all`, including its "unprobed at snapshot time never
+  enters the target set" asymmetry and "a run that registers afterward is out of
+  scope" trade-off), and the exact same by-`run_id` mutation the single-run form uses
+  — including its own registry re-scan, resolve-to-dispatch re-confirmation, and wire
+  exchange — is applied to every snapshot entry in turn; `--all` invents no new way to
+  reach or end a run. Instead of one ack, `--all` prints a single JSON array on
+  stdout, one `{"run_id":...,"accepted":...}` entry per snapshot target (plus `error`
+  on any entry that was not accepted, carrying the same message text the single-run
+  form would have printed to stderr for that failure), so a caller can see every
+  target's individual outcome. An empty snapshot is not an error — an empty report
+  and exit `0`, mirroring `prune` — but a partial or full failure is never a silent
+  `0`: it reuses the reserved `CONTROL` (103) code with a stderr summary, so `cancel
+  --all` ahead of `wait --all`/`prune` in a teardown sequence cannot silently swallow
+  a target it failed to reach. `cancel --run-id`/`kill --run-id` are byte-for-byte
+  unchanged. Appears in the `probe` surface tokens automatically (`cancel:--all`,
+  `kill:--all`). See README.md, "Command interface", and docs/control-plane.md,
+  "`cancel --all` / `kill --all`".
 - **New `wait --all` flag: a barrier on every live run, not just one.** `wait`
   previously blocked on only one `run_id`; a supervisor or CI teardown step often
   needs the aggregate version instead — cancel everything, wait until none of it is

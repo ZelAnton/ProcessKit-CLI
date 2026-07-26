@@ -39,6 +39,14 @@ pub const BACKEND: u8 = 102;
 /// it — and reports it with this same code even though it speaks to no runner,
 /// because it is the same verdict: there is no single target run to act on (see
 /// `docs/registry.md`, "Run id resolution — ambiguity is a hard failure").
+///
+/// `cancel --all` / `kill --all` ([`crate::control::mutate_all`], T-217) reuse this
+/// same code for a different fact — one or more targets in the confirmed-live
+/// snapshot could not be reached or did not acknowledge the command — never a silent
+/// `0` on a partial fan-out failure. Unlike the by-`run-id` case above, this does
+/// *not* mean "no single target run": some snapshot targets may have been acted on
+/// successfully; the per-target detail is in the aggregate's own JSON report, not
+/// just this code (see `docs/control-plane.md`, "`cancel --all` / `kill --all`").
 pub const CONTROL: u8 = 103;
 /// Unexpected runner fault — the runner reached a state its own logic rules out,
 /// or lost a trustworthy view of the run it cannot recover from (a `wait` on the

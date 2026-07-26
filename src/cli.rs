@@ -30,9 +30,11 @@ pub enum Command {
     Run(Box<RunArgs>),
     /// Query a live run over local IPC.
     Inspect(InspectArgs),
-    /// Ask a live run to cancel (graceful where supported, then a hard kill).
+    /// Ask a live run to cancel (graceful where supported, then a hard kill), by
+    /// `--run-id` or, in aggregate, `--all`.
     Cancel(TargetArgs),
-    /// Hard-kill a live run's container immediately.
+    /// Hard-kill a live run's container immediately, by `--run-id` or, in
+    /// aggregate, `--all`.
     Kill(TargetArgs),
     /// Block until a run recorded in the per-user registry has finished.
     Wait(WaitArgs),
@@ -274,12 +276,40 @@ pub struct InspectArgs {
     pub json: bool,
 }
 
-/// Shared argument for the by-run-id control commands (`cancel`, `kill`).
+/// `cancel (--run-id <id> | --all)`, `kill (--run-id <id> | --all)`
+///
+/// Shared argument for the mutating control commands (`cancel`, `kill`): act on the
+/// single named run (`--run-id`), exactly as before T-217, or, in aggregate
+/// (`--all`), on every run confirmed live in a snapshot taken the moment the
+/// command starts — the mutating counterpart to `wait --all` (T-216), reusing its
+/// exact clap convention.
+///
+/// `--run-id` and `--all` are mutually exclusive (`conflicts_with`) and exactly one
+/// is required (`required_unless_present`): a bare `cancel`/`kill` with neither
+/// names no target and is rejected at parse time as a `USAGE` (100) form error,
+/// exactly like a bare `wait`.
 #[derive(Debug, Args)]
 pub struct TargetArgs {
-    /// The run to act on.
-    #[arg(long, value_name = "id")]
-    pub run_id: String,
+    /// The single run to act on. Mutually exclusive with `--all`; exactly one of
+    /// the two is required.
+    #[arg(
+        long,
+        value_name = "id",
+        conflicts_with = "all",
+        required_unless_present = "all"
+    )]
+    pub run_id: Option<String>,
+
+    /// Act on every run confirmed live in a snapshot taken the moment this
+    /// invocation starts, instead of one named run — the aggregate counterpart to
+    /// `--run-id`, for the typical orchestrator teardown sequence (cancel
+    /// everything, wait for it all to be gone, then prune). A run that registers
+    /// *after* the snapshot is out of scope for this invocation and is never acted
+    /// on. Mutually exclusive with `--run-id`; exactly one of the two is required.
+    /// See [`crate::control::cancel_all`] / [`crate::control::kill_all`] and
+    /// `docs/control-plane.md` for the snapshot and per-run report semantics.
+    #[arg(long, conflicts_with = "run_id", required_unless_present = "run_id")]
+    pub all: bool,
 }
 
 /// `wait (--run-id <id> | --all) [--timeout <duration>]`
@@ -938,11 +968,46 @@ mod tests {
     }
 
     #[test]
-    fn cancel_and_kill_require_a_run_id() {
+    fn cancel_and_kill_require_a_run_id_or_all() {
         assert!(Cli::try_parse_from(["processkit-cli", "cancel", "--run-id", "r1"]).is_ok());
         assert!(Cli::try_parse_from(["processkit-cli", "kill", "--run-id", "r1"]).is_ok());
-        assert!(Cli::try_parse_from(["processkit-cli", "cancel"]).is_err());
-        assert!(Cli::try_parse_from(["processkit-cli", "kill"]).is_err());
+        assert!(
+            Cli::try_parse_from(["processkit-cli", "cancel"]).is_err(),
+            "one of --run-id/--all is required: there is no default target"
+        );
+        assert!(
+            Cli::try_parse_from(["processkit-cli", "kill"]).is_err(),
+            "one of --run-id/--all is required: there is no default target"
+        );
+    }
+
+    /// T-217: `--all` is a valid alternative to `--run-id` for both `cancel` and
+    /// `kill`, the two are mutually exclusive, and naming neither is rejected — the
+    /// same clap convention `WaitArgs`/T-216 already established for `wait --all`
+    /// (see `wait_all_is_an_alternative_to_run_id_and_the_two_are_mutually_exclusive`
+    /// above).
+    #[test]
+    fn cancel_and_kill_all_is_an_alternative_to_run_id_and_the_two_are_mutually_exclusive() {
+        for sub in ["cancel", "kill"] {
+            let cli = Cli::try_parse_from(["processkit-cli", sub, "--all"])
+                .unwrap_or_else(|err| panic!("{sub} --all alone must parse: {err}"));
+            let (all, run_id) = match (sub, cli.command) {
+                ("cancel", Command::Cancel(args)) => (args.all, args.run_id),
+                ("kill", Command::Kill(args)) => (args.all, args.run_id),
+                _ => panic!("expected the {sub} subcommand"),
+            };
+            assert!(all);
+            assert!(
+                run_id.is_none(),
+                "--all alone must not imply a --run-id for {sub}"
+            );
+
+            assert!(
+                Cli::try_parse_from(["processkit-cli", sub, "--run-id", "r1", "--all"]).is_err(),
+                "--run-id and --all are mutually exclusive and must be clap-rejected \
+                 together for {sub}"
+            );
+        }
     }
 
     #[test]

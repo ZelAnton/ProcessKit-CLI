@@ -137,7 +137,10 @@ issue or a path collision) rather than deleting registry files by hand.
 ## `CONTROL` (103): the runner could not be reached
 
 **Symptom.** `inspect` / `cancel` / `kill` exits `103` and prints an
-explanatory line on stderr instead of doing anything.
+explanatory line on stderr. For the by-`run_id` form this means the command did
+nothing to any run; **`cancel --all` / `kill --all` are the exception** — see
+"`cancel --all` / `kill --all` and a partial `103`" below before assuming
+nothing happened.
 
 **Diagnose.** stderr names which of three reasons applied — a **stale registry
 entry** (the runner died abruptly, so the entry's record is left behind but
@@ -168,10 +171,37 @@ take a `0` from `wait` as proof a stale-looking `run_id` was ever live. See
 [`docs/registry.md`](registry.md#an-unknown-run_id-reads-as-finished).
 
 **Not a run outcome.** A `103` says nothing about how the target run itself
-ended (or whether it is still running) — it is purely "this client could not
-resolve or reach a single target run". Do not conflate it with the
-run-outcome codes (`106`–`109`, or the child's own code), which come only
-from the run's own process exit.
+ended (or whether it is still running) — for the by-`run_id` form it is purely
+"this client could not resolve or reach a single target run". Do not conflate
+it with the run-outcome codes (`106`–`109`, or the child's own code), which
+come only from the run's own process exit. (`cancel --all` / `kill --all`'s
+`103` is different — see below.)
+
+## `cancel --all` / `kill --all` and a partial `103`
+
+**Symptom.** `cancel --all` or `kill --all` (T-217) exits `103`, but the JSON
+report it printed to stdout shows at least one target with `"accepted": true`
+— so, unlike the by-`run_id` form's `103` above, this run **was** acted on.
+
+**Diagnose.** `--all`'s `103` is a different fact from the by-`run_id` form's:
+it means "one or more targets in the confirmed-live snapshot could not be
+reached or did not acknowledge the command", not "nothing was found or
+reached". A snapshot with several live runs commonly has a mix — most targets
+ack cleanly while one is mid-exit, has become ambiguous, or does not respond in
+time — and the aggregate exit code reflects that *any* failure occurred so an
+automated caller never mistakes a partial teardown for a complete one. Read
+the JSON report on stdout (not just the stderr tally) to see exactly which
+`run_id`s failed and why; stderr on its own only gives the failure count. See
+[`docs/control-plane.md`](control-plane.md), "`cancel --all` / `kill --all`",
+and the `CONTROL` (103) row of the reserved-band table in
+[`docs/exit-codes.md`](exit-codes.md).
+
+**Fix.** Re-running `cancel --all` / `kill --all` is safe: a target already
+ended is simply absent from the next snapshot, and a target that failed for a
+transient reason (e.g. it was mid-exit) is retried. If a specific `run_id`
+keeps failing, use `list --json` or `inspect --run-id <id>` to see why (a
+stale entry, an unprobed one, or a genuine ambiguity — the same reasons the
+by-`run_id` sections above and below cover).
 
 ## An ambiguous `run_id`
 
