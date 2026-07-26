@@ -301,12 +301,18 @@ immediately, and `wait`'s `0` must never be read as proof the run existed. See
 is the aggregate counterpart: an orchestrator teardown barrier that blocks until no run
 this invocation considers in scope is still live, for the typical "cancel everything,
 wait for it all to be gone, then `prune`" sequence. Its target set is a **snapshot**,
-fixed once at the moment `--all` starts to exactly the entries confirmed live right
-then — a run that registers afterward is out of scope for that invocation and is never
-waited for; re-issue `wait --all` to catch it. An entry whose liveness cannot be
-re-probed on a later pass stays outstanding rather than being silently dropped, the
-same conservative stance `--run-id` takes. See [`docs/registry.md`](docs/registry.md),
-"Waiting — `wait`", "The aggregate barrier — `wait --all`".
+fixed once at the moment `--all` starts to exactly the entries **confirmed** live right
+then — an entry that is only unprobed (not confirmed live) *at that instant* is
+excluded from the target set outright, and a run that registers afterward is likewise
+out of scope for that invocation; re-issue `wait --all` to catch either. This is a
+deliberate asymmetry with `--run-id`, which has no equivalent "excluded before
+tracking begins" step of its own: a registry holding only unprobeable entries and no
+confirmed-live ones makes `--all` return `0` immediately, the same as an empty
+registry. Once an entry *is* in the target set, though, it stays outstanding on every
+later pass for as long as its liveness cannot be re-probed, rather than being silently
+dropped — the same conservative stance `--run-id` takes. See
+[`docs/registry.md`](docs/registry.md), "Waiting — `wait`", "The aggregate barrier —
+`wait --all`".
 
 `list` is the discovery counterpart to `inspect`/`cancel`/`kill`: it scans the same
 per-user registry and prints every entry it finds — `run_id`, health (`live`/

@@ -42,7 +42,10 @@
 //! built on, and would still learn nothing about a record that disappears without its
 //! lock ever changing hands (the clean-exit path deletes both files).
 //!
-//! # The three outcomes
+//! # The three outcomes of `--run-id`
+//!
+//! Scoped to the single-`run_id` mode only — see "The aggregate barrier: `wait --all`"
+//! below for why `--all` has just two outcomes, with no `CONTROL` among them.
 //!
 //! | Exit | Meaning |
 //! | --- | --- |
@@ -93,10 +96,20 @@
 //!   `--all` could ever return. A caller that wants to catch a run starting
 //!   concurrently with the wait re-issues `wait --all` once this one returns. See
 //!   `docs/registry.md`, "Waiting — `wait`".
-//! - **An unprobeable snapshot entry stays outstanding**, exactly like the
-//!   single-run case above: [`RunStatus::Unprobed`]'s conservative stance ("unknown is
-//!   not confirmed") applies per-entry here too, never silently dropping an
-//!   unprobeable entry from the target set.
+//! - **The same "confirmed live" bar applies to the snapshot itself**, so an entry
+//!   that is [`registry::Health::Unprobed`] — not confirmed live — at the exact
+//!   instant the snapshot is taken is excluded from the target set outright: it is
+//!   never tracked, and its outcome never affects `--all` at all. This is a
+//!   deliberate, documented asymmetry with `--run-id`, which starts already knowing
+//!   the one id to track and so has no equivalent "exclude before tracking begins"
+//!   step of its own. See [`snapshot_live_targets`] and `docs/registry.md`, "Waiting —
+//!   `wait`".
+//! - **Once an entry is in the target set, it stays outstanding for as long as it
+//!   cannot be confirmed over** — every pass *after* the snapshot applies the exact
+//!   same conservative stance the single-run case above takes:
+//!   [`RunStatus::Unprobed`]'s "unknown is not confirmed" rule, per entry, on every
+//!   later re-probe. [`reprobe_targets`] never silently drops an entry it could not
+//!   re-probe from the target set.
 //! - Success (`0`) means every snapshot entry probed stale or vanished from the
 //!   registry entirely (the same two indistinguishable "over" observations
 //!   [`RunStatus::Finished`] already folds into one case). There is no aggregate
@@ -584,5 +597,195 @@ mod tests {
             expired.next_step().is_none(),
             "a deadline already reached must not schedule another sleep"
         );
+    }
+
+    /// A unique, empty scratch directory for a fixture registry, mirroring
+    /// `src/registry.rs`'s own `scratch` test helper — there is no cross-module test
+    /// helper to share, so `wait`'s unit tests need their own copy.
+    fn scratch(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "processkit-cli-wait-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Hand-write a confirmed-stale entry directly into `dir`: a well-formed record
+    /// plus an **unlocked** sibling lock file — mirrors `tests/registry.rs`'s
+    /// `write_stale_entry` (no cross-target test helper exists to share). Returns the
+    /// record's path, the same identity [`snapshot_live_targets`]/[`reprobe_targets`]
+    /// track entries by.
+    fn write_stale_entry(dir: &std::path::Path, stem: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).expect("create the registry directory");
+        let lock_name = format!("{stem}.lock");
+        let record = format!(
+            "{{\"registry_version\":1,\"run_id\":\"{stem}\",\"endpoint\":null,\
+             \"started_at\":\"2026-07-22T00:00:00.000Z\",\
+             \"liveness\":{{\"kind\":\"advisory_lock\",\"lock_file\":\"{lock_name}\"}}}}"
+        );
+        let json_path = dir.join(format!("{stem}.json"));
+        std::fs::write(&json_path, record).expect("write the stale record");
+        std::fs::write(dir.join(&lock_name), b"").expect("write the unlocked lock file");
+        json_path
+    }
+
+    /// Hand-write an unprobeable entry (T-206 fixture) directly into `dir`: a
+    /// well-formed record whose `lock_file` name resolves to a **directory** rather
+    /// than a regular file, so the liveness probe's write-open fails with a semantic
+    /// error on every platform and for every user — mirrors `tests/registry.rs`'s
+    /// `write_unprobeable_entry`. Returns the record's path.
+    fn write_unprobeable_entry(dir: &std::path::Path, stem: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).expect("create the registry directory");
+        let lock_name = format!("{stem}.lock");
+        let record = format!(
+            "{{\"registry_version\":1,\"run_id\":\"{stem}\",\"endpoint\":null,\
+             \"started_at\":\"2026-07-22T00:00:00.000Z\",\
+             \"liveness\":{{\"kind\":\"advisory_lock\",\"lock_file\":\"{lock_name}\"}}}}"
+        );
+        let json_path = dir.join(format!("{stem}.json"));
+        std::fs::write(&json_path, record).expect("write the record");
+        std::fs::create_dir(dir.join(&lock_name))
+            .expect("create the directory the lock name resolves to");
+        json_path
+    }
+
+    /// [`snapshot_live_targets`]'s decision logic, proved directly rather than only
+    /// through `run_all`'s end-to-end behavior: a confirmed-`Health::Live` entry is in
+    /// scope, while a confirmed-`Health::Stale` entry and — the R-02 asymmetry
+    /// documented in the module doc above — an entry that is only `Health::Unprobed`
+    /// *at the snapshot instant* are both excluded outright, never entering the target
+    /// set at all.
+    #[test]
+    fn snapshot_live_targets_includes_only_confirmed_live_entries() {
+        let dir = scratch("snapshot");
+        let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
+
+        let live = registry
+            .register_plain("live-run", None, std::time::SystemTime::now())
+            .expect("register a live run");
+        let live_path = live.record_path().to_path_buf();
+
+        let stale_path = write_stale_entry(&dir, "stale-run");
+        let unprobed_path = write_unprobeable_entry(&dir, "unprobed-run");
+
+        let snapshot = snapshot_live_targets(&registry).expect("scan the fixture registry");
+
+        assert!(
+            snapshot.contains(&live_path),
+            "a confirmed-live entry is in the snapshot's target set"
+        );
+        assert!(
+            !snapshot.contains(&stale_path),
+            "a confirmed-stale entry is excluded from the snapshot"
+        );
+        assert!(
+            !snapshot.contains(&unprobed_path),
+            "an entry only unprobed at snapshot time is excluded outright, never \
+             entering the target set at all"
+        );
+        assert_eq!(
+            snapshot.len(),
+            1,
+            "exactly the confirmed-live entry is ever in scope"
+        );
+
+        live.remove();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [`reprobe_targets`]'s decision logic on entries already in the target set — the
+    /// half of the barrier's honesty discipline [`snapshot_live_targets`]'s test above
+    /// does not reach. A `Health::Live` survivor stays outstanding; a `Health::Stale`
+    /// survivor, and one gone from the scan entirely, are both dropped as confirmed
+    /// over; and — the explicit task criterion this proves — a `Health::Unprobed`
+    /// survivor stays outstanding too, never silently dropped, and is reported through
+    /// `any_unprobed` rather than folded into a confident "still live".
+    #[test]
+    fn reprobe_targets_keeps_live_and_unprobed_drops_stale_and_missing() {
+        let dir = scratch("reprobe");
+        let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
+
+        let live = registry
+            .register_plain("live-run", None, std::time::SystemTime::now())
+            .expect("register a live run");
+        let live_path = live.record_path().to_path_buf();
+
+        let stale_path = write_stale_entry(&dir, "stale-run");
+        let unprobed_path = write_unprobeable_entry(&dir, "unprobed-run");
+        // A target the fixture never wrote at all — the "vanished from the scan" case
+        // a clean exit produces (its own record removed).
+        let missing_path = dir.join("never-existed.json");
+
+        let mut targets: HashSet<PathBuf> = HashSet::new();
+        targets.insert(live_path.clone());
+        targets.insert(stale_path.clone());
+        targets.insert(unprobed_path.clone());
+        targets.insert(missing_path.clone());
+
+        let (surviving, any_unprobed) =
+            reprobe_targets(&registry, &targets).expect("reprobe against the fixture registry");
+
+        assert!(
+            surviving.contains(&live_path),
+            "a Live entry stays outstanding"
+        );
+        assert!(
+            surviving.contains(&unprobed_path),
+            "an Unprobed entry stays outstanding, never silently dropped"
+        );
+        assert!(
+            !surviving.contains(&stale_path),
+            "a Stale entry is dropped as confirmed over"
+        );
+        assert!(
+            !surviving.contains(&missing_path),
+            "an entry gone from the scan entirely is dropped as confirmed over"
+        );
+        assert_eq!(
+            surviving.len(),
+            2,
+            "exactly the live and unprobed entries survive the pass"
+        );
+        assert!(
+            any_unprobed,
+            "the unprobed survivor is reported honestly, not folded into a confident \
+             'still live'"
+        );
+
+        live.remove();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `any_unprobed` flag is `false` when every survivor is confirmed `Live` — the
+    /// counterpart to the mixed case above, proving the flag is not simply always
+    /// `true` once anything at all is outstanding.
+    #[test]
+    fn reprobe_targets_reports_no_unprobed_when_every_survivor_is_confirmed_live() {
+        let dir = scratch("reprobe-all-live");
+        let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
+
+        let live = registry
+            .register_plain("live-run", None, std::time::SystemTime::now())
+            .expect("register a live run");
+        let live_path = live.record_path().to_path_buf();
+
+        let mut targets: HashSet<PathBuf> = HashSet::new();
+        targets.insert(live_path.clone());
+
+        let (surviving, any_unprobed) =
+            reprobe_targets(&registry, &targets).expect("reprobe against the fixture registry");
+
+        assert!(surviving.contains(&live_path));
+        assert!(
+            !any_unprobed,
+            "no survivor is unprobed, so the flag must not overclaim one is"
+        );
+
+        live.remove();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

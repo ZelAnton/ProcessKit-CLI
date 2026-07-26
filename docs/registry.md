@@ -663,13 +663,27 @@ would leave a caller unable to say when `--all` could ever return at all. A call
 wants to catch a run starting concurrently with the wait re-issues `wait --all` once
 this one returns.
 
-**Unprobed entries stay "not confirmed done".** On every later pass, a snapshot entry
-that re-probes `Health::Live` **or** `Health::Unprobed` stays outstanding — the exact
-same conservative stance the "Liveness it cannot confirm" section above documents for
-`--run-id`, applied per-entry instead of to a single target. An entry that re-probes
-`Health::Stale`, or that has vanished from the scan entirely (a clean exit deletes its
-own record), is dropped from the target set — the same "confirmed over" observation
-that lets an unknown `run_id` read as finished.
+**Unprobed entries stay "not confirmed done" — once they are in the target set.** On
+every later pass, a snapshot entry that re-probes `Health::Live` **or**
+`Health::Unprobed` stays outstanding — the exact same conservative stance the
+"Liveness it cannot confirm" section above documents for `--run-id`, applied per-entry
+instead of to a single target. An entry that re-probes `Health::Stale`, or that has
+vanished from the scan entirely (a clean exit deletes its own record), is dropped from
+the target set — the same "confirmed over" observation that lets an unknown `run_id`
+read as finished.
+
+This conservative rule governs every pass **after** the snapshot, not the snapshot
+itself: because the target set is fixed to exactly the entries confirmed `Health::Live`
+at the snapshot instant (above), an entry that is only `Health::Unprobed` — not
+confirmed live — *at that instant* is excluded from the target set from the start,
+never entering it at all. This is a genuine, deliberate asymmetry with `--run-id`,
+which never excludes its one target this way (it always has exactly the id it was
+asked to wait for): a registry holding only unprobeable entries and no confirmed-live
+ones makes `wait --all` return `0` immediately, the same as an empty registry, even
+though none of those entries' liveness was actually established. A caller relying on
+`--all` as a teardown barrier must not read that `0` as proof every run in the registry
+was actually confirmed over — only that nothing was confirmed live at the moment the
+snapshot was taken.
 
 **Outcomes.** Success (`0`) means every snapshot entry probed stale or vanished; a
 bounded `--timeout` that elapses with entries still outstanding is the same

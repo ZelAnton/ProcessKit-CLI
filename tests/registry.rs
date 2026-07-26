@@ -1538,6 +1538,89 @@ fn wait_all_snapshot_excludes_a_run_that_registers_after_it_starts() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// R-02's documented asymmetry, proved end to end: a registry holding **only** an
+/// unprobeable entry (no confirmed-live one at all — see [`write_unprobeable_entry`])
+/// makes `wait --all` return `0` immediately, exactly like an empty registry, because
+/// the snapshot's target set is exactly the entries *confirmed* `Health::Live` at that
+/// instant — an entry that is only unprobed then is excluded outright, never entering
+/// the target set. This is deliberately **not** the same "unknown is not confirmed"
+/// leniency `--run-id` and a *later* pass over an already-tracked entry both give an
+/// unprobeable record; see `snapshot_live_targets_includes_only_confirmed_live_entries`
+/// in `src/wait.rs` for the unit-level proof of the same rule.
+#[test]
+fn wait_all_returns_at_once_when_the_only_entry_is_unprobed_at_snapshot_time() {
+    let dir = scratch("wait-all-unprobed-only");
+    let registry = registry_dir(&dir);
+
+    write_unprobeable_entry(&registry, "run-unprobed-0000");
+
+    let out = wait_all_for(&registry, Some("10s"));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an entry unprobed at snapshot time is excluded from the target set outright, \
+         so there is nothing to wait for; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "`wait --all` prints nothing on success: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The other half of the same asymmetry: an unprobeable entry sitting **alongside** a
+/// confirmed-live run at snapshot time never enters the target set either, so it must
+/// not leak into the timeout diagnostic — a give-up here is worded exactly like
+/// `wait_all_times_out_with_a_run_still_live`'s single-live-run case ("still live"),
+/// never the `any_unprobed` wording that would wrongly claim the unprobeable sibling
+/// was actually being tracked.
+#[test]
+fn wait_all_timeout_ignores_an_unprobed_entry_never_in_the_snapshot() {
+    let dir = scratch("wait-all-unprobed-and-live");
+    let registry = registry_dir(&dir);
+    let mut runner = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "long-all-runner-with-unprobed-sibling"],
+        long_child(),
+    )
+    .spawn()
+    .expect("spawn the runner");
+
+    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+    write_unprobeable_entry(&registry, "run-unprobed-sibling-0000");
+
+    let out = wait_all_for(&registry, Some("1s"));
+    assert_eq!(
+        out.status.code(),
+        Some(112),
+        "the live run alone still times out the waiter; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains('1') && stderr.contains("still outstanding"),
+        "exactly one snapshot entry (the live run) is outstanding — the unprobed \
+         sibling was never tracked: {stderr}"
+    );
+    assert!(
+        stderr.contains("still live"),
+        "the diagnostic must confidently say the tracked run is still live, since the \
+         untracked unprobed sibling never contributes to `any_unprobed`: {stderr}"
+    );
+    assert!(
+        !stderr.contains("not confirmed finished"),
+        "the untracked unprobed sibling must never leak into the give-up wording: {stderr}"
+    );
+
+    let _ = runner.kill();
+    let _ = runner.wait();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The end-to-end reaping contract: `prune` deletes a confirmed-stale entry from disk
 /// while leaving a live run's entry completely untouched — the through-the-binary
 /// counterpart to the fine-grained `Registry::prune` unit tests in `src/registry.rs`.
