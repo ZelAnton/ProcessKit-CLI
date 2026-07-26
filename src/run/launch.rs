@@ -959,19 +959,37 @@ fn register_run(
     }
 }
 
-/// The child's working directory as recorded in `run_started`: the explicit
-/// `--cwd`, else the runner's own current directory (which processkit inherits),
-/// rendered lossily to a string, or `None` if it cannot be resolved.
+/// The child's absolute working directory as recorded in `run_started`: the explicit
+/// `--cwd` resolved against the runner's current directory by the same rule child
+/// spawn uses, else that current directory itself. Rendered lossily to a string, or
+/// `None` if it cannot be resolved.
 fn resolve_cwd(args: &RunArgs) -> Option<String> {
-    args.cwd
-        .clone()
-        .or_else(|| std::env::current_dir().ok())
-        .map(|path| path.to_string_lossy().into_owned())
+    let path = match args.cwd.as_ref() {
+        Some(path) if path.is_absolute() => path.clone(),
+        Some(path) => std::env::current_dir().ok()?.join(path),
+        None => std::env::current_dir().ok()?,
+    };
+    Some(path.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+    use std::path::PathBuf;
+
+    fn run_args(argv: &[&str]) -> RunArgs {
+        let mut full = vec!["processkit-cli", "run", "--jsonl", "events.jsonl"];
+        full.extend_from_slice(argv);
+        full.extend_from_slice(&["--", "true"]);
+        match crate::cli::Cli::try_parse_from(full)
+            .expect("valid run")
+            .command
+        {
+            crate::cli::Command::Run(args) => *args,
+            _ => panic!("expected run"),
+        }
+    }
 
     /// The `limit_hit.limit` string for each `LimitKind` matches the schema and the
     /// golden fixture (`"memory"`/`"processes"`/`"cpu"`). Cross-platform and
@@ -991,23 +1009,8 @@ mod tests {
     /// flag flips it to `with_options`.
     #[test]
     fn build_limit_options_is_none_without_flags_and_some_with_any() {
-        use clap::Parser;
-
-        let base = |argv: &[&str]| -> RunArgs {
-            let mut full = vec!["processkit-cli", "run", "--jsonl", "events.jsonl"];
-            full.extend_from_slice(argv);
-            full.extend_from_slice(&["--", "true"]);
-            match crate::cli::Cli::try_parse_from(full)
-                .expect("valid run")
-                .command
-            {
-                crate::cli::Command::Run(args) => *args,
-                _ => panic!("expected run"),
-            }
-        };
-
         assert!(
-            build_limit_options(&base(&[])).is_none(),
+            build_limit_options(&run_args(&[])).is_none(),
             "no limit flag ⇒ the unchanged ProcessGroup::new() path"
         );
         for flag in [
@@ -1016,9 +1019,34 @@ mod tests {
             vec!["--cpu-quota", "1.5"],
         ] {
             assert!(
-                build_limit_options(&base(&flag)).is_some(),
+                build_limit_options(&run_args(&flag)).is_some(),
                 "the {flag:?} flag must request ProcessGroupOptions"
             );
         }
+    }
+
+    /// A relative `--cwd` is resolved against the runner's own working directory,
+    /// just as child spawn resolves it. The relative suffix is retained rather than
+    /// lexically normalized so symlink/junction traversal keeps the OS's semantics;
+    /// the absolute prefix still makes the value self-contained for consumers.
+    #[test]
+    fn resolve_cwd_makes_a_relative_flag_absolute() {
+        let runner_cwd = std::env::current_dir().expect("resolve the test runner cwd");
+        let expected = runner_cwd.join("../processkit-cli-cwd-target");
+        let resolved = resolve_cwd(&run_args(&["--cwd", "../processkit-cli-cwd-target"]))
+            .expect("resolve the relative cwd");
+
+        let resolved = PathBuf::from(resolved);
+        assert!(resolved.is_absolute());
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn resolve_cwd_without_a_flag_reports_the_absolute_runner_cwd() {
+        let resolved = resolve_cwd(&run_args(&[])).expect("resolve inherited cwd");
+        assert_eq!(
+            PathBuf::from(resolved),
+            std::env::current_dir().expect("resolve the test runner cwd")
+        );
     }
 }

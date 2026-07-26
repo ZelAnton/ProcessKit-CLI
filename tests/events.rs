@@ -19,7 +19,7 @@ mod common;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use common::{events_path, run, run_with_flags, scratch, shell_inline};
+use common::{command_with_flags, events_path, run, run_with_flags, scratch, shell_inline};
 use jsonschema::Validator;
 use serde_json::Value;
 
@@ -212,6 +212,37 @@ fn run_started_reports_root_pid_mechanism_and_redacts_the_command() {
     assert!(
         command["hint"].is_null(),
         "a plain shell command is not a recognized worker shape: {command}"
+    );
+}
+
+/// The binary resolves a relative `--cwd` exactly as child spawn does, but records
+/// the resulting absolute path so a JSONL consumer never needs the runner's ambient
+/// working directory to interpret `run_started.cwd`.
+#[test]
+fn run_started_normalizes_a_relative_cwd_to_absolute() {
+    let dir = scratch("run-started-relative-cwd");
+    let child_cwd = dir.join("child");
+    std::fs::create_dir_all(&child_cwd).expect("create the child working directory");
+
+    let mut command = command_with_flags(&dir, &[], &["--cwd", "child"], shell_inline("exit 0"));
+    command.current_dir(&dir);
+    let out = command.output().expect("spawn the runner binary");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the child runs successfully in the relative cwd; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let events = read_events(&dir);
+    let started = events
+        .iter()
+        .find(|event| event["event"] == "run_started")
+        .expect("a run_started event");
+    assert_eq!(
+        started["cwd"],
+        child_cwd.to_string_lossy().as_ref(),
+        "the event identifies the absolute directory the child actually used"
     );
 }
 

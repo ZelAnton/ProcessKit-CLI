@@ -102,7 +102,7 @@
 //!   never tracked, and its outcome never affects `--all` at all. This is a
 //!   deliberate, documented asymmetry with `--run-id`, which starts already knowing
 //!   the one id to track and so has no equivalent "exclude before tracking begins"
-//!   step of its own. See [`snapshot_live_targets`] and `docs/registry.md`, "Waiting —
+//!   step of its own. See [`snapshot_target_paths`] and `docs/registry.md`, "Waiting —
 //!   `wait`".
 //! - **Once an entry is in the target set, it stays outstanding for as long as it
 //!   cannot be confirmed over** — every pass *after* the snapshot applies the exact
@@ -308,7 +308,7 @@ pub fn run_all(timeout: Option<Duration>) -> Result<(), RunnerError> {
     // The snapshot: one scan, fixed before the first poll, to exactly the entries
     // confirmed live right now. Every later pass only ever *removes* from this set —
     // nothing is ever added to it (see the module doc for why).
-    let mut targets = snapshot_live_targets(&registry).map_err(read_error)?;
+    let mut targets = snapshot_target_paths(&registry).map_err(read_error)?;
     // Whether the most recent pass over `targets` found an entry that could not be
     // re-probed — reported honestly on a timeout instead of a confident "still live"
     // the last pass never actually established for every remaining entry.
@@ -344,11 +344,10 @@ pub fn run_all(timeout: Option<Duration>) -> Result<(), RunnerError> {
 /// entry [`Health::Unprobed`] at snapshot time is **not** included: the target set is
 /// documented as exactly the entries *confirmed* live at that instant, not "anything
 /// that might be" — see the module doc.
-fn snapshot_live_targets(registry: &registry::Registry) -> std::io::Result<HashSet<PathBuf>> {
+fn snapshot_target_paths(registry: &registry::Registry) -> std::io::Result<HashSet<PathBuf>> {
     Ok(registry
-        .entries()?
+        .snapshot_live_entries()?
         .into_iter()
-        .filter(|entry| entry.health == Health::Live)
         .map(|entry| entry.path)
         .collect())
 }
@@ -617,7 +616,7 @@ mod tests {
     /// Hand-write a confirmed-stale entry directly into `dir`: a well-formed record
     /// plus an **unlocked** sibling lock file — mirrors `tests/registry.rs`'s
     /// `write_stale_entry` (no cross-target test helper exists to share). Returns the
-    /// record's path, the same identity [`snapshot_live_targets`]/[`reprobe_targets`]
+    /// record's path, the same identity [`snapshot_target_paths`]/[`reprobe_targets`]
     /// track entries by.
     fn write_stale_entry(dir: &std::path::Path, stem: &str) -> PathBuf {
         std::fs::create_dir_all(dir).expect("create the registry directory");
@@ -653,14 +652,14 @@ mod tests {
         json_path
     }
 
-    /// [`snapshot_live_targets`]'s decision logic, proved directly rather than only
+    /// [`snapshot_target_paths`]'s projection, proved directly rather than only
     /// through `run_all`'s end-to-end behavior: a confirmed-`Health::Live` entry is in
     /// scope, while a confirmed-`Health::Stale` entry and — the R-02 asymmetry
     /// documented in the module doc above — an entry that is only `Health::Unprobed`
     /// *at the snapshot instant* are both excluded outright, never entering the target
     /// set at all.
     #[test]
-    fn snapshot_live_targets_includes_only_confirmed_live_entries() {
+    fn snapshot_target_paths_include_only_confirmed_live_entries() {
         let dir = scratch("snapshot");
         let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
 
@@ -672,7 +671,7 @@ mod tests {
         let stale_path = write_stale_entry(&dir, "stale-run");
         let unprobed_path = write_unprobeable_entry(&dir, "unprobed-run");
 
-        let snapshot = snapshot_live_targets(&registry).expect("scan the fixture registry");
+        let snapshot = snapshot_target_paths(&registry).expect("scan the fixture registry");
 
         assert!(
             snapshot.contains(&live_path),
@@ -698,7 +697,7 @@ mod tests {
     }
 
     /// [`reprobe_targets`]'s decision logic on entries already in the target set — the
-    /// half of the barrier's honesty discipline [`snapshot_live_targets`]'s test above
+    /// half of the barrier's honesty discipline [`snapshot_target_paths`]'s test above
     /// does not reach. A `Health::Live` survivor stays outstanding; a `Health::Stale`
     /// survivor, and one gone from the scan entirely, are both dropped as confirmed
     /// over; and — the explicit task criterion this proves — a `Health::Unprobed`

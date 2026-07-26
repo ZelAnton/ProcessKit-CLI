@@ -99,7 +99,7 @@ The run has begun: the child is spawned into the container.
 | `root_pid`       | integer, nullable | The root child's PID; `null` if the backend exposed none.             |
 | `mechanism`      | string            | Containment mechanism: `job_object`, `cgroup_v2`, or `process_group`. |
 | `abrupt_cleanup` | string            | Cleanup surviving abrupt runner death: `whole_tree`, `direct_child_only`, or `none`. |
-| `cwd`            | string, nullable  | The child's working directory; `null` if it could not be resolved.    |
+| `cwd`            | string, nullable  | The child's absolute working directory; `null` if it could not be resolved. |
 | `command`        | object            | The command, redacted by default — see "Command redaction".           |
 
 `abrupt_cleanup` is distinct from `mechanism` and from ordinary teardown. It is

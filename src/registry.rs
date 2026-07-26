@@ -578,6 +578,18 @@ impl Registry {
         Ok(entries)
     }
 
+    /// Take one snapshot of every entry whose advisory-lock probe confirms it live.
+    /// Aggregate control mutations and `wait --all` deliberately share this exact
+    /// inclusion bar; each consumer projects the returned records into its own target
+    /// shape, but neither reimplements the `Health::Live` filter.
+    pub(crate) fn snapshot_live_entries(&self) -> io::Result<Vec<Entry>> {
+        Ok(self
+            .entries()?
+            .into_iter()
+            .filter(|entry| entry.health == Health::Live)
+            .collect())
+    }
+
     /// Reap every **confirmed-stale** entry — both its files, plus (on unix) the
     /// control socket it published — and leave every other entry untouched. The
     /// safe-by-construction cleanup for what an abruptly-killed runner leaves behind

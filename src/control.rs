@@ -939,7 +939,7 @@ fn mutate_all(command: ControlCommand) -> Result<(), RunnerError> {
 async fn mutate_all_async(command: ControlCommand) -> Result<(), RunnerError> {
     let action = command.verb();
     let registry = open_registry_for_all(action)?;
-    let targets = snapshot_live_targets(&registry).map_err(|err| {
+    let targets = snapshot_mutation_targets(&registry).map_err(|err| {
         RunnerError::new(
             exit::SETUP,
             format!("could not read the run registry: {err}"),
@@ -1013,11 +1013,10 @@ fn open_registry_for_all(action: &str) -> Result<registry::Registry, RunnerError
 /// Snapshot every entry confirmed live, preserving the unique record path and the
 /// endpoint that exact record advertised. `run_id` is deliberately only report data:
 /// two live records may share it, and `--all` must still reach both.
-fn snapshot_live_targets(registry: &registry::Registry) -> io::Result<Vec<MutationTarget>> {
+fn snapshot_mutation_targets(registry: &registry::Registry) -> io::Result<Vec<MutationTarget>> {
     Ok(registry
-        .entries()?
+        .snapshot_live_entries()?
         .into_iter()
-        .filter(|entry| entry.health == Health::Live)
         .map(|entry| MutationTarget {
             run_id: entry.record.run_id,
             record_path: entry.path,
@@ -1084,7 +1083,7 @@ async fn mutate_snapshot_target(
     Ok(SnapshotMutation::Accepted(ack))
 }
 
-/// Reconfirm the exact registry record captured by [`snapshot_live_targets`].
+/// Reconfirm the exact registry record captured by [`snapshot_mutation_targets`].
 /// Missing and confirmed-stale records are successful terminal states for `--all`;
 /// unprobeable records and identity changes are not evidence that the target ended.
 fn snapshot_target_state(
@@ -2773,16 +2772,16 @@ mod tests {
         );
     }
 
-    /// [`snapshot_live_targets`]'s decision logic, proved directly rather
+    /// [`snapshot_mutation_targets`]'s projection, proved directly rather
     /// than only through `cancel --all`/`kill --all`'s end-to-end behavior — the same
-    /// three-way fixture [`crate::wait::tests::snapshot_live_targets_includes_only_confirmed_live_entries`]
+    /// three-way fixture [`crate::wait::tests::snapshot_target_paths_include_only_confirmed_live_entries`]
     /// drives for the aggregate `wait --all` barrier: a confirmed-`Health::Live`
     /// entry is in scope, while a confirmed-`Health::Stale` entry and one that is
     /// only `Health::Unprobed` are both excluded outright — `--all` acts only on
     /// confirmed-live entries, never a wider or narrower bar than the single-run
     /// form's own [`resolve_in_registry`] applies.
     #[test]
-    fn snapshot_live_targets_include_only_confirmed_live_entries() {
+    fn snapshot_mutation_targets_include_only_confirmed_live_entries() {
         let dir = scratch_registry_dir("snapshot-live");
         let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
 
@@ -2792,7 +2791,7 @@ mod tests {
         write_stale_entry(&dir, "stale-stem", "stale-run");
         write_unprobeable_entry(&dir, "unprobed-stem", "unprobed-run");
 
-        let targets = snapshot_live_targets(&registry).expect("scan the fixture registry");
+        let targets = snapshot_mutation_targets(&registry).expect("scan the fixture registry");
 
         assert_eq!(
             targets
@@ -2815,7 +2814,7 @@ mod tests {
     /// in the outcome list, rather than the entry being silently excluded from the
     /// snapshot up front.
     #[test]
-    fn snapshot_live_targets_include_a_live_entry_with_no_endpoint() {
+    fn snapshot_mutation_targets_include_a_live_entry_with_no_endpoint() {
         let dir = scratch_registry_dir("snapshot-live-no-endpoint");
         let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
 
@@ -2823,7 +2822,7 @@ mod tests {
             .register_plain("endpointless-run", None, SystemTime::now())
             .expect("register a live run that never published an endpoint");
 
-        let targets = snapshot_live_targets(&registry).expect("scan the fixture registry");
+        let targets = snapshot_mutation_targets(&registry).expect("scan the fixture registry");
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].run_id, "endpointless-run");
         assert_eq!(targets[0].endpoint, None);
@@ -2923,7 +2922,7 @@ mod tests {
         let registration = registry
             .register_plain("short-run", Some("endpoint-now-gone"), SystemTime::now())
             .expect("register the live target");
-        let mut targets = snapshot_live_targets(&registry).expect("snapshot live targets");
+        let mut targets = snapshot_mutation_targets(&registry).expect("snapshot live targets");
         let target = targets.pop().expect("the target is in the snapshot");
 
         drop(registration);
@@ -2943,7 +2942,7 @@ mod tests {
         let registration = registry
             .register_plain("short-run", None, SystemTime::now())
             .expect("register the live target without an endpoint");
-        let mut targets = snapshot_live_targets(&registry).expect("snapshot live targets");
+        let mut targets = snapshot_mutation_targets(&registry).expect("snapshot live targets");
         let target = targets.pop().expect("the target is in the snapshot");
 
         drop(registration);
@@ -2963,7 +2962,7 @@ mod tests {
         let registration = registry
             .register_plain("target", Some("endpoint-a"), SystemTime::now())
             .expect("register the live target");
-        let mut targets = snapshot_live_targets(&registry).expect("snapshot live targets");
+        let mut targets = snapshot_mutation_targets(&registry).expect("snapshot live targets");
         let target = targets.pop().expect("the target is in the snapshot");
 
         std::fs::write(&target.record_path, b"not valid JSON")

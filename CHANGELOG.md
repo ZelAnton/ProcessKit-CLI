@@ -116,6 +116,9 @@ to a dated version section.
   completions, and man pages.
 
 ### Changed
+- Aggregate control mutations and `wait --all` now take their confirmed-live target
+  snapshot through one registry primitive, so both commands share the same liveness
+  inclusion rule while retaining their command-specific target projections.
 - **Upgraded to `processkit` 3, and Windows soft-stop reporting is honest again.**
   The dependency moves from `2` to `3` (`limits` feature unchanged; the declared MSRV
   stays `1.88`, which is still `processkit`'s own floor). Two things in the major
@@ -155,6 +158,18 @@ to a dated version section.
   simply no longer required.
 
 ### Fixed
+- `run_started.cwd` is now always absolute, including when `--cwd` is relative, so
+  event consumers can identify the child's actual working directory without knowing
+  the runner's ambient cwd. Foreground and detached runs use the same resolution path.
+- Single-run `cancel`/`kill` now reject an acknowledgement whose `run_id` does not
+  match the requested run, using the same shared acceptance/action/id validation as
+  their `--all` forms.
+- Human-readable `inspect` now collapses terminal control characters in snapshot and
+  process-member strings, matching the existing safety boundary in `list` and
+  `prune --dry-run`; `inspect --json` remains byte-for-byte unchanged.
+- Failed registry reservations now arm lock-file cleanup immediately after
+  `create_new` and close the handle before unlinking, so an early lock-probe error or
+  retry does not leak an orphan `.lock` file, including on Windows.
 - Human-readable `list` and `prune --dry-run` output now collapses control characters
   from untrusted registry `run_id`/`endpoint` values and orphaned lock-file names,
   preventing forged rows and terminal escape injection while preserving raw values

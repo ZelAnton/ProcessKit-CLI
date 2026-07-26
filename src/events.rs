@@ -79,8 +79,8 @@ pub enum Event {
         /// `whole_tree` | `direct_child_only` | `none`: the cleanup guarantee that
         /// remains if the runner itself dies without running destructors.
         abrupt_cleanup: &'static str,
-        /// Working directory the child runs in, or `null` if it could not be
-        /// resolved.
+        /// Absolute working directory the child runs in, or `null` if it could not
+        /// be resolved.
         cwd: Option<String>,
         command: CommandInfo,
     },

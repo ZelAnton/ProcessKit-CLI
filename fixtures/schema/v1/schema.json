@@ -127,7 +127,7 @@
           "enum": ["whole_tree", "direct_child_only", "none"],
           "description": "Cleanup surviving abrupt runner death."
         },
-        "cwd": { "type": ["string", "null"], "description": "The child's working directory; null if it could not be resolved." },
+        "cwd": { "type": ["string", "null"], "description": "The child's absolute working directory; null if it could not be resolved." },
         "command": { "$ref": "#/$defs/commandInfo" }
       },
       "required": ["schema_version", "time", "event", "run_id", "root_pid", "mechanism", "abrupt_cleanup", "cwd", "command"],
