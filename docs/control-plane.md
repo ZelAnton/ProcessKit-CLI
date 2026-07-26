@@ -123,10 +123,10 @@ processkit-cli inspect --run-id <id> [--json]
 
 `inspect` finds the live runner for `<id>` through the registry, connects to its
 endpoint, sends the `inspect` verb, and prints the snapshot to **stdout** — as a
-single JSON line with `--json`, or, by default, as a human-readable rendering (run
-id, mechanism, root pid, start time, and a member table), mirroring `list`/`prune`'s
-optional `--json`. `--json` is optional; `inspect --json`'s output is unchanged from
-before `--json` became optional.
+single JSON line with `--json`, or, by default, as a human-readable rendering
+(snapshot version, run id, mechanism, root pid, start time, and a member table),
+mirroring `list`/`prune`'s optional `--json`. `--json` is optional; `inspect --json`'s
+output is unchanged from before `--json` became optional.
 
 ### The inspect snapshot
 

@@ -1147,8 +1147,9 @@ struct Verdict {
     outcome: ClientOutcome,
 }
 
-/// Run one control verb against `run_id` under [`CLIENT_BOUND`]. `inspect` takes the
-/// mandatory `--json` flag its fixed CLI form requires; the mutating verbs take none.
+/// Run one control verb against `run_id` under [`CLIENT_BOUND`]. `inspect` is passed
+/// `--json` explicitly — it is optional (T-214), but this harness parses the reply as
+/// JSON, so it always asks for that form; the mutating verbs take no flags.
 fn control_verdict(paths: &Paths, verb: &'static str, run_id: &str) -> Verdict {
     let args: Vec<&str> = if verb == "inspect" {
         vec![verb, "--run-id", run_id, "--json"]

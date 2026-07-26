@@ -43,12 +43,12 @@ to a dated version section.
 
 ### Changed
 - **`inspect --json` is now optional**, mirroring `list`/`prune`: without it,
-  `inspect` prints a human-readable rendering of the snapshot (run id, mechanism,
-  root pid, start time, and a column-aligned member table) instead of requiring an
-  operator to pass `--json` and read raw JSON at the terminal. `inspect --json`'s
-  output is unchanged, byte-for-byte, from before this change. The `inspect:--json`
-  `probe` surface token is unaffected — the flag still exists, it is simply no
-  longer required.
+  `inspect` prints a human-readable rendering of the snapshot (snapshot version, run
+  id, mechanism, root pid, start time, and a column-aligned member table) instead of
+  requiring an operator to pass `--json` and read raw JSON at the terminal. `inspect
+  --json`'s output is unchanged, byte-for-byte, from before this change. The
+  `inspect:--json` `probe` surface token is unaffected — the flag still exists, it is
+  simply no longer required.
 
 ### Fixed
 - **`prune` now reaps the leaked control-socket directory of a run that died

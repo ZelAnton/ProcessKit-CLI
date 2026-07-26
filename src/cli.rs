@@ -377,9 +377,10 @@ pub struct PruneArgs {
 /// their evaluation (see its own doc comment below).
 #[derive(Debug, Args)]
 pub struct ProbeArgs {
-    /// Emit the report as JSON. Required to match the fixed form (JSON is the only
-    /// supported output format, as for `inspect`); clap enforces its presence and
-    /// `probe` always prints JSON.
+    /// Emit the report as JSON. Required because `probe` is a machine-readable
+    /// preflight contract with a single fixed output shape — unlike `inspect`, whose
+    /// `--json` is optional (T-214) since it also has a human-readable form. clap
+    /// enforces this flag's presence and `probe` always prints JSON.
     #[allow(dead_code)] // Part of the fixed CLI form; enforced by clap, never read.
     #[arg(long, required = true)]
     pub json: bool,
@@ -1351,7 +1352,8 @@ mod tests {
 
     #[test]
     fn probe_requires_json_and_accepts_the_require_flags() {
-        // The fixed form mirrors `inspect`: `--json` is mandatory.
+        // `probe` keeps a fixed form where `--json` is mandatory, unlike `inspect`,
+        // where `--json` became optional (T-214).
         assert!(
             Cli::try_parse_from(["processkit-cli", "probe", "--json"]).is_ok(),
             "a bare `probe --json` is the minimal valid form"

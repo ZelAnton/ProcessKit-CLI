@@ -263,17 +263,18 @@ runner-owned cancellation outcome should use the control-plane `cancel` command.
 same local IPC control plane, addressing it by `run_id` through the per-user registry
 — never by PID. `inspect` is read-only and, like `list`/`prune`, has an optional
 `--json`: without it, `inspect` prints a human-readable rendering of the snapshot
-(run id, mechanism, root pid, start time, and a member table); with `--json` it
-prints the snapshot as a single JSON line, unchanged. `cancel` ends the run through
-the *same* soft-stop → grace → hard-kill teardown a `Ctrl-C` uses (exiting the run with the
-reserved code `108`), and `kill` hard-kills the whole tree immediately with no grace
-(code `109`). The scope of a cancel/kill is only the target run's ProcessKit
-container — never processes matched by executable name. Both outcomes are also written
-to the run's JSONL stream (a `cancelled` / `killed` event and a terminal
-`runner_exit`), so an external observer reading the event file sees the command too,
-not just the control client. If the runner has already died, the registry entry is
-stale rather than an invitation to address processes by PID, and a cancel/kill against
-it is a bounded `CONTROL` (103) failure — never a hang. Cleanup after an abrupt runner
+(snapshot version, run id, mechanism, root pid, start time, and a member table); with
+`--json` it prints the snapshot as a single JSON line, unchanged. `cancel` ends the
+run through the *same* soft-stop → grace → hard-kill teardown a `Ctrl-C` uses
+(exiting the run with the reserved code `108`), and `kill` hard-kills the whole tree
+immediately with no grace (code `109`). The scope of a cancel/kill is only the
+target run's ProcessKit container — never processes matched by executable name. Both
+outcomes are also written to the run's JSONL stream (a `cancelled` / `killed` event
+and a terminal `runner_exit`), so an external observer reading the event file sees
+the command too, not just the control client. If the runner has already died, the
+registry entry is stale rather than an invitation to address processes by PID, and a
+cancel/kill against it is a bounded `CONTROL` (103) failure — never a hang. Cleanup
+after an abrupt runner
 death follows the platform-specific `abrupt_cleanup` guarantee above; only Windows
 currently guarantees the whole tree.
 
