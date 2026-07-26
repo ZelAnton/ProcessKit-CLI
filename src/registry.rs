@@ -1679,7 +1679,7 @@ mod platform {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::path::{Path, PathBuf};
 
-    use crate::control::{SOCKET_DIR_PREFIX, SOCKET_FILE_NAME, socket_base_dirs};
+    use crate::control::{SOCKET_FILE_NAME, socket_base_dirs, unix_control_endpoint_dir};
 
     /// Owner-only directory: mode `0700`, re-asserted with `chmod` (which, unlike the
     /// initial `mkdir`, is not filtered by the umask) so both a freshly created and a
@@ -1821,53 +1821,17 @@ mod platform {
     /// directories — the whole check, with its one environment-derived input
     /// ([`socket_base_dirs`]) passed in so it can be exercised deterministically.
     pub fn socket_dir_within(endpoint: &str, bases: &[PathBuf]) -> Option<PathBuf> {
-        // Reject any embedded NUL or control character up front: a NUL truncates the
-        // name at the OS boundary, and no path this project publishes contains one.
-        if endpoint.chars().any(char::is_control) {
-            return None;
-        }
-        // Deliberately parsed as raw `/`-separated segments rather than through
-        // `Path::components()`: that iterator *normalizes* — it silently drops `.`
-        // and empty (doubled-separator) segments — so a value like `/tmp/./pkc-1/
-        // c.sock` would inspect as though it were the published form. Here every
-        // segment is checked as written, and `.`/`..`/empty are all refused, so what
-        // this returns is a path with no traversal or normalization left in it.
-        let mut segments = endpoint.split('/');
-        // An absolute path, and only an absolute path, splits with an empty leading
-        // segment.
-        if segments.next() != Some("") {
-            return None;
-        }
-        let segments: Vec<&str> = segments.collect();
-        if segments
-            .iter()
-            .any(|segment| segment.is_empty() || *segment == "." || *segment == "..")
-        {
-            return None;
-        }
-
-        // `<base…>/pkc-<token>/c.sock`: the socket file itself, its private directory,
-        // and the base directory that directory was created in.
-        let [base_segments @ .., dir_name, file_name] = segments.as_slice() else {
-            return None;
-        };
-        if *file_name != SOCKET_FILE_NAME {
-            return None;
-        }
-        let token = dir_name.strip_prefix(SOCKET_DIR_PREFIX)?;
-        if token.is_empty() || !token.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-            return None;
-        }
+        let dir = unix_control_endpoint_dir(endpoint)?;
         // The directory must sit *directly* in a base `ControlServer::bind` uses —
         // one level, no deeper — so nothing outside those bases is ever a candidate.
         // The bases themselves come from this process's own environment, not from the
         // record, so they are compared as paths (`/tmp` and `/tmp/` are one place),
         // while the untrusted part above had to match to the character.
-        let base = PathBuf::from(format!("/{}", base_segments.join("/")));
-        if !bases.contains(&base) {
+        let base = dir.parent()?;
+        if !bases.iter().any(|candidate| candidate == base) {
             return None;
         }
-        Some(base.join(dir_name))
+        Some(dir)
     }
 
     /// Reap a confirmed-stale record's control socket and the private directory that

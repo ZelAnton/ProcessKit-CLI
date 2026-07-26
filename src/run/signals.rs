@@ -178,6 +178,11 @@ pub(super) async fn wait_for_cancel_signal() -> CancelSignal {
 /// installed we degrade to "no cancel" (never resolving) after an honest warning,
 /// rather than aborting an otherwise-healthy run.
 async fn wait_for_ctrl_c() {
+    #[cfg(unix)]
+    if signal_is_ignored(libc::SIGINT) {
+        return std::future::pending().await;
+    }
+
     match tokio::signal::ctrl_c().await {
         Ok(()) => {}
         Err(err) => {
@@ -229,10 +234,9 @@ async fn wait_for_unix_signal(number: libc::c_int, name: &str) {
 /// changed here. A failed query reads as "not ignored", so the caller falls back to
 /// its ordinary listener rather than silently dropping a signal it could have caught.
 ///
-/// Applied to the **new** `SIGTERM`/`SIGHUP` listeners only, not to the pre-existing
-/// `Ctrl-C` one: this guard exists to avoid *changing* how an already-neutralized
-/// signal behaves, and `Ctrl-C` has always installed its handler unconditionally.
-/// Reworking that would be a behavior change of its own, not part of this addition.
+/// Applied to every Unix stop-signal listener, including `SIGINT`: the guard exists
+/// to avoid changing how an already-neutralized signal behaves when a shell or
+/// supervisor deliberately launched the runner with that disposition.
 #[cfg(unix)]
 fn signal_is_ignored(number: libc::c_int) -> bool {
     // SAFETY: `sigaction` with a null `act` only reads the current disposition and

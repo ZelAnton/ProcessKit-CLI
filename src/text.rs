@@ -1,18 +1,50 @@
 //! Shared text normalization for human-readable terminal output.
 
-/// Collapse terminal control characters to ordinary spaces before interpolating an
-/// untrusted string into a human-readable line. JSON renderers deliberately do not
-/// use this helper: `serde_json` escapes controls without changing the data contract.
+/// Collapse terminal control and invisible formatting characters to ordinary spaces
+/// before interpolating an untrusted string into a human-readable line. JSON
+/// renderers deliberately do not use this helper: `serde_json` escapes controls
+/// without changing the data contract.
 pub(crate) fn terminal_safe(text: &str) -> String {
     text.chars()
         .map(|character| {
-            if character.is_control() {
+            if character.is_control() || is_terminal_format(character) {
                 ' '
             } else {
                 character
             }
         })
         .collect()
+}
+
+/// Unicode's formatting characters are not covered by [`char::is_control`], but
+/// bidi overrides, isolates, zero-width marks, and tag characters can still change
+/// or conceal what a human sees in one terminal line. Keep this dependency-free
+/// table explicit so the terminal boundary does not silently trust them.
+fn is_terminal_format(character: char) -> bool {
+    matches!(
+        character,
+        '\u{00ad}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061c}'
+            | '\u{06dd}'
+            | '\u{070f}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08e2}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
+    )
 }
 
 /// Render a column-aligned table with `separator` between cells and `prefix` before
@@ -79,6 +111,18 @@ mod tests {
         assert!(
             safe.chars().all(|character| !character.is_control()),
             "no terminal control character survives: {safe:?}"
+        );
+    }
+
+    #[test]
+    fn terminal_safe_collapses_bidi_and_zero_width_formatting() {
+        let safe = terminal_safe(
+            "left\u{202e}override\u{202c}\u{2066}isolate\u{2069}\u{200b}zero\u{200e}mark\u{feff}",
+        );
+        assert_eq!(safe, "left override  isolate  zero mark ");
+        assert!(
+            safe.chars().all(|character| !is_terminal_format(character)),
+            "no invisible formatting character survives: {safe:?}"
         );
     }
 

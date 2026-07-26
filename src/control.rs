@@ -1251,6 +1251,13 @@ async fn connect_live(
     action: &str,
     run_id: &str,
 ) -> Result<imp::Stream, RunnerError> {
+    if !endpoint_is_valid(endpoint) {
+        return Err(unreachable_run(
+            action,
+            run_id,
+            "the registry entry contains an invalid control endpoint".into(),
+        ));
+    }
     tokio::time::timeout(CONNECT_DEADLINE, imp::connect(endpoint))
         .await
         .map_err(|_| {
@@ -1494,6 +1501,66 @@ pub(crate) const SOCKET_FILE_NAME: &str = "c.sock";
 #[cfg(unix)]
 pub(crate) const SOCKET_DIR_PREFIX: &str = "pkc-";
 
+/// Parse the platform-produced lexical shape of a unix control endpoint and return
+/// its private socket directory. This intentionally does not constrain the base
+/// directory: a client can inherit a different `TMPDIR` from the live runner that
+/// published the record, while the endpoint itself remains legitimate.
+#[cfg(unix)]
+pub(crate) fn unix_control_endpoint_dir(endpoint: &str) -> Option<std::path::PathBuf> {
+    if endpoint.chars().any(char::is_control) {
+        return None;
+    }
+
+    let mut segments = endpoint.split('/');
+    if segments.next() != Some("") {
+        return None;
+    }
+    let segments: Vec<&str> = segments.collect();
+    if segments
+        .iter()
+        .any(|segment| segment.is_empty() || *segment == "." || *segment == "..")
+    {
+        return None;
+    }
+
+    let [base_segments @ .., dir_name, file_name] = segments.as_slice() else {
+        return None;
+    };
+    if *file_name != SOCKET_FILE_NAME {
+        return None;
+    }
+    let token = dir_name.strip_prefix(SOCKET_DIR_PREFIX)?;
+    if token.is_empty()
+        || !token
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
+        return None;
+    }
+
+    let base = std::path::PathBuf::from(format!("/{}", base_segments.join("/")));
+    Some(base.join(dir_name))
+}
+
+#[cfg(unix)]
+fn endpoint_is_valid(endpoint: &str) -> bool {
+    unix_control_endpoint_dir(endpoint).is_some()
+}
+
+#[cfg(windows)]
+const PIPE_ENDPOINT_PREFIX: &str = r"\\.\pipe\processkit-cli-";
+
+#[cfg(windows)]
+fn endpoint_is_valid(endpoint: &str) -> bool {
+    let Some(token) = endpoint.strip_prefix(PIPE_ENDPOINT_PREFIX) else {
+        return false;
+    };
+    !token.is_empty()
+        && token
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+}
+
 /// The base directories a unix control socket's private directory is created in, in
 /// preference order: `/tmp` first (short enough to keep the advertised socket path
 /// comfortably below `SUN_LEN` even when the registry itself lives under a deeply
@@ -1685,7 +1752,8 @@ mod imp {
     use crate::win_security::SecurityDescriptor;
 
     use super::{
-        ControlCommandSink, Infallible, SnapshotSource, handle_connection, io, unique_token,
+        ControlCommandSink, Infallible, PIPE_ENDPOINT_PREFIX, SnapshotSource, handle_connection,
+        io, unique_token,
     };
 
     /// The connected client stream type on this platform — a named-pipe client. Named
@@ -1707,7 +1775,7 @@ mod imp {
         /// user. No directory is taken — the pipe lives in the kernel namespace, not
         /// the filesystem.
         pub fn bind() -> io::Result<Self> {
-            let endpoint = format!(r"\\.\pipe\processkit-cli-{}", unique_token());
+            let endpoint = format!("{PIPE_ENDPOINT_PREFIX}{}", unique_token());
             let security = owner_only_descriptor()?;
             let first = create_instance(&endpoint, &security, true)?;
             Ok(Self {
@@ -2412,6 +2480,46 @@ mod tests {
         assert!(message.contains("cancel"), "names the action: {message}");
         assert!(message.contains("run-9"), "names the run: {message}");
         assert!(message.contains("stale"), "carries the reason: {message}");
+    }
+
+    #[tokio::test]
+    async fn connect_live_rejects_an_invalid_registry_endpoint_before_io() {
+        let err = match connect_live("not-a-platform-endpoint", "kill", "run-9").await {
+            Ok(_) => panic!("an invalid registry endpoint must not be opened"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), exit::CONTROL);
+        assert!(err.to_string().contains("invalid control endpoint"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_control_endpoint_validation_accepts_any_base_but_rejects_unsafe_shapes() {
+        assert!(endpoint_is_valid("/different/tmp/pkc-123-abc/c.sock"));
+        for endpoint in [
+            "relative/pkc-123/c.sock",
+            "/tmp/../pkc-123/c.sock",
+            "/tmp//pkc-123/c.sock",
+            "/tmp/pkc-/c.sock",
+            "/tmp/pkc-123/not-the-socket",
+            "/tmp/pkc-bad_token/c.sock",
+        ] {
+            assert!(!endpoint_is_valid(endpoint), "must reject {endpoint:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_control_endpoint_validation_requires_the_owned_pipe_shape() {
+        assert!(endpoint_is_valid(r"\\.\pipe\processkit-cli-1234-abc-0"));
+        for endpoint in [
+            r"\\.\pipe\other-1234",
+            r"\\server\pipe\processkit-cli-1234",
+            r"\\.\pipe\processkit-cli-",
+            r"\\.\pipe\processkit-cli-bad\suffix",
+        ] {
+            assert!(!endpoint_is_valid(endpoint), "must reject {endpoint:?}");
+        }
     }
 
     /// An "ambiguous run id" error also takes the reserved CONTROL code, and names

@@ -1908,6 +1908,65 @@ fn cancel_via_ctrl_c_reports_the_cancel_code_and_tears_down_the_tree() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A shell or supervisor can deliberately launch the runner with `SIGINT` ignored.
+/// The runner must preserve that inherited policy instead of installing its Ctrl-C
+/// handler and making the run interruptible behind the launcher's back.
+#[cfg(unix)]
+#[test]
+fn inherited_sigint_ignore_is_preserved_by_the_runner() {
+    use std::os::unix::process::CommandExt;
+
+    let dir = scratch("sigint-ignore");
+    let mut command = common::command_with_flags(
+        &dir,
+        &[],
+        &[],
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 300".to_string(),
+        ],
+    );
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // SAFETY: this pre-exec hook makes one async-signal-safe libc call in the child
+    // between fork and exec. It changes only the child runner's inherited SIGINT
+    // disposition, which is the behavior under test.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::signal(libc::SIGINT, libc::SIG_IGN) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
+        .spawn()
+        .expect("spawn the runner with SIGINT ignored");
+
+    wait_until(|| file_len(&events_path(&dir)) > 0, Duration::from_secs(10));
+    let rc = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
+    assert_eq!(rc, 0, "failed to deliver the inherited-ignored SIGINT");
+    sleep(Duration::from_millis(500));
+    assert!(
+        child.try_wait().expect("probe runner state").is_none(),
+        "the runner must remain live after an inherited-ignored SIGINT"
+    );
+
+    let rc = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(rc, 0, "failed to stop the runner after the assertion");
+    let out = child
+        .wait_with_output()
+        .expect("runner did not exit on SIGTERM");
+    assert_eq!(out.status.code(), Some(107));
+    let cancelled = read_run_events(&dir)
+        .into_iter()
+        .find(|event| event["event"] == "cancelled")
+        .expect("the cleanup SIGTERM is reported");
+    assert_eq!(cancelled["source"], "sigterm");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A `SIGTERM` mid-run — the *standard external stop* (`kill <pid>`, `systemctl
 /// stop`, a cancelled CI job, a supervisor's shutdown timeout) — must be a
 /// **first-class cancel**, not an abrupt death of the runner: the same reserved

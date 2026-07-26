@@ -158,6 +158,15 @@ to a dated version section.
   simply no longer required.
 
 ### Fixed
+- Control clients now validate an untrusted registry endpoint against the local
+  Unix-socket or Windows named-pipe shape before opening it, rejecting malformed
+  endpoints with the reserved control error instead of performing arbitrary I/O.
+- Human-readable output now replaces Unicode bidi, zero-width, and other formatting
+  characters with spaces alongside terminal controls, preventing invisible or
+  reordered text from surviving the shared terminal-safety boundary.
+- On Unix, the Ctrl-C listener now preserves an inherited ignored `SIGINT`
+  disposition, matching the existing SIGTERM/SIGHUP policy and direct-launch
+  behavior; Windows signal handling is unchanged.
 - `run_started.cwd` is now always absolute, including when `--cwd` is relative, so
   event consumers can identify the child's actual working directory without knowing
   the runner's ambient cwd. Foreground and detached runs use the same resolution path.
