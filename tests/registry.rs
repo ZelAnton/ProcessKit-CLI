@@ -682,18 +682,11 @@ fn control_all_client(registry: &Path, verb: &str) -> Output {
         .expect("spawn the --all control client")
 }
 
-/// `cancel --all` against a snapshot mixing one resolvable run with a pair of runs
-/// sharing a duplicate `run_id` — a deterministic way to exercise the *aggregate
-/// failure* path (`mutate_all_async`'s `if failed > 0`) in the default (non-`e2e`)
-/// tier, since the ambiguity itself never needs a live control-plane round trip to
-/// fail: the resolvable run is genuinely ended over the control plane exactly like
-/// the single-run form, the ambiguous pair is rejected by the identical
-/// `resolve_in_registry` "ambiguous run id" check, and the aggregate exit code plus
-/// the stderr tally must reflect the partial failure — none of which the `e2e`-only,
-/// full-success `control_plane_cancel_all_reaps_every_live_run` exercises (R-01, see
-/// `.work/tasks/T-217/review.md`).
+/// `cancel --all` keys its snapshot by registry record, not by the non-unique
+/// `run_id`, so two live runs sharing an id are independently reachable and both are
+/// torn down. The by-`run-id` form remains ambiguous and is tested separately.
 #[test]
-fn cancel_all_reports_a_partial_failure_for_an_ambiguous_snapshot_entry() {
+fn cancel_all_reaches_every_duplicate_run_id_entry() {
     let dir = scratch("control-all-partial-failure");
     let registry = registry_dir(&dir);
 
@@ -728,8 +721,8 @@ fn cancel_all_reports_a_partial_failure_for_an_ambiguous_snapshot_entry() {
     let out = control_all_client(&registry, "cancel");
     assert_eq!(
         out.status.code(),
-        Some(103),
-        "a partial failure surfaces the aggregate CONTROL code, never a silent 0; stderr: {}",
+        Some(0),
+        "record-addressed aggregate dispatch reaches every duplicate id; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -766,42 +759,29 @@ fn cancel_all_reports_a_partial_failure_for_an_ambiguous_snapshot_entry() {
     );
     for outcome in &dup_outcomes {
         assert_eq!(
-            outcome["accepted"], false,
-            "an ambiguous target is not accepted: {report}"
+            outcome["accepted"], true,
+            "each duplicate-id record is independently accepted: {report}"
         );
-        let error = outcome["error"]
-            .as_str()
-            .unwrap_or_else(|| panic!("a failed outcome carries an error string: {report}"));
         assert!(
-            error.contains("ambiguous"),
-            "the failure reason names the ambiguity: {error}"
+            outcome.get("error").is_none() || outcome["error"].is_null(),
+            "a successful duplicate target carries no error: {report}"
         );
+        assert_eq!(outcome["status"], "accepted");
     }
 
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("2 of 3"),
-        "stderr names the failure tally so an oncall reader does not need the JSON: {stderr}"
-    );
-
-    // The resolvable run really was cancelled over the control plane…
-    let status = solo.wait().expect("the resolvable runner exits");
-    assert_eq!(
-        status.code(),
-        Some(108),
-        "the resolvable target still receives the real control-plane cancel, not a no-op"
-    );
-    // …while the rejected ambiguous pair was never touched: both stay live.
-    assert_eq!(
-        record_count(&registry),
-        2,
-        "the rejected ambiguous pair must not be torn down by the partial failure"
-    );
-
-    let _ = dup_first.kill();
-    let _ = dup_first.wait();
-    let _ = dup_second.kill();
-    let _ = dup_second.wait();
+    for (name, child) in [
+        ("solo-run", &mut solo),
+        ("dup-target first", &mut dup_first),
+        ("dup-target second", &mut dup_second),
+    ] {
+        let status = child.wait().expect("the aggregate target exits");
+        assert_eq!(
+            status.code(),
+            Some(108),
+            "{name} receives the real control-plane cancel"
+        );
+    }
+    assert_eq!(record_count(&registry), 0, "all three records are removed");
     let _ = fs::remove_dir_all(&dir);
 }
 

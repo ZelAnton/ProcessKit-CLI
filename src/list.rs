@@ -268,12 +268,12 @@ fn render_table_lines(rows: &[ListEntry]) -> Vec<String> {
         .iter()
         .map(|row| {
             [
-                row.run_id.clone(),
+                crate::text::terminal_safe(&row.run_id),
                 row.health.to_string(),
                 row.started_at.clone(),
                 row.hint.as_deref().unwrap_or(ABSENT_CELL).to_string(),
                 abbreviated_argv_sha256(row.argv_sha256.as_deref()),
-                row.endpoint.as_deref().unwrap_or(ABSENT_CELL).to_string(),
+                crate::text::terminal_safe(row.endpoint.as_deref().unwrap_or(ABSENT_CELL)),
             ]
         })
         .collect();
@@ -528,6 +528,34 @@ mod tests {
         for line in &lines {
             assert_eq!(line.trim_end(), line, "no trailing whitespace: {line:?}");
         }
+    }
+
+    #[test]
+    fn human_table_sanitizes_registry_controls_without_changing_json_data() {
+        let row = ListEntry {
+            run_id: "forged\nROW\u{1b}[31m".to_string(),
+            health: "live",
+            started_at: "2026-07-22T00:00:00.000Z".to_string(),
+            hint: None,
+            argv_sha256: None,
+            endpoint: Some("pipe\tname\u{7}".to_string()),
+        };
+
+        let lines = render_table_lines(std::slice::from_ref(&row));
+        assert_eq!(lines.len(), 2, "a forged newline cannot add a table row");
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.chars().all(|character| !character.is_control())),
+            "human-readable cells contain no terminal controls: {lines:?}"
+        );
+        assert!(lines[1].contains("forged ROW [31m"));
+        assert!(lines[1].contains("pipe name "));
+
+        let json = serde_json::to_string(&row).expect("the raw JSON row serializes safely");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(value["run_id"], "forged\nROW\u{1b}[31m");
+        assert_eq!(value["endpoint"], "pipe\tname\u{7}");
     }
 
     /// The property T-215 exists for, at the surface an operator actually reads:

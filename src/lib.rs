@@ -64,6 +64,7 @@ pub mod prune;
 pub mod registry;
 #[doc(hidden)]
 pub mod run;
+mod text;
 #[doc(hidden)]
 pub mod wait;
 #[cfg(windows)]

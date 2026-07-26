@@ -1382,6 +1382,11 @@ pub fn parse_and_validate_record(text: &str) -> Option<Record> {
         .argv_sha256
         .filter(|value| is_valid_argv_sha256(value));
     record.hint = record.hint.filter(|value| is_valid_hint(value));
+    // `run_id` and `endpoint` remain byte-for-byte identity/address data here:
+    // changing either during parsing would make a later resolver target something
+    // other than the record actually says. Human-readable renderers pass them
+    // through `crate::text::terminal_safe` at the terminal boundary instead, while
+    // JSON output relies on serde's escaping and preserves the original values.
     Some(record)
 }
 

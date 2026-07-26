@@ -21,14 +21,15 @@ to a dated version section.
   entry confirmed live is taken once, the moment the invocation starts (the same
   snapshot discipline as `wait --all`, including its "unprobed at snapshot time never
   enters the target set" asymmetry and "a run that registers afterward is out of
-  scope" trade-off), and the exact same by-`run_id` mutation the single-run form uses
-  — including its own registry re-scan, resolve-to-dispatch re-confirmation, and wire
-  exchange — is applied to every snapshot entry in turn; `--all` invents no new way to
-  reach or end a run. Instead of one ack, `--all` prints a single JSON array on
-  stdout, one `{"run_id":...,"accepted":...}` entry per snapshot target (plus `error`
-  on any entry that was not accepted, carrying the same message text the single-run
-  form would have printed to stderr for that failure), so a caller can see every
-  target's individual outcome. An empty snapshot is not an error — an empty report
+  scope" trade-off), and every snapshot entry is addressed by its unique registry
+  record path plus remembered endpoint rather than its non-unique `run_id`, so live
+  duplicate ids are all torn down instead of becoming unreachable ambiguities. The
+  client reconfirms that exact record's liveness and endpoint before dispatch. Instead
+  of one ack, `--all` prints a single JSON array on stdout with `run_id`, `accepted`,
+  and `status` (`accepted`, `already_gone`, or `failed`) per target, plus `error` only
+  for failures. A target confirmed gone before its turn is `already_gone`: it did not
+  acknowledge this invocation, but the teardown goal is already met, so it does not
+  fail the aggregate. An empty snapshot is not an error — an empty report
   and exit `0`, mirroring `prune` — but a partial or full failure is never a silent
   `0`: it reuses the reserved `CONTROL` (103) code with a stderr summary, so `cancel
   --all` ahead of `wait --all`/`prune` in a teardown sequence cannot silently swallow
@@ -154,6 +155,13 @@ to a dated version section.
   simply no longer required.
 
 ### Fixed
+- Human-readable `list` and `prune --dry-run` output now collapses control characters
+  from untrusted registry `run_id`/`endpoint` values and orphaned lock-file names,
+  preventing forged rows and terminal escape injection while preserving raw values
+  in safely escaped JSON output.
+- Capture metadata now includes bytes accepted by a partial file write before a
+  later write error, so `output_captured.sha256` and the internal written-byte count
+  continue to describe exactly the bytes present on disk.
 - **`prune` now reaps the leaked control-socket directory of a run that died
   abruptly, not only its registry record and lock.** On unix a runner's control
   transport is a socket inside a per-run `0700` `pkc-<token>` directory under `/tmp`

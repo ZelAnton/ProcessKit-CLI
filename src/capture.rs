@@ -166,15 +166,19 @@ impl StreamCapture {
             // matrix today this is a no-op (the subtraction always fits).
             let room = usize::try_from(self.max_bytes - self.written).unwrap_or(usize::MAX);
             let take = room.min(bytes.len());
-            match self.file.write_all(&bytes[..take]) {
-                Ok(()) => {
-                    self.hasher.update(&bytes[..take]);
-                    self.written += take as u64;
-                }
+            if write_and_account(
+                &mut self.file,
+                &bytes[..take],
+                &mut self.hasher,
+                &mut self.written,
+            )
+            .is_err()
+            {
                 // A file write failure disables further capture for this stream but
                 // never disturbs the live echo or the run — the recorded digest and
-                // byte count then reflect what reached disk.
-                Err(_) => self.write_error = true,
+                // byte count then reflect what reached disk, including any prefix
+                // accepted before the failure.
+                self.write_error = true;
             }
         }
         if self.seen > self.max_bytes {
@@ -194,6 +198,37 @@ impl StreamCapture {
             self.write_error,
         )
     }
+}
+
+/// Write all of `bytes`, accounting for every successful partial write before a
+/// later error. `std::io::Write::write_all` does not report how much it wrote when it
+/// returns `Err`, so using it here would make the digest and `written` lag behind the
+/// actual capture file after a mid-buffer failure.
+fn write_and_account(
+    writer: &mut impl std::io::Write,
+    mut bytes: &[u8],
+    hasher: &mut Sha256,
+    written: &mut u64,
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        match writer.write(bytes) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write the complete capture buffer",
+                ));
+            }
+            Ok(count) => {
+                let accepted = &bytes[..count];
+                hasher.update(accepted);
+                *written += count as u64;
+                bytes = &bytes[count..];
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 type Shared = Arc<Mutex<StreamCapture>>;
@@ -646,6 +681,50 @@ mod tests {
         // written, and `bytes` (5) exceeds the file's size (0) as the flag warns.
         assert_eq!(info.sha256(), crate::hash::sha256_hex(b""));
         assert_eq!(std::fs::read(&path).unwrap(), b"");
+    }
+
+    #[test]
+    fn a_partial_write_before_an_error_is_included_in_the_digest_and_count() {
+        struct PartialThenError {
+            accepted: Vec<u8>,
+            first_write: usize,
+        }
+
+        impl std::io::Write for PartialThenError {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.accepted.is_empty() {
+                    let count = self.first_write.min(bytes.len());
+                    self.accepted.extend_from_slice(&bytes[..count]);
+                    Ok(count)
+                } else {
+                    Err(std::io::Error::other(
+                        "injected failure after a partial write",
+                    ))
+                }
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut writer = PartialThenError {
+            accepted: Vec::new(),
+            first_write: 3,
+        };
+        let mut hasher = Sha256::new();
+        let mut written = 0;
+
+        let result = write_and_account(&mut writer, b"abcdef", &mut hasher, &mut written);
+
+        assert!(result.is_err(), "the injected second write fails");
+        assert_eq!(writer.accepted, b"abc", "three bytes reached the writer");
+        assert_eq!(written, 3, "the count includes those accepted bytes");
+        assert_eq!(
+            hasher.finalize_hex(),
+            crate::hash::sha256_hex(b"abc"),
+            "the digest covers exactly the accepted prefix"
+        );
     }
 
     /// A fresh `touch` re-arms (nearly) the whole idle window: right after it, the

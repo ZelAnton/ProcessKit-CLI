@@ -269,15 +269,23 @@ fn print_dry_run_json(preview: PrunePreview) -> Result<(), RunnerError> {
 /// such leftover — no endpoint, an endpoint the reap would refuse, or a Windows
 /// named pipe — simply omits the field rather than printing an empty value.
 fn print_dry_run_summary(preview: &PrunePreview) {
+    for line in dry_run_summary_lines(preview) {
+        println!("{line}");
+    }
+}
+
+/// Build the human-readable dry-run lines without touching stdout, so the boundary
+/// that sanitizes registry/file-system strings is directly testable.
+fn dry_run_summary_lines(preview: &PrunePreview) -> Vec<String> {
     let outcome = preview.outcome;
     if outcome.pruned == 0
         && outcome.live == 0
         && outcome.unprobed == 0
         && outcome.orphaned_locks == 0
     {
-        println!("no stale entries to prune (dry run)");
-        return;
+        return vec!["no stale entries to prune (dry run)".to_string()];
     }
+    let mut lines = Vec::with_capacity(preview.candidates.len() + 1);
     for candidate in &preview.candidates {
         match candidate {
             PruneCandidate::Entry {
@@ -289,17 +297,24 @@ fn print_dry_run_summary(preview: &PrunePreview) {
                     .as_ref()
                     .map(|dir| format!(" socket_dir={dir}"))
                     .unwrap_or_default();
-                println!("would prune entry run_id={run_id} started_at={started_at}{socket}");
+                lines.push(format!(
+                    "would prune entry run_id={} started_at={started_at}{socket}",
+                    crate::text::terminal_safe(run_id)
+                ));
             }
             PruneCandidate::OrphanedLock { lock_file_name } => {
-                println!("would prune orphaned lock {lock_file_name}");
+                lines.push(format!(
+                    "would prune orphaned lock {}",
+                    crate::text::terminal_safe(lock_file_name)
+                ));
             }
         }
     }
-    println!(
+    lines.push(format!(
         "would prune {} stale ({} orphaned locks), keep {} live, leave {} unprobeable",
         outcome.pruned, outcome.orphaned_locks, outcome.live, outcome.unprobed
-    );
+    ));
+    lines
 }
 
 #[cfg(test)]
@@ -401,6 +416,38 @@ mod tests {
             candidate["socket_dir"].is_null(),
             "an entry with no reapable socket reports socket_dir null: {value}"
         );
+    }
+
+    #[test]
+    fn dry_run_human_output_sanitizes_record_and_file_name_controls() {
+        let preview = PrunePreview {
+            outcome: PruneOutcome {
+                pruned: 1,
+                orphaned_locks: 1,
+                ..PruneOutcome::default()
+            },
+            candidates: vec![
+                PruneCandidate::Entry {
+                    run_id: "forged\nentry\u{1b}[31m".to_string(),
+                    started_at: "2026-07-22T00:00:00.000Z".to_string(),
+                    socket_dir: None,
+                },
+                PruneCandidate::OrphanedLock {
+                    lock_file_name: "orphan\nlock\u{7}.lock".to_string(),
+                },
+            ],
+        };
+
+        let lines = dry_run_summary_lines(&preview);
+        assert_eq!(lines.len(), 3, "controls cannot forge extra output rows");
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.chars().all(|character| !character.is_control())),
+            "human-readable prune lines contain no terminal controls: {lines:?}"
+        );
+        assert!(lines[0].contains("run_id=forged entry [31m"));
+        assert!(lines[1].contains("orphan lock .lock"));
     }
 
     /// A dry run over an empty registry reports an empty `candidates` array — not a

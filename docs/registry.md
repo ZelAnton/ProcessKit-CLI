@@ -266,7 +266,9 @@ it carries none of the "could not reach the target run" failure modes
 `inspect`/`cancel`/`kill` do — it has no single target to fail to reach.
 
 - **No `--json`** prints a human-readable table (or `no runs registered` for an
-  empty registry).
+  empty registry). Because record files are untrusted input, control characters in
+  `run_id` or `endpoint` are collapsed to spaces at this terminal boundary; they
+  cannot forge another row or inject an ANSI sequence.
 - **`--json`** prints one JSON object per entry, one per line, sorted by `run_id`,
   then `started_at`, then the entry's registry record path (a tertiary tie-break,
   never itself printed) for a fully deterministic order even when two entries share
@@ -534,6 +536,8 @@ gone (reaping it is best-effort, exactly like the record/lock deletions).
   orphaned lock by its file name — then the same summary-line shape `prune`'s
   human-readable output uses, prefixed `would` throughout since nothing is actually
   reaped (`no stale entries to prune (dry run)` when there is nothing to preview).
+  Control characters in the record's `run_id` or the directory entry's lock-file name
+  are collapsed to spaces before interpolation, so neither can forge output lines.
 - **`--json`** prints a single JSON object with the exact same aggregate fields
   `prune --json` reports (`pruned`/`live`/`unprobed`/`orphaned_locks`), plus an
   additional `candidates` array: one object per confirmed-stale candidate, internally

@@ -179,7 +179,7 @@ come only from the run's own process exit. (`cancel --all` / `kill --all`'s
 
 ## `cancel --all` / `kill --all` and a partial `103`
 
-**Symptom.** `cancel --all` or `kill --all` (T-217) exits `103`, but the JSON
+**Symptom.** `cancel --all` or `kill --all` exits `103`, but the JSON
 report it printed to stdout shows at least one target with `"accepted": true`
 — so, unlike the by-`run_id` form's `103` above, this run **was** acted on.
 
@@ -187,17 +187,22 @@ report it printed to stdout shows at least one target with `"accepted": true`
 it means "one or more targets in the confirmed-live snapshot could not be
 reached or did not acknowledge the command", not "nothing was found or
 reached". A snapshot with several live runs commonly has a mix — most targets
-ack cleanly while one is mid-exit, has become ambiguous, or does not respond in
+ack cleanly while one becomes unprobeable, changes identity, or does not respond in
 time — and the aggregate exit code reflects that *any* failure occurred so an
 automated caller never mistakes a partial teardown for a complete one. Read
 the JSON report on stdout (not just the stderr tally) to see exactly which
-`run_id`s failed and why; stderr on its own only gives the failure count. See
+records failed and why; stderr on its own only gives the failure count. A duplicate
+`run_id` is not itself an aggregate failure because `--all` addresses each record
+path and endpoint independently. Likewise `status: "already_gone"` is non-error: the
+target ended after the snapshot, so `accepted` is false but teardown is already
+complete for it. See
 [`docs/control-plane.md`](control-plane.md), "`cancel --all` / `kill --all`",
 and the `CONTROL` (103) row of the reserved-band table in
 [`docs/exit-codes.md`](exit-codes.md).
 
 **Fix.** Re-running `cancel --all` / `kill --all` is safe: a target already
-ended is simply absent from the next snapshot, and a target that failed for a
+ended is absent from the next snapshot (or `already_gone` if it ended during this
+one), and a target that failed for a
 transient reason (e.g. it was mid-exit) is retried. If a specific `run_id`
 keeps failing, use `list --json` or `inspect --run-id <id>` to see why (a
 stale entry, an unprobed one, or a genuine ambiguity — the same reasons the

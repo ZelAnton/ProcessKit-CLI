@@ -221,19 +221,21 @@ See [`docs/schema.md`](schema.md) for these events.
 
 ### `cancel --all` / `kill --all`
 
-`--all` (T-217) is the aggregate counterpart to `--run-id`: instead of one named run,
-it acts on **every run confirmed live in a snapshot taken the moment the invocation
+`--all` is the aggregate counterpart to `--run-id`: instead of one named run,
+it acts on **every registry record confirmed live in a snapshot taken the moment the invocation
 starts** — the mutating counterpart to `wait --all` (T-216; see
 [`docs/registry.md`](registry.md), "Waiting — `wait`", "The aggregate barrier —
 `wait --all`"), reusing its exact snapshot discipline. The target set is fixed once, before
 the first mutation is dispatched: a run that registers *after* the snapshot is out of
 scope for this invocation, and a run that is only `unprobed` (not confirmed live) *at
 that instant* is excluded from the snapshot outright, the same asymmetry `wait --all`
-documents. Each snapshot entry is then acted on through the **exact same** by-`run_id`
-mutation `--run-id` uses — including its own registry re-scan, its own
-resolve-to-dispatch re-confirmation (see "Ambiguous run id" above), and its own
-[wire exchange](#wire-protocol) — so `--all` never invents a second way to reach or end
-a run; it only fans the existing one out over a snapshot.
+documents. Each target is keyed by its unique registry-record path and the endpoint
+that exact record advertised at snapshot time, never by its potentially duplicated
+`run_id`. `--all` can therefore reach two live records sharing an id independently,
+while the by-`run-id` form remains the hard ambiguity described above. Immediately
+before dispatch the client re-scans the registry and requires the same record path to
+remain live with the same id and endpoint; only then does it use the ordinary
+[wire exchange](#wire-protocol).
 
 An **empty snapshot** (no confirmed-live entry at all — an empty or fully-stale
 registry) is not an error, mirroring `prune`: it prints an empty report (`[]`) and
@@ -248,22 +250,25 @@ reachability in question yet at that point.
 
 | Field      | Type              | Notes                                                                 |
 |------------|-------------------|------------------------------------------------------------------------|
-| `run_id`   | string            | The target's run id.                                                   |
-| `accepted` | boolean           | Whether this target's mutation was accepted.                           |
-| `error`    | string, omitted on success | Present only when `accepted` is `false` — the same message text the single-run form would have printed to stderr for the identical failure (an unreachable/stale/unprobed/ambiguous target, or a rejected ack). |
+| `run_id`   | string            | The target record's descriptive run id; not its aggregate identity key. |
+| `accepted` | boolean           | Whether the runner acknowledged this invocation's mutation.             |
+| `status`   | string            | `accepted`, `already_gone`, or `failed`.                                |
+| `error`    | string, omitted unless failed | Present only for `failed`; names why the still-potentially-live target could not be safely reached or did not acknowledge. |
 
 ```json
-[{"run_id":"build-42","accepted":true},{"run_id":"build-43","accepted":false,"error":"cannot kill run `build-43`: its registry entry is stale"}]
+[{"run_id":"build-42","accepted":true,"status":"accepted"},{"run_id":"build-43","accepted":false,"status":"already_gone"}]
 ```
 
-A target that goes stale, becomes unreachable, or turns ambiguous between the
-snapshot and its own dispatch fails **only that entry** — it is reported in the array
-with `accepted: false` and does not stop the fan-out from acting on every other
-target. `--all` never skips a snapshot entry silently: every one of them gets exactly
-one array entry.
+A target that disappears or becomes confirmed stale between the snapshot and its
+dispatch is reported as `already_gone`: no runner acknowledged the verb, so
+`accepted` remains false, but the aggregate's terminal-state goal is already met and
+the outcome is non-error. An entry that becomes unprobeable, changes identity, cannot
+be reached while still confirmed live, or rejects/mismatches its ack is `failed` and
+does not stop fan-out to the remaining targets. `--all` never skips a snapshot entry
+silently: every one gets exactly one array entry.
 
-**The aggregate exit code.** Full success — every snapshot target accepted — is `0`,
-exactly like the single-run form. A **partial or full failure** is never a silent
+**The aggregate exit code.** Full success — every snapshot target is either
+`accepted` or `already_gone` — is `0`. A **partial or full failure** is never a silent
 `0`: it reuses the reserved **`CONTROL` (103)** code (the same one the single-run form
 uses for "could not reach the target run" — there being one or more unreachable
 targets is the same class of fact for the aggregate), with a summary message on

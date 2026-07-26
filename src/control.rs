@@ -68,7 +68,7 @@
 //! once. [`resolve_live_endpoint`] (via [`resolve_in_registry`]) detects that (more
 //! than one *live* entry matches the requested `run_id`, counted regardless of
 //! whether each one has published an endpoint yet) and refuses to pick one: every
-//! verb — `inspect`, `cancel`, and `kill` alike — reports the same reserved
+//! by-`run-id` verb — `inspect`, `cancel`, and `kill` alike — reports the same reserved
 //! [`exit::CONTROL`] (103) "ambiguous run id" failure rather than acting on whichever
 //! entry the directory scan happens to return first. For the mutating verbs this is
 //! load-bearing (a wrong guess cancels or kills the *other* run); the read-only
@@ -93,7 +93,10 @@
 //! `racing_duplicate_after_reconfirm_does_not_misdirect_the_dispatched_verb` in this
 //! module's tests. `inspect` does not repeat this re-check: it is read-only, so a
 //! race that surfaces a snapshot from just before a duplicate registered is stale
-//! information, not a wrong-target action.
+//! information, not a wrong-target action. The aggregate `cancel --all` / `kill
+//! --all` forms are deliberately different: their snapshot is keyed by the unique
+//! registry-record path and dispatches directly to each record's endpoint, so two
+//! duplicate ids are two independent targets rather than an ambiguity.
 //!
 //! ## Wire protocol
 //!
@@ -128,6 +131,7 @@
 
 use std::convert::Infallible;
 use std::io;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -800,12 +804,8 @@ async fn mutate_async(run_id: &str, command: ControlCommand) -> Result<(), Runne
 
 /// The by-`run_id` mutation itself: registry lookup, connect, re-confirm the target
 /// is still the sole live match, send the verb, read and verify the ack — the exact
-/// exchange both [`mutate_async`] (the single-run `cancel`/`kill` client) and
-/// [`mutate_all_async`] (the `--all` aggregate, T-217) drive per target, so the two
-/// forms can never drift apart on the wire exchange or the ambiguity/reachability
-/// rules, only on how each one reports the outcome. Returns the parsed
-/// [`ControlAck`] rather than printing it — printing is each caller's own job (a
-/// single JSON line for the single-run form, one aggregate entry for `--all`).
+/// exchange the single-run `cancel`/`kill` client drives. Returns the parsed
+/// [`ControlAck`] rather than printing it so lookup and rendering stay separate.
 async fn mutate_one(run_id: &str, command: ControlCommand) -> Result<ControlAck, RunnerError> {
     let action = command.verb();
     let registry = open_registry(action, run_id)?;
@@ -859,25 +859,61 @@ pub fn kill_all() -> Result<(), RunnerError> {
     mutate_all(ControlCommand::Kill)
 }
 
-/// One target's outcome in the aggregate report `cancel --all` / `kill --all` print
-/// — the `--all` counterpart to the single-run form's bare [`ControlAck`] line: since
-/// `--all` acts on a whole snapshot rather than one run, its report is a JSON array
-/// of these, one per snapshot entry, rather than a single ack object.
+/// One target's outcome in the aggregate report `cancel --all` / `kill --all` print.
 #[derive(Debug, Serialize)]
 pub struct ControlAllOutcome {
-    /// The run this record names — the same `run_id` [`mutate_one`] resolved (or, on
-    /// a failure that never got that far, the `run_id` the snapshot itself recorded).
+    /// The run id the snapshot entry recorded. It is descriptive, not the target key:
+    /// aggregate dispatch is keyed by the unique registry-record path.
     pub run_id: String,
-    /// Whether this target's mutation was accepted.
+    /// Whether the live runner acknowledged the requested mutation.
     pub accepted: bool,
-    /// Why it was not accepted — the same message text the single-run form would
-    /// have printed to stderr for the identical failure. `None` on success.
+    /// The aggregate result. `already_gone` is successful without claiming an ack.
+    pub status: ControlAllStatus,
+    /// Why a failed target was not accepted. `None` for both successful statuses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
+/// The three honest outcomes of dispatching one aggregate snapshot target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlAllStatus {
+    /// The runner acknowledged the verb.
+    Accepted,
+    /// The snapshot target finished before dispatch; the desired terminal state is
+    /// already reached, but no runner accepted this invocation's verb.
+    AlreadyGone,
+    /// The target is still potentially live, but could not be safely reached or did
+    /// not acknowledge the verb.
+    Failed,
+}
+
+/// A confirmed-live registry entry captured before aggregate dispatch starts.
+///
+/// `run_id` is not unique. The record path is the stable key that lets `--all`
+/// address duplicate ids independently, while the endpoint is the transport address
+/// the same record advertised at snapshot time.
+#[derive(Debug)]
+struct MutationTarget {
+    run_id: String,
+    record_path: PathBuf,
+    endpoint: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SnapshotTargetState {
+    Live,
+    AlreadyGone,
+}
+
+#[derive(Debug)]
+enum SnapshotMutation {
+    Accepted(ControlAck),
+    AlreadyGone,
+}
+
 /// Shared driver for [`cancel_all`] / [`kill_all`]: snapshot the registry's
-/// confirmed-live entries once, apply `command` to each through [`mutate_one`],
+/// confirmed-live entries once, apply `command` directly to each record's endpoint,
 /// print the aggregate report, and turn any per-target failure into the reserved
 /// [`exit::CONTROL`] aggregate outcome — never a silent `0` when part of the fan-out
 /// failed (see `docs/control-plane.md`, "`cancel --all` / `kill --all`").
@@ -887,42 +923,47 @@ pub struct ControlAllOutcome {
 /// that registers mid-fan-out is out of scope for this invocation, and every target
 /// this call acts on was confirmed live at one consistent instant. Snapshotting by
 /// [`registry::Health::Live`] alone, before looking at any other field, mirrors
-/// [`resolve_in_registry`]'s own "count identity/health before ever looking at
-/// endpoints" discipline (K-016): a live entry with no endpoint yet is still in
-/// scope, and its per-target mutation fails on its own, reported in the outcome
-/// list, rather than being silently excluded from the snapshot up front.
+/// [`resolve_in_registry`]'s own health bar: a live entry with no endpoint yet is
+/// still in scope, and its per-target mutation fails on its own rather than being
+/// silently excluded from the snapshot up front. Unlike the by-id form, the target
+/// key is the record path, so duplicate `run_id`s remain independently addressable.
 fn mutate_all(command: ControlCommand) -> Result<(), RunnerError> {
     let runtime = current_thread_runtime()?;
     runtime.block_on(mutate_all_async(command))
 }
 
-/// The async body of [`mutate_all`]: snapshot, fan out [`mutate_one`] per target
-/// (sequentially — the registry's decentralized, no-cross-process-locking design
-/// gives no stronger guarantee for concurrent dispatch than for sequential, and
-/// sequential keeps the per-run re-resolve/reconfirm dispatch of each target
-/// trivially free of interference from its siblings), print the report, then map the
-/// tally onto the aggregate exit code.
+/// The async body of [`mutate_all`]: snapshot, dispatch each record-specific target
+/// sequentially, print the report, then map genuine failures onto the aggregate exit
+/// code. A target that finishes before its turn is successful as `already_gone`.
 async fn mutate_all_async(command: ControlCommand) -> Result<(), RunnerError> {
     let action = command.verb();
     let registry = open_registry_for_all(action)?;
-    let run_ids = snapshot_live_run_ids(&registry).map_err(|err| {
+    let targets = snapshot_live_targets(&registry).map_err(|err| {
         RunnerError::new(
             exit::SETUP,
             format!("could not read the run registry: {err}"),
         )
     })?;
 
-    let mut outcomes = Vec::with_capacity(run_ids.len());
-    for run_id in run_ids {
-        match mutate_one(&run_id, command).await {
-            Ok(ack) => outcomes.push(ControlAllOutcome {
+    let mut outcomes = Vec::with_capacity(targets.len());
+    for target in targets {
+        match mutate_snapshot_target(&registry, &target, command).await {
+            Ok(SnapshotMutation::Accepted(ack)) => outcomes.push(ControlAllOutcome {
                 run_id: ack.run_id,
                 accepted: ack.accepted,
+                status: ControlAllStatus::Accepted,
+                error: None,
+            }),
+            Ok(SnapshotMutation::AlreadyGone) => outcomes.push(ControlAllOutcome {
+                run_id: target.run_id,
+                accepted: false,
+                status: ControlAllStatus::AlreadyGone,
                 error: None,
             }),
             Err(err) => outcomes.push(ControlAllOutcome {
-                run_id,
+                run_id: target.run_id,
                 accepted: false,
+                status: ControlAllStatus::Failed,
                 error: Some(err.to_string()),
             }),
         }
@@ -936,7 +977,10 @@ async fn mutate_all_async(command: ControlCommand) -> Result<(), RunnerError> {
     })?;
     println!("{line}");
 
-    let failed = outcomes.iter().filter(|outcome| !outcome.accepted).count();
+    let failed = outcomes
+        .iter()
+        .filter(|outcome| outcome.status == ControlAllStatus::Failed)
+        .count();
     if failed > 0 {
         return Err(RunnerError::new(
             exit::CONTROL,
@@ -965,22 +1009,139 @@ fn open_registry_for_all(action: &str) -> Result<registry::Registry, RunnerError
     })
 }
 
-/// One registry scan, filtered to the entries [`Health::Live`] confirms live right
-/// now, and mapped to their `run_id` — the snapshot [`mutate_all_async`] fixes its
-/// target set to before dispatching a single mutation. An entry [`Health::Stale`] or
-/// [`Health::Unprobed`] at snapshot time is excluded outright: `--all` acts only on
-/// confirmed-live entries, the same bar the single-run form's [`resolve_in_registry`]
-/// applies, never widened or narrowed for the aggregate case. Mirrors
-/// [`crate::wait::snapshot_live_targets`], differing only in what it keys entries by
-/// (`run_id`, since the caller reports per `run_id` here, versus the record path
-/// `wait --all` needs to tell two same-`run_id` duplicates apart across polls).
-fn snapshot_live_run_ids(registry: &registry::Registry) -> io::Result<Vec<String>> {
+/// Snapshot every entry confirmed live, preserving the unique record path and the
+/// endpoint that exact record advertised. `run_id` is deliberately only report data:
+/// two live records may share it, and `--all` must still reach both.
+fn snapshot_live_targets(registry: &registry::Registry) -> io::Result<Vec<MutationTarget>> {
     Ok(registry
         .entries()?
         .into_iter()
         .filter(|entry| entry.health == Health::Live)
-        .map(|entry| entry.record.run_id)
+        .map(|entry| MutationTarget {
+            run_id: entry.record.run_id,
+            record_path: entry.path,
+            endpoint: entry.record.endpoint,
+        })
         .collect())
+}
+
+/// Dispatch one aggregate target without resolving its non-unique `run_id` again.
+///
+/// A failed connect or conversation is reclassified only when the record-specific
+/// liveness check confirms the target is now absent or stale. That is the desired
+/// terminal state for mass teardown, so it is reported as `already_gone`; an
+/// unprobeable or identity-changed record remains a hard failure.
+async fn mutate_snapshot_target(
+    registry: &registry::Registry,
+    target: &MutationTarget,
+    command: ControlCommand,
+) -> Result<SnapshotMutation, RunnerError> {
+    let action = command.verb();
+    if snapshot_target_state(registry, target, action)? == SnapshotTargetState::AlreadyGone {
+        return Ok(SnapshotMutation::AlreadyGone);
+    }
+    let Some(endpoint) = target.endpoint.as_deref() else {
+        return Err(unreachable_run(
+            action,
+            &target.run_id,
+            "the run is live but exposes no control endpoint".to_string(),
+        ));
+    };
+
+    let stream = match connect_live(endpoint, action, &target.run_id).await {
+        Ok(stream) => stream,
+        Err(err) => {
+            return match snapshot_target_state(registry, target, action)? {
+                SnapshotTargetState::AlreadyGone => Ok(SnapshotMutation::AlreadyGone),
+                SnapshotTargetState::Live => Err(err),
+            };
+        }
+    };
+
+    if snapshot_target_state(registry, target, action)? == SnapshotTargetState::AlreadyGone {
+        return Ok(SnapshotMutation::AlreadyGone);
+    }
+
+    let ack: ControlAck =
+        match converse_under_deadline(stream, command.verb(), action, &target.run_id).await {
+            Ok(ack) => ack,
+            Err(err) => {
+                return match snapshot_target_state(registry, target, action)? {
+                    SnapshotTargetState::AlreadyGone => Ok(SnapshotMutation::AlreadyGone),
+                    SnapshotTargetState::Live => Err(err),
+                };
+            }
+        };
+
+    if !ack.accepted || ack.action != action || ack.run_id != target.run_id {
+        return Err(unreachable_run(
+            action,
+            &target.run_id,
+            "the runner did not acknowledge the command for the snapshotted target".to_string(),
+        ));
+    }
+    Ok(SnapshotMutation::Accepted(ack))
+}
+
+/// Reconfirm the exact registry record captured by [`snapshot_live_targets`].
+/// Missing and confirmed-stale records are successful terminal states for `--all`;
+/// unprobeable records and identity changes are not evidence that the target ended.
+fn snapshot_target_state(
+    registry: &registry::Registry,
+    target: &MutationTarget,
+    action: &str,
+) -> Result<SnapshotTargetState, RunnerError> {
+    let entries = registry.entries().map_err(|err| {
+        unreachable_run(
+            action,
+            &target.run_id,
+            format!("could not re-read the run registry: {err}"),
+        )
+    })?;
+    let Some(entry) = entries
+        .into_iter()
+        .find(|entry| entry.path == target.record_path)
+    else {
+        return match std::fs::metadata(&target.record_path) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                Ok(SnapshotTargetState::AlreadyGone)
+            }
+            Ok(_) => Err(unreachable_run(
+                action,
+                &target.run_id,
+                "the snapshotted registry record still exists but no longer passes validation, so the target is not confirmed gone"
+                    .to_string(),
+            )),
+            Err(err) => Err(unreachable_run(
+                action,
+                &target.run_id,
+                format!(
+                    "the snapshotted registry record could not be checked after it disappeared from the registry scan: {err}"
+                ),
+            )),
+        };
+    };
+
+    match entry.health {
+        Health::Stale => Ok(SnapshotTargetState::AlreadyGone),
+        Health::Unprobed => Err(unreachable_run(
+            action,
+            &target.run_id,
+            "the snapshotted entry's liveness could not be re-probed, so it is not confirmed gone"
+                .to_string(),
+        )),
+        Health::Live => {
+            if entry.record.run_id != target.run_id || entry.record.endpoint != target.endpoint {
+                return Err(unreachable_run(
+                    action,
+                    &target.run_id,
+                    "the snapshotted registry record changed identity before dispatch; refusing to act on its replacement"
+                        .to_string(),
+                ));
+            }
+            Ok(SnapshotTargetState::Live)
+        }
+    }
 }
 
 /// Find the endpoint of the *live* run named `run_id`, or a distinguishable
@@ -1175,10 +1336,7 @@ const MAX_PEER_ERROR_CHARS: usize = 500;
 /// characters (including `\n`/`\r`/`\t`) to spaces, trims the result, and truncates
 /// to [`MAX_PEER_ERROR_CHARS`].
 fn normalize_peer_error_text(text: &str) -> String {
-    let single_line: String = text
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
+    let single_line = crate::text::terminal_safe(text);
     let trimmed = single_line.trim();
     if trimmed.chars().count() > MAX_PEER_ERROR_CHARS {
         let truncated: String = trimmed.chars().take(MAX_PEER_ERROR_CHARS).collect();
@@ -2561,7 +2719,7 @@ mod tests {
         );
     }
 
-    /// (T-217) [`snapshot_live_run_ids`]'s decision logic, proved directly rather
+    /// [`snapshot_live_targets`]'s decision logic, proved directly rather
     /// than only through `cancel --all`/`kill --all`'s end-to-end behavior — the same
     /// three-way fixture [`crate::wait::tests::snapshot_live_targets_includes_only_confirmed_live_entries`]
     /// drives for the aggregate `wait --all` barrier: a confirmed-`Health::Live`
@@ -2570,7 +2728,7 @@ mod tests {
     /// confirmed-live entries, never a wider or narrower bar than the single-run
     /// form's own [`resolve_in_registry`] applies.
     #[test]
-    fn snapshot_live_run_ids_includes_only_confirmed_live_entries() {
+    fn snapshot_live_targets_include_only_confirmed_live_entries() {
         let dir = scratch_registry_dir("snapshot-live");
         let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
 
@@ -2580,12 +2738,15 @@ mod tests {
         write_stale_entry(&dir, "stale-stem", "stale-run");
         write_unprobeable_entry(&dir, "unprobed-stem", "unprobed-run");
 
-        let run_ids = snapshot_live_run_ids(&registry).expect("scan the fixture registry");
+        let targets = snapshot_live_targets(&registry).expect("scan the fixture registry");
 
         assert_eq!(
-            run_ids,
-            vec!["live-run".to_string()],
-            "only the confirmed-live entry's run_id is in the snapshot: {run_ids:?}"
+            targets
+                .iter()
+                .map(|target| target.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["live-run"],
+            "only the confirmed-live entry is in the snapshot: {targets:?}"
         );
 
         drop(live);
@@ -2600,7 +2761,7 @@ mod tests {
     /// in the outcome list, rather than the entry being silently excluded from the
     /// snapshot up front.
     #[test]
-    fn snapshot_live_run_ids_includes_a_live_entry_with_no_endpoint() {
+    fn snapshot_live_targets_include_a_live_entry_with_no_endpoint() {
         let dir = scratch_registry_dir("snapshot-live-no-endpoint");
         let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
 
@@ -2608,8 +2769,10 @@ mod tests {
             .register_plain("endpointless-run", None, SystemTime::now())
             .expect("register a live run that never published an endpoint");
 
-        let run_ids = snapshot_live_run_ids(&registry).expect("scan the fixture registry");
-        assert_eq!(run_ids, vec!["endpointless-run".to_string()]);
+        let targets = snapshot_live_targets(&registry).expect("scan the fixture registry");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].run_id, "endpointless-run");
+        assert_eq!(targets[0].endpoint, None);
 
         drop(live);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2623,12 +2786,14 @@ mod tests {
         let ok = ControlAllOutcome {
             run_id: "run-a".to_string(),
             accepted: true,
+            status: ControlAllStatus::Accepted,
             error: None,
         };
         let ok_json = serde_json::to_string(&ok).expect("a successful outcome serializes");
         let ok_value: serde_json::Value = serde_json::from_str(&ok_json).expect("valid JSON");
         assert_eq!(ok_value["run_id"], "run-a");
         assert_eq!(ok_value["accepted"], true);
+        assert_eq!(ok_value["status"], "accepted");
         assert!(
             ok_value.get("error").is_none(),
             "a successful outcome omits `error` entirely: {ok_json}"
@@ -2637,6 +2802,7 @@ mod tests {
         let failed = ControlAllOutcome {
             run_id: "run-b".to_string(),
             accepted: false,
+            status: ControlAllStatus::Failed,
             error: Some("cannot kill run `run-b`: its registry entry is stale".to_string()),
         };
         let failed_json = serde_json::to_string(&failed).expect("a failed outcome serializes");
@@ -2644,10 +2810,24 @@ mod tests {
             serde_json::from_str(&failed_json).expect("valid JSON");
         assert_eq!(failed_value["run_id"], "run-b");
         assert_eq!(failed_value["accepted"], false);
+        assert_eq!(failed_value["status"], "failed");
         assert_eq!(
             failed_value["error"],
             "cannot kill run `run-b`: its registry entry is stale"
         );
+
+        let already_gone = ControlAllOutcome {
+            run_id: "run-c".to_string(),
+            accepted: false,
+            status: ControlAllStatus::AlreadyGone,
+            error: None,
+        };
+        let gone_json =
+            serde_json::to_string(&already_gone).expect("an already-gone outcome serializes");
+        let gone_value: serde_json::Value = serde_json::from_str(&gone_json).expect("valid JSON");
+        assert_eq!(gone_value["accepted"], false);
+        assert_eq!(gone_value["status"], "already_gone");
+        assert!(gone_value.get("error").is_none());
     }
 
     /// (T-217) A whole array of [`ControlAllOutcome`]s — the exact shape
@@ -2659,11 +2839,13 @@ mod tests {
             ControlAllOutcome {
                 run_id: "run-a".to_string(),
                 accepted: true,
+                status: ControlAllStatus::Accepted,
                 error: None,
             },
             ControlAllOutcome {
                 run_id: "run-b".to_string(),
                 accepted: false,
+                status: ControlAllStatus::Failed,
                 error: Some(
                     "cannot cancel run `run-b`: no run with that id is registered".to_string(),
                 ),
@@ -2678,5 +2860,92 @@ mod tests {
         assert_eq!(array[1]["run_id"], "run-b");
         assert_eq!(array[1]["accepted"], false);
         assert!(array[1]["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn aggregate_target_that_finishes_before_dispatch_is_already_gone() {
+        let dir = scratch_registry_dir("aggregate-target-gone");
+        let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
+        let registration = registry
+            .register_plain("short-run", Some("endpoint-now-gone"), SystemTime::now())
+            .expect("register the live target");
+        let mut targets = snapshot_live_targets(&registry).expect("snapshot live targets");
+        let target = targets.pop().expect("the target is in the snapshot");
+
+        drop(registration);
+
+        let outcome = mutate_snapshot_target(&registry, &target, ControlCommand::Kill)
+            .await
+            .expect("an already-finished target is a successful aggregate outcome");
+        assert!(matches!(outcome, SnapshotMutation::AlreadyGone));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn endpointless_target_that_finishes_before_dispatch_is_already_gone() {
+        let dir = scratch_registry_dir("aggregate-endpointless-gone");
+        let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
+        let registration = registry
+            .register_plain("short-run", None, SystemTime::now())
+            .expect("register the live target without an endpoint");
+        let mut targets = snapshot_live_targets(&registry).expect("snapshot live targets");
+        let target = targets.pop().expect("the target is in the snapshot");
+
+        drop(registration);
+
+        let outcome = mutate_snapshot_target(&registry, &target, ControlCommand::Kill)
+            .await
+            .expect("an already-finished endpointless target is successful");
+        assert!(matches!(outcome, SnapshotMutation::AlreadyGone));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_replacement_record_is_not_mistaken_for_an_already_gone_target() {
+        let dir = scratch_registry_dir("aggregate-corrupt-replacement");
+        let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
+        let registration = registry
+            .register_plain("target", Some("endpoint-a"), SystemTime::now())
+            .expect("register the live target");
+        let mut targets = snapshot_live_targets(&registry).expect("snapshot live targets");
+        let target = targets.pop().expect("the target is in the snapshot");
+
+        std::fs::write(&target.record_path, b"not valid JSON")
+            .expect("replace the record with corrupt content");
+
+        let err = snapshot_target_state(&registry, &target, "kill")
+            .expect_err("a still-present corrupt record is not proof the target ended");
+        assert_eq!(err.code(), exit::CONTROL);
+        assert!(err.to_string().contains("no longer passes validation"));
+
+        drop(registration);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_snapshot_record_is_an_already_gone_target() {
+        let dir = scratch_registry_dir("aggregate-stale-target");
+        let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
+        write_stale_entry(&dir, "target-stem", "target");
+        let entry = registry
+            .entries()
+            .expect("scan the registry")
+            .pop()
+            .expect("the stale entry exists");
+        let target = MutationTarget {
+            run_id: entry.record.run_id,
+            record_path: entry.path,
+            endpoint: entry.record.endpoint,
+        };
+
+        assert_eq!(
+            snapshot_target_state(&registry, &target, "kill")
+                .expect("confirmed-stale means already gone"),
+            SnapshotTargetState::AlreadyGone
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

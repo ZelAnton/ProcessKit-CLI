@@ -280,20 +280,23 @@ after an abrupt runner
 death follows the platform-specific `abrupt_cleanup` guarantee above; only Windows
 currently guarantees the whole tree.
 
-`cancel --all` / `kill --all` (T-217; mutually exclusive with `--run-id`, exactly one
+`cancel --all` / `kill --all` (mutually exclusive with `--run-id`, exactly one
 of the two required, the same clap shape `wait --all` established) are the mutating
 counterpart to `wait --all`: instead of one named run, they act on every run confirmed
-live in a **snapshot** taken the moment the invocation starts, applying the exact same
-by-`run_id` mutation `--run-id` uses to each one — the same registry re-scan, the same
-resolve-to-dispatch re-confirmation, and the same wire exchange, just fanned out over
-the snapshot rather than reused for one target. A run that registers after the
+live in a **snapshot** taken the moment the invocation starts. The snapshot keys each
+target by its unique registry-record path and remembered endpoint, not by `run_id`, so
+two concurrent records sharing one explicit id are both reached independently; the
+by-`run-id` form remains an ambiguity failure. Before dispatch the client reconfirms
+that exact record is still live and still advertises the remembered endpoint. A run
+that registers after the
 snapshot, or one that is only `unprobed` (not confirmed live) *at that instant*, is
 out of scope, mirroring `wait --all`'s own asymmetry. Instead of one ack, `--all`
-prints a single JSON array on stdout — one `{"run_id":...,"accepted":...}` entry per
-snapshot target, with an added `error` field on any entry that was not accepted (the
-same message text the single-run form would have printed to stderr for that failure)
-— so a caller sees every target's outcome even when only some of them failed. An empty
-snapshot is not an error, mirroring `prune`: an empty report and exit `0`. A partial or
+prints a single JSON array on stdout — one entry per snapshot target with `run_id`,
+`accepted`, and `status` (`accepted`, `already_gone`, or `failed`), plus `error` only
+for `failed`. `already_gone` means the runner finished after the snapshot but before
+its turn: no command was acknowledged (`accepted` stays false), yet the aggregate's
+desired terminal state is already reached, so this is not a failure. An empty snapshot
+is likewise not an error, mirroring `prune`: an empty report and exit `0`. A partial or
 full failure is never a silent `0`, though — it reuses the reserved `CONTROL` (103)
 code with a summary on stderr, so `cancel --all` before `wait --all`/`prune` in a
 teardown sequence cannot silently swallow a target it failed to reach. See
