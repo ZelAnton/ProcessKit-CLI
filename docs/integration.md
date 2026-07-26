@@ -246,9 +246,10 @@ normatively in [`docs/control-plane.md`](control-plane.md); `wait` does not
 contact the runner at all and is described in [`docs/registry.md`](registry.md),
 "Waiting — `wait`".
 
-- **`inspect`** is read-only: it prints a JSON snapshot (`mechanism`,
-  `root_pid`, `started_at`, the current `members`) to stdout and changes
-  nothing.
+- **`inspect`** is read-only: it prints a snapshot (`mechanism`, `root_pid`,
+  `started_at`, the current `members`) to stdout and changes nothing — as
+  JSON with `--json` (shown above), or a human-readable rendering by
+  default.
 - **`cancel`** ends the run through the *same* soft-stop → grace → hard-kill
   teardown a `--timeout` or a local `Ctrl-C` drives, exiting the run with
   `CONTROL_CANCELLED` (`108`).

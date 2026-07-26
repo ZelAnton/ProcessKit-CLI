@@ -306,6 +306,54 @@ fn inspect_reports_a_live_run() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// T-214 regression: without `--json`, `inspect` prints the human-readable rendering,
+/// not JSON — the `if json` branch in `inspect_async` (`src/control.rs`) actually
+/// takes the other arm on a real binary invocation, not just in a unit test of the
+/// pure rendering function.
+#[test]
+fn inspect_reports_a_live_run_in_human_form() {
+    let dir = scratch("inspect-live-human");
+    let registry = registry_dir(&dir);
+    let mut child = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "inspect-me-human"],
+        inspectable_child(),
+    )
+    .spawn()
+    .expect("spawn the runner");
+
+    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+
+    let out = Command::new(bin())
+        .args(["inspect", "--run-id", "inspect-me-human"])
+        .env("PROCESSKIT_CLI_REGISTRY_DIR", &registry)
+        .output()
+        .expect("spawn the inspect client without --json");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "inspecting a live run without --json succeeds; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&stdout).is_err(),
+        "without --json, stdout must not itself parse as a single JSON value: {stdout}"
+    );
+    assert!(
+        stdout.contains("run_id:") && stdout.contains("inspect-me-human"),
+        "the human-readable form names the run: {stdout}"
+    );
+    assert!(
+        stdout.contains("mechanism:"),
+        "the human-readable form names the containment mechanism: {stdout}"
+    );
+
+    let _ = child.wait();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A run id that is not registered is a distinguishable failure: the reserved
 /// `CONTROL` code (103), a message naming the run on stderr, and no snapshot — never a
 /// hang or a generic error.
