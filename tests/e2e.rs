@@ -523,6 +523,17 @@ fn control_client(verb: &str, registry: &std::path::Path, run_id: &str) -> std::
         .expect("spawn the control client")
 }
 
+/// Run a mutating control client's aggregate form (`cancel --all` / `kill --all`,
+/// T-217) against a scratch registry and wait for it — the `--all` counterpart to
+/// [`control_client`].
+fn control_all_client(verb: &str, registry: &std::path::Path) -> std::process::Output {
+    Command::new(bin())
+        .args([verb, "--all"])
+        .env("PROCESSKIT_CLI_REGISTRY_DIR", registry)
+        .output()
+        .expect("spawn the control --all client")
+}
+
 /// Whether a usable `dotnet` SDK is on this host — gates the real `dotnet build`
 /// scenario, which otherwise skips **loudly** (see [`dotnet_build_leaves_no_reuse_worker`]).
 fn dotnet_available() -> bool {
@@ -912,6 +923,220 @@ fn control_plane_kill_reaps_only_the_target_run() {
     control_verb_reaps_only_the_target(
         "e2e-control-kill",
         "e2e-kill",
+        "kill",
+        109,
+        "killed",
+        "control_kill",
+    );
+}
+
+/// The shared body of the aggregate `cancel --all` / `kill --all` scenarios (T-217):
+/// several live runs at once, `verb --all` reaps **every** one of them in a single
+/// invocation, its aggregate report names every affected `run_id` with an accepted
+/// outcome, and the aggregate process itself exits `0` (full success). A standalone
+/// bystander — never registered in the scratch registry `--all` scans — proves the
+/// aggregate's scope is still exactly the registry, never "every process this host
+/// can see", the same isolation claim `control_verb_reaps_only_the_target` makes for
+/// the single-run form.
+fn control_all_verb_reaps_every_live_run(
+    scenario_tag: &str,
+    verb: &str,
+    expected_code: i32,
+    ending_event: &str,
+    ending_source: &str,
+) {
+    let scenario = Scenario::new(scenario_tag);
+    let registry = scenario.path("registry");
+
+    // A standalone bystander, never handed to any run and never registered: it must
+    // be untouched by `--all`, exactly like the single-run scenario's bystander.
+    let heartbeat = scenario.path("bystander.hb");
+    let heartbeat_arg = heartbeat.to_string_lossy().into_owned();
+    let bystander = Command::new(helper_bin())
+        .args(["spin", "--sleep-secs", "120", "--heartbeat", &heartbeat_arg])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the bystander");
+    let mut bystander = ChildGuard::new(bystander);
+    let bystander_pid = bystander.child_mut().id();
+    assert!(
+        wait_for_file_nonempty(&heartbeat, Duration::from_secs(20)),
+        "the bystander never started heartbeating"
+    );
+
+    // Two live target runs at once, registered under distinct run_ids in the shared
+    // scratch registry `--all` will scan — the snapshot this aggregate form takes
+    // must cover both.
+    let run_ids = ["e2e-all-a", "e2e-all-b"];
+    let mut runners = Vec::new();
+    let mut grandchildren = Vec::new();
+    let mut jsonl_paths = Vec::new();
+    for run_id in run_ids {
+        let jsonl = scenario.path(&format!("{run_id}.jsonl"));
+        let pidfile = scenario.path(&format!("{run_id}.pid"));
+        let pidfile_arg = pidfile.to_string_lossy().into_owned();
+
+        let mut command = Command::new(bin());
+        command
+            .arg("run")
+            .arg("--jsonl")
+            .arg(&jsonl)
+            .args(["--run-id", run_id])
+            .env("PROCESSKIT_CLI_REGISTRY_DIR", &registry)
+            .arg("--")
+            .args(helper(
+                "root",
+                &[
+                    "--pidfile",
+                    &pidfile_arg,
+                    "--root-sleep-secs",
+                    "120",
+                    "--grandchild-sleep-secs",
+                    "120",
+                ],
+            ));
+        let runner = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a target runner");
+        runners.push(ChildGuard::new(runner));
+        jsonl_paths.push(jsonl);
+
+        // Only proceed once this run is actually reachable over the control plane, so
+        // the aggregate verb below never races an unready runner.
+        assert!(
+            wait_until(
+                || inspect(&registry, run_id).status.code() == Some(0),
+                Duration::from_secs(20)
+            ),
+            "run `{run_id}` never became reachable over the control plane"
+        );
+        assert!(
+            wait_for_file_nonempty(&pidfile, Duration::from_secs(20)),
+            "run `{run_id}` never recorded a grandchild PID"
+        );
+        let grandchild = read_pid(&pidfile).expect("the root recorded the grandchild PID");
+        assert!(
+            pid_is_alive(grandchild),
+            "run `{run_id}`'s grandchild (PID {grandchild}) should be alive before the {verb}"
+        );
+        grandchildren.push(grandchild);
+    }
+    assert!(
+        pid_is_alive(bystander_pid),
+        "the bystander (PID {bystander_pid}) should be alive before the {verb}"
+    );
+
+    // Act on every live run at once.
+    let out = control_all_client(verb, &registry);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a fully successful {verb} --all exits 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("the --all client prints a JSON report array");
+    let outcomes = report.as_array().expect("the report is a JSON array");
+    assert_eq!(
+        outcomes.len(),
+        run_ids.len(),
+        "the report names every snapshot target: {report}"
+    );
+    for run_id in run_ids {
+        let outcome = outcomes
+            .iter()
+            .find(|entry| entry["run_id"] == run_id)
+            .unwrap_or_else(|| panic!("the report names run `{run_id}`: {report}"));
+        assert_eq!(
+            outcome["accepted"], true,
+            "the {verb} was accepted for run `{run_id}`: {report}"
+        );
+        assert!(
+            outcome.get("error").is_none() || outcome["error"].is_null(),
+            "a successful outcome carries no error for run `{run_id}`: {report}"
+        );
+    }
+
+    // Every targeted runner ends with the verb's reserved control code.
+    for (runner, run_id) in runners.iter_mut().zip(run_ids) {
+        let status = wait_child_bounded(runner.child_mut(), Duration::from_secs(20))
+            .unwrap_or_else(|| panic!("run `{run_id}` never exited after the {verb} --all"));
+        assert_eq!(
+            status.code(),
+            Some(expected_code),
+            "run `{run_id}` must exit with the reserved control code {expected_code}"
+        );
+    }
+
+    // Every targeted tree is reaped…
+    for (grandchild, run_id) in grandchildren.iter().zip(run_ids) {
+        assert!(
+            wait_until(|| !pid_is_alive(*grandchild), Duration::from_secs(15)),
+            "run `{run_id}`'s grandchild (PID {grandchild}) survived the {verb} --all teardown"
+        );
+    }
+    // …but the standalone bystander is untouched: still alive and still heartbeating
+    // (the same growth proof `control_verb_reaps_only_the_target` uses, since mere
+    // `pid_is_alive` cannot tell a live process from a lingering zombie).
+    assert!(
+        pid_is_alive(bystander_pid),
+        "the bystander (PID {bystander_pid}) was collaterally reaped by the {verb} --all"
+    );
+    let heartbeat_after = file_len(&heartbeat);
+    assert!(
+        wait_until(
+            || file_len(&heartbeat) > heartbeat_after,
+            Duration::from_secs(10)
+        ),
+        "the bystander stopped heartbeating after the {verb} --all (suspended, killed, or a \
+         zombie?)"
+    );
+
+    // Every target's own stream records an externally-initiated ending.
+    for (jsonl, run_id) in jsonl_paths.iter().zip(run_ids) {
+        let events = read_events(jsonl);
+        assert!(
+            events
+                .iter()
+                .any(|event| event_tag(event) == ending_event && event["source"] == ending_source),
+            "run `{run_id}`'s JSONL must record a {ending_event}/{ending_source} ending"
+        );
+        let runner_exit = events.last().expect("a terminal event");
+        assert_eq!(event_tag(runner_exit), "runner_exit");
+        assert_eq!(runner_exit["source"], ending_source);
+        assert_eq!(runner_exit["code"], expected_code);
+    }
+
+    bystander.kill_now();
+}
+
+/// `cancel --all` over the control plane runs the shared soft-stop → grace →
+/// hard-kill teardown of **every** confirmed-live run in the registry snapshot,
+/// leaves a separately-spawned bystander alive, and reports every affected run in
+/// its aggregate JSON report with exit `0`.
+#[test]
+fn control_plane_cancel_all_reaps_every_live_run() {
+    control_all_verb_reaps_every_live_run(
+        "e2e-control-cancel-all",
+        "cancel",
+        108,
+        "cancelled",
+        "control_cancel",
+    );
+}
+
+/// `kill --all` hard-kills **every** confirmed-live run's tree immediately, leaves a
+/// separately-spawned bystander alive, and reports every affected run in its
+/// aggregate JSON report with exit `0`.
+#[test]
+fn control_plane_kill_all_reaps_every_live_run() {
+    control_all_verb_reaps_every_live_run(
+        "e2e-control-kill-all",
         "kill",
         109,
         "killed",

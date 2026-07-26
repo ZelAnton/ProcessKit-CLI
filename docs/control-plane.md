@@ -152,13 +152,19 @@ Example:
 ## `cancel` and `kill`
 
 ```
-processkit-cli cancel --run-id <id>
-processkit-cli kill   --run-id <id>
+processkit-cli cancel (--run-id <id> | --all)
+processkit-cli kill   (--run-id <id> | --all)
 ```
 
-Both find the live runner for `<id>` through the registry exactly as `inspect` does —
-by matching `run_id`, **never** a PID — connect to its endpoint, send their verb, and
-end the run. They differ only in *how* the run is ended:
+`--run-id` and `--all` are mutually exclusive and exactly one is required, the same
+clap convention [`docs/registry.md`](registry.md#waiting--wait)'s `wait --all`
+(T-216) established — a bare `cancel`/`kill` with neither is a `USAGE` (100) form
+error at parse time.
+
+`--run-id <id>` finds the live runner for `<id>` through the registry exactly as
+`inspect` does — by matching `run_id`, **never** a PID — connects to its endpoint,
+sends the verb, and ends the run. `cancel` and `kill` differ only in *how* the run is
+ended:
 
 - **`cancel`** asks the runner to run its **shared** soft-stop → grace → hard-kill
   teardown — the same path a `--timeout` or a `Ctrl-C` drives. On Unix a real
@@ -212,13 +218,76 @@ file — not the control client — still sees that the run ended by an outside 
 
 See [`docs/schema.md`](schema.md) for these events.
 
+### `cancel --all` / `kill --all`
+
+`--all` (T-217) is the aggregate counterpart to `--run-id`: instead of one named run,
+it acts on **every run confirmed live in a snapshot taken the moment the invocation
+starts** — the mutating counterpart to `wait --all` (T-216; see
+[`docs/registry.md`](registry.md), "Waiting — `wait`", "The aggregate barrier —
+`wait --all`"), reusing its exact snapshot discipline. The target set is fixed once, before
+the first mutation is dispatched: a run that registers *after* the snapshot is out of
+scope for this invocation, and a run that is only `unprobed` (not confirmed live) *at
+that instant* is excluded from the snapshot outright, the same asymmetry `wait --all`
+documents. Each snapshot entry is then acted on through the **exact same** by-`run_id`
+mutation `--run-id` uses — including its own registry re-scan, its own
+resolve-to-dispatch re-confirmation (see "Ambiguous run id" above), and its own
+[wire exchange](#wire-protocol) — so `--all` never invents a second way to reach or end
+a run; it only fans the existing one out over a snapshot.
+
+An **empty snapshot** (no confirmed-live entry at all — an empty or fully-stale
+registry) is not an error, mirroring `prune`: it prints an empty report (`[]`) and
+exits `0`. Opening or scanning the registry itself failing (not "found nothing", but
+"could not even look") is a [`exit::SETUP`](exit-codes.md) (111) failure, the same
+support/prerequisite failure `list`/`prune`/`wait` report for the identical condition
+— distinct from the single-run form's `CONTROL` (103), since there is no one target's
+reachability in question yet at that point.
+
+**The report.** Instead of the single-run form's one [ack](#cancel-and-kill) object,
+`--all` prints one JSON array, one entry per snapshot target, to **stdout**:
+
+| Field      | Type              | Notes                                                                 |
+|------------|-------------------|------------------------------------------------------------------------|
+| `run_id`   | string            | The target's run id.                                                   |
+| `accepted` | boolean           | Whether this target's mutation was accepted.                           |
+| `error`    | string, omitted on success | Present only when `accepted` is `false` — the same message text the single-run form would have printed to stderr for the identical failure (an unreachable/stale/unprobed/ambiguous target, or a rejected ack). |
+
+```json
+[{"run_id":"build-42","accepted":true},{"run_id":"build-43","accepted":false,"error":"cannot kill run `build-43`: its registry entry is stale"}]
+```
+
+A target that goes stale, becomes unreachable, or turns ambiguous between the
+snapshot and its own dispatch fails **only that entry** — it is reported in the array
+with `accepted: false` and does not stop the fan-out from acting on every other
+target. `--all` never skips a snapshot entry silently: every one of them gets exactly
+one array entry.
+
+**The aggregate exit code.** Full success — every snapshot target accepted — is `0`,
+exactly like the single-run form. A **partial or full failure** is never a silent
+`0`: it reuses the reserved **`CONTROL` (103)** code (the same one the single-run form
+uses for "could not reach the target run" — there being one or more unreachable
+targets is the same class of fact for the aggregate), with a summary message on
+stderr naming how many of the snapshot targets failed; the full per-target detail is
+only in the JSON report on stdout, printed **before** that failing exit. A caller
+that needs `--all` to fail loudly on any partial failure (the typical teardown
+sequence — `cancel --all` before `wait --all`/`prune`) gets that for free from the
+non-zero exit; one that wants the detail parses the report.
+
+**Skipped entries — unchanged from the single-run form.** A registry entry that is
+`stale` or `unprobed` at snapshot time is never in the target set at all (`--all`
+acts only on entries [`Health::Live`](registry.md) confirms), exactly the same bar
+the single-run form's own resolver applies — `--all` only distributes that existing
+rule over a snapshot, it never widens or narrows it.
+
 ### When the runner cannot be reached: a distinguishable result, never a hang
 
 Every client — `inspect`, `cancel`, and `kill` — can lose the runner the same three
-ways. All of them are reported as the reserved **`CONTROL` exit code (103)** — "could
+ways (this applies per target under `--all` too, one snapshot entry at a time). All
+of them are reported as the reserved **`CONTROL` exit code (103)** — "could
 not reach the target run" (see [`docs/exit-codes.md`](exit-codes.md)) — with an
 explanatory message on **stderr** (naming the action and the run) and nothing on
-stdout. None is a generic error, and none hangs:
+stdout for the single-run form (under `--all`, the same message text lands in that
+target's `error` field in the report instead). None is a generic error, and none
+hangs:
 
 - **Stale registry entry.** The runner died abruptly, leaving its record behind; the
   released liveness lock makes the entry stale. The client detects this *before*

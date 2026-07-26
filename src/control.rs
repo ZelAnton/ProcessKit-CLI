@@ -783,11 +783,30 @@ fn run_mutation(run_id: &str, command: ControlCommand) -> Result<(), RunnerError
     runtime.block_on(mutate_async(run_id, command))
 }
 
-/// The async body of [`cancel`] / [`kill`]: registry lookup, connect, re-confirm the
-/// target is still the sole live match, send the verb, read and verify the ack,
-/// print it. Every runner-loss path is a bounded [`exit::CONTROL`] failure,
-/// mirroring [`inspect_async`].
+/// The async body of [`cancel`] / [`kill`]: run [`mutate_one`] and print its ack.
+/// Every runner-loss path is a bounded [`exit::CONTROL`] failure, mirroring
+/// [`inspect_async`].
 async fn mutate_async(run_id: &str, command: ControlCommand) -> Result<(), RunnerError> {
+    let ack = mutate_one(run_id, command).await?;
+    let json = serde_json::to_string(&ack).map_err(|err| {
+        RunnerError::new(
+            exit::SETUP,
+            format!("could not render the control ack: {err}"),
+        )
+    })?;
+    println!("{json}");
+    Ok(())
+}
+
+/// The by-`run_id` mutation itself: registry lookup, connect, re-confirm the target
+/// is still the sole live match, send the verb, read and verify the ack — the exact
+/// exchange both [`mutate_async`] (the single-run `cancel`/`kill` client) and
+/// [`mutate_all_async`] (the `--all` aggregate, T-217) drive per target, so the two
+/// forms can never drift apart on the wire exchange or the ambiguity/reachability
+/// rules, only on how each one reports the outcome. Returns the parsed
+/// [`ControlAck`] rather than printing it — printing is each caller's own job (a
+/// single JSON line for the single-run form, one aggregate entry for `--all`).
+async fn mutate_one(run_id: &str, command: ControlCommand) -> Result<ControlAck, RunnerError> {
     let action = command.verb();
     let registry = open_registry(action, run_id)?;
     let endpoint = resolve_in_registry(&registry, action, run_id)?;
@@ -822,15 +841,146 @@ async fn mutate_async(run_id: &str, command: ControlCommand) -> Result<(), Runne
             "the runner did not acknowledge the command".to_string(),
         ));
     }
+    Ok(ack)
+}
 
-    let json = serde_json::to_string(&ack).map_err(|err| {
+/// Client entry for `cancel --all` (T-217): the aggregate counterpart to [`cancel`],
+/// reusing the exact same per-run mutation ([`mutate_one`] with
+/// [`ControlCommand::Cancel`]) against every run confirmed live in a snapshot taken
+/// the moment this call starts. See [`mutate_all`] for the snapshot, per-run report,
+/// and aggregate exit-code semantics shared with [`kill_all`].
+pub fn cancel_all() -> Result<(), RunnerError> {
+    mutate_all(ControlCommand::Cancel)
+}
+
+/// Client entry for `kill --all` (T-217): the aggregate counterpart to [`kill`]. See
+/// [`mutate_all`].
+pub fn kill_all() -> Result<(), RunnerError> {
+    mutate_all(ControlCommand::Kill)
+}
+
+/// One target's outcome in the aggregate report `cancel --all` / `kill --all` print
+/// — the `--all` counterpart to the single-run form's bare [`ControlAck`] line: since
+/// `--all` acts on a whole snapshot rather than one run, its report is a JSON array
+/// of these, one per snapshot entry, rather than a single ack object.
+#[derive(Debug, Serialize)]
+pub struct ControlAllOutcome {
+    /// The run this record names — the same `run_id` [`mutate_one`] resolved (or, on
+    /// a failure that never got that far, the `run_id` the snapshot itself recorded).
+    pub run_id: String,
+    /// Whether this target's mutation was accepted.
+    pub accepted: bool,
+    /// Why it was not accepted — the same message text the single-run form would
+    /// have printed to stderr for the identical failure. `None` on success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Shared driver for [`cancel_all`] / [`kill_all`]: snapshot the registry's
+/// confirmed-live entries once, apply `command` to each through [`mutate_one`],
+/// print the aggregate report, and turn any per-target failure into the reserved
+/// [`exit::CONTROL`] aggregate outcome — never a silent `0` when part of the fan-out
+/// failed (see `docs/control-plane.md`, "`cancel --all` / `kill --all`").
+///
+/// The snapshot is taken **once**, before any mutation is dispatched — the same
+/// principle [`crate::wait::run_all`] (T-216) uses for its own target set — so a run
+/// that registers mid-fan-out is out of scope for this invocation, and every target
+/// this call acts on was confirmed live at one consistent instant. Snapshotting by
+/// [`registry::Health::Live`] alone, before looking at any other field, mirrors
+/// [`resolve_in_registry`]'s own "count identity/health before ever looking at
+/// endpoints" discipline (K-016): a live entry with no endpoint yet is still in
+/// scope, and its per-target mutation fails on its own, reported in the outcome
+/// list, rather than being silently excluded from the snapshot up front.
+fn mutate_all(command: ControlCommand) -> Result<(), RunnerError> {
+    let runtime = current_thread_runtime()?;
+    runtime.block_on(mutate_all_async(command))
+}
+
+/// The async body of [`mutate_all`]: snapshot, fan out [`mutate_one`] per target
+/// (sequentially — the registry's decentralized, no-cross-process-locking design
+/// gives no stronger guarantee for concurrent dispatch than for sequential, and
+/// sequential keeps the per-run re-resolve/reconfirm dispatch of each target
+/// trivially free of interference from its siblings), print the report, then map the
+/// tally onto the aggregate exit code.
+async fn mutate_all_async(command: ControlCommand) -> Result<(), RunnerError> {
+    let action = command.verb();
+    let registry = open_registry_for_all(action)?;
+    let run_ids = snapshot_live_run_ids(&registry).map_err(|err| {
         RunnerError::new(
             exit::SETUP,
-            format!("could not render the control ack: {err}"),
+            format!("could not read the run registry: {err}"),
         )
     })?;
-    println!("{json}");
+
+    let mut outcomes = Vec::with_capacity(run_ids.len());
+    for run_id in run_ids {
+        match mutate_one(&run_id, command).await {
+            Ok(ack) => outcomes.push(ControlAllOutcome {
+                run_id: ack.run_id,
+                accepted: ack.accepted,
+                error: None,
+            }),
+            Err(err) => outcomes.push(ControlAllOutcome {
+                run_id,
+                accepted: false,
+                error: Some(err.to_string()),
+            }),
+        }
+    }
+
+    let line = serde_json::to_string(&outcomes).map_err(|err| {
+        RunnerError::new(
+            exit::SETUP,
+            format!("could not render the {action} --all report: {err}"),
+        )
+    })?;
+    println!("{line}");
+
+    let failed = outcomes.iter().filter(|outcome| !outcome.accepted).count();
+    if failed > 0 {
+        return Err(RunnerError::new(
+            exit::CONTROL,
+            format!(
+                "{action} --all: {failed} of {} target run(s) could not be reached or did not \
+                 acknowledge the {action}; see the report above for the per-run reason",
+                outcomes.len()
+            ),
+        ));
+    }
     Ok(())
+}
+
+/// Open the registry read-only for the `--all` aggregate forms, mapping an open
+/// failure onto [`exit::SETUP`] — not the single-run form's [`exit::CONTROL`],
+/// because opening/reading the registry wholesale here is the same kind of
+/// support/prerequisite step [`crate::list`]/[`crate::prune`]/[`crate::wait`] already
+/// map to `SETUP`, not a specific target's unreachability (there is no one target
+/// yet at this point).
+fn open_registry_for_all(action: &str) -> Result<registry::Registry, RunnerError> {
+    registry::Registry::open_read_only().map_err(|err| {
+        RunnerError::new(
+            exit::SETUP,
+            format!("could not open the run registry for `{action} --all`: {err}"),
+        )
+    })
+}
+
+/// One registry scan, filtered to the entries [`Health::Live`] confirms live right
+/// now, and mapped to their `run_id` — the snapshot [`mutate_all_async`] fixes its
+/// target set to before dispatching a single mutation. An entry [`Health::Stale`] or
+/// [`Health::Unprobed`] at snapshot time is excluded outright: `--all` acts only on
+/// confirmed-live entries, the same bar the single-run form's [`resolve_in_registry`]
+/// applies, never widened or narrowed for the aggregate case. Mirrors
+/// [`crate::wait::snapshot_live_targets`], differing only in what it keys entries by
+/// (`run_id`, since the caller reports per `run_id` here, versus the record path
+/// `wait --all` needs to tell two same-`run_id` duplicates apart across polls).
+fn snapshot_live_run_ids(registry: &registry::Registry) -> io::Result<Vec<String>> {
+    Ok(registry
+        .entries()?
+        .into_iter()
+        .filter(|entry| entry.health == Health::Live)
+        .map(|entry| entry.record.run_id)
+        .collect())
 }
 
 /// Find the endpoint of the *live* run named `run_id`, or a distinguishable
@@ -2409,5 +2559,124 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    /// (T-217) [`snapshot_live_run_ids`]'s decision logic, proved directly rather
+    /// than only through `cancel --all`/`kill --all`'s end-to-end behavior — the same
+    /// three-way fixture [`crate::wait::tests::snapshot_live_targets_includes_only_confirmed_live_entries`]
+    /// drives for the aggregate `wait --all` barrier: a confirmed-`Health::Live`
+    /// entry is in scope, while a confirmed-`Health::Stale` entry and one that is
+    /// only `Health::Unprobed` are both excluded outright — `--all` acts only on
+    /// confirmed-live entries, never a wider or narrower bar than the single-run
+    /// form's own [`resolve_in_registry`] applies.
+    #[test]
+    fn snapshot_live_run_ids_includes_only_confirmed_live_entries() {
+        let dir = scratch_registry_dir("snapshot-live");
+        let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
+
+        let live = registry
+            .register_plain("live-run", Some("endpoint-live"), SystemTime::now())
+            .expect("register a live run");
+        write_stale_entry(&dir, "stale-stem", "stale-run");
+        write_unprobeable_entry(&dir, "unprobed-stem", "unprobed-run");
+
+        let run_ids = snapshot_live_run_ids(&registry).expect("scan the fixture registry");
+
+        assert_eq!(
+            run_ids,
+            vec!["live-run".to_string()],
+            "only the confirmed-live entry's run_id is in the snapshot: {run_ids:?}"
+        );
+
+        drop(live);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (T-217) A live entry that has not (yet, or ever) published a control endpoint
+    /// is still in the `--all` snapshot — endpoint presence is not part of the
+    /// snapshot's identity/health bar, mirroring `resolve_in_registry`'s own "count
+    /// live entries before ever looking at endpoints" discipline (K-016). Its
+    /// eventual per-target mutation fails on its own (no control endpoint), reported
+    /// in the outcome list, rather than the entry being silently excluded from the
+    /// snapshot up front.
+    #[test]
+    fn snapshot_live_run_ids_includes_a_live_entry_with_no_endpoint() {
+        let dir = scratch_registry_dir("snapshot-live-no-endpoint");
+        let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
+
+        let live = registry
+            .register_plain("endpointless-run", None, SystemTime::now())
+            .expect("register a live run that never published an endpoint");
+
+        let run_ids = snapshot_live_run_ids(&registry).expect("scan the fixture registry");
+        assert_eq!(run_ids, vec!["endpointless-run".to_string()]);
+
+        drop(live);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (T-217) The aggregate `--all` report's JSON shape: a successful outcome omits
+    /// `error` entirely (not `null`), and a failed one carries it — the per-run
+    /// detail an aggregate exit code alone cannot convey.
+    #[test]
+    fn control_all_outcome_serializes_error_only_on_failure() {
+        let ok = ControlAllOutcome {
+            run_id: "run-a".to_string(),
+            accepted: true,
+            error: None,
+        };
+        let ok_json = serde_json::to_string(&ok).expect("a successful outcome serializes");
+        let ok_value: serde_json::Value = serde_json::from_str(&ok_json).expect("valid JSON");
+        assert_eq!(ok_value["run_id"], "run-a");
+        assert_eq!(ok_value["accepted"], true);
+        assert!(
+            ok_value.get("error").is_none(),
+            "a successful outcome omits `error` entirely: {ok_json}"
+        );
+
+        let failed = ControlAllOutcome {
+            run_id: "run-b".to_string(),
+            accepted: false,
+            error: Some("cannot kill run `run-b`: its registry entry is stale".to_string()),
+        };
+        let failed_json = serde_json::to_string(&failed).expect("a failed outcome serializes");
+        let failed_value: serde_json::Value =
+            serde_json::from_str(&failed_json).expect("valid JSON");
+        assert_eq!(failed_value["run_id"], "run-b");
+        assert_eq!(failed_value["accepted"], false);
+        assert_eq!(
+            failed_value["error"],
+            "cannot kill run `run-b`: its registry entry is stale"
+        );
+    }
+
+    /// (T-217) A whole array of [`ControlAllOutcome`]s — the exact shape
+    /// `cancel --all` / `kill --all` print — round-trips through JSON as a list, the
+    /// aggregate counterpart to the single-run form's bare [`ControlAck`] object.
+    #[test]
+    fn control_all_outcome_list_serializes_as_a_json_array() {
+        let outcomes = vec![
+            ControlAllOutcome {
+                run_id: "run-a".to_string(),
+                accepted: true,
+                error: None,
+            },
+            ControlAllOutcome {
+                run_id: "run-b".to_string(),
+                accepted: false,
+                error: Some(
+                    "cannot cancel run `run-b`: no run with that id is registered".to_string(),
+                ),
+            },
+        ];
+        let line = serde_json::to_string(&outcomes).expect("the outcome list serializes");
+        let value: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
+        let array = value.as_array().expect("the report is a JSON array");
+        assert_eq!(array.len(), 2);
+        assert_eq!(array[0]["run_id"], "run-a");
+        assert_eq!(array[0]["accepted"], true);
+        assert_eq!(array[1]["run_id"], "run-b");
+        assert_eq!(array[1]["accepted"], false);
+        assert!(array[1]["error"].is_string());
     }
 }
