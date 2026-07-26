@@ -4,7 +4,7 @@ The **run registry** is the first brick of processkit-cli's control plane. The
 control plane lives in the live `run` process, not in named kernel objects
 (`AGENTS.md`, "The control plane lives in the live runner process"): a runner must
 stay alive to hold its kill-on-drop container, so the live process is exactly where
-`inspect` / `cancel` / `kill` (later tasks) reach it. The registry is how those
+`inspect` / `cancel` / `kill` reach it. The registry is how those
 clients *find* a live runner — a per-user directory holding one record per in-flight
 run.
 

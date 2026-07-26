@@ -277,42 +277,7 @@ fn render_table_lines(rows: &[ListEntry]) -> Vec<String> {
             ]
         })
         .collect();
-    let mut widths = HEADERS.map(str::len);
-    for row in &cells {
-        for (width, cell) in widths.iter_mut().zip(row.iter()) {
-            *width = (*width).max(cell.len());
-        }
-    }
-    // The last column is left-aligned but not padded, so trailing whitespace
-    // is never printed after the final value.
-    let mut lines = Vec::with_capacity(cells.len() + 1);
-    lines.push(format_row(&HEADERS.map(str::to_string), &widths));
-    for row in &cells {
-        lines.push(format_row(row, &widths));
-    }
-    lines
-}
-
-/// One table line: every column but the last padded to its column width, joined by
-/// two spaces. Split out of [`render_table_lines`] so the header and the data rows
-/// are laid out by the very same code — the alignment the table promises cannot
-/// drift between them — and so adding a column is one entry in `HEADERS`/`cells`
-/// rather than two hand-written, positionally-argumented `format!`s to keep in sync.
-fn format_row(cells: &[String; 6], widths: &[usize; 6]) -> String {
-    let mut line = String::new();
-    for (index, (cell, width)) in cells.iter().zip(widths.iter()).enumerate() {
-        if index > 0 {
-            line.push_str("  ");
-        }
-        if index + 1 == cells.len() {
-            // The final column is never padded: no trailing whitespace is printed
-            // after the last value on a line.
-            line.push_str(cell);
-        } else {
-            line.push_str(&format!("{cell:width$}"));
-        }
-    }
-    line
+    crate::text::aligned_table(HEADERS, &cells, "", "  ")
 }
 
 #[cfg(test)]
@@ -550,7 +515,7 @@ mod tests {
             "human-readable cells contain no terminal controls: {lines:?}"
         );
         assert!(lines[1].contains("forged ROW [31m"));
-        assert!(lines[1].contains("pipe name "));
+        assert!(lines[1].ends_with("pipe name"));
 
         let json = serde_json::to_string(&row).expect("the raw JSON row serializes safely");
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");

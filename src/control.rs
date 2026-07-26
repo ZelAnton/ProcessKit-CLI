@@ -731,34 +731,7 @@ fn render_snapshot_human(snapshot: &Snapshot) -> Vec<String> {
             ]
         })
         .collect();
-    let mut widths = HEADERS.map(str::len);
-    for row in &cells {
-        for (width, cell) in widths.iter_mut().zip(row.iter()) {
-            *width = (*width).max(cell.len());
-        }
-    }
-    lines.push(format!(
-        "  {:w0$}  {:w1$}  {:w2$}  {}",
-        HEADERS[0],
-        HEADERS[1],
-        HEADERS[2],
-        HEADERS[3],
-        w0 = widths[0],
-        w1 = widths[1],
-        w2 = widths[2],
-    ));
-    for row in &cells {
-        lines.push(format!(
-            "  {:w0$}  {:w1$}  {:w2$}  {}",
-            row[0],
-            row[1],
-            row[2],
-            row[3],
-            w0 = widths[0],
-            w1 = widths[1],
-            w2 = widths[2],
-        ));
-    }
+    lines.extend(crate::text::aligned_table(HEADERS, &cells, "  ", "  "));
     lines
 }
 

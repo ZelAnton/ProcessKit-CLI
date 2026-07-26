@@ -7,12 +7,13 @@
 //! is the in-code mirror of that contract; `docs/exit-codes.md` is the normative
 //! document consumers and adapters pin against.
 //!
-//! A successful run forwards the *child's* exit code verbatim (implemented in a
-//! later task). The codes below are minted only when the runner itself fails
-//! before or around the child. Because a child could, in principle, also exit
-//! with a number inside this band, the authoritative disambiguator is always the
-//! `runner_exit` JSONL event — the numeric code is the best-effort signal for
-//! shells that cannot read the event stream.
+//! A successful run forwards the *child's* exit code verbatim: [`crate::run::execute`]
+//! exits with the code `run::teardown::exit_code_for` derives from the ProcessKit
+//! outcome. The codes below are minted only when the runner itself fails
+//! before or around the child. Because a child could, in principle, also exit with a
+//! number inside this band, the authoritative disambiguator is always the
+//! `runner_exit` JSONL event — the numeric code is the best-effort signal for shells
+//! that cannot read the event stream.
 
 /// Inclusive lower bound of the runner-own exit-code band. Read by the preflight
 /// probe (`src/probe.rs`) so a consumer can pin the reserved band before a launch.
@@ -40,13 +41,15 @@ pub const BACKEND: u8 = 102;
 /// because it is the same verdict: there is no single target run to act on (see
 /// `docs/registry.md`, "Run id resolution — ambiguity is a hard failure").
 ///
-/// `cancel --all` / `kill --all` ([`crate::control::mutate_all`], T-217) reuse this
+/// `cancel --all` / `kill --all` reuse this
 /// same code for a different fact — one or more targets in the confirmed-live
 /// snapshot could not be reached or did not acknowledge the command — never a silent
-/// `0` on a partial fan-out failure. Unlike the by-`run-id` case above, this does
-/// *not* mean "no single target run": some snapshot targets may have been acted on
-/// successfully; the per-target detail is in the aggregate's own JSON report, not
-/// just this code (see `docs/control-plane.md`, "`cancel --all` / `kill --all`").
+/// `0` on a partial fan-out failure. A target confirmed gone before dispatch is a
+/// successful `already_gone` report outcome and does not mint this code. Unlike the
+/// by-`run-id` case above, aggregate `CONTROL` does *not* mean "no single target
+/// run": some snapshot targets may have been acted on successfully; the per-target
+/// detail is in the aggregate's own JSON report, not just this code (see
+/// `docs/control-plane.md`, "`cancel --all` / `kill --all`").
 pub const CONTROL: u8 = 103;
 /// Unexpected runner fault — the runner reached a state its own logic rules out,
 /// or lost a trustworthy view of the run it cannot recover from (a `wait` on the
