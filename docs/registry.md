@@ -621,6 +621,11 @@ fact must establish it separately — it launched the run itself, or it saw the 
 
 ### Liveness it cannot confirm
 
+Scoped to `wait --run-id` only — see "The aggregate barrier — `wait --all`" below for
+how `--all` reuses this same conservative stance on every pass *after* its snapshot,
+but not on the snapshot step itself, which excludes an unconfirmed entry rather than
+waiting on it (a genuine, documented asymmetry with the single-`run_id` case below).
+
 One case is neither live nor confirmed over: a matching record whose lock file cannot be
 probed at all (a directory in its place, a permission error, a rejected reparse point —
 the same "probe failed" case "The reaping safety invariant" above keeps apart from
@@ -631,16 +636,17 @@ and behaviorally unchanged for `inspect`/`cancel`/`kill`, which act only on
 [`Health::Live`] and so refuse on `Unprobed` exactly as they refused on the old
 collapsed `Stale` (their *message* now tells the two apart, so no client asserts a
 death this case never established). Minting a *positive* "finished" from that same
-unconfirmed case would still be wrong for `wait`, whose `0` is a positive claim about
-a run's lifetime — so `wait` does not read `Entry::health` at all here, live or
-otherwise.
+unconfirmed case would still be wrong for `wait --run-id`, whose `0` is a positive claim
+about a run's lifetime — so on this path `wait` probes through [`Registry::probe_run`]
+directly and does not read `Entry::health` at all, live or otherwise. (`wait --all`
+does read it — see below.)
 
-So `wait` probes on its own path and **keeps waiting** on an unconfirmable entry rather
-than announcing a completion it never observed. A bounded caller still gets a definite
-answer when `--timeout` elapses (`WAIT_TIMEOUT`, honestly meaning "could not confirm
-completion in time"); an unbounded one keeps waiting for a real verdict. This is the
-same "unknown is not confirmed" stance `prune` takes when it refuses to reap an entry it
-could not probe.
+So `wait --run-id` probes on its own path and **keeps waiting** on an unconfirmable
+entry rather than announcing a completion it never observed. A bounded caller still gets
+a definite answer when `--timeout` elapses (`WAIT_TIMEOUT`, honestly meaning "could not
+confirm completion in time"); an unbounded one keeps waiting for a real verdict. This is
+the same "unknown is not confirmed" stance `prune` takes when it refuses to reap an
+entry it could not probe.
 
 ### The aggregate barrier — `wait --all`
 

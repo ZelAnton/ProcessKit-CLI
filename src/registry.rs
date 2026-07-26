@@ -532,9 +532,16 @@ impl Registry {
     /// which a probe-failed entry, being [`Health::Unprobed`] (not [`Health::Live`]),
     /// never is, so those clients behave exactly as they did when this case was
     /// folded into `Stale` (see [K-024]). `list` (the operator-facing discovery
-    /// surface, T-206) is the one consumer that must tell the two apart: printing a
-    /// probe-failed entry as `"stale"` is a positive, unconfirmed claim that the
-    /// runner is dead, distinct from what the probe actually established.
+    /// surface, T-206) and `wait --all` (T-216, [`crate::wait::run_all`]) are the two
+    /// consumers that must tell the two apart. For `list`, printing a probe-failed
+    /// entry as `"stale"` would be a positive, unconfirmed claim that the runner is
+    /// dead, distinct from what the probe actually established. For `wait --all`, the
+    /// distinction is not merely a display nicety but a condition of correctness at
+    /// snapshot time: an entry this method reports [`Health::Unprobed`] is excluded
+    /// from the wait's target set from the start (never entering it, unlike an entry
+    /// that re-probes `Unprobed` on a *later* pass, which does stay outstanding — see
+    /// `docs/registry.md`, "The aggregate barrier — `wait --all`"), so folding
+    /// `Unprobed` into `Stale` here would silently shrink what `--all` waits for.
     pub fn entries(&self) -> io::Result<Vec<Entry>> {
         let mut entries = Vec::new();
         for ScannedRecord {

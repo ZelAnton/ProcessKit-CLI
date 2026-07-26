@@ -25,7 +25,10 @@ to a dated version section.
   same "one clear rule beats an unbounded alternative" trade-off `wait --run-id`
   already documents for an unknown id reading as finished. An entry whose liveness
   cannot be re-probed on a later pass stays outstanding rather than being silently
-  dropped — the exact conservative stance `wait --run-id` already applies. A bounded
+  dropped — the exact conservative stance `wait --run-id` already applies, but only
+  once an entry is in the target set: one that was itself unconfirmed live at the
+  snapshot instant is excluded from that set from the start rather than waited on, a
+  documented asymmetry with `--run-id`'s own always-tracked target. A bounded
   `--timeout` reports how many snapshot entries are still outstanding and, when any of
   them was only unconfirmed on the last pass, says so rather than confidently claiming
   they are all still live; unbounded, it keeps polling. Same reserved `WAIT_TIMEOUT`
