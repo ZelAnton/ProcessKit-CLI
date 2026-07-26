@@ -938,13 +938,8 @@ fn mutate_all(command: ControlCommand) -> Result<(), RunnerError> {
 /// code. A target that finishes before its turn is successful as `already_gone`.
 async fn mutate_all_async(command: ControlCommand) -> Result<(), RunnerError> {
     let action = command.verb();
-    let registry = open_registry_for_all(action)?;
-    let targets = snapshot_mutation_targets(&registry).map_err(|err| {
-        RunnerError::new(
-            exit::SETUP,
-            format!("could not read the run registry: {err}"),
-        )
-    })?;
+    let registry = registry::open_read_only_for_setup()?;
+    let targets = snapshot_mutation_targets(&registry).map_err(registry::setup_read_error)?;
 
     let mut outcomes = Vec::with_capacity(targets.len());
     for target in targets {
@@ -993,21 +988,6 @@ async fn mutate_all_async(command: ControlCommand) -> Result<(), RunnerError> {
         ));
     }
     Ok(())
-}
-
-/// Open the registry read-only for the `--all` aggregate forms, mapping an open
-/// failure onto [`exit::SETUP`] — not the single-run form's [`exit::CONTROL`],
-/// because opening/reading the registry wholesale here is the same kind of
-/// support/prerequisite step [`crate::list`]/[`crate::prune`]/[`crate::wait`] already
-/// map to `SETUP`, not a specific target's unreachability (there is no one target
-/// yet at this point).
-fn open_registry_for_all(action: &str) -> Result<registry::Registry, RunnerError> {
-    registry::Registry::open_read_only().map_err(|err| {
-        RunnerError::new(
-            exit::SETUP,
-            format!("could not open the run registry for `{action} --all`: {err}"),
-        )
-    })
 }
 
 /// Snapshot every entry confirmed live, preserving the unique record path and the
@@ -1091,35 +1071,15 @@ fn snapshot_target_state(
     target: &MutationTarget,
     action: &str,
 ) -> Result<SnapshotTargetState, RunnerError> {
-    let entries = registry.entries().map_err(|err| {
+    let entry = registry.probe_entry(&target.record_path).map_err(|err| {
         unreachable_run(
             action,
             &target.run_id,
-            format!("could not re-read the run registry: {err}"),
+            format!("could not re-read the snapshotted registry record: {err}"),
         )
     })?;
-    let Some(entry) = entries
-        .into_iter()
-        .find(|entry| entry.path == target.record_path)
-    else {
-        return match std::fs::metadata(&target.record_path) {
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                Ok(SnapshotTargetState::AlreadyGone)
-            }
-            Ok(_) => Err(unreachable_run(
-                action,
-                &target.run_id,
-                "the snapshotted registry record still exists but no longer passes validation, so the target is not confirmed gone"
-                    .to_string(),
-            )),
-            Err(err) => Err(unreachable_run(
-                action,
-                &target.run_id,
-                format!(
-                    "the snapshotted registry record could not be checked after it disappeared from the registry scan: {err}"
-                ),
-            )),
-        };
+    let Some(entry) = entry else {
+        return Ok(SnapshotTargetState::AlreadyGone);
     };
 
     match entry.health {
@@ -3060,6 +3020,60 @@ mod tests {
             .expect("an already-finished endpointless target is successful");
         assert!(matches!(outcome, SnapshotMutation::AlreadyGone));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unprobeable_snapshot_record_remains_a_hard_failure() {
+        let dir = scratch_registry_dir("aggregate-unprobed-target");
+        let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
+        write_unprobeable_entry(&dir, "opaque", "target");
+        let entry = registry
+            .entries()
+            .expect("scan registry")
+            .pop()
+            .expect("unprobeable entry remains visible");
+        let target = MutationTarget {
+            run_id: entry.record.run_id,
+            record_path: entry.path,
+            endpoint: entry.record.endpoint,
+        };
+
+        let err = snapshot_target_state(&registry, &target, "kill")
+            .expect_err("unknown liveness is not proof the target ended");
+        assert_eq!(err.code(), exit::CONTROL);
+        assert!(err.to_string().contains("could not be re-probed"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_snapshot_record_with_changed_identity_remains_a_hard_failure() {
+        let dir = scratch_registry_dir("aggregate-changed-target");
+        let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
+        let registration = registry
+            .register_plain("target", Some("endpoint-a"), SystemTime::now())
+            .expect("register live target");
+        let mut targets = snapshot_mutation_targets(&registry).expect("snapshot live targets");
+        let target = targets.pop().expect("target is in the snapshot");
+
+        let mut replacement: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&target.record_path).expect("read target record"),
+        )
+        .expect("parse target record");
+        replacement["run_id"] = serde_json::Value::String("replacement".to_string());
+        std::fs::write(
+            &target.record_path,
+            serde_json::to_vec(&replacement).expect("serialize replacement"),
+        )
+        .expect("replace target identity while its lock remains live");
+
+        let err = snapshot_target_state(&registry, &target, "kill")
+            .expect_err("a live replacement must not inherit the snapshot action");
+        assert_eq!(err.code(), exit::CONTROL);
+        assert!(err.to_string().contains("changed identity"));
+
+        drop(registration);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

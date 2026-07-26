@@ -203,11 +203,13 @@ impl WaitDeadline {
 /// on (a bad `PROCESSKIT_CLI_REGISTRY_DIR`, denied permissions), and emphatically not
 /// an answer about the run.
 pub fn run(run_id: &str, timeout: Option<Duration>) -> Result<(), RunnerError> {
-    let registry = open_registry()?;
+    let registry = registry::open_read_only_for_setup()?;
     let deadline = timeout.map(WaitDeadline::new);
 
     loop {
-        let status = registry.probe_run(run_id).map_err(read_error)?;
+        let status = registry
+            .probe_run(run_id)
+            .map_err(registry::setup_read_error)?;
         match status {
             RunStatus::Finished => return Ok(()),
             RunStatus::Ambiguous { live } => {
@@ -261,28 +263,6 @@ fn wait_timed_out(run_id: &str, limit: Duration, last: RunStatus) -> RunnerError
     )
 }
 
-/// Open the registry read-only, mapping the "could not even open it" failure onto
-/// [`exit::SETUP`] — shared by [`run`] and [`run_all`], word-for-word the same
-/// diagnostic either way.
-fn open_registry() -> Result<registry::Registry, RunnerError> {
-    registry::Registry::open_read_only().map_err(|err| {
-        RunnerError::new(
-            exit::SETUP,
-            format!("could not open the run registry: {err}"),
-        )
-    })
-}
-
-/// Map a registry **scan** failure (as opposed to the open above) onto
-/// [`exit::SETUP`] — shared by every probe [`run`]/[`run_all`] make on an
-/// already-open registry.
-fn read_error(err: std::io::Error) -> RunnerError {
-    RunnerError::new(
-        exit::SETUP,
-        format!("could not read the run registry: {err}"),
-    )
-}
-
 /// Run `wait --all [--timeout <duration>]`: poll the per-user registry until none of
 /// the runs confirmed live in a snapshot taken at the moment this call starts are
 /// still live, then exit `0` — the aggregate counterpart to [`run`]'s single-`run_id`
@@ -302,13 +282,13 @@ fn read_error(err: std::io::Error) -> RunnerError {
 /// findings (`any_unprobed`) are what a timeout reports — never a status the loop
 /// itself never actually observed.
 pub fn run_all(timeout: Option<Duration>) -> Result<(), RunnerError> {
-    let registry = open_registry()?;
+    let registry = registry::open_read_only_for_setup()?;
     let deadline = timeout.map(WaitDeadline::new);
 
     // The snapshot: one scan, fixed before the first poll, to exactly the entries
     // confirmed live right now. Every later pass only ever *removes* from this set —
     // nothing is ever added to it (see the module doc for why).
-    let mut targets = snapshot_target_paths(&registry).map_err(read_error)?;
+    let mut targets = snapshot_target_paths(&registry).map_err(registry::setup_read_error)?;
     // Whether the most recent pass over `targets` found an entry that could not be
     // re-probed — reported honestly on a timeout instead of a confident "still live"
     // the last pass never actually established for every remaining entry.
@@ -333,7 +313,8 @@ pub fn run_all(timeout: Option<Duration>) -> Result<(), RunnerError> {
             },
         }
 
-        let (next_targets, unprobed) = reprobe_targets(&registry, &targets).map_err(read_error)?;
+        let (next_targets, unprobed) =
+            reprobe_targets(&registry, &targets).map_err(registry::setup_read_error)?;
         targets = next_targets;
         any_unprobed = unprobed;
     }

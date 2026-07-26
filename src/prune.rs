@@ -176,20 +176,12 @@ impl From<PrunePreview> for PruneDryRunReport {
 /// either way; the only failure is the registry directory itself being unreadable, an
 /// [`exit::SETUP`] condition (a support/prerequisite failure).
 pub fn run(json: bool, dry_run: bool) -> Result<(), RunnerError> {
-    let registry = registry::Registry::open_read_only().map_err(|err| {
-        RunnerError::new(
-            exit::SETUP,
-            format!("could not open the run registry: {err}"),
-        )
-    })?;
+    let registry = registry::open_read_only_for_setup()?;
 
     if dry_run {
-        let preview = registry.preview_prune().map_err(|err| {
-            RunnerError::new(
-                exit::SETUP,
-                format!("could not read the run registry: {err}"),
-            )
-        })?;
+        let preview = registry
+            .preview_prune()
+            .map_err(registry::setup_read_error)?;
         if json {
             print_dry_run_json(preview)
         } else {
@@ -197,12 +189,7 @@ pub fn run(json: bool, dry_run: bool) -> Result<(), RunnerError> {
             Ok(())
         }
     } else {
-        let outcome = registry.prune().map_err(|err| {
-            RunnerError::new(
-                exit::SETUP,
-                format!("could not read the run registry: {err}"),
-            )
-        })?;
+        let outcome = registry.prune().map_err(registry::setup_read_error)?;
         if json {
             print_json(outcome)
         } else {

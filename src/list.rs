@@ -116,18 +116,8 @@ struct ListEntry {
 /// scan it (see the module docs above) — that mutating path exists only for `run`,
 /// which is actually about to write a record.
 pub fn run(json: bool) -> Result<(), RunnerError> {
-    let registry = registry::Registry::open_read_only().map_err(|err| {
-        RunnerError::new(
-            exit::SETUP,
-            format!("could not open the run registry: {err}"),
-        )
-    })?;
-    let entries = registry.entries().map_err(|err| {
-        RunnerError::new(
-            exit::SETUP,
-            format!("could not read the run registry: {err}"),
-        )
-    })?;
+    let registry = registry::open_read_only_for_setup()?;
+    let entries = registry.entries().map_err(registry::setup_read_error)?;
 
     let mut rows: Vec<(PathBuf, ListEntry)> = entries
         .into_iter()

@@ -233,9 +233,9 @@ documents. Each target is keyed by its unique registry-record path and the endpo
 that exact record advertised at snapshot time, never by its potentially duplicated
 `run_id`. `--all` can therefore reach two live records sharing an id independently,
 while the by-`run-id` form remains the hard ambiguity described above. Immediately
-before dispatch the client re-scans the registry and requires the same record path to
-remain live with the same id and endpoint; only then does it use the ordinary
-[wire exchange](#wire-protocol).
+before dispatch the client re-reads and probes that exact record path, without
+scanning or probing unrelated entries, and requires it to remain live with the same
+id and endpoint; only then does it use the ordinary [wire exchange](#wire-protocol).
 
 An **empty snapshot** (no confirmed-live entry at all — an empty or fully-stale
 registry) is not an error, mirroring `prune`: it prints an empty report (`[]`) and

@@ -116,6 +116,13 @@ to a dated version section.
   completions, and man pages.
 
 ### Changed
+- Human-readable tables now measure column widths in Unicode characters, matching
+  Rust's padding unit so ordinary multibyte text no longer over-pads later columns.
+- Whole-registry commands now share one `SETUP` mapping for registry open and read
+  failures; by-run-id control clients retain their intentional `CONTROL` mapping.
+- Aggregate `cancel --all` / `kill --all` reconfirm each snapshot target by reading
+  and probing only its exact record, avoiding repeated full-registry scans while
+  preserving missing, stale, unprobeable, and identity-change outcomes.
 - Aggregate control mutations and `wait --all` now take their confirmed-live target
   snapshot through one registry primitive, so both commands share the same liveness
   inclusion rule while retaining their command-specific target projections.

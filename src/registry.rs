@@ -45,6 +45,28 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::events;
+use crate::exit::{self, RunnerError};
+
+/// Open the registry for a whole-registry CLI operation and map the prerequisite
+/// failure onto the shared `SETUP` contract. By-run-id control clients deliberately
+/// keep their distinct `CONTROL` mapping in `control`.
+pub(crate) fn open_read_only_for_setup() -> Result<Registry, RunnerError> {
+    Registry::open_read_only().map_err(|err| {
+        RunnerError::new(
+            exit::SETUP,
+            format!("could not open the run registry: {err}"),
+        )
+    })
+}
+
+/// Map a whole-registry scan failure onto the shared `SETUP` diagnostic used by
+/// `list`, `prune`, `wait`, and aggregate control operations.
+pub(crate) fn setup_read_error(err: io::Error) -> RunnerError {
+    RunnerError::new(
+        exit::SETUP,
+        format!("could not read the run registry: {err}"),
+    )
+}
 
 /// On-disk record format version. Independent of the JSONL event
 /// [`schema_version`](crate::events::SCHEMA_VERSION): the registry is a private
@@ -588,6 +610,35 @@ impl Registry {
             .into_iter()
             .filter(|entry| entry.health == Health::Live)
             .collect())
+    }
+
+    /// Read, validate, and probe one exact registry record without scanning or
+    /// probing unrelated entries. A missing path is the ordinary `None` result;
+    /// corrupt or unreadable content remains an error so a caller cannot mistake an
+    /// unvalidated replacement for a run that is confirmed gone.
+    pub(crate) fn probe_entry(&self, record_path: &Path) -> io::Result<Option<Entry>> {
+        let text = match fs::read_to_string(record_path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let record = parse_and_validate_record(&text).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the registry record no longer passes validation",
+            )
+        })?;
+        let lock_path = self.dir.join(&record.liveness.lock_file);
+        let health = match probe_health(&lock_path) {
+            Ok(LivenessProbe::Live) => Health::Live,
+            Ok(LivenessProbe::Stale) => Health::Stale,
+            Err(_) => Health::Unprobed,
+        };
+        Ok(Some(Entry {
+            record,
+            health,
+            path: record_path.to_path_buf(),
+        }))
     }
 
     /// Reap every **confirmed-stale** entry — both its files, plus (on unix) the
@@ -2441,6 +2492,49 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn shared_setup_read_error_pins_the_exit_code_and_diagnostic() {
+        let err = setup_read_error(io::Error::new(io::ErrorKind::PermissionDenied, "denied"));
+        assert_eq!(err.code(), exit::SETUP);
+        assert_eq!(err.to_string(), "could not read the run registry: denied");
+    }
+
+    #[test]
+    fn point_probe_reads_only_the_requested_validated_record() {
+        let dir = scratch("point-probe");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+        let registration = registry
+            .register_plain("target", Some("endpoint-a"), SystemTime::now())
+            .expect("register target");
+        fs::write(dir.join("unrelated.json"), "not valid JSON")
+            .expect("write unrelated corrupt record");
+
+        let entry = registry
+            .probe_entry(registration.record_path())
+            .expect("probe exact target")
+            .expect("target exists");
+        assert_eq!(entry.record.run_id, "target");
+        assert_eq!(entry.health, Health::Live);
+
+        assert!(
+            registry
+                .probe_entry(&dir.join("missing.json"))
+                .expect("probe a missing target")
+                .is_none(),
+            "a missing exact record is distinct from corrupt content"
+        );
+        assert_eq!(
+            registry
+                .probe_entry(&dir.join("unrelated.json"))
+                .expect_err("corrupt target content is a hard read failure")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        drop(registration);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Test-only: set `path`'s mtime `age` in the past, without a real sleep — used

@@ -59,10 +59,10 @@ pub(crate) fn aligned_table<const N: usize>(
 ) -> Vec<String> {
     assert!(N > 0, "an aligned table needs at least one column");
 
-    let mut widths = headers.map(str::len);
+    let mut widths = headers.map(|header| header.chars().count());
     for row in rows {
         for (width, cell) in widths.iter_mut().zip(row.iter()) {
-            *width = (*width).max(cell.len());
+            *width = (*width).max(cell.chars().count());
         }
     }
 
@@ -151,5 +151,16 @@ mod tests {
         let lines = aligned_table(["A", "B"], &empty_final, "", "  ");
         assert_eq!(lines[1], "value");
         assert_eq!(lines[1].trim_end(), lines[1]);
+    }
+
+    #[test]
+    fn aligned_table_measures_multibyte_cells_in_characters_like_padding_does() {
+        let rows = [
+            ["ééé".to_string(), "first".to_string()],
+            ["x".to_string(), "second".to_string()],
+        ];
+        let lines = aligned_table(["A", "B"], &rows, "", "|");
+
+        assert_eq!(lines, vec!["A  |B", "ééé|first", "x  |second"]);
     }
 }
