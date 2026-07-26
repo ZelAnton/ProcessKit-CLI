@@ -75,13 +75,22 @@ pub const CAPTURE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 ///
 /// **Byte accounting under ProcessKit 3 (verified, not assumed).** ProcessKit 3
 /// made its *cumulative* output-byte counter raw — the bytes read from the pipe,
-/// including line terminators and pre-decode invalid UTF-8. That counter feeds
-/// exactly two things, and this runner uses **neither**: the fail-loud
+/// including line terminators and pre-decode invalid UTF-8 — by accumulating it
+/// at the read boundary (`seen_bytes`) instead of per decoded line. That counter
+/// feeds exactly two things, and this runner uses **neither**: the fail-loud
 /// `OverflowMode::Error` ceiling (`ErrorReason::OutputTooLarge`), and the
 /// `RunningProcess::stdout_bytes_seen`/`stderr_bytes_seen` readbacks. `run` hands
 /// the pump `OutputBufferPolicy::bounded(0)` — a *drop* mode — whose retention and
-/// per-line cap are still measured on decoded line content, and whose in-flight
-/// assembly cap (the one this constant sets) has always counted raw chunk bytes.
+/// per-line cap are measured on **decoded** line content, and so is the in-flight
+/// assembly cap this constant sets: the pump weighs the cap against the decoded
+/// text of the still-unterminated line, minus a lone trailing `\r` (which may yet
+/// turn out to be half of a CRLF terminator). That arithmetic is byte-identical to
+/// 2.x — it is *not* the accounting that went raw. Two consequences to keep
+/// straight when reasoning about this ceiling: invalid UTF-8 decodes to U+FFFD
+/// (3 bytes per replacement), so the measured length can exceed the raw bytes read
+/// rather than trail them; and the cap is rechecked once per read, after a whole
+/// 8 KiB chunk has decoded in, so the real memory bound is about `cap` plus one
+/// read chunk, not exactly `cap`.
 /// So neither ceiling shifted with the upgrade and none of the runner's own
 /// counting had to move: [`CaptureTee`]'s per-stream `--capture-max-bytes` budget
 /// stays what it always was — the bytes this runner writes to the transcript file
