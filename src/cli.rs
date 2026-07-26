@@ -260,18 +260,17 @@ pub struct RunArgs {
     pub command: Vec<OsString>,
 }
 
-/// `inspect --run-id <id> --json`
+/// `inspect --run-id <id> [--json]`
 #[derive(Debug, Args)]
 pub struct InspectArgs {
     /// The run to inspect.
     #[arg(long, value_name = "id")]
     pub run_id: String,
 
-    /// Emit the snapshot as JSON. Required to match the fixed form; JSON is
-    /// currently the only supported output format, so the flag is not branched on —
-    /// clap enforces its presence and `inspect` always prints JSON.
-    #[allow(dead_code)] // Part of the fixed CLI form; enforced by clap, never read.
-    #[arg(long, required = true)]
+    /// Emit the snapshot as JSON instead of a human-readable rendering. Optional,
+    /// mirroring `list`/`prune` — `inspect` has a human-readable form of its own
+    /// (see `src/control.rs::render_snapshot_human`).
+    #[arg(long)]
     pub json: bool,
 }
 
@@ -729,14 +728,22 @@ mod tests {
     }
 
     #[test]
-    fn inspect_requires_run_id_and_json() {
+    fn inspect_requires_run_id_but_json_is_optional() {
         assert!(
             Cli::try_parse_from(["processkit-cli", "inspect", "--run-id", "r1", "--json"]).is_ok()
         );
+
+        let cli = Cli::try_parse_from(["processkit-cli", "inspect", "--run-id", "r1"])
+            .expect("--json is optional and defaults to off for inspect");
+        let Command::Inspect(args) = cli.command else {
+            panic!("expected the inspect subcommand");
+        };
+        assert_eq!(args.run_id, "r1");
         assert!(
-            Cli::try_parse_from(["processkit-cli", "inspect", "--run-id", "r1"]).is_err(),
-            "--json is part of the fixed form"
+            !args.json,
+            "--json is optional and defaults to off for inspect"
         );
+
         assert!(
             Cli::try_parse_from(["processkit-cli", "inspect", "--json"]).is_err(),
             "--run-id is required"

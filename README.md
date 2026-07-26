@@ -176,7 +176,7 @@ processkit-cli run     [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl>
                        [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
                        [--env-clear] [--env-remove <KEY>]... [--env <KEY=VALUE>]...
                        -- <program> <args...>
-processkit-cli inspect --run-id <id> --json
+processkit-cli inspect --run-id <id> [--json]
 processkit-cli cancel  --run-id <id>
 processkit-cli kill    --run-id <id>
 processkit-cli wait    --run-id <id> [--timeout <duration>]
@@ -261,8 +261,11 @@ runner-owned cancellation outcome should use the control-plane `cancel` command.
 
 `inspect`, `cancel`, and `kill` all communicate with a live `run` process over the
 same local IPC control plane, addressing it by `run_id` through the per-user registry
-— never by PID. `inspect` is read-only; `cancel` ends the run through the *same*
-soft-stop → grace → hard-kill teardown a `Ctrl-C` uses (exiting the run with the
+— never by PID. `inspect` is read-only and, like `list`/`prune`, has an optional
+`--json`: without it, `inspect` prints a human-readable rendering of the snapshot
+(run id, mechanism, root pid, start time, and a member table); with `--json` it
+prints the snapshot as a single JSON line, unchanged. `cancel` ends the run through
+the *same* soft-stop → grace → hard-kill teardown a `Ctrl-C` uses (exiting the run with the
 reserved code `108`), and `kill` hard-kills the whole tree immediately with no grace
 (code `109`). The scope of a cancel/kill is only the target run's ProcessKit
 container — never processes matched by executable name. Both outcomes are also written
