@@ -282,26 +282,53 @@ pub struct TargetArgs {
     pub run_id: String,
 }
 
-/// `wait --run-id <id> [--timeout <duration>]`
+/// `wait (--run-id <id> | --all) [--timeout <duration>]`
 ///
-/// Blocks while the named run is still live in the per-user registry and returns as
-/// soon as it is not — the supervision primitive for a caller that is **not** the
-/// runner's parent and so cannot simply wait on a child process (see
-/// [`crate::wait`], which implements it, and `docs/registry.md`, "Waiting —
-/// `wait`"). Read-only in every sense: it scans the registry, never connects to the
-/// run's control transport, never mutates registry state, and never ends the run.
+/// Blocks while the named run (`--run-id`) — or, in aggregate (`--all`), every run
+/// confirmed live in a snapshot taken the moment the wait starts — is still live in
+/// the per-user registry, and returns as soon as it is not — the supervision
+/// primitive for a caller that is **not** the runner's parent and so cannot simply
+/// wait on a child process (see [`crate::wait`], which implements both modes, and
+/// `docs/registry.md`, "Waiting — `wait`"). Read-only in every sense: it scans the
+/// registry, never connects to any run's control transport, never mutates registry
+/// state, and never ends a run.
+///
+/// `--run-id` and `--all` are mutually exclusive (`conflicts_with`, the same clap
+/// convention `RunArgs`'s stdio modes use above) and exactly one is required
+/// (`required_unless_present`): a bare `wait` with neither names no target and is
+/// rejected at parse time as a `USAGE` (100) form error, exactly like any other
+/// malformed invocation.
 #[derive(Debug, Args)]
 pub struct WaitArgs {
-    /// The run to wait for.
-    #[arg(long, value_name = "id")]
-    pub run_id: String,
+    /// The single run to wait for. Mutually exclusive with `--all`; exactly one of
+    /// the two is required.
+    #[arg(
+        long,
+        value_name = "id",
+        conflicts_with = "all",
+        required_unless_present = "all"
+    )]
+    pub run_id: Option<String>,
+
+    /// Wait for every run confirmed live in a snapshot taken the moment this
+    /// invocation starts, instead of one named run — the aggregate counterpart to
+    /// `--run-id`'s single-run barrier, for the typical orchestrator teardown
+    /// sequence (cancel everything, wait for it all to be gone, then prune). A run
+    /// that registers *after* the snapshot is out of scope for this invocation and
+    /// is never waited for; re-issue `wait --all` once this one returns to catch it.
+    /// Mutually exclusive with `--run-id`; exactly one of the two is required. See
+    /// [`crate::wait::run_all`] and `docs/registry.md`, "Waiting — `wait`", for the
+    /// full snapshot and unprobed-entry semantics.
+    #[arg(long, conflicts_with = "run_id", required_unless_present = "run_id")]
+    pub all: bool,
 
     /// Give up after this long instead of waiting indefinitely. This is a deadline
-    /// on **the wait**, not on the run: when it elapses the run is left running,
-    /// completely untouched, and `wait` exits with its own reserved
-    /// [`crate::exit::WAIT_TIMEOUT`] (112) — never the run's
-    /// [`crate::exit::TIMEOUT`] (106), which would claim the runner tore the tree
-    /// down. Omit it to block until the run actually finishes.
+    /// on **the wait**, not on any run: when it elapses, the run (or, under `--all`,
+    /// every still-outstanding run) is left running, completely untouched, and
+    /// `wait` exits with its own reserved [`crate::exit::WAIT_TIMEOUT`] (112) —
+    /// never a run's own [`crate::exit::TIMEOUT`] (106), which would claim the
+    /// runner tore the tree down. Omit it to block until the target(s) actually
+    /// finish.
     ///
     /// Same grammar and parse-time validation as `run --timeout` — the very same
     /// [`parse_positive_duration`], not a second parser — so a malformed value is
@@ -825,7 +852,8 @@ mod tests {
         let Command::Wait(args) = cli.command else {
             panic!("expected the wait subcommand");
         };
-        assert_eq!(args.run_id, "r1");
+        assert_eq!(args.run_id.as_deref(), Some("r1"));
+        assert!(!args.all, "--run-id alone must not imply --all");
         assert!(
             args.timeout.is_none(),
             "omitting --timeout means wait blocks until the run finishes"
@@ -833,8 +861,45 @@ mod tests {
 
         assert!(
             Cli::try_parse_from(["processkit-cli", "wait"]).is_err(),
-            "--run-id is required: there is no default run to wait for"
+            "one of --run-id/--all is required: there is no default target to wait for"
         );
+    }
+
+    /// T-216: `--all` is a valid alternative to `--run-id`, the two are mutually
+    /// exclusive, and naming neither is rejected just like naming neither used to be
+    /// impossible when `--run-id` alone was required.
+    #[test]
+    fn wait_all_is_an_alternative_to_run_id_and_the_two_are_mutually_exclusive() {
+        let cli =
+            Cli::try_parse_from(["processkit-cli", "wait", "--all"]).expect("wait --all alone");
+        let Command::Wait(args) = cli.command else {
+            panic!("expected the wait subcommand");
+        };
+        assert!(args.all);
+        assert!(
+            args.run_id.is_none(),
+            "--all alone must not imply a --run-id"
+        );
+
+        assert!(
+            Cli::try_parse_from(["processkit-cli", "wait", "--run-id", "r1", "--all"]).is_err(),
+            "--run-id and --all are mutually exclusive and must be clap-rejected together"
+        );
+        assert!(
+            Cli::try_parse_from(["processkit-cli", "wait", "--timeout", "5s"]).is_err(),
+            "naming neither --run-id nor --all leaves no target and must be rejected"
+        );
+    }
+
+    #[test]
+    fn wait_all_combines_with_timeout_using_the_same_grammar_as_run_id() {
+        let cli = Cli::try_parse_from(["processkit-cli", "wait", "--all", "--timeout", "2m"])
+            .expect("wait --all --timeout 2m");
+        let Command::Wait(args) = cli.command else {
+            panic!("expected the wait subcommand");
+        };
+        assert!(args.all);
+        assert_eq!(args.timeout, Some(Duration::from_secs(120)));
     }
 
     #[test]

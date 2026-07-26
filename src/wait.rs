@@ -10,6 +10,7 @@
 //!
 //! ```text
 //! processkit-cli wait --run-id build-42 [--timeout 10m]
+//! processkit-cli wait --all             [--timeout 10m]
 //! ```
 //!
 //! It is the *lifetime* counterpart to [`crate::list`]'s discovery and
@@ -74,14 +75,43 @@
 //! that needs to know a run really existed must establish that separately — it
 //! launched the run itself, or it saw the id in [`crate::list`] — and must not read
 //! `wait`'s `0` as proof of existence. See `docs/registry.md`, "Waiting — `wait`".
+//!
+//! # The aggregate barrier: `wait --all`
+//!
+//! [`run_all`] is the counterpart for a caller that does not hold one `run_id` but
+//! wants a barrier on *every* run — the typical orchestrator teardown sequence
+//! (cancel everything → wait for it all to be gone → prune). It reuses the exact same
+//! periodic-probing mechanism as [`run`], differing only in what it tracks:
+//!
+//! - **The target set is a snapshot, fixed once, at the moment the call starts** —
+//!   exactly the entries [`registry::Registry::entries`] confirms
+//!   [`registry::Health::Live`] at that instant. A run that registers *after* the
+//!   snapshot is out of scope for this invocation and is never waited for. This is a
+//!   deliberate, documented trade-off, not an oversight — one clear rule (the target
+//!   set never grows) beats a plausible-sounding but unbounded alternative ("keep
+//!   discovering new runs forever"), which would leave a caller unable to say when
+//!   `--all` could ever return. A caller that wants to catch a run starting
+//!   concurrently with the wait re-issues `wait --all` once this one returns. See
+//!   `docs/registry.md`, "Waiting — `wait`".
+//! - **An unprobeable snapshot entry stays outstanding**, exactly like the
+//!   single-run case above: [`RunStatus::Unprobed`]'s conservative stance ("unknown is
+//!   not confirmed") applies per-entry here too, never silently dropping an
+//!   unprobeable entry from the target set.
+//! - Success (`0`) means every snapshot entry probed stale or vanished from the
+//!   registry entirely (the same two indistinguishable "over" observations
+//!   [`RunStatus::Finished`] already folds into one case). There is no aggregate
+//!   `Ambiguous` outcome — `--all` never resolves an id at all, so the duplicate-id
+//!   question [`RunStatus::Ambiguous`] answers for `--run-id` does not arise.
 
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use crate::control;
 use crate::duration_fmt::format_duration;
 use crate::exit::{self, RunnerError};
-use crate::registry::{self, RunStatus};
+use crate::registry::{self, Health, RunStatus};
 
 /// How long to sleep between registry probes.
 ///
@@ -160,21 +190,11 @@ impl WaitDeadline {
 /// on (a bad `PROCESSKIT_CLI_REGISTRY_DIR`, denied permissions), and emphatically not
 /// an answer about the run.
 pub fn run(run_id: &str, timeout: Option<Duration>) -> Result<(), RunnerError> {
-    let registry = registry::Registry::open_read_only().map_err(|err| {
-        RunnerError::new(
-            exit::SETUP,
-            format!("could not open the run registry: {err}"),
-        )
-    })?;
+    let registry = open_registry()?;
     let deadline = timeout.map(WaitDeadline::new);
 
     loop {
-        let status = registry.probe_run(run_id).map_err(|err| {
-            RunnerError::new(
-                exit::SETUP,
-                format!("could not read the run registry: {err}"),
-            )
-        })?;
+        let status = registry.probe_run(run_id).map_err(read_error)?;
         match status {
             RunStatus::Finished => return Ok(()),
             RunStatus::Ambiguous { live } => {
@@ -223,6 +243,158 @@ fn wait_timed_out(run_id: &str, limit: Duration, last: RunStatus) -> RunnerError
         format!(
             "stopped waiting for run `{run_id}` after {}: {observed} — \
              raise or drop `--timeout` to keep waiting",
+            format_duration(limit)
+        ),
+    )
+}
+
+/// Open the registry read-only, mapping the "could not even open it" failure onto
+/// [`exit::SETUP`] — shared by [`run`] and [`run_all`], word-for-word the same
+/// diagnostic either way.
+fn open_registry() -> Result<registry::Registry, RunnerError> {
+    registry::Registry::open_read_only().map_err(|err| {
+        RunnerError::new(
+            exit::SETUP,
+            format!("could not open the run registry: {err}"),
+        )
+    })
+}
+
+/// Map a registry **scan** failure (as opposed to the open above) onto
+/// [`exit::SETUP`] — shared by every probe [`run`]/[`run_all`] make on an
+/// already-open registry.
+fn read_error(err: std::io::Error) -> RunnerError {
+    RunnerError::new(
+        exit::SETUP,
+        format!("could not read the run registry: {err}"),
+    )
+}
+
+/// Run `wait --all [--timeout <duration>]`: poll the per-user registry until none of
+/// the runs confirmed live in a snapshot taken at the moment this call starts are
+/// still live, then exit `0` — the aggregate counterpart to [`run`]'s single-`run_id`
+/// barrier. See the module doc's "The aggregate barrier: `wait --all`" section for the
+/// snapshot and unprobed-entry semantics this implements.
+///
+/// Each snapshot entry is tracked by its record file path ([`registry::Entry::path`]),
+/// not by `run_id`: two entries can share a `run_id` (the registry never enforces
+/// uniqueness, `docs/registry.md`, "Run id resolution"), and this barrier's job is
+/// "every *entry* confirmed live at the snapshot", not "every distinct id" — unlike
+/// [`run`], there is no per-id ambiguity question to ask here at all.
+///
+/// Structured exactly like [`run`]'s loop, just with a set of targets standing in for
+/// the single `run_id`: a target's health is established **first** (the snapshot
+/// before the loop, then [`reprobe_targets`] at the end of each iteration), the loop
+/// body only ever *decides* from the health already established, and the last pass's
+/// findings (`any_unprobed`) are what a timeout reports — never a status the loop
+/// itself never actually observed.
+pub fn run_all(timeout: Option<Duration>) -> Result<(), RunnerError> {
+    let registry = open_registry()?;
+    let deadline = timeout.map(WaitDeadline::new);
+
+    // The snapshot: one scan, fixed before the first poll, to exactly the entries
+    // confirmed live right now. Every later pass only ever *removes* from this set —
+    // nothing is ever added to it (see the module doc for why).
+    let mut targets = snapshot_live_targets(&registry).map_err(read_error)?;
+    // Whether the most recent pass over `targets` found an entry that could not be
+    // re-probed — reported honestly on a timeout instead of a confident "still live"
+    // the last pass never actually established for every remaining entry.
+    let mut any_unprobed = false;
+
+    loop {
+        if targets.is_empty() {
+            return Ok(());
+        }
+
+        match &deadline {
+            None => sleep(POLL_INTERVAL),
+            Some(deadline) => match deadline.next_step() {
+                Some(step) => sleep(step),
+                None => {
+                    return Err(wait_all_timed_out(
+                        targets.len(),
+                        any_unprobed,
+                        deadline.limit,
+                    ));
+                }
+            },
+        }
+
+        let (next_targets, unprobed) = reprobe_targets(&registry, &targets).map_err(read_error)?;
+        targets = next_targets;
+        any_unprobed = unprobed;
+    }
+}
+
+/// One registry scan, filtered to the entries [`Health::Live`] confirms live right
+/// now — the snapshot [`run_all`] fixes its target set to before its first poll. An
+/// entry [`Health::Unprobed`] at snapshot time is **not** included: the target set is
+/// documented as exactly the entries *confirmed* live at that instant, not "anything
+/// that might be" — see the module doc.
+fn snapshot_live_targets(registry: &registry::Registry) -> std::io::Result<HashSet<PathBuf>> {
+    Ok(registry
+        .entries()?
+        .into_iter()
+        .filter(|entry| entry.health == Health::Live)
+        .map(|entry| entry.path)
+        .collect())
+}
+
+/// Re-probe every entry still in `targets` against a fresh scan, dropping any that is
+/// confirmed over — [`Health::Stale`], or gone from the scan entirely (a clean exit
+/// removes its own record, the same "no record" observation [`RunStatus::Finished`]
+/// already folds into one case for the single-run barrier) — and keeping every one
+/// that re-probes [`Health::Live`] or [`Health::Unprobed`] (an unprobeable entry is
+/// never read as a completed run — the same stance [`RunStatus::Unprobed`] documents).
+/// Returns the surviving set alongside whether any survivor is only
+/// [`Health::Unprobed`], for [`wait_all_timed_out`] to report honestly.
+fn reprobe_targets(
+    registry: &registry::Registry,
+    targets: &HashSet<PathBuf>,
+) -> std::io::Result<(HashSet<PathBuf>, bool)> {
+    let mut current: HashMap<PathBuf, Health> = registry
+        .entries()?
+        .into_iter()
+        .map(|entry| (entry.path, entry.health))
+        .collect();
+
+    let mut still_outstanding = HashSet::with_capacity(targets.len());
+    let mut any_unprobed = false;
+    for path in targets {
+        match current.remove(path) {
+            Some(Health::Live) => {
+                still_outstanding.insert(path.clone());
+            }
+            Some(Health::Unprobed) => {
+                any_unprobed = true;
+                still_outstanding.insert(path.clone());
+            }
+            // Confirmed stale, or no longer present in the scan at all: over either
+            // way.
+            Some(Health::Stale) | None => {}
+        }
+    }
+    Ok((still_outstanding, any_unprobed))
+}
+
+/// The give-up error for [`run_all`]: `--timeout` elapsed with `outstanding` snapshot
+/// entries not yet confirmed over. Worded like [`wait_timed_out`] — names *waiting* as
+/// what stopped, never claims a run was ended — and, like it, never overstates what the
+/// last pass actually established: `any_unprobed` says whether at least one outstanding
+/// entry is only unconfirmed rather than affirmatively still live.
+fn wait_all_timed_out(outstanding: usize, any_unprobed: bool, limit: Duration) -> RunnerError {
+    let noun = if outstanding == 1 { "run" } else { "runs" };
+    let observed = if any_unprobed {
+        "at least one of them is not confirmed finished — a matching registry entry \
+         could not be re-probed, and an unprobeable entry is never read as a completed run"
+    } else {
+        "all of them are still live and were left running"
+    };
+    RunnerError::new(
+        exit::WAIT_TIMEOUT,
+        format!(
+            "stopped waiting for all runs after {}: {outstanding} snapshot {noun} still \
+             outstanding — {observed} — raise or drop `--timeout` to keep waiting",
             format_duration(limit)
         ),
     )
@@ -303,6 +475,62 @@ mod tests {
             "reads as a sentence about waiting: {message}"
         );
         assert!(message.contains("ambiguous"), "names the reason: {message}");
+    }
+
+    /// The `--all` give-up error carries the same reserved `WAIT_TIMEOUT` code as the
+    /// single-run one, names how many snapshot entries are still outstanding (with
+    /// correct singular/plural wording), and — when nothing was left unprobeable —
+    /// confidently says they are still live.
+    #[test]
+    fn wait_all_timed_out_uses_the_waiters_own_code_and_reports_the_outstanding_count() {
+        let err = wait_all_timed_out(2, false, Duration::from_secs(5));
+        assert_eq!(err.code(), exit::WAIT_TIMEOUT);
+        assert_ne!(
+            err.code(),
+            exit::TIMEOUT,
+            "a waiter's deadline must never be reported as any run's deadline"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains('2'),
+            "names the outstanding count: {message}"
+        );
+        assert!(message.contains("runs"), "uses plural wording: {message}");
+        assert!(
+            message.contains("still live"),
+            "states the runs outlived the wait: {message}"
+        );
+        assert!(
+            message.contains("5s"),
+            "echoes the requested deadline: {message}"
+        );
+
+        let singular = wait_all_timed_out(1, false, Duration::from_secs(5));
+        assert!(
+            singular.to_string().contains("1 snapshot run "),
+            "uses singular wording for exactly one outstanding entry: {}",
+            singular
+        );
+    }
+
+    /// Giving up while at least one outstanding entry is only unprobeable reports
+    /// that honestly, never a confident "still live" the last pass never established
+    /// for every entry — the aggregate counterpart to
+    /// `wait_timed_out_does_not_claim_liveness_it_never_confirmed`.
+    #[test]
+    fn wait_all_timed_out_does_not_claim_liveness_it_never_confirmed() {
+        let err = wait_all_timed_out(3, true, Duration::from_secs(5));
+        assert_eq!(err.code(), exit::WAIT_TIMEOUT);
+        let message = err.to_string();
+        assert!(
+            message.contains("not confirmed finished")
+                && message.contains("could not be re-probed"),
+            "names the unprobeable entry as the reason: {message}"
+        );
+        assert!(
+            !message.contains("still live"),
+            "must not assert liveness the probe never confirmed: {message}"
+        );
     }
 
     /// The sleep between probes is bounded twice over: by the poll step, and by the

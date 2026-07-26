@@ -12,6 +12,28 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- **New `wait --all` flag: a barrier on every live run, not just one.** `wait`
+  previously blocked on only one `run_id`; a supervisor or CI teardown step often
+  needs the aggregate version instead — cancel everything, wait until none of it is
+  left, then `prune` — which used to mean hand-rolling a polling loop over `list
+  --json`. `wait --all` (mutually exclusive with `--run-id`; exactly one of the two is
+  now required, `USAGE` (100) if neither is given) is that barrier: it blocks until no
+  run this invocation considers in scope is still live, then exits `0`. Its target set
+  is a **snapshot**, fixed once at the moment `--all` starts, to exactly the registry
+  entries confirmed live right then — a run that registers afterward is out of scope
+  for that invocation and is never waited for (re-issue `wait --all` to catch it), the
+  same "one clear rule beats an unbounded alternative" trade-off `wait --run-id`
+  already documents for an unknown id reading as finished. An entry whose liveness
+  cannot be re-probed on a later pass stays outstanding rather than being silently
+  dropped — the exact conservative stance `wait --run-id` already applies. A bounded
+  `--timeout` reports how many snapshot entries are still outstanding and, when any of
+  them was only unconfirmed on the last pass, says so rather than confidently claiming
+  they are all still live; unbounded, it keeps polling. Same reserved `WAIT_TIMEOUT`
+  (112) as the single-run case, and — unlike it — no aggregate `CONTROL` outcome, since
+  `--all` never resolves an id at all. `wait --run-id` is byte-for-byte unchanged.
+  Appears in the `probe` surface tokens automatically (`wait:--all`). See README.md,
+  "Command interface", and docs/registry.md, "Waiting — `wait`", "The aggregate
+  barrier — `wait --all`".
 - **`list` now says which run is which.** A registry entry used to carry only its
   `run_id`, health, `started_at`, and control endpoint, so an operator with several
   live runs saw rows that were indistinguishable in every way that mattered — nothing

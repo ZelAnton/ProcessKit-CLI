@@ -549,11 +549,14 @@ gone (reaping it is best-effort, exactly like the record/lock deletions).
 
 ## Waiting — `wait`
 
-`processkit-cli wait --run-id <id> [--timeout <duration>]` is the *lifetime*
-counterpart to `list`'s discovery and `prune`'s cleanup: it blocks while the named run
-is live and returns as soon as it is not. It exists for the supervisor that did **not**
-start the run — an adapter that restarted, a cleanup step, anything holding only a
-`run_id` — and therefore has no child process to wait on. Like `list` and `prune` it
+`processkit-cli wait (--run-id <id> | --all) [--timeout <duration>]` is the *lifetime*
+counterpart to `list`'s discovery and `prune`'s cleanup: it blocks while its target is
+live and returns as soon as it is not. `--run-id` and `--all` are mutually exclusive
+(clap rejects both together) and exactly one is required — see "The aggregate barrier
+— `wait --all`" below for the second mode. It exists for the supervisor that did
+**not** start the run — an adapter that restarted, a cleanup step, anything holding
+only a `run_id` (or nothing but "I want every run gone") — and therefore has no child
+process to wait on. Like `list` and `prune` it
 opens the registry through `Registry::open_read_only` (`src/registry.rs`), so waiting
 never creates the registry directory or touches its permissions, and unlike
 `inspect`/`cancel`/`kill` it never connects to the run's control transport: the run is
@@ -638,6 +641,44 @@ answer when `--timeout` elapses (`WAIT_TIMEOUT`, honestly meaning "could not con
 completion in time"); an unbounded one keeps waiting for a real verdict. This is the
 same "unknown is not confirmed" stance `prune` takes when it refuses to reap an entry it
 could not probe.
+
+### The aggregate barrier — `wait --all`
+
+`wait --all [--timeout <duration>]` (T-216) is the counterpart for a caller that does
+not hold one `run_id` but wants a barrier on *every* run — the typical orchestrator
+teardown sequence: cancel everything, wait for it all to be gone, then `prune`. It
+reuses the exact same periodic-probing mechanism (`src/wait.rs::run_all`), differing
+from `--run-id` only in what it tracks.
+
+**Snapshot semantics, fixed rather than left ambiguous.** At the moment `--all` starts,
+`wait` takes a single [`Registry::entries`] scan and fixes its target set to exactly
+the entries confirmed `Health::Live` at that instant, each identified by its record
+file (not by `run_id` — two entries can share one, since the registry never enforces
+uniqueness; see "Run id resolution" above). **A run that registers after the snapshot
+is out of scope for this invocation** and is never waited for — this is a deliberate,
+documented trade-off, the same "one clear rule beats a plausible-sounding but unbounded
+alternative" stance the "An unknown `run_id` reads as finished" section above already
+takes for the single-run case. The alternative — keep discovering new runs forever —
+would leave a caller unable to say when `--all` could ever return at all. A caller that
+wants to catch a run starting concurrently with the wait re-issues `wait --all` once
+this one returns.
+
+**Unprobed entries stay "not confirmed done".** On every later pass, a snapshot entry
+that re-probes `Health::Live` **or** `Health::Unprobed` stays outstanding — the exact
+same conservative stance the "Liveness it cannot confirm" section above documents for
+`--run-id`, applied per-entry instead of to a single target. An entry that re-probes
+`Health::Stale`, or that has vanished from the scan entirely (a clean exit deletes its
+own record), is dropped from the target set — the same "confirmed over" observation
+that lets an unknown `run_id` read as finished.
+
+**Outcomes.** Success (`0`) means every snapshot entry probed stale or vanished; a
+bounded `--timeout` that elapses with entries still outstanding is the same
+`WAIT_TIMEOUT` (112) `--run-id` uses, reporting how many snapshot entries are still
+outstanding and, when at least one of them was only `Unprobed` on the last pass, saying
+so rather than confidently claiming they are all still live. There is no aggregate
+`CONTROL`/ambiguity outcome: `--all` never resolves an id at all, so the duplicate-id
+question `--run-id` answers with `CONTROL` does not arise for it. Nothing is printed on
+success, exactly like `--run-id`.
 
 ## Lifecycle
 

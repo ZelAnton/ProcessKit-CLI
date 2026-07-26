@@ -110,11 +110,12 @@ pub const PROBE_INCOMPATIBLE: u8 = 110;
 /// Takes the next free code after [`PROBE_INCOMPATIBLE`] so no existing assignment
 /// shifts; `113`–`119` remain reserved.
 pub const SETUP: u8 = 111;
-/// The **`wait` subcommand's own** deadline elapsed while the run it was waiting for
-/// was still live: `wait --run-id <id> --timeout <duration>` gave up rather than
-/// block forever. This is *the waiter's* timeout, not the run's — the run itself was
-/// neither ended nor even touched (`wait` is read-only and never reaches the runner),
-/// and it keeps going after this exit. That is precisely why it cannot reuse
+/// The **`wait` subcommand's own** deadline elapsed while its target(s) were still
+/// live: `wait --timeout <duration>`, either the single-run form (`--run-id <id>`) or
+/// the aggregate one (`--all`), gave up rather than block forever. This is *the
+/// waiter's* timeout, not the run's — the run itself was neither ended nor even
+/// touched (`wait` is read-only and never reaches the runner), and it keeps going
+/// after this exit. That is precisely why it cannot reuse
 /// [`TIMEOUT`] (106), which means the opposite: *the runner* enforced a deadline and
 /// tore the child's tree down. A caller reading `112` learns "I stopped waiting",
 /// never "the run was stopped"; the run's own ending, whenever it comes, is still

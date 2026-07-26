@@ -1292,6 +1292,252 @@ fn wait_does_not_create_the_registry_directory() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Spawn `wait --all [--timeout <duration>]` against `registry` **without** waiting
+/// for it, mirroring `spawn_wait` for the aggregate barrier: the only way to prove
+/// blocking (or the deliberate absence of it, T-216) rather than infer it from
+/// elapsed time.
+fn spawn_wait_all(registry: &Path, timeout: Option<&str>) -> Child {
+    let mut cmd = Command::new(bin());
+    cmd.args(["wait", "--all"]);
+    if let Some(timeout) = timeout {
+        cmd.args(["--timeout", timeout]);
+    }
+    cmd.env("PROCESSKIT_CLI_REGISTRY_DIR", registry)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the wait --all client")
+}
+
+/// Run `wait --all` to completion against `registry` and hand back its output.
+fn wait_all_for(registry: &Path, timeout: Option<&str>) -> Output {
+    spawn_wait_all(registry, timeout)
+        .wait_with_output()
+        .expect("the wait --all client exits")
+}
+
+/// `wait --all` against a registry with no live runs at all — an absent directory, or
+/// one holding only confirmed-stale leftovers — succeeds at once: the snapshot's
+/// target set is already empty, so there is nothing to wait for.
+///
+/// The generous `--timeout` makes this a real assertion rather than a timing guess,
+/// exactly like `wait_returns_at_once_for_a_stale_entry`: an implementation that
+/// mistook a stale entry for live could only ever exit `WAIT_TIMEOUT` (112) here.
+#[test]
+fn wait_all_returns_at_once_with_no_live_runs() {
+    let dir = scratch("wait-all-empty");
+    let registry = registry_dir(&dir);
+
+    // A never-created registry: no live runs, trivially.
+    let out = wait_all_for(&registry, Some("10s"));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an empty (missing) registry has nothing to wait for; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "`wait --all` prints nothing on success: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // A registry with only confirmed-stale leftovers is likewise nothing to wait for.
+    write_stale_entry(&registry, "run-stale-0000");
+    let out = wait_all_for(&registry, Some("10s"));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a registry with only stale entries has nothing live to wait for; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The core `--all` contract, proved by observation like
+/// `wait_blocks_until_a_live_run_finishes`: while the one snapshot-confirmed run is
+/// live the client stays blocked, and once that run finishes `wait --all` returns `0`.
+#[test]
+fn wait_all_blocks_until_the_one_live_run_finishes() {
+    let dir = scratch("wait-all-live");
+    let registry = registry_dir(&dir);
+    let mut runner = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "wait-all-me"],
+        inspectable_child(),
+    )
+    .spawn()
+    .expect("spawn the runner");
+
+    // The run is waitable once its record is published.
+    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+
+    let mut waiter = spawn_wait_all(&registry, None);
+
+    // While the run is live the waiter must still be blocked, cross-checked against
+    // the registry actually still holding the live record on every probe.
+    for _ in 0..4 {
+        sleep(Duration::from_millis(250));
+        if record_count(&registry) == 0 {
+            panic!("the run ended sooner than this fixture expects; test is inconclusive");
+        }
+        assert!(
+            waiter
+                .try_wait()
+                .expect("poll the wait --all client")
+                .is_none(),
+            "`wait --all` must still be blocked while its snapshot-confirmed run is live"
+        );
+    }
+
+    // Let the run finish on its own (a clean exit removes its entry)...
+    let status = runner.wait().expect("the runner exits");
+    assert!(status.success(), "the fixture run exits cleanly");
+
+    // ...and the waiter must then return promptly, with success and no output.
+    let out = waiter
+        .wait_with_output()
+        .expect("the wait --all client exits once its snapshot is clear");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "waiting for every snapshot run to finish exits 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "`wait --all` prints nothing on success: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The waiter's own deadline, aggregate flavor: `--timeout` elapsing while a
+/// snapshot-confirmed run is still live reports `WAIT_TIMEOUT` (112), names how many
+/// snapshot entries are still outstanding, and leaves the run completely
+/// untouched — the aggregate counterpart to
+/// `wait_times_out_on_a_live_run_with_its_own_reserved_code`.
+#[test]
+fn wait_all_times_out_with_a_run_still_live() {
+    let dir = scratch("wait-all-timeout");
+    let registry = registry_dir(&dir);
+    let mut runner = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "long-all-runner"],
+        long_child(),
+    )
+    .spawn()
+    .expect("spawn the runner");
+
+    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+
+    let out = wait_all_for(&registry, Some("1s"));
+    assert_eq!(
+        out.status.code(),
+        Some(112),
+        "the waiter's own deadline exits with the reserved WAIT_TIMEOUT code; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "a timed-out `wait --all` prints nothing on stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains('1') && stderr.contains("still outstanding"),
+        "the failure names how many snapshot entries are still outstanding: {stderr}"
+    );
+    assert!(
+        stderr.contains("still live"),
+        "the failure says the outstanding run(s) outlived the wait, not that they were \
+         stopped: {stderr}"
+    );
+
+    // The give-up left the run completely alone — it is still registered and running.
+    assert_eq!(
+        record_count(&registry),
+        1,
+        "a wait --all that gave up must not have ended the run it was waiting for"
+    );
+    assert!(
+        runner.try_wait().expect("poll the runner").is_none(),
+        "the run is still going after the waiter gave up"
+    );
+
+    let _ = runner.kill();
+    let _ = runner.wait();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// **Snapshot semantics.** A run that registers *after* `wait --all`'s snapshot is out
+/// of scope for that invocation — documented in `src/wait.rs`'s module doc and
+/// `docs/registry.md`, "Waiting — `wait`" — and this proves it by observation rather
+/// than by reading the doc comment. `run1` is confirmed live *before* `wait --all`
+/// starts, so it is inside the snapshot; `run2` is spawned — and only confirmed live —
+/// well after `wait --all` has had time to take its snapshot, so it is provably
+/// outside it. Once `run1` alone finishes, `wait --all` must return `0` even though
+/// `run2` is still live and registered.
+#[test]
+fn wait_all_snapshot_excludes_a_run_that_registers_after_it_starts() {
+    let dir = scratch("wait-all-snapshot");
+    let registry = registry_dir(&dir);
+
+    let mut run1 = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "snapshot-run1"],
+        inspectable_child(),
+    )
+    .spawn()
+    .expect("spawn the first runner");
+    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+
+    let waiter = spawn_wait_all(&registry, None);
+    // Give the waiter comfortable room to take its one snapshot scan before the
+    // second run is ever spawned, let alone registered.
+    sleep(Duration::from_millis(500));
+
+    let mut run2 = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "snapshot-run2"],
+        long_child(),
+    )
+    .spawn()
+    .expect("spawn the second runner");
+    wait_until(|| record_count(&registry) == 2, Duration::from_secs(10));
+
+    // `run1` finishing on its own clears everything the snapshot actually contained.
+    let status = run1.wait().expect("the first runner exits");
+    assert!(status.success(), "the first fixture run exits cleanly");
+
+    // `run2` is still live and registered, but it is not part of this invocation's
+    // snapshot, so the waiter must return promptly rather than block on it.
+    let out = waiter
+        .wait_with_output()
+        .expect("the wait --all client exits once its snapshot is clear");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a run outside the snapshot must never be waited for; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        record_count(&registry),
+        1,
+        "run2 must still be registered and live after the waiter returned"
+    );
+
+    let _ = run2.kill();
+    let _ = run2.wait();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The end-to-end reaping contract: `prune` deletes a confirmed-stale entry from disk
 /// while leaving a live run's entry completely untouched — the through-the-binary
 /// counterpart to the fine-grained `Registry::prune` unit tests in `src/registry.rs`.

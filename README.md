@@ -179,7 +179,7 @@ processkit-cli run     [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl>
 processkit-cli inspect --run-id <id> [--json]
 processkit-cli cancel  --run-id <id>
 processkit-cli kill    --run-id <id>
-processkit-cli wait    --run-id <id> [--timeout <duration>]
+processkit-cli wait    (--run-id <id> | --all) [--timeout <duration>]
 processkit-cli list    [--json]
 processkit-cli prune   [--json] [--dry-run]
 processkit-cli probe   --json [--require-schema-version <N>]
@@ -296,6 +296,17 @@ entry, an **unknown** `run_id` is indistinguishable from one that already finish
 was cleaned up, so both exit `0` — meaning a typo'd `run_id` returns success
 immediately, and `wait`'s `0` must never be read as proof the run existed. See
 [`docs/registry.md`](docs/registry.md), "Waiting — `wait`".
+
+`wait --all` (mutually exclusive with `--run-id`; exactly one of the two is required)
+is the aggregate counterpart: an orchestrator teardown barrier that blocks until no run
+this invocation considers in scope is still live, for the typical "cancel everything,
+wait for it all to be gone, then `prune`" sequence. Its target set is a **snapshot**,
+fixed once at the moment `--all` starts to exactly the entries confirmed live right
+then — a run that registers afterward is out of scope for that invocation and is never
+waited for; re-issue `wait --all` to catch it. An entry whose liveness cannot be
+re-probed on a later pass stays outstanding rather than being silently dropped, the
+same conservative stance `--run-id` takes. See [`docs/registry.md`](docs/registry.md),
+"Waiting — `wait`", "The aggregate barrier — `wait --all`".
 
 `list` is the discovery counterpart to `inspect`/`cancel`/`kill`: it scans the same
 per-user registry and prints every entry it finds — `run_id`, health (`live`/
@@ -737,9 +748,11 @@ the JSONL stream and by exit code, and each a bounded `CONTROL` (103) failure wh
 run cannot be reached. `list` scans the same registry read-only and prints every
 entry, whatever its health (`live`/`stale`/`unprobed`), as a table or (with
 `--json`) as JSON Lines — the discovery counterpart for a caller that has lost or
-never had a `run_id` — and `prune` reaps the confirmed-stale leftovers it shows. `wait` blocks on that same registry until a
-run is no longer live, for a supervisor that is not the runner's parent, bounding
-itself with `--timeout` and its own reserved exit code (`112`). `probe` reports and
+never had a `run_id` — and `prune` reaps the confirmed-stale leftovers it shows. `wait`
+blocks on that same registry until its target — one named run (`--run-id`) or every
+run confirmed live in a snapshot taken at the start (`--all`) — is no longer live, for
+a supervisor that is not the runner's parent, bounding itself with `--timeout` and its
+own reserved exit code (`112`). `probe` reports and
 verifies the binary's compatibility surface for a consumer's fail-closed launcher
 preflight, with no side effects, exiting `PROBE_INCOMPATIBLE` (110) on an
 incompatible candidate; `probe --print-schema` instead prints the binary's

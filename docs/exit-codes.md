@@ -85,9 +85,11 @@ stream — see `docs/schema.md`.
 ## A waiter's deadline is not a run's deadline
 
 `WAIT_TIMEOUT` (112) is the one code in this table that describes **the client**, not
-the run. It is minted only by `wait --run-id <id> --timeout <duration>` (see
-[`docs/registry.md`](registry.md), "Waiting — `wait`"), and only for one situation: the
-wait deadline elapsed while the run was still live, so the command stopped waiting.
+the run. It is minted only by `wait --timeout <duration>` — targeting one run
+(`--run-id <id>`) or, in aggregate, every run confirmed live in a snapshot taken at the
+start (`--all`) — (see [`docs/registry.md`](registry.md), "Waiting — `wait`"), and only
+for one situation: the wait deadline elapsed while its target(s) were still live, so
+the command stopped waiting.
 
 The distinction from `TIMEOUT` (106) is the whole reason it exists, and the two must
 never be conflated:
