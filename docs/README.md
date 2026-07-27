@@ -69,11 +69,32 @@ an old command at an unrelated process.
 | Finite input | `--stdin-file FILE`. |
 | Durable bounded transcripts | `--capture-dir DIR`, optionally `--no-echo`. |
 | A stuck-worker detector | `--idle-timeout DURATION`. |
+| External tools launched by an automation agent | A foreground run with a unique id, finite deadlines, JSONL, and bounded capture. |
 | Launch now, supervise from another process | `--detach` plus a durable JSONL path and run id. |
 | Whole-tree resource caps | `--max-memory`, `--max-processes`, `--cpu-quota` where supported. |
 
 The [Cookbook](cookbook.md) gives copyable complete invocations. The narrative
 guides explain why combinations are accepted or rejected.
+
+## Use from automation agents
+
+An automation or coding agent can use this binary without a dedicated SDK. A
+project instruction can simply require external tools to be launched through
+`processkit-cli run` with a unique run id, finite deadlines, lifecycle JSONL,
+and bounded capture. The agent then has explicit `inspect` / `cancel` / `wait` /
+`kill` recovery operations instead of tracking a fragile PID or cleaning up by
+process name.
+
+This makes agent-driven builds, tests, compilers, and long-lived workers more
+robust: descendant cleanup is scoped to the run, silent hangs can be bounded,
+diagnostics survive an interrupted agent turn, and different workloads can use
+different timeout, output, environment, and resource strategies. It does not
+pretend that disappearance of an arbitrary agent process is itself a portable
+cleanup signal; prefer foreground runs, terminate the runner during agent
+teardown, and use finite deadlines. Detached work needs a separate supervisor.
+
+See [Agent and automation workflows](agent-workflows.md) for a ready-to-paste
+agent policy and complete foreground, recovery, and escalation examples.
 
 ## What the runner guarantees
 
@@ -130,6 +151,7 @@ cleanup path. See the [architecture](architecture.md) and
 | --- | --- |
 | [Installation and distribution](installation.md) | Archives, target selection, checksums, attestations, Cargo, completions, man pages. |
 | [Cookbook](cookbook.md) | Task → command recipes for common foreground, detached, capture, control, and container workflows. |
+| [Agent and automation workflows](agent-workflows.md) | A drop-in agent instruction, bounded execution strategies, recovery, and honest agent-stop guarantees. |
 | [Running commands](running-commands.md) | Shell-free argv, cwd, environment, run ids, foreground lifecycle, and flag interactions. |
 | [Standard I/O and capture](io-and-capture.md) | Default pipes, inherited handles, stdin files, no-echo, bounded transcripts, TTY caveats. |
 | [Detached runs](detached-runs.md) | Startup proof, changed launcher exit semantics, recovery, and out-of-band supervision. |

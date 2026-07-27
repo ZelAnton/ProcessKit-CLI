@@ -2,12 +2,12 @@
 
 <!-- These draft prefix chapters form the ProcessKit-family switcher. mdBook
      cannot point a SUMMARY entry at an external URL, so theme/nav-links.js
-     upgrades the first three entries to links and marks CLI runner as the
+     upgrades the other implementations to links and marks CLI runner as the
      current project. -->
 [Rust version]()
+[CLI runner]()
 [Python wrapper]()
 [.NET version]()
-[CLI runner]()
 
 ---
 
@@ -19,6 +19,7 @@
 
 - [Installation and distribution](installation.md)
 - [Cookbook](cookbook.md)
+- [Agent and automation workflows](agent-workflows.md)
 - [Running commands](running-commands.md)
 - [Standard I/O and capture](io-and-capture.md)
 - [Detached runs](detached-runs.md)

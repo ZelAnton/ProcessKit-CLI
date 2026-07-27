@@ -423,6 +423,8 @@ carries the "could not reach the target run" failure modes of §4.
 
 ## See also
 
+- [`docs/agent-workflows.md`](agent-workflows.md) — a policy and execution
+  strategy for automation agents that launch external tools through the runner.
 - [`docs/schema.md`](schema.md) — the normative JSONL event schema (every
   field, every event, versioning rules).
 - [`docs/exit-codes.md`](exit-codes.md) — the normative reserved exit-code

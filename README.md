@@ -20,6 +20,7 @@ owner of containment, teardown, PID-reuse discipline, and lifecycle semantics.
 The complete [GitHub Pages guide set](https://zelanton.github.io/ProcessKit-CLI/)
 starts with [installation](docs/installation.md), a task-oriented
 [cookbook](docs/cookbook.md), and focused guides for
+[agent and automation workflows](docs/agent-workflows.md),
 [running commands](docs/running-commands.md),
 [I/O and capture](docs/io-and-capture.md),
 [timeouts](docs/timeouts-and-cancellation.md),

@@ -16,7 +16,8 @@ to a dated version section.
   theme, rendered-link validation, and GitHub Pages deployment from `main`.
 - A user-focused Pages guide set covering installation, cookbook workflows,
   command execution, I/O and bounded capture, detached runs, timeouts,
-  resource limits, platforms, containers, and compatibility upgrades.
+  resource limits, platforms, containers, compatibility upgrades, and robust
+  external-process execution from automation agents.
 
 ### Changed
 -

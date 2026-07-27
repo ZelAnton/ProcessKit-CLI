@@ -298,6 +298,26 @@ processkit-cli wait --run-id recovered-run --timeout 30s
 Use the registry for current liveness and the JSONL file for durable history.
 Never reconnect by recorded PID.
 
+## Give an automation agent a bounded execution policy
+
+Instruct the agent to launch external tools through a foreground runner with a
+unique run id, finite deadlines, lifecycle JSONL, and bounded capture:
+
+```sh
+mkdir -p .agent-runs/agent-task-42
+processkit-cli run --run-id agent-task-42 \
+  --timeout 20m --idle-timeout 3m \
+  --capture-dir .agent-runs/agent-task-42/capture \
+  --jsonl .agent-runs/agent-task-42/events.jsonl \
+  -- <program> <args...>
+```
+
+The agent should cancel and wait by run id, never clean up by PID or process
+name, and reserve `--detach` for work with a separate supervisor. See
+[Agent and automation workflows](agent-workflows.md) for a ready-to-paste
+instruction, recovery strategy, and the precise limits of cleanup when the
+agent itself stops.
+
 ## Use as a container entrypoint
 
 ```dockerfile
@@ -326,5 +346,6 @@ is writable and the orchestrator's termination grace exceeds the CLI's grace.
 | deadlines and stop behavior | [Timeouts and cancellation](timeouts-and-cancellation.md) |
 | memory/process/CPU caps | [Resource limits](resource-limits.md) |
 | OS differences | [Platform support](platform-support.md) |
+| agent tool execution | [Agent and automation workflows](agent-workflows.md) |
 | adapter design | [Integration guide](integration.md) |
 | event fields | [JSONL event schema](schema.md) |

@@ -8,9 +8,9 @@
 
   var ENTRIES = {
     "Rust version": { href: "https://zelanton.github.io/ProcessKit-rs/" },
+    "CLI runner": { placeholder: "Current project" },
     "Python wrapper": { href: "https://zelanton.github.io/processkit-py/" },
-    ".NET version": { href: "https://zelanton.github.io/ProcessKit-fSharp/" },
-    "CLI runner": { placeholder: "Current project" }
+    ".NET version": { href: "https://zelanton.github.io/ProcessKit-fSharp/" }
   };
 
   function apply() {
