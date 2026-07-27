@@ -12,7 +12,8 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+- A ProcessKit-family mdBook documentation site, including the shared cover and
+  theme, rendered-link validation, and GitHub Pages deployment from `main`.
 
 ### Changed
 -

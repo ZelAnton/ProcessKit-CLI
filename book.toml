@@ -1,0 +1,14 @@
+[book]
+title = "ProcessKit CLI"
+description = "A standalone, shell-free ProcessKit runner with versioned JSONL events and a live control plane"
+src = "docs"
+language = "en"
+
+[output.html]
+git-repository-url = "https://github.com/ZelAnton/ProcessKit-CLI"
+edit-url-template = "https://github.com/ZelAnton/ProcessKit-CLI/edit/main/docs/{path}"
+site-url = "/ProcessKit-CLI/"
+additional-css = ["theme/custom.css"]
+# nav-links.js turns the reserved ProcessKit-family draft chapters into
+# external links and marks the CLI entry as the current project.
+additional-js = ["theme/nav-links.js"]

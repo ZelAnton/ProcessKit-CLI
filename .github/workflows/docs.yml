@@ -1,0 +1,88 @@
+name: Docs
+
+# Build the mdBook guides with the same pinned generator and shared theme as
+# the ProcessKit-rs, processkit-py, and ProcessKit-fSharp documentation sites.
+# Every relevant pull request validates the rendered site; only main deploys.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'theme/**'
+      - book.toml
+      - justfile
+      - scripts/check_docs_links.py
+      - .github/workflows/docs.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'theme/**'
+      - book.toml
+      - justfile
+      - scripts/check_docs_links.py
+      - .github/workflows/docs.yml
+  workflow_dispatch:
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (mdBook)
+    runs-on: ubuntu-latest
+    steps:
+      # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install mdBook
+        env:
+          MDBOOK_VERSION: 0.4.40
+        run: |
+          archive="mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -sSL "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/${archive}" \
+            | tar -xz -C /usr/local/bin
+      - name: Build the book
+        run: mdbook build
+      - name: Check rendered local links and anchors
+        run: python scripts/check_docs_links.py book
+
+  deploy:
+    name: deploy (GitHub Pages)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install mdBook
+        env:
+          MDBOOK_VERSION: 0.4.40
+        run: |
+          archive="mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -sSL "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/${archive}" \
+            | tar -xz -C /usr/local/bin
+      - name: Build the book
+        run: mdbook build
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: book
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

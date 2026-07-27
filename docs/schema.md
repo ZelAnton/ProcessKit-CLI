@@ -8,11 +8,11 @@ shapes. Treat every field below as public API.
 
 - The in-code source of truth is `src/events.rs`.
 - The golden sample stream is
-  [`fixtures/schema/v1/events.jsonl`](../fixtures/schema/v1/events.jsonl); the
+  [`fixtures/schema/v1/events.jsonl`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/fixtures/schema/v1/events.jsonl); the
   golden test (`events::tests::golden_stream_matches_the_fixture`) keeps this
   document, the code, and the fixture in lockstep.
 - A machine-readable JSON Schema (draft 2020-12) is published at
-  [`fixtures/schema/v1/schema.json`](../fixtures/schema/v1/schema.json) — one
+  [`fixtures/schema/v1/schema.json`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/fixtures/schema/v1/schema.json) — one
   variant per event type plus the shared envelope, transcribed from this
   document. **This prose document remains the normative source of truth**; the
   JSON Schema is a mechanical mirror of it, kept honest by

@@ -1,4 +1,6 @@
 /target
+/book
+**/__pycache__/
 
 # Build/log output `cargo mutants` writes locally (see CONTRIBUTING.md,
 # "Mutation testing") — never committed, same treatment as fuzz/.gitignore's

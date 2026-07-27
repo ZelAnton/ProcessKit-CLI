@@ -1,4 +1,8 @@
+![ProcessKit: async child-process management with a kernel-backed no-orphan guarantee](docs/processkit-cover.png)
+
 # processkit-cli
+
+[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-0A7BBB?logo=github)](https://zelanton.github.io/ProcessKit-CLI/)
 
 `processkit-cli` is a standalone, cross-platform command runner built on the
 public API of [`processkit`](https://crates.io/crates/processkit). It runs one

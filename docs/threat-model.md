@@ -177,7 +177,7 @@ explicitly **out of scope** for this project's own security mechanisms:
   opt-in, best-effort `--max-memory`/`--max-processes`/`--cpu-quota` caps on
   the child's own process tree (platform-limited: real Windows Job Object or
   Linux cgroup v2 enforcement only, fail-fast rather than silently
-  unenforced — see [`README.md`](../README.md), "Resource limits"),
+  unenforced — see [`README.md`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/README.md), "Resource limits"),
   `processkit-cli` does not defend against exhaustion of system-wide
   resources (memory, file descriptors, process table slots) by other
   workloads on the same machine; that remains the operating system's and the
@@ -185,7 +185,7 @@ explicitly **out of scope** for this project's own security mechanisms:
 
 ## See also
 
-- [`SECURITY.md`](../SECURITY.md) — how to report a vulnerability, and the
+- [`SECURITY.md`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/SECURITY.md) — how to report a vulnerability, and the
   automated supply-chain scanning this document's "Supply-chain compromise"
   entry summarizes.
 - [`docs/architecture.md`](architecture.md) — the module map and data flow

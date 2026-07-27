@@ -62,7 +62,7 @@ The report (one line, shown reformatted here):
 This is a **fail-closed** contract: an adapter that skips the preflight (or
 silently proceeds after a `PROBE_INCOMPATIBLE`) re-introduces exactly the
 uncontained-launch hazard this project exists to prevent. See
-[`src/probe.rs`](../src/probe.rs) and the normative exit-code table in
+[`src/probe.rs`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/src/probe.rs) and the normative exit-code table in
 [`docs/exit-codes.md`](exit-codes.md).
 
 `probe --print-schema` is a separate, simpler mode on the same subcommand: it

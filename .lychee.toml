@@ -16,4 +16,8 @@ exclude_path = [
     "^\\.work/",
     "^target/",
     "^fuzz/(corpus|artifacts|target)/",
+    # The ProcessKit-family switcher uses mdBook draft chapters (`[Title]()`).
+    # mdBook validates and renders those entries, while lychee treats their
+    # deliberately empty targets as broken URLs.
+    "SUMMARY\\.md$",
 ]

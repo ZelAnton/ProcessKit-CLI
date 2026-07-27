@@ -112,3 +112,8 @@ mutants *args='':
 docs-checks:
     typos .
     lychee --offline --config .lychee.toml README.md CONTRIBUTING.md SECURITY.md CHANGELOG.md 'docs/**/*.md'
+
+# Build the public mdBook site and verify every rendered local link and anchor.
+docs:
+    mdbook build
+    python scripts/check_docs_links.py book
