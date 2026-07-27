@@ -14,6 +14,9 @@ to a dated version section.
 ### Added
 - A ProcessKit-family mdBook documentation site, including the shared cover and
   theme, rendered-link validation, and GitHub Pages deployment from `main`.
+- A user-focused Pages guide set covering installation, cookbook workflows,
+  command execution, I/O and bounded capture, detached runs, timeouts,
+  resource limits, platforms, containers, and compatibility upgrades.
 
 ### Changed
 -

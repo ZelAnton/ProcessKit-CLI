@@ -17,14 +17,19 @@ The project owns the versioned JSONL event contract used by runner clients and
 future adapters, including `processkit-py`. ProcessKit-rs remains the sole
 owner of containment, teardown, PID-reuse discipline, and lifecycle semantics.
 
-For a map of the modules below, the data flow of one run, and the
-control-plane contour, see [the architecture overview](docs/architecture.md).
-For a consumer/adapter walkthrough — preflight, launching a run, reading the
-JSONL stream, supervision, and housekeeping — see
-[the integration guide](docs/integration.md). For symptom-to-cause diagnosis
-of common operator issues (CI resource-limit failures, a stray Windows
-console window, ambiguous run ids, and more), see
-[the troubleshooting guide](docs/troubleshooting.md).
+The complete [GitHub Pages guide set](https://zelanton.github.io/ProcessKit-CLI/)
+starts with [installation](docs/installation.md), a task-oriented
+[cookbook](docs/cookbook.md), and focused guides for
+[running commands](docs/running-commands.md),
+[I/O and capture](docs/io-and-capture.md),
+[timeouts](docs/timeouts-and-cancellation.md),
+[resource limits](docs/resource-limits.md), and
+[platform support](docs/platform-support.md). For adapter authors, the
+[integration guide](docs/integration.md) walks from fail-closed preflight through
+JSONL consumption, supervision, and housekeeping. The
+[architecture overview](docs/architecture.md) maps modules and data flow; the
+[troubleshooting guide](docs/troubleshooting.md) is organized by operator
+symptom.
 
 ## Installation
 

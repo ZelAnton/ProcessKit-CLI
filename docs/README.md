@@ -32,6 +32,9 @@ cargo install processkit-cli
 
 Release archives contain the binary, shell completions, man pages, the JSON
 Schema, a SHA-256 checksum, and a signed build-provenance attestation.
+See [Installation and distribution](installation.md) for target selection,
+checksum/attestation verification, completions, man pages, and post-install
+preflight.
 
 ## Quick start
 
@@ -56,6 +59,21 @@ processkit-cli cancel --run-id build-42
 The control commands address a per-user registry entry and a live local IPC
 endpoint, never an operating-system PID. A reused PID therefore cannot retarget
 an old command at an unrelated process.
+
+## Choose a run shape
+
+| You need | Use |
+| --- | --- |
+| A normal CI command with live output | Default `run`: closed stdin, pipe + echo stdout/stderr. |
+| A real existing terminal | `--inherit-stdio` (no capture or idle timeout). |
+| Finite input | `--stdin-file FILE`. |
+| Durable bounded transcripts | `--capture-dir DIR`, optionally `--no-echo`. |
+| A stuck-worker detector | `--idle-timeout DURATION`. |
+| Launch now, supervise from another process | `--detach` plus a durable JSONL path and run id. |
+| Whole-tree resource caps | `--max-memory`, `--max-processes`, `--cpu-quota` where supported. |
+
+The [Cookbook](cookbook.md) gives copyable complete invocations. The narrative
+guides explain why combinations are accepted or rejected.
 
 ## What the runner guarantees
 
@@ -106,18 +124,54 @@ platform. The last column is intentionally narrower: it describes only a crash,
 cleanup path. See the [architecture](architecture.md) and
 [troubleshooting guide](troubleshooting.md) for the exact caveats.
 
-## Documentation
+## Guides
 
 | Guide | Covers |
 | --- | --- |
+| [Installation and distribution](installation.md) | Archives, target selection, checksums, attestations, Cargo, completions, man pages. |
+| [Cookbook](cookbook.md) | Task → command recipes for common foreground, detached, capture, control, and container workflows. |
+| [Running commands](running-commands.md) | Shell-free argv, cwd, environment, run ids, foreground lifecycle, and flag interactions. |
+| [Standard I/O and capture](io-and-capture.md) | Default pipes, inherited handles, stdin files, no-echo, bounded transcripts, TTY caveats. |
+| [Detached runs](detached-runs.md) | Startup proof, changed launcher exit semantics, recovery, and out-of-band supervision. |
+| [Timeouts and cancellation](timeouts-and-cancellation.md) | Overall/idle clocks, grace, signals, cancel vs kill, and platform soft-stop behavior. |
+| [Resource limits](resource-limits.md) | Whole-tree memory/process/CPU caps and fail-closed enforcement. |
+| [Platform support](platform-support.md) | Release targets, mechanisms, abrupt cleanup, capability and CI matrices. |
+| [Running in containers](containers.md) | musl/glibc images, PID 1, signals, writable paths, cgroup delegation, outer limits. |
 | [Integration guide](integration.md) | Probe, launch, event consumption, supervision, and housekeeping for adapters. |
-| [Control plane](control-plane.md) | IPC transport, inspect/cancel/kill semantics, and safe targeting. |
+| [Compatibility and upgrades](compatibility.md) | Surface tokens, schema/exit-band pinning, rolling upgrades, and acceptance policy. |
+| [Live-run control plane](control-plane.md) | IPC transport, inspect/cancel/kill semantics, and safe targeting. |
 | [Run registry](registry.md) | Per-user records, liveness probing, ambiguity, waiting, and pruning. |
 | [JSONL event schema](schema.md) | The normative `schema_version = 1` contract and golden fixtures. |
 | [Exit-code contract](exit-codes.md) | Child-code fidelity and the reserved runner failure band. |
 | [Troubleshooting](troubleshooting.md) | Symptom-to-cause diagnosis for operators and CI. |
 | [Threat model](threat-model.md) | Trusted boundaries, hostile inputs, local IPC, and supply chain. |
 | [Architecture](architecture.md) | Module map and the data flow of one run. |
+
+## The 60-second tour
+
+```sh
+# 1. Prove the installed runner supports the contract your caller needs.
+processkit-cli probe --json \
+  --require-schema-version 1 \
+  --require-exit-code-band 100-119 \
+  --require-surface run:--capture-dir
+
+# 2. Start one shell-free command with a stable id and bounded transcripts.
+processkit-cli run --run-id demo --capture-dir ./demo-output \
+  --jsonl demo.jsonl -- cargo test
+
+# 3. While it is live, inspect or cancel it from another process.
+processkit-cli inspect --run-id demo --json
+processkit-cli cancel --run-id demo
+
+# 4. Discover or clean up registry state after an orchestrator restart.
+processkit-cli list --json
+processkit-cli prune --dry-run --json
+```
+
+The JSONL file is the durable lifecycle record. The registry and control
+endpoint exist only while a run is live (or as detectable stale leftovers after
+an abrupt runner death).
 
 Source, release history, and contribution guidance live in the
 [GitHub repository](https://github.com/ZelAnton/ProcessKit-CLI).
