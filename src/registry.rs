@@ -984,12 +984,19 @@ impl Registry {
             if path.extension().and_then(|ext| ext.to_str()) != Some("lock") {
                 continue;
             }
-            if path.with_extension("json").exists() {
-                // A `.json` sibling exists (whether or not it is itself a valid,
-                // parsable record) — this lock is not an orphan, so leave it to the
-                // paired-record pass above (or, for a corrupt `.json`, to neither
-                // pass, exactly as `scan` already leaves a corrupt record untouched).
-                continue;
+            match fs::symlink_metadata(path.with_extension("json")) {
+                Ok(_) => {
+                    // A `.json` sibling exists (whether or not it is itself a valid,
+                    // parsable record) — this lock is not an orphan, so leave it to the
+                    // paired-record pass above (or, for a corrupt `.json`, to neither
+                    // pass, exactly as `scan` already leaves a corrupt record untouched).
+                    continue;
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                // An unreadable sibling is unknown, not confirmed absent. The orphan
+                // pass deletes only when absence is affirmative, just as its later
+                // liveness probe reaps only an affirmative stale verdict.
+                Err(_) => continue,
             }
             let is_old_enough = match dir_entry.metadata().and_then(|meta| meta.modified()) {
                 Ok(modified) => now
@@ -3876,6 +3883,35 @@ mod tests {
         );
 
         drop(held);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_treats_a_dangling_json_symlink_as_an_existing_sibling() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch("prune-dangling-json-sibling");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+        let lock_path = dir.join("paired.lock");
+        let json_path = dir.join("paired.json");
+        fs::write(&lock_path, b"").expect("write the lock file");
+        symlink(dir.join("missing-target"), &json_path).expect("create dangling record symlink");
+        backdate(&lock_path, ORPHAN_LOCK_MIN_AGE + Duration::from_secs(1));
+
+        let outcome = registry.prune().expect("prune must not fail");
+        assert_eq!(
+            outcome,
+            PruneOutcome::default(),
+            "a dangling record symlink is still an existing sibling, so its lock is not orphaned"
+        );
+        assert!(lock_path.exists(), "the paired lock survives prune");
+        assert!(
+            fs::symlink_metadata(&json_path).is_ok(),
+            "the dangling record symlink survives prune"
+        );
+
+        let _ = fs::remove_file(&json_path);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -489,21 +489,28 @@ where
 /// sends more. A line that reaches the cap without a trailing `\n` is the overflow
 /// case: it is reported as an `InvalidData` error rather than silently handed back
 /// truncated (which a caller could easily mistake for a short, valid line) or grown
-/// without bound (the bug this cap exists to close). A clean, empty read (peer closed
-/// before sending anything) still comes back as `Ok(0)`, matching
-/// `AsyncBufReadExt::read_line`'s own contract.
+/// without bound (the bug this cap exists to close). A shorter unterminated line is
+/// a different protocol failure: it proves the peer closed mid-line, not that the
+/// bound was exhausted. A clean, empty read (peer closed before sending anything)
+/// still comes back as `Ok(0)`, matching `AsyncBufReadExt::read_line`'s own contract.
 async fn read_bounded_line<R>(reader: &mut R, line: &mut String) -> io::Result<usize>
 where
     R: AsyncBufRead + Unpin,
 {
     let read = reader.take(MAX_LINE_BYTES as u64).read_line(line).await?;
-    if read > 0 && !line.ends_with('\n') {
+    if read == MAX_LINE_BYTES && !line.ends_with('\n') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "line exceeded the {MAX_LINE_BYTES}-byte control-plane limit without a \
                  terminating newline"
             ),
+        ));
+    }
+    if read > 0 && !line.ends_with('\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the peer closed the connection before terminating its control-plane line",
         ));
     }
     Ok(read)
@@ -2276,6 +2283,36 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "an oversized request must never route a teardown command"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_line_distinguishes_mid_line_eof_from_limit_exhaustion() {
+        let mut short_reader = BufReader::new(&b"inspect"[..]);
+        let mut short_line = String::new();
+        let short_err = read_bounded_line(&mut short_reader, &mut short_line)
+            .await
+            .expect_err("a partial line at EOF is invalid");
+        assert_eq!(short_err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            short_err.to_string().contains("peer closed"),
+            "short EOF must describe the actual failure: {short_err}"
+        );
+        assert!(
+            !short_err.to_string().contains("exceeded"),
+            "short EOF must not claim the byte limit was exhausted: {short_err}"
+        );
+
+        let at_limit = vec![b'x'; MAX_LINE_BYTES];
+        let mut limit_reader = BufReader::new(at_limit.as_slice());
+        let mut limit_line = String::new();
+        let limit_err = read_bounded_line(&mut limit_reader, &mut limit_line)
+            .await
+            .expect_err("an unterminated line at the cap is invalid");
+        assert_eq!(limit_err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            limit_err.to_string().contains("exceeded"),
+            "cap exhaustion keeps the bounded-read diagnostic: {limit_err}"
         );
     }
 

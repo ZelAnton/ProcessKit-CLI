@@ -282,7 +282,7 @@ fn dry_run_summary_lines(preview: &PrunePreview) -> Vec<String> {
             } => {
                 let socket = socket_dir
                     .as_ref()
-                    .map(|dir| format!(" socket_dir={dir}"))
+                    .map(|dir| format!(" socket_dir={}", crate::text::terminal_safe(dir)))
                     .unwrap_or_default();
                 lines.push(format!(
                     "would prune entry run_id={} started_at={started_at}{socket}",
@@ -406,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_human_output_sanitizes_record_and_file_name_controls() {
+    fn dry_run_human_output_sanitizes_all_untrusted_fields() {
         let preview = PrunePreview {
             outcome: PruneOutcome {
                 pruned: 1,
@@ -417,7 +417,7 @@ mod tests {
                 PruneCandidate::Entry {
                     run_id: "forged\nentry\u{1b}[31m".to_string(),
                     started_at: "2026-07-22T00:00:00.000Z".to_string(),
-                    socket_dir: None,
+                    socket_dir: Some("/tmp/pkc-\u{202e}hidden\u{200b}".to_string()),
                 },
                 PruneCandidate::OrphanedLock {
                     lock_file_name: "orphan\nlock\u{7}.lock".to_string(),
@@ -434,6 +434,9 @@ mod tests {
             "human-readable prune lines contain no terminal controls: {lines:?}"
         );
         assert!(lines[0].contains("run_id=forged entry [31m"));
+        assert!(lines[0].contains("socket_dir=/tmp/pkc- hidden "));
+        assert!(!lines[0].contains('\u{202e}'));
+        assert!(!lines[0].contains('\u{200b}'));
         assert!(lines[1].contains("orphan lock .lock"));
     }
 
