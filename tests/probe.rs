@@ -107,6 +107,7 @@ fn probe_reports_a_consistent_compatible_surface() {
         "run:--jsonl",
         "run:--capture-dir",
         "run:--inherit-stdio",
+        "run:--windows-graceful-ctrl-break",
         "run:--inherit-stdin",
         "run:--stdin-file",
         "inspect:--json",

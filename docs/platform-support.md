@@ -51,7 +51,8 @@ Properties:
 - whole-tree memory, CPU, and active-process limits;
 - member snapshots through Job queries;
 - atomic hard kill on timeout/cancel/kill teardown;
-- best-effort graceful close before hard kill where a member exposes a window.
+- best-effort graceful close before hard kill where a member exposes a window;
+- opt-in `CTRL_BREAK` for console children via `--windows-graceful-ctrl-break`.
 
 ### Nested jobs
 
@@ -65,6 +66,10 @@ job remains authoritative and can terminate the runner plus its child job.
 The runner does not allocate a console. A normal child inherits what the
 platform would ordinarily provide. `--create-no-window` is an explicit
 Windows-only request and conflicts with `--inherit-stdio`.
+
+`--windows-graceful-ctrl-break` keeps the shared console, creates a child console
+process group, and lets ProcessKit address that group during graceful teardown. It
+therefore conflicts with `--create-no-window` and detached execution.
 
 ## Linux cgroup v2
 
@@ -107,7 +112,7 @@ its workload requires stronger containment.
 | Memory limit | Yes | With controller access | No |
 | Process-count limit | Yes | With controller access | No |
 | CPU quota | Yes | With controller access | No |
-| Soft-stop request | Window close where available | `SIGTERM` | `SIGTERM` |
+| Soft-stop request | Window close plus opt-in console `CTRL_BREAK` | `SIGTERM` | `SIGTERM` |
 | Direct inherited terminal | Yes | Yes | Yes |
 | PTY emulation | No | No | No |
 

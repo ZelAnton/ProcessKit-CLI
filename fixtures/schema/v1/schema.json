@@ -33,6 +33,10 @@
       "type": "integer",
       "minimum": 0
     },
+    "nonNegativeIntOrNull": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
     "u8": {
       "type": "integer",
       "minimum": 0,
@@ -196,9 +200,29 @@
           "enum": ["signalled", "unsupported", "failed", null],
           "description": "The soft-stop tier for a runner-imposed ending; null on the natural-exit path."
         },
+        "shutdown": {
+          "description": "ProcessKit capability and ShutdownReport observations for a runner-imposed graceful teardown; null when no soft stop was attempted.",
+          "anyOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "properties": {
+                "soft_stop_scope": { "type": "string", "enum": ["whole_tree", "opt_in_members", "none"] },
+                "soft_signal": { "type": "string", "enum": ["sent", "unsupported", "failed"] },
+                "members_before": { "$ref": "#/$defs/nonNegativeIntOrNull" },
+                "members_after": { "$ref": "#/$defs/nonNegativeIntOrNull" },
+                "drained_within_grace": { "type": ["boolean", "null"] },
+                "escalated": { "type": ["boolean", "null"] },
+                "elapsed_ms": { "$ref": "#/$defs/u64OrNull" }
+              },
+              "required": ["soft_stop_scope", "soft_signal", "members_before", "members_after", "drained_within_grace", "escalated", "elapsed_ms"],
+              "additionalProperties": false
+            }
+          ]
+        },
         "read_error": { "type": "boolean", "description": "true when the post-kill member read itself failed, in which case remaining/remaining_pids fall back to an empty snapshot, not a confirmed-clean teardown." }
       },
-      "required": ["schema_version", "time", "event", "remaining", "remaining_pids", "soft_terminate", "read_error"],
+      "required": ["schema_version", "time", "event", "remaining", "remaining_pids", "soft_terminate", "shutdown", "read_error"],
       "additionalProperties": false
     },
     "limitHit": {

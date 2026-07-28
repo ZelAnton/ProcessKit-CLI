@@ -1293,6 +1293,64 @@ fn inherited_stdio_preserves_real_windows_console_handles() {
     assert_eq!(runner_exit["child_code"], 0);
 }
 
+/// A fresh Windows console and an installed handler prove the opt-in path sends
+/// a real `CTRL_BREAK`, drains during grace, and reports that outcome without a
+/// hard-kill escalation.
+#[cfg(windows)]
+#[test]
+fn windows_graceful_ctrl_break_reaches_the_console_leader() {
+    let scenario = Scenario::new("e2e-windows-graceful-ctrl-break");
+    let jsonl = events_path(&scenario.dir);
+    let marker = scenario.path("ctrl-break.marker");
+    let jsonl_arg = jsonl.to_string_lossy().into_owned();
+    let marker_arg = marker.to_string_lossy().into_owned();
+
+    let host = Command::new(helper_bin())
+        .args([
+            "graceful-console-parent",
+            "--runner",
+            bin(),
+            "--jsonl",
+            &jsonl_arg,
+            "--marker",
+            &marker_arg,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn the dedicated Windows graceful-shutdown host");
+    let mut host = ChildGuard::new(host);
+    let status = wait_child_bounded(host.child_mut(), Duration::from_secs(30))
+        .expect("the graceful console-hosted runner exited");
+    assert_eq!(
+        status.code(),
+        Some(106),
+        "the runner must preserve its reserved timeout outcome"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker).expect("the CTRL_BREAK handler wrote its marker"),
+        "ctrl-break\n"
+    );
+
+    let events = read_events(&jsonl);
+    let cleanup = events
+        .iter()
+        .find(|event| event_tag(event) == "cleanup_finished")
+        .expect("the timed-out run records completed containment cleanup");
+    let shutdown = &cleanup["shutdown"];
+    assert_eq!(shutdown["soft_stop_scope"], "opt_in_members");
+    assert_eq!(shutdown["soft_signal"], "sent");
+    assert_eq!(shutdown["drained_within_grace"], true);
+    assert_eq!(shutdown["escalated"], false);
+    assert_eq!(cleanup["remaining"], 0);
+
+    let runner_exit = events.last().expect("a terminal lifecycle event");
+    assert_eq!(event_tag(runner_exit), "runner_exit");
+    assert_eq!(runner_exit["source"], "timeout");
+    assert_eq!(runner_exit["code"], 106);
+}
+
 /// A Unix pseudo-terminal proves more than descriptor inheritance: the contained
 /// child sees all streams as terminals and successfully reads. On targets where
 /// ProcessKit uses a separate process group, the runner temporarily hands that

@@ -346,6 +346,7 @@ mod tests {
             // automatically too — same derivation as the resource-limit flags below.
             "run:--capture-max-bytes",
             "run:--inherit-stdio",
+            "run:--windows-graceful-ctrl-break",
             "run:--inherit-stdin",
             "run:--stdin-file",
             "run:--timeout",

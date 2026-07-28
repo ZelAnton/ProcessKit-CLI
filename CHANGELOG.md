@@ -18,9 +18,14 @@ to a dated version section.
   command execution, I/O and bounded capture, detached runs, timeouts,
   resource limits, platforms, containers, compatibility upgrades, and robust
   external-process execution from automation agents.
+- `run --windows-graceful-ctrl-break`, an opt-in cooperative `CTRL_BREAK` tier for
+  Windows console children before Job Object escalation.
+- Structured `cleanup_finished.shutdown` observations from ProcessKit's pre-stop
+  capability probe and `ShutdownReport`.
 
 ### Changed
--
+- Split the registry into a stable facade, platform-specific implementation files,
+  and an isolated test module before further record/control-plane growth.
 
 ### Fixed
 -
@@ -162,10 +167,8 @@ to a dated version section.
   "signalled"` and says a close was asked for, never that a signal was sent; the far
   commoner windowless console child still reports `"unsupported"`, and its stderr line
   now states *why* nothing was delivered (no windowed member, no console-CTRL leader)
-  instead of blaming the platform. Deliberately **not** adopted here: opting the
-  runner's own child into ProcessKit's `windows_graceful_ctrl_break`, and the new
-  `soft_stop_scope()`/`stop()` capability and teardown reports — those change the
-  teardown contract itself and stay a roadmap item (`docs/ROADMAP.md`). Verified
+  instead of blaming the platform. The later `[Unreleased]` work now adopts the
+  console opt-in and structured stop reporting. Verified
   rather than assumed while upgrading: the release's switch to raw pipe-byte
   accounting applies only to the fail-loud `OverflowMode::Error` ceiling and the
   `*_bytes_seen` readbacks, neither of which this runner uses, so both of its own
@@ -238,8 +241,8 @@ to a dated version section.
   member-read failure.** Both emitters previously turned a `ProcessGroup::members()`
   read error into a silent `members_before: 0` / `remaining: 0, remaining_pids: []` —
   indistinguishable from a genuinely empty tree, and inconsistent with the sibling
-  `emit_members_snapshot`'s honest degradation and `wait_grace_or_empty`'s "a read
-  failure is not a confirmed empty tree" policy. Both now warn on stderr on a read
+  `emit_members_snapshot`'s honest degradation and the teardown policy that a read
+  failure is not a confirmed empty tree. Both now warn on stderr on a read
   failure and set the new `read_error: true` flag instead of letting the fallback
   stand as an observation; the success path is unaffected.
 - `list` (`--json` and the human-readable table) no longer prints a registry entry
@@ -470,7 +473,7 @@ to a dated version section.
   output capture".
 
 - **New `prune --dry-run` flag: preview a reap without deleting anything.**
-  `Registry::preview_prune` (`src/registry.rs`) runs the exact same two-pass scan and
+  `Registry::preview_prune` (`src/registry/mod.rs`) runs the exact same two-pass scan and
   the exact same `probe_for_prune` liveness classification a real `prune` uses, but
   never calls `fs::remove_file` — a confirmed-stale verdict releases its
   probe-acquired lock immediately (there is nothing to reclaim it for) and records

@@ -21,8 +21,13 @@ use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+static CTRL_BREAK_SEEN: AtomicBool = AtomicBool::new(false);
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -34,11 +39,14 @@ fn main() -> ExitCode {
         Some("job-parent") => job_parent(&args[1..]),
         Some("stdio-report") => stdio_report(&args[1..]),
         Some("console-parent") => console_parent(&args[1..]),
+        Some("graceful-console-parent") => graceful_console_parent(&args[1..]),
+        Some("ctrl-break-wait") => ctrl_break_wait(&args[1..]),
         Some("pty-parent") => pty_parent(&args[1..]),
         other => {
             eprintln!(
                 "e2e-helper: expected a mode \
-                 (root|spin|chatter|exit|job-parent|stdio-report|console-parent|pty-parent), \
+                 (root|spin|chatter|exit|job-parent|stdio-report|console-parent|\
+                 graceful-console-parent|ctrl-break-wait|pty-parent), \
                  got {other:?}"
             );
             ExitCode::from(2)
@@ -393,6 +401,113 @@ fn console_parent(args: &[String]) -> ExitCode {
                 ExitCode::from(4)
             }
         }
+    }
+}
+
+/// Allocate a fresh Windows console, then prove the runner's opt-in graceful
+/// tier reaches a contained console leader through a real `CTRL_BREAK` event.
+fn graceful_console_parent(args: &[String]) -> ExitCode {
+    #[cfg(not(windows))]
+    {
+        let _ = args;
+        eprintln!("e2e-helper graceful-console-parent is Windows-only");
+        ExitCode::from(2)
+    }
+    #[cfg(windows)]
+    {
+        let Some(runner) = flag_value(args, "--runner") else {
+            eprintln!("e2e-helper graceful-console-parent: expected --runner <path>");
+            return ExitCode::from(2);
+        };
+        let Some(jsonl) = flag_value(args, "--jsonl") else {
+            eprintln!("e2e-helper graceful-console-parent: expected --jsonl <path>");
+            return ExitCode::from(2);
+        };
+        let Some(marker) = flag_value(args, "--marker") else {
+            eprintln!("e2e-helper graceful-console-parent: expected --marker <path>");
+            return ExitCode::from(2);
+        };
+        if let Err(err) = allocate_fresh_console() {
+            eprintln!("e2e-helper graceful-console-parent: could not allocate a console: {err}");
+            return ExitCode::from(3);
+        }
+
+        let helper = std::env::current_exe().expect("resolve current e2e helper");
+        match Command::new(runner)
+            .args([
+                "run",
+                "--windows-graceful-ctrl-break",
+                "--timeout",
+                "2s",
+                "--grace",
+                "5s",
+                "--jsonl",
+                jsonl,
+                "--",
+            ])
+            .arg(helper)
+            .args(["ctrl-break-wait", "--marker", marker])
+            .status()
+        {
+            Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+            Err(err) => {
+                eprintln!("e2e-helper graceful-console-parent: could not spawn the runner: {err}");
+                ExitCode::from(4)
+            }
+        }
+    }
+}
+
+/// Wait for a Windows console `CTRL_BREAK` and record that the handler ran. The
+/// marker is written by the ordinary main thread rather than from the handler,
+/// keeping the callback async-safe and deterministic.
+fn ctrl_break_wait(args: &[String]) -> ExitCode {
+    #[cfg(not(windows))]
+    {
+        let _ = args;
+        eprintln!("e2e-helper ctrl-break-wait is Windows-only");
+        ExitCode::from(2)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+
+        let Some(marker) = flag_value(args, "--marker") else {
+            eprintln!("e2e-helper ctrl-break-wait: expected --marker <path>");
+            return ExitCode::from(2);
+        };
+        // SAFETY: the process-lifetime callback touches only a lock-free atomic,
+        // and remains a valid function pointer until this helper exits.
+        if unsafe { SetConsoleCtrlHandler(Some(ctrl_break_handler), 1) } == 0 {
+            eprintln!(
+                "e2e-helper ctrl-break-wait: could not install the handler: {}",
+                std::io::Error::last_os_error()
+            );
+            return ExitCode::from(3);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if CTRL_BREAK_SEEN.load(Ordering::Acquire) {
+                write_atomic(Path::new(marker), "ctrl-break\n");
+                return ExitCode::SUCCESS;
+            }
+            sleep(Duration::from_millis(25));
+        }
+        eprintln!("e2e-helper ctrl-break-wait: no CTRL_BREAK arrived within 20s");
+        ExitCode::from(5)
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn ctrl_break_handler(control_type: u32) -> windows_sys::core::BOOL {
+    use windows_sys::Win32::System::Console::CTRL_BREAK_EVENT;
+
+    if control_type == CTRL_BREAK_EVENT {
+        CTRL_BREAK_SEEN.store(true, Ordering::Release);
+        1
+    } else {
+        0
     }
 }
 

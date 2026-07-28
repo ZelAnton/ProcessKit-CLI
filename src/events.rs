@@ -48,6 +48,26 @@ use processkit::{Command as PkCommand, Mechanism, MemberInfo, Outcome, ParentDea
 /// (`docs/schema.md`, "Versioning").
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Structured observations from ProcessKit's graceful-stop driver. Present only
+/// when the runner attempted soft-stop -> grace -> escalation; natural exits and
+/// immediate control-plane kills carry `null` instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ShutdownInfo {
+    /// ProcessKit's pre-attempt capability probe: `whole_tree`, `opt_in_members`,
+    /// or `none`.
+    pub soft_stop_scope: &'static str,
+    /// What the stop driver observed: `sent`, `unsupported`, or `failed`.
+    pub soft_signal: &'static str,
+    /// Reported member counts; `null` means ProcessKit could not read the set.
+    pub members_before: Option<usize>,
+    pub members_after: Option<usize>,
+    /// Report-only facts are `null` if the stop operation itself failed before it
+    /// could return a `ShutdownReport`.
+    pub drained_within_grace: Option<bool>,
+    pub escalated: Option<bool>,
+    pub elapsed_ms: Option<u64>,
+}
+
 /// The wire record actually serialized per line: the common envelope
 /// (`schema_version`, `time`) plus the flattened event body (its `event` type tag
 /// and payload). Field order here is the on-the-wire order and is stable.
@@ -124,6 +144,7 @@ pub enum Event {
         remaining: usize,
         remaining_pids: Vec<u32>,
         soft_terminate: Option<&'static str>,
+        shutdown: Option<ShutdownInfo>,
         read_error: bool,
     },
     /// A configured ProcessKit resource limit could not be applied. Emitted when a
@@ -771,6 +792,7 @@ mod tests {
                 remaining: 0,
                 remaining_pids: vec![],
                 soft_terminate: None,
+                shutdown: None,
                 read_error: false,
             },
             // One `output_captured`: stdout captured in full (the `abc` vector),
@@ -801,6 +823,21 @@ mod tests {
                 timeout_ms: 5_000,
                 grace_ms: Some(2_000),
                 reason: "overall",
+            },
+            Event::CleanupFinished {
+                remaining: 0,
+                remaining_pids: vec![],
+                soft_terminate: Some("signalled"),
+                shutdown: Some(ShutdownInfo {
+                    soft_stop_scope: "whole_tree",
+                    soft_signal: "sent",
+                    members_before: Some(2),
+                    members_after: Some(0),
+                    drained_within_grace: Some(true),
+                    escalated: Some(false),
+                    elapsed_ms: Some(125),
+                }),
+                read_error: false,
             },
             Event::Cancelled {
                 source: "ctrl_c",

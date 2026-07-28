@@ -64,7 +64,9 @@ processkit-cli run \
 
 The runner first asks the tree to stop, waits up to the grace window, and then
 hard-kills survivors through the owning container. `cleanup_finished` reports
-whether a soft request was delivered, was unsupported, or failed.
+whether a soft request was delivered, was unsupported, or failed. Its `shutdown`
+object also records the pre-attempt `soft_stop_scope` and ProcessKit's
+`ShutdownReport`: observed member counts, early drain, escalation, and elapsed time.
 
 Grace is a maximum opportunity for cooperative exit, not a promise that every
 platform has a signal capable of reaching the child.
@@ -132,12 +134,15 @@ The command prints a JSON array with per-target `accepted`, `already_gone`, or
 ## Windows soft-stop behavior
 
 A Job Object has no POSIX signal. ProcessKit first tries a best-effort soft
-close of eligible windowed members. A plain console child that exposes no
-window and has not opted into a console-control leader receives no soft request.
+close of eligible windowed members. `run --windows-graceful-ctrl-break` also
+launches the direct console child as an addressable console process-group leader,
+so ProcessKit can send `CTRL_BREAK` before the grace window. The flag is a no-op
+off Windows and conflicts with `--create-no-window`/`--detach` because those modes
+have no shared console through which to deliver the event.
 
-The runner reports that honestly, still waits the requested grace, and then
-atomically kills the Job Object. It never labels the grace as “served” by the
-child when nothing was delivered.
+The runner probes `soft_stop_scope` before delivery and reports `none` when no
+eligible target exists. It never labels the grace as served by the child when
+nothing was delivered.
 
 Windows gives a console-close handler only a short system deadline. For that
 source the runner caps an excessive grace request so it can finish teardown and

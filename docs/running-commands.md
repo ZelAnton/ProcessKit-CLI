@@ -167,6 +167,10 @@ promising to preserve the caller's terminal are contradictory. It is especially
 useful with [detached runs](detached-runs.md), whose detached runner owns no
 console for a console child to inherit.
 
+`--windows-graceful-ctrl-break` opts a Windows console child into ProcessKit's
+cooperative `CTRL_BREAK` tier before Job Object escalation. It is a no-op off
+Windows and conflicts with both consoleless modes (`--create-no-window`, `--detach`).
+
 ## Flag interaction summary
 
 | Combination | Result |
@@ -178,6 +182,7 @@ console for a console child to inherit.
 | `--detach` + `--inherit-stdio` | Rejected: the caller is no longer present. |
 | `--detach` + `--capture-dir` | Valid: the detached runner still captures. |
 | `--create-no-window` + `--inherit-stdio` | Rejected on every platform at parse time. |
+| `--windows-graceful-ctrl-break` + `--create-no-window`/`--detach` | Rejected: `CTRL_BREAK` needs a shared console. |
 
 Parse-time conflicts are usage failures (`100`); no child is spawned.
 

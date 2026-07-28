@@ -50,6 +50,7 @@ pub enum Command {
 }
 
 /// `run [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl> [--create-no-window]
+/// [--windows-graceful-ctrl-break]
 /// [--timeout <duration>] [--idle-timeout <duration>] [--grace <duration>]
 /// [--max-memory <size>] [--max-processes <n>] [--cpu-quota <cores>]
 /// [--capture-dir <dir>] [--capture-max-bytes <size>] [--no-echo] [--detach]
@@ -57,7 +58,8 @@ pub enum Command {
 /// [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
 /// -- <program> <args...>`
 //
-// `run` consumes every field: `cwd`, `create_no_window`, `timeout`,
+// `run` consumes every field: `cwd`, `create_no_window`,
+// `windows_graceful_ctrl_break`, `timeout`,
 // `idle_timeout`, `grace`, `max_memory`, `max_processes`, `cpu_quota` — the
 // whole-tree ProcessKit resource caps (see `src/run/launch.rs`) — `command`, `jsonl`,
 // `run_id`, `argv_raw`, `capture_dir`/`capture_max_bytes` — bounded stdout/stderr
@@ -83,6 +85,17 @@ pub struct RunArgs {
     /// Windows: create the child with CREATE_NO_WINDOW.
     #[arg(long)]
     pub create_no_window: bool,
+
+    /// Windows: launch the child as a console process-group leader so ProcessKit's
+    /// graceful stop can send it `CTRL_BREAK` before the hard Job Object kill. This
+    /// is opt-in because it changes Windows console-signal routing. It is a no-op on
+    /// other platforms and conflicts with modes that deliberately provide no shared
+    /// console (`--create-no-window` and `--detach`).
+    #[arg(
+        long,
+        conflicts_with_all = ["create_no_window", "detach"]
+    )]
+    pub windows_graceful_ctrl_break: bool,
 
     /// Hard deadline for the whole run; the tree is torn down when it elapses. A
     /// value of `0` is rejected at parse time (see [`parse_positive_duration`]) —
@@ -1478,6 +1491,41 @@ mod tests {
             Cli::try_parse_from(["processkit-cli", "run", "--detach", "--", "true"]).is_err(),
             "--detach does not make the required --jsonl optional"
         );
+    }
+
+    #[test]
+    fn run_parses_windows_graceful_ctrl_break_and_rejects_consoleless_modes() {
+        let parsed = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--windows-graceful-ctrl-break",
+            "--",
+            "worker",
+        ])
+        .expect("the graceful Windows console opt-in parses");
+        let Command::Run(args) = parsed.command else {
+            panic!("expected run");
+        };
+        assert!(args.windows_graceful_ctrl_break);
+
+        for incompatible in ["--create-no-window", "--detach"] {
+            assert!(
+                Cli::try_parse_from([
+                    "processkit-cli",
+                    "run",
+                    "--jsonl",
+                    "events.jsonl",
+                    "--windows-graceful-ctrl-break",
+                    incompatible,
+                    "--",
+                    "worker",
+                ])
+                .is_err(),
+                "{incompatible} removes the shared console needed for CTRL_BREAK"
+            );
+        }
     }
 
     #[test]

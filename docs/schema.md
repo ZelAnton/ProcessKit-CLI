@@ -160,6 +160,7 @@ Container teardown finished (after the hard kill).
 | `remaining`      | integer           | Count of `remaining_pids`.                                              |
 | `remaining_pids` | array of integer  | Post-kill member snapshot; normally empty.                             |
 | `soft_terminate` | string, nullable  | The soft-stop tier for a runner-imposed ending (below); `null` on the natural-exit path. |
+| `shutdown`       | object, nullable  | Pre-attempt capability plus ProcessKit `ShutdownReport` observations; `null` when no soft stop was attempted. |
 | `read_error`     | boolean | `true` when the post-kill member read itself failed; see "Honest degradation on a teardown read failure" below. |
 
 `remaining_pids` is a snapshot: on the Job Object and cgroup mechanisms a process
@@ -170,14 +171,31 @@ is reaped. `soft_terminate` is one of:
 - `signalled` — a soft stop really was delivered to the tree: on Unix a `SIGTERM`
   broadcast; on Windows, where a Job Object has no POSIX signal, ProcessKit's
   best-effort soft *close* — a `WM_CLOSE` to every top-level window owned by a live
-  member (plus a console `CTRL_BREAK` to a child opted into ProcessKit's
-  `windows_graceful_ctrl_break`, which this runner does not use).
+  member plus a console `CTRL_BREAK` to a child opted in with
+  `--windows-graceful-ctrl-break`.
 - `unsupported` — nothing in the tree could receive a soft stop, so none was sent
   and the runner does not pretend otherwise. Windows-only in practice, and the
   ordinary case there for a plain console child: no windowed member and no
   console-CTRL leader means the soft tier has nothing to trigger. The grace window
   still elapsed before the atomic Job Object kill.
 - `failed` — the soft stop could not be delivered; the hard kill ran regardless.
+
+`shutdown` is `null` for natural exits and immediate `kill` endings. Otherwise it
+contains:
+
+| Field | Type | Notes |
+|---|---|---|
+| `soft_stop_scope` | string | Pre-attempt capability: `whole_tree`, `opt_in_members`, or `none`. |
+| `soft_signal` | string | Observed delivery: `sent`, `unsupported`, or `failed`. |
+| `members_before` / `members_after` | integer, nullable | ProcessKit's point-in-time counts; `null` on read failure. |
+| `drained_within_grace` | boolean, nullable | Whether every member exited before escalation. |
+| `escalated` | boolean, nullable | Whether ProcessKit hard-killed survivors. |
+| `elapsed_ms` | integer, nullable | Actual stop-driver duration in milliseconds. |
+
+The last three fields are `null` only when `ProcessGroup::stop` itself failed and
+could not return a `ShutdownReport`; the owning container's hard-kill backstop still
+runs. This is additive to schema v1 and leaves `soft_terminate` in place for existing
+consumers.
 
 **Honest degradation on a teardown read failure.** `members_before`/`remaining`/
 `remaining_pids` are read from the live container (`ProcessGroup::members()`),

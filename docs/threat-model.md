@@ -14,7 +14,7 @@ Three input surfaces are treated as untrusted or semi-trusted and are handled
 accordingly (bounded parsing, validation before use, no blind trust in shape):
 
 - **Registry bytes.** Every record file under the per-user run registry
-  (`src/registry.rs`) is parsed defensively — a corrupt or malformed record is
+  (`src/registry/mod.rs`) is parsed defensively — a corrupt or malformed record is
   skipped, never trusted to abort a scan or to smuggle a path outside the
   registry directory (see "Closed threats" below for the `lock_file` case).
 - **Control-plane wire strings.** The one request-verb line a client sends,
@@ -51,7 +51,7 @@ code/docs it is implemented and described in.
   The per-user registry directory's permissions are re-asserted on every
   mutating open, not merely checked: `0o700` re-applied via `chmod` on Unix
   (bypassing umask), a protected owner-only DACL replaced on Windows
-  (`src/registry.rs`, `Registry::open`/`open_in`,
+  (`src/registry/mod.rs`, `Registry::open`/`open_in`,
   `platform::create_owner_only_dir`, `platform::restrict_to_current_user`).
   The control-plane transport is deliberately **not** derived from that
   directory: each run atomically reserves its own short-lived `0o700`
@@ -91,7 +91,7 @@ code/docs it is implemented and described in.
   (with or without an extension, including superscript-digit aliases), and
   symlink targets (rejected at open time via `O_NOFOLLOW` on Unix / a
   reparse-point check on Windows) are all refused
-  (`src/registry.rs`, `is_simple_lock_file_name`,
+  (`src/registry/mod.rs`, `is_simple_lock_file_name`,
   `is_windows_reserved_device_name`, `platform::open_lock_file`).
 - **A record steering a deletion outside its own leftovers.** `prune` reaps
   the Unix control socket a **confirmed-stale** record published, which means
@@ -104,7 +104,7 @@ code/docs it is implemented and described in.
   `O_NOFOLLOW | O_DIRECTORY` and the socket is unlinked relative to that
   handle, only if it really is a socket, with the directory itself removed by
   an empty-only `rmdir`. A value failing any of that deletes nothing at all —
-  the record and its lock are still reaped (`src/registry.rs`,
+  the record and its lock are still reaped (`src/registry/mod.rs`,
   `platform::control_socket_dir_to_reap`,
   `platform::reap_control_socket_dir`; rationale in
   [`docs/registry.md`](registry.md#reaping-the-control-socket)).

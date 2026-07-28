@@ -193,7 +193,7 @@ concurrent runs started with the same explicit `--run-id` are both written as
 independent entries (independent opaque file stems — see "No PID addressing" above)
 and both read as live for as long as they run. Resolution is therefore the client's
 job — in `resolve_live_endpoint` (`src/control.rs`) for the control-plane verbs, and
-in `Registry::probe_run` (`src/registry.rs`) for the registry-only `wait`, which
+in `Registry::probe_run` (`src/registry/mod.rs`) for the registry-only `wait`, which
 reaches the same verdict from its own scan — and it is deliberately conservative:
 
 - The client scans every entry and filters to those matching the requested
@@ -255,7 +255,7 @@ wrong-target action. See
 ## Discovery — `list`
 
 `processkit-cli list [--json]` opens the registry through
-[`Registry::open_read_only`] (`src/registry.rs`) — **not** the mutating
+[`Registry::open_read_only`] (`src/registry/mod.rs`) — **not** the mutating
 [`Registry::open`] `run` uses, so listing never creates the registry directory and
 never touches its permissions — and scans it with [`Registry::entries`], the same
 scan every other client shares, printing every entry it finds, whatever its health:
@@ -322,7 +322,7 @@ it carries none of the "could not reach the target run" failure modes
 
 `processkit-cli prune [--json]` is the cleanup counterpart to `list`. Where `list`
 shows a stale leftover, `prune` deletes it: it opens the registry through
-[`Registry::open_read_only`] (`src/registry.rs`) — like `list`, so it never creates
+[`Registry::open_read_only`] (`src/registry/mod.rs`) — like `list`, so it never creates
 the directory or touches its permissions; a missing or empty registry simply has
 nothing to prune — scans it with the same shared scan `list` uses, and for each
 scanned record deletes **both** its files (`<stem>.json` then `<stem>.lock`, the same
@@ -351,7 +351,7 @@ freshly `create_new`-d `.lock` file that a **just-starting** `Registry::register
 not yet locked is, for a moment, indistinguishable from a genuine, long-dead orphan —
 both are simply an unlocked `.lock` with no `.json` next to them. The second pass
 therefore only ever considers a candidate whose mtime is already at least a few
-seconds old (`ORPHAN_LOCK_MIN_AGE` in `src/registry.rs`); a genuine orphan never ages
+seconds old (`ORPHAN_LOCK_MIN_AGE` in `src/registry/mod.rs`); a genuine orphan never ages
 out of that check, so the extra latency costs nothing, while the two-syscall
 reservation window reliably falls inside it. `Registry::reserve_entry` closes the
 same window from its own side: after taking its lock it re-checks that `lock_path`
@@ -496,7 +496,7 @@ a no-op that exits `0`.
 
 `processkit-cli prune --dry-run [--json]` (T-199) answers "what would `prune` reap
 right now?" without reaping anything. It is [`Registry::preview_prune`]
-(`src/registry.rs`), the non-destructive sibling of [`Registry::prune`]: the exact
+(`src/registry/mod.rs`), the non-destructive sibling of [`Registry::prune`]: the exact
 same two-pass scan (paired records via `Registry::scan`, then orphaned locks via
 `Registry::orphaned_lock_paths`) classified through the exact same
 [`probe_for_prune`] three-way probe described in "The reaping safety invariant"
@@ -561,7 +561,7 @@ live and returns as soon as it is not. `--run-id` and `--all` are mutually exclu
 **not** start the run — an adapter that restarted, a cleanup step, anything holding
 only a `run_id` (or nothing but "I want every run gone") — and therefore has no child
 process to wait on. Like `list` and `prune` it
-opens the registry through `Registry::open_read_only` (`src/registry.rs`), so waiting
+opens the registry through `Registry::open_read_only` (`src/registry/mod.rs`), so waiting
 never creates the registry directory or touches its permissions, and unlike
 `inspect`/`cancel`/`kill` it never connects to the run's control transport: the run is
 not disturbed, not ended, and not even aware of the waiter. A run whose transport never

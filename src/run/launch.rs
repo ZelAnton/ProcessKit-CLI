@@ -28,8 +28,8 @@ use super::signals::{deadline, effective_grace_for, idle_deadline, wait_for_canc
 use super::teardown::{
     clear_registration, control_kill_error, duration_ms, emit_cleanup_finished,
     emit_cleanup_started, emit_hard_teardown, emit_members_snapshot, emit_output_captured,
-    exit_code_for, finish, finish_foreground_failure, launch_failure_event, launch_failure_source,
-    map_launch_error, soft_terminate_label, soft_terminate_then_grace, termination_error,
+    exit_code_for, finish, finish_foreground_failure, graceful_teardown, launch_failure_event,
+    launch_failure_source, map_launch_error, termination_error,
 };
 use super::{Ending, Termination, TimeoutTrigger};
 
@@ -229,6 +229,12 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     // extra host on its own account. (See README, "Windows console".)
     if args.create_no_window {
         command = command.create_no_window();
+    }
+    // Opt-in console children can receive ProcessKit's Windows `CTRL_BREAK` soft
+    // stop before Job Object escalation. The builder is a documented no-op off
+    // Windows; clap has already rejected the two consoleless Windows modes.
+    if args.windows_graceful_ctrl_break {
+        command = command.windows_graceful_ctrl_break();
     }
     // Stdin defaults to ProcessKit's closed/null mode. The inheritance opt-ins
     // share this runner's real stdin, while a file is streamed through the core's
@@ -543,14 +549,15 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             // `cleanup_started` brackets the whole teardown — soft stop, grace, and
             // hard kill — so `members_before` is the full tree, not a post-soft remnant.
             emit_cleanup_started(&mut emitter, &group);
-            let soft = soft_terminate_then_grace(&group, grace).await;
-            emit_cleanup_finished(&mut emitter, &group, Some(soft_terminate_label(soft)));
+            let teardown = graceful_teardown(&group, grace).await;
+            emit_cleanup_finished(&mut emitter, &group, Some(&teardown));
             // A forced ending still reports whatever was captured before teardown.
             emit_output_captured(&mut emitter, &capture);
             // The registry entry is removed on every decided ending, not just the
             // happy path: a timeout tears the run down cleanly too.
             clear_registration(&registration);
-            let error = termination_error(Termination::Timeout { limit, trigger }, soft, grace);
+            let error =
+                termination_error(Termination::Timeout { limit, trigger }, &teardown, grace);
             Err(finish(&mut emitter, "timeout", None, error))
         }
         Ending::Cancelled(signal) => {
@@ -572,13 +579,13 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
                 grace_ms: grace.map(duration_ms),
             });
             emit_cleanup_started(&mut emitter, &group);
-            let soft = soft_terminate_then_grace(&group, grace).await;
-            emit_cleanup_finished(&mut emitter, &group, Some(soft_terminate_label(soft)));
+            let teardown = graceful_teardown(&group, grace).await;
+            emit_cleanup_finished(&mut emitter, &group, Some(&teardown));
             // A forced ending still reports whatever was captured before teardown.
             emit_output_captured(&mut emitter, &capture);
             // A signal cancel tears the run down cleanly too — its entry goes with it.
             clear_registration(&registration);
-            let error = termination_error(Termination::Cancelled(signal), soft, grace);
+            let error = termination_error(Termination::Cancelled(signal), &teardown, grace);
             Err(finish(&mut emitter, "cancelled", None, error))
         }
         Ending::ControlCancelled => {
@@ -590,11 +597,11 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
                 grace_ms: grace.map(duration_ms),
             });
             emit_cleanup_started(&mut emitter, &group);
-            let soft = soft_terminate_then_grace(&group, grace).await;
-            emit_cleanup_finished(&mut emitter, &group, Some(soft_terminate_label(soft)));
+            let teardown = graceful_teardown(&group, grace).await;
+            emit_cleanup_finished(&mut emitter, &group, Some(&teardown));
             emit_output_captured(&mut emitter, &capture);
             clear_registration(&registration);
-            let error = termination_error(Termination::ControlCancelled, soft, grace);
+            let error = termination_error(Termination::ControlCancelled, &teardown, grace);
             Err(finish(&mut emitter, "control_cancel", None, error))
         }
         Ending::ControlKilled => {

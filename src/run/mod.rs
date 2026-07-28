@@ -40,13 +40,12 @@
 //!   soft-stop → grace → hard-kill path, `kill` hard-kills the tree at once — so a
 //!   remote command never invents a parallel termination mechanism.
 //! - **One teardown path for every ending, honest per platform.** The deadline
-//!   and the cancel share a single termination path: attempt a *soft* stop
-//!   (`SIGTERM` to the whole tree on Unix), wait out `--grace`, then let the owning
-//!   group's kill-on-drop hard-tear-down the tree. On **Windows** a Job Object has
-//!   no POSIX signal, so the soft tier is ProcessKit's best-effort soft *close* —
-//!   a `WM_CLOSE` to any windowed member of the tree — which reaches nothing at
-//!   all for the ordinary console child, in which case the grace window still
-//!   elapses and the Job Object is then killed atomically. The runner never
+//!   and the cancel share ProcessKit's single reporting stop path: capability
+//!   probe, soft request, grace, and hard escalation. On Unix the request is
+//!   `SIGTERM` to the tree. On **Windows** a Job Object has no POSIX signal, so the
+//!   soft tier is `WM_CLOSE` to windowed members plus `CTRL_BREAK` for an opted-in
+//!   console leader. A tree with neither reports a `none` capability and escalates
+//!   atomically. The runner never
 //!   *pretends* a soft stop happened when it could not, and never claims a signal
 //!   the platform cannot send: the stderr message states exactly what was done
 //!   (see [`teardown::describe_teardown`]).

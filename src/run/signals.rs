@@ -115,9 +115,8 @@ pub(super) async fn wait_for_cancel_signal() -> CancelSignal {
         // a default disposition, so a *second* signal arriving mid-teardown is absorbed
         // rather than killing the runner half-way through the cleanup it is running.
         // That is deliberate and already the behavior of the existing `Ctrl-C` arm:
-        // teardown is bounded (`--grace` is an upper bound, cut short by
-        // `wait_grace_or_empty`), and finishing it is the whole point of catching the
-        // signal.
+        // teardown is bounded (`--grace` is an upper bound in ProcessKit's stop
+        // driver), and finishing it is the whole point of catching the signal.
         tokio::select! {
             biased;
             () = wait_for_ctrl_c() => CancelSignal::CtrlC,

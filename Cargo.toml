@@ -125,14 +125,14 @@ stress = []
 # (see the `[[bench]]` / `[[bin]]` `required-features` below).
 bench = []
 
-# Unix-only: the run registry (src/registry.rs) restricts its directory to `0700`
+# Unix-only: the run registry (src/registry/mod.rs) restricts its directory to `0700`
 # via std, but the per-run liveness lock — a BSD `flock` whose OS-released-on-death
 # semantics make an orphaned entry detectably stale — has no std wrapper, so it
 # calls `flock`/`LOCK_EX`/`EWOULDBLOCK` through libc directly.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# Windows-only: the run registry (src/registry.rs) needs two Win32 facilities with
+# Windows-only: the run registry (src/registry/mod.rs) needs two Win32 facilities with
 # no std equivalent — a *protected* owner-only DACL (the equivalent of unix `0700`;
 # built and applied via the Authorization/Security APIs) and the `LockFileEx`
 # liveness lock. Only the security, file-locking, token, and memory surfaces are

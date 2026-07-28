@@ -177,7 +177,8 @@ tri-state applies only where the runner never gets to run it at all (a crash, a
 
 ```text
 processkit-cli run     [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl>
-                       [--create-no-window] [--timeout <duration>]
+                       [--create-no-window] [--windows-graceful-ctrl-break]
+                       [--timeout <duration>]
                        [--idle-timeout <duration>]
                        [--grace <duration>] [--max-memory <size>]
                        [--max-processes <n>] [--cpu-quota <cores>]
@@ -583,18 +584,14 @@ unit) at parse time, the same "degenerate cap" treatment `--max-memory`,
 to leave that deadline unbounded instead.
 
 **Honest degradation on Windows.** A Windows Job Object has no POSIX signal, so the
-soft stop there is not a signal at all: ProcessKit makes a best-effort soft *close*
-of whatever the tree exposes — a `WM_CLOSE` to every top-level window owned by a live
-member. A plain console child owns no window, so for the ordinary Windows run
-**nothing** is delivered: the grace window still elapses, and then the Job Object is
-killed atomically. The runner never pretends a graceful soft-terminate happened when
-it could not — the stderr line for such a timeout/cancel says plainly that nothing in
-the tree could receive a soft close and that it was hard-killed via the Job Object
-after the grace delay. When the tree *does* contain a windowed member, the close is
-delivered and reported as `signalled` (see the `cleanup_finished` event's
-`soft_terminate` field in
-[the JSONL event schema](#jsonl-event-schema)) — never as a signal, which Windows
-cannot send. On Unix the soft stop is a real `SIGTERM` to the tree.
+soft stop there is a best-effort soft *close*: `WM_CLOSE` for windowed members and,
+when `--windows-graceful-ctrl-break` is set, `CTRL_BREAK` for the direct console child
+and its console process group. The opt-in conflicts with `--create-no-window` and
+`--detach`, which deliberately remove the shared console it needs; it is a no-op on
+non-Windows targets. Without an eligible window or opted-in console leader, the
+pre-stop capability probe reports `none` and the Job Object is killed atomically.
+`cleanup_finished.shutdown` records that scope and ProcessKit's structured stop
+observations; the runner never claims a request was delivered when none was.
 
 The machine-readable form of these outcomes is the `timeout` / `cancelled` event
 (and the terminal `runner_exit`) in the versioned JSONL stream written to
@@ -614,6 +611,11 @@ Windows deployments that want to suppress a stray `conhost` window for the child
 pass `--create-no-window` explicitly. It cannot be combined with
 `--inherit-stdio`: suppressing the child's console and promising to preserve the
 caller's terminal are contradictory requests.
+
+`--windows-graceful-ctrl-break` is the opposite console policy: it keeps the shared
+console and opts the child into a dedicated console process group so timeout/cancel
+teardown can send `CTRL_BREAK` before hard escalation. It conflicts with
+`--create-no-window` and `--detach` at parse time.
 
 A [detached run](#detached-runs) is the case where passing it matters most: the
 detached runner is created without a console at all, so a console child cannot

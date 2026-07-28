@@ -580,7 +580,7 @@ mod tests {
     }
 
     /// A unique, empty scratch directory for a fixture registry, mirroring
-    /// `src/registry.rs`'s own `scratch` test helper — there is no cross-module test
+    /// `src/registry/mod.rs`'s own `scratch` test helper — there is no cross-module test
     /// helper to share, so `wait`'s unit tests need their own copy.
     fn scratch(tag: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};

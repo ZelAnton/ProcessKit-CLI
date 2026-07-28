@@ -1166,7 +1166,7 @@ fn resolve_in_registry(
     }
 
     // Count *live* entries first — regardless of whether they advertise an
-    // endpoint — before ever looking at endpoints. `register` (`src/registry.rs`)
+    // endpoint — before ever looking at endpoints. `register` (`src/registry/mod.rs`)
     // never enforces `run_id` uniqueness, so two concurrent runs started with the
     // same explicit `--run-id` can both be live at once, and one of them may not
     // (yet, or ever) have published an endpoint (disconnected/failed transport).

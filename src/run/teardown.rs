@@ -5,9 +5,9 @@
 //! Two teardown tiers, and one site each, so no caller can drift from the
 //! others: [`emit_hard_teardown`] for every ending with no soft-stop tier of its
 //! own (a natural exit, a wait failure, a control-plane `kill`), and
-//! [`soft_terminate_then_grace`] — soft stop, then `--grace` as an *upper bound*
-//! via [`wait_grace_or_empty`] — for the three that have one (`timeout`,
-//! a signal `cancel`, `control_cancel`). Both end at the same terminal
+//! [`graceful_teardown`] — ProcessKit's reported soft stop, grace, and escalation —
+//! for the three that have one (`timeout`, a signal `cancel`, `control_cancel`).
+//! Both end at the same terminal
 //! [`finish`], which writes the one [`Event::RunnerExit`] every return path of
 //! [`super::launch::run_async`] owes the stream.
 //!
@@ -18,11 +18,13 @@
 
 use std::time::Duration;
 
-use processkit::{Error as PkError, ErrorReason as PkErrorReason, Outcome, ProcessGroup, Signal};
+use processkit::{
+    Error as PkError, ErrorReason as PkErrorReason, Outcome, ProcessGroup, SoftSignal,
+};
 
 use crate::capture::Capture;
 use crate::duration_fmt::format_duration;
-use crate::events::{Emitter, Event, Member};
+use crate::events::{Emitter, Event, Member, ShutdownInfo};
 use crate::exit::{self, RunnerError};
 use crate::registry;
 
@@ -68,7 +70,7 @@ pub(super) fn emit_output_captured(emitter: &mut Emitter, capture: &Option<Captu
 ///
 /// The three endings with a soft-stop tier (`timeout` / `cancel` /
 /// `control_cancel`, in [`super::launch::run_async`]'s `Ending` match) are not funneled
-/// through here: they run `soft_terminate_then_grace` between
+/// through here: they run [`graceful_teardown`] between
 /// `cleanup_started` and `cleanup_finished`, so their `cleanup_finished`
 /// carries `Some(label)` instead of this function's fixed `None`. That is
 /// the *only* difference in their tail — every other step matches this one.
@@ -219,14 +221,13 @@ fn remaining_pids_or_unknown(members: Result<Vec<u32>, PkError>) -> (Vec<u32>, b
 ///
 /// A post-kill `group.members()` read failure is not silently fabricated as "0
 /// remaining, confirmed clean": it warns on stderr, matching the honest
-/// degradation [`wait_grace_or_empty`] already applies to the same read (a
-/// failure there is treated as "not yet empty", never as a confirmed-empty
-/// tree — see its doc comment), and [`remaining_pids_or_unknown`]'s `read_error`
-/// flag carries that same "not confirmed" verdict onto the wire.
+/// degradation ProcessKit's own `ShutdownReport` applies to its member counts,
+/// and [`remaining_pids_or_unknown`]'s `read_error` flag carries that same "not
+/// confirmed" verdict onto the wire.
 pub(super) fn emit_cleanup_finished(
     emitter: &mut Emitter,
     group: &ProcessGroup,
-    soft: Option<&'static str>,
+    teardown: Option<&GracefulTeardown>,
 ) {
     let _ = group.kill_all();
     let members = group.members();
@@ -237,7 +238,8 @@ pub(super) fn emit_cleanup_finished(
     emitter.emit(&Event::CleanupFinished {
         remaining: remaining_pids.len(),
         remaining_pids,
-        soft_terminate: soft,
+        soft_terminate: teardown.map(|teardown| soft_terminate_label(teardown.soft)),
+        shutdown: teardown.map(|teardown| teardown.shutdown.clone()),
         read_error,
     });
 }
@@ -286,83 +288,59 @@ pub(super) fn launch_failure_source(error: &RunnerError) -> &'static str {
     }
 }
 
-/// The shared teardown path for both runner-imposed endings: try a soft stop,
-/// wait out `--grace`, and report what the soft stop actually did. The *hard*
-/// teardown is not done here — the caller drops the owning [`ProcessGroup`]
-/// afterwards, and its kernel-backed kill-on-drop is the single hard-kill path.
-///
-/// On Unix the soft stop is a `SIGTERM` broadcast to the whole tree. A Windows
-/// Job Object still has no POSIX signal, but since ProcessKit 3
-/// [`ProcessGroup::signal`] no longer refuses a `Signal::Term` outright: it makes
-/// a **best-effort soft close** of whatever the tree exposes — a `WM_CLOSE` to
-/// every top-level window owned by a live member, plus a console `CTRL_BREAK` to
-/// any child spawned through ProcessKit's opt-in `windows_graceful_ctrl_break`
-/// (which this runner does not use, so only the windowed members are reachable
-/// here). It returns [`PkErrorReason::Unsupported`] only when the tree has
-/// *neither* — the ordinary case for the console children `run` usually contains
-/// — and that is recorded faithfully rather than dressed up as a soft stop that
-/// never happened. Either way the grace window still elapses (giving a child that
-/// *can* stop — e.g. one that received the console's own `Ctrl-C` on Windows — a
-/// chance to exit first) before the atomic kill — but only as an *upper bound*:
-/// [`wait_grace_or_empty`] cuts the wait short the moment the tree is observed
-/// empty, rather than always sleeping the whole window.
-pub(super) async fn soft_terminate_then_grace(
-    group: &ProcessGroup,
-    grace: Option<Duration>,
-) -> SoftTerminate {
-    let soft = match group.signal(Signal::Term) {
-        Ok(()) => SoftTerminate::Signalled,
-        // ProcessKit 3 carries the structured failure mode behind a pointer-sized
-        // `Error`, so the classification borrows the reason rather than matching
-        // the wrapper itself; the tiers it selects are unchanged.
-        Err(err) => match err.reason() {
-            PkErrorReason::Unsupported { .. } => SoftTerminate::Unsupported,
-            // Best-effort: a delivery failure does not stop teardown — the group's
-            // kill-on-drop still reaps the tree — but it is reported honestly.
-            _ => SoftTerminate::Failed,
-        },
-    };
-    if let Some(grace) = grace {
-        wait_grace_or_empty(group, grace).await;
-    }
-    soft
+/// The shared reporting path for runner-imposed endings. ProcessKit owns the
+/// actual soft stop, grace polling, and escalation; this layer reads the capability
+/// first and projects the returned observations into the CLI's stable JSONL shape.
+#[derive(Debug, Clone)]
+pub(super) struct GracefulTeardown {
+    soft: SoftTerminate,
+    shutdown: ShutdownInfo,
 }
 
-/// The polling step used by [`wait_grace_or_empty`] to check for an early-empty
-/// container: short enough that a promptly-exiting tree does not hold the runner
-/// (and an already-acked control client) for a meaningfully longer tail than
-/// necessary, long enough not to turn teardown into a busy-poll.
-const GRACE_POLL_STEP: Duration = Duration::from_millis(25);
-
-/// Wait out `grace`, but return as soon as the container's tree is observed
-/// empty — `--grace` is an *upper bound* on how long we wait for a voluntary
-/// exit after the soft stop, not a mandatory delay. Polls
-/// [`ProcessGroup::members`] on [`GRACE_POLL_STEP`] instead of a single
-/// `sleep(grace)`, so a tree that dies well inside the window releases the
-/// runner (and any control-plane caller already ack'd) promptly instead of
-/// idling for the rest of `grace`.
-///
-/// POSIX caveat, deliberately accepted rather than worked around: a member that
-/// *just* exited can still be reported by `members()` until something reaps it
-/// (an un-reaped process is still "there" to a liveness check) — this is the
-/// same abrupt-cleanup tri-state documented at [`crate::events::abrupt_cleanup_str`]
-/// (K-005), not a Windows-only concern. The effect here is bounded and one-sided:
-/// it can make the empty-tree check lag the real exit by at most one poll step
-/// (negligible next to the grace window it shortens), and it can never
-/// *under*-report a live tree as empty — a still-running member is always seen —
-/// so an early return is always honest, only possibly a poll step late. A read
-/// failure is treated the same as "not yet empty": teardown falls back to the
-/// unmodified full-grace wait rather than guessing.
-async fn wait_grace_or_empty(group: &ProcessGroup, grace: Duration) {
-    let deadline = tokio::time::Instant::now() + grace;
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return;
+/// Drive ProcessKit's reporting stop primitive. The capability scope is read
+/// before the attempt, while the remaining fields come from its observed
+/// `ShutdownReport`. If the driver itself errors, kill-on-drop/`kill_all` remains
+/// the hard-stop backstop and the missing report facts stay explicitly null.
+pub(super) async fn graceful_teardown(
+    group: &ProcessGroup,
+    grace: Option<Duration>,
+) -> GracefulTeardown {
+    let soft_stop_scope = group.soft_stop_scope().name();
+    match group.stop(grace.unwrap_or_default(), true).await {
+        Ok(report) => {
+            let (soft, soft_signal) = match report.soft_signal() {
+                SoftSignal::Sent(_) => (SoftTerminate::Signalled, "sent"),
+                SoftSignal::Unsupported => (SoftTerminate::Unsupported, "unsupported"),
+                SoftSignal::Failed(_) => (SoftTerminate::Failed, "failed"),
+                _ => (SoftTerminate::Failed, "failed"),
+            };
+            GracefulTeardown {
+                soft,
+                shutdown: ShutdownInfo {
+                    soft_stop_scope,
+                    soft_signal,
+                    members_before: report.members_before(),
+                    members_after: report.members_after(),
+                    drained_within_grace: Some(report.drained_within_grace()),
+                    escalated: Some(report.escalated()),
+                    elapsed_ms: Some(duration_ms(report.elapsed())),
+                },
+            }
         }
-        tokio::time::sleep(remaining.min(GRACE_POLL_STEP)).await;
-        if matches!(group.members(), Ok(members) if members.is_empty()) {
-            return;
+        Err(err) => {
+            eprintln!("processkit-cli: warning: ProcessKit graceful stop failed: {err}");
+            GracefulTeardown {
+                soft: SoftTerminate::Failed,
+                shutdown: ShutdownInfo {
+                    soft_stop_scope,
+                    soft_signal: "failed",
+                    members_before: None,
+                    members_after: None,
+                    drained_within_grace: None,
+                    escalated: None,
+                    elapsed_ms: None,
+                },
+            }
         }
     }
 }
@@ -370,9 +348,38 @@ async fn wait_grace_or_empty(group: &ProcessGroup, grace: Duration) {
 /// Turn a runner-imposed ending into the reserved-band error it surfaces:
 /// [`exit::TIMEOUT`] / [`exit::CANCELLED`] plus a message that names the ending
 /// and describes, truthfully, how the tree was torn down.
-pub(super) fn termination_error(
+pub(super) trait TeardownDescription {
+    fn soft(&self) -> SoftTerminate;
+    fn soft_stop_scope(&self) -> &'static str;
+}
+
+impl TeardownDescription for SoftTerminate {
+    fn soft(&self) -> SoftTerminate {
+        *self
+    }
+
+    fn soft_stop_scope(&self) -> &'static str {
+        match self {
+            SoftTerminate::Unsupported => "none",
+            SoftTerminate::Signalled | SoftTerminate::Failed if cfg!(windows) => "opt_in_members",
+            SoftTerminate::Signalled | SoftTerminate::Failed => "whole_tree",
+        }
+    }
+}
+
+impl TeardownDescription for &GracefulTeardown {
+    fn soft(&self) -> SoftTerminate {
+        self.soft
+    }
+
+    fn soft_stop_scope(&self) -> &'static str {
+        self.shutdown.soft_stop_scope
+    }
+}
+
+pub(super) fn termination_error<T: TeardownDescription>(
     kind: Termination,
-    soft: SoftTerminate,
+    teardown: T,
     grace: Option<Duration>,
 ) -> RunnerError {
     let (code, headline) = match kind {
@@ -409,7 +416,7 @@ pub(super) fn termination_error(
     };
     RunnerError::new(
         code,
-        format!("{headline}: {}", describe_teardown(soft, grace)),
+        format!("{headline}: {}", describe_teardown(teardown, grace)),
     )
 }
 
@@ -440,13 +447,13 @@ pub(super) fn control_kill_error() -> RunnerError {
 fn soft_stop_mechanism(windows: bool) -> &'static str {
     if windows {
         // ProcessKit 3's Windows soft tier: `WM_CLOSE` to every top-level window
-        // owned by a live member (plus a console `CTRL_BREAK` to an opted-in
-        // leader, which this runner never registers). Deliberately not called a
+        // owned by a live member plus a console `CTRL_BREAK` to an opted-in
+        // leader. Deliberately not called a
         // signal — a Job Object has none — and deliberately free of the word
         // "grace", which belongs to the separate `--grace` wording this phrase is
         // spliced in front of.
-        "asked the process tree to close (a WM_CLOSE to its windowed members — \
-         a Job Object has no POSIX signal to send)"
+        "asked the reachable process-tree members to close (WM_CLOSE for windowed members and \
+         CTRL_BREAK for an opted-in console leader — a Job Object has no POSIX signal)"
     } else {
         "sent SIGTERM to the process tree"
     }
@@ -457,15 +464,17 @@ fn soft_stop_mechanism(windows: bool) -> &'static str {
 /// a real soft stop was delivered (and by which mechanism, see
 /// [`soft_stop_mechanism`]), whether a grace window was waited, and that the hard
 /// kill is the container's kill-on-drop (a Windows Job Object terminate).
-fn describe_teardown(soft: SoftTerminate, grace: Option<Duration>) -> String {
+fn describe_teardown<T: TeardownDescription>(teardown: T, grace: Option<Duration>) -> String {
+    let soft = teardown.soft();
+    let scope = teardown.soft_stop_scope();
     let waited = match grace {
         Some(grace) => format!("waited {} grace, then ", format_duration(grace)),
         None => String::new(),
     };
     match soft {
         SoftTerminate::Signalled => format!(
-            "{}, {waited}hard-killed it via the container's kill-on-drop",
-            soft_stop_mechanism(cfg!(windows))
+            "{} (capability scope: {scope}), {waited}hard-killed any survivors via the container",
+            soft_stop_mechanism(cfg!(windows)),
         ),
         // Windows-only in practice: every Unix backend always has a real SIGTERM
         // tier, so `Unsupported` can only come from a Job Object with nothing a
@@ -473,8 +482,8 @@ fn describe_teardown(soft: SoftTerminate, grace: Option<Duration>) -> String {
         // not "the platform has no soft tier" any more, but "this tree exposes
         // nothing that tier can trigger" — and the message says exactly that.
         SoftTerminate::Unsupported => format!(
-            "Windows delivered no soft-terminate request to this process tree (it has no \
-             windowed member to close and no console-CTRL leader), so — after {}— the tree \
+            "the Windows pre-stop capability probe reported no soft-terminate target reachable (no \
+             windowed member and no console-CTRL leader opted in), so — after {}— the tree \
              was hard-killed atomically via the Job Object",
             match grace {
                 Some(grace) => format!("a {} grace delay ", format_duration(grace)),
@@ -482,8 +491,8 @@ fn describe_teardown(soft: SoftTerminate, grace: Option<Duration>) -> String {
             }
         ),
         SoftTerminate::Failed => format!(
-            "the soft-terminate request could not be delivered, so {waited}the process tree was \
-             hard-killed via the container's kill-on-drop"
+            "the soft-terminate request for capability scope {scope} could not be delivered, so \
+             {waited}the process tree was hard-killed via the container"
         ),
     }
 }

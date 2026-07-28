@@ -1,6 +1,6 @@
 //! Concurrency stress tier — the invariants that only break under *simultaneous*
 //! load on the two resources this binary shares across every run: the per-user run
-//! registry (`src/registry.rs`) and the per-run control plane (`src/control.rs`).
+//! registry (`src/registry/mod.rs`) and the per-run control plane (`src/control.rs`).
 //!
 //! The other tiers each prove a *functional* path (`AGENTS.md`, "Testing tiers"):
 //! the unit tier proves a helper in isolation, the through-the-binary tier proves
@@ -77,7 +77,7 @@ use common::{bin, scratch, shell_inline};
 // ---------------------------------------------------------------------------
 
 /// The environment variable every runner and client is pointed at, so one scenario's
-/// whole fleet contends for a single scratch registry (see `src/registry.rs`).
+/// whole fleet contends for a single scratch registry (see `src/registry/mod.rs`).
 const REGISTRY_ENV: &str = "PROCESSKIT_CLI_REGISTRY_DIR";
 
 /// Wall-clock ceiling on one client invocation (`list`/`prune`/`inspect`/`cancel`/
@@ -622,7 +622,7 @@ fn plant_stale_entry(registry: &Path, stem: &str, run_id: &str) -> (PathBuf, Pat
         // of these fixtures is ever connected to, only scanned and reaped.
         "endpoint": serde_json::Value::Null,
         // The exact shape `events::format_rfc3339_utc` produces, which the record
-        // scan validates as a full calendar date (`src/registry.rs`).
+        // scan validates as a full calendar date (`src/registry/mod.rs`).
         "started_at": "2026-01-02T03:04:05.678Z",
         "liveness": {
             "kind": "advisory_lock",

@@ -10,7 +10,7 @@
 //! ambiguous id, all without ever contacting a runner. These prove the
 //! *binary's* registry/control lifecycle end-to-end; the fine-grained mechanics —
 //! owner-only permissions, stale detection, concurrency, the wire snapshot, verb
-//! routing — are unit-tested in `src/registry.rs` and `src/control.rs`.
+//! routing — are unit-tested in `src/registry/mod.rs` and `src/control.rs`.
 //!
 //! Each test points the runner *and* the inspect client at an isolated scratch
 //! registry via the `PROCESSKIT_CLI_REGISTRY_DIR` override so they never touch the
@@ -70,7 +70,7 @@ fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) {
 }
 
 /// Set `path`'s mtime `age` in the past, without a real sleep — used to age an
-/// orphaned-lock fixture past `Registry`'s `ORPHAN_LOCK_MIN_AGE` (`src/registry.rs`,
+/// orphaned-lock fixture past `Registry`'s `ORPHAN_LOCK_MIN_AGE` (`src/registry/mod.rs`,
 /// [R-01]) so `prune`'s orphan-lock pass actually treats it as a candidate, rather
 /// than the fixture racing that floor purely by test timing. Keep the age passed by
 /// callers comfortably above that constant's value.
@@ -1791,7 +1791,7 @@ fn wait_all_timeout_ignores_an_unprobed_entry_never_in_the_snapshot() {
 
 /// The end-to-end reaping contract: `prune` deletes a confirmed-stale entry from disk
 /// while leaving a live run's entry completely untouched — the through-the-binary
-/// counterpart to the fine-grained `Registry::prune` unit tests in `src/registry.rs`.
+/// counterpart to the fine-grained `Registry::prune` unit tests in `src/registry/mod.rs`.
 #[test]
 fn prune_reaps_a_stale_entry_and_keeps_a_live_one() {
     let dir = scratch("prune-mixed");

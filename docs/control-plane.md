@@ -170,10 +170,10 @@ ended:
   teardown — the same path a `--timeout` or a `Ctrl-C` drives. On Unix a real
   `SIGTERM` is delivered to the tree, the `--grace` window (if the run was started
   with one) elapses, and the container's kill-on-drop then hard-tears-down whatever
-  remains. On Windows a Job Object has no POSIX signal, so — exactly as for a
-  `Ctrl-C` — the soft tier is a best-effort `WM_CLOSE` to any windowed member of the
-  tree, which reaches nothing at all for the ordinary console child; either way the
-  grace window still elapses and the Job Object is then killed atomically. The run
+  remains. On Windows a Job Object has no POSIX signal, so the soft tier is
+  `WM_CLOSE` to windowed members plus `CTRL_BREAK` for a child launched with
+  `--windows-graceful-ctrl-break`; a capability probe reports when neither target
+  exists, and ProcessKit then escalates atomically. The run
   exits with the reserved **`CONTROL_CANCELLED` (108)**.
 - **`kill`** hard-kills the whole tree **immediately**: no soft stop, no grace. The
   run exits with the reserved **`CONTROL_KILLED` (109)**.

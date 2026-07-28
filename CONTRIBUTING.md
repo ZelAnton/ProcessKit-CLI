@@ -191,7 +191,7 @@ subcommand's contract through the binary, or containment against a scripted
 handful of real processes. [`tests/stress.rs`] covers what none of them can
 reach by construction — the invariants that only break when many runs contend
 for the two resources *every* run shares, the per-user registry
-([`src/registry.rs`](src/registry.rs)) and the per-run control plane
+([`src/registry/mod.rs`](src/registry/mod.rs)) and the per-run control plane
 ([`src/control.rs`](src/control.rs)). It launches dozens of simultaneous `run`
 invocations against a single scratch registry directory and drives parallel
 `list`/`prune`/`wait`/`inspect`/`cancel`/`kill` clients at them, asserting four
@@ -307,7 +307,7 @@ reported.
 [proptest]: https://github.com/proptest-rs/proptest
 [`fuzz/`]: fuzz
 [`cargo-fuzz`]: https://github.com/rust-fuzz/cargo-fuzz
-[`Registry::scan`]: src/registry.rs
+[`Registry::scan`]: src/registry/mod.rs
 
 ## Code coverage
 
