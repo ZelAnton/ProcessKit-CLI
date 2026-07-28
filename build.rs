@@ -38,11 +38,15 @@ use clap_complete::aot::{Shell, generate_to};
 
 #[path = "src/cli.rs"]
 mod cli;
+#[path = "src/labels.rs"]
+#[allow(dead_code)]
+mod labels;
 
 fn main() {
     // Re-run only when the CLI surface (or this script) actually changes —
     // otherwise Cargo would already skip re-running an unchanged build script.
     println!("cargo:rerun-if-changed=src/cli.rs");
+    println!("cargo:rerun-if-changed=src/labels.rs");
     println!("cargo:rerun-if-changed=build.rs");
 
     let manifest_dir = PathBuf::from(

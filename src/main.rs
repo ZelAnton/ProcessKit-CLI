@@ -37,7 +37,7 @@ fn main() -> ExitCode {
         Command::Run(args) => run::execute(*args),
         Command::Inspect(args) => report(control::inspect(&args.run_id, args.json)),
         Command::Cancel(args) => report(if args.all {
-            control::cancel_all()
+            control::cancel_all(&args.labels)
         } else {
             // clap's `required_unless_present`/`conflicts_with` pair on `TargetArgs`
             // guarantees exactly one of `run_id`/`all` is set, so this is never
@@ -49,7 +49,7 @@ fn main() -> ExitCode {
             )
         }),
         Command::Kill(args) => report(if args.all {
-            control::kill_all()
+            control::kill_all(&args.labels)
         } else {
             control::kill(
                 args.run_id
@@ -58,7 +58,7 @@ fn main() -> ExitCode {
             )
         }),
         Command::Wait(args) => report(if args.all {
-            wait::run_all(args.timeout)
+            wait::run_all(args.timeout, &args.labels)
         } else {
             // clap's `required_unless_present`/`conflicts_with` pair on `WaitArgs`
             // guarantees exactly one of `run_id`/`all` is set, so this is never

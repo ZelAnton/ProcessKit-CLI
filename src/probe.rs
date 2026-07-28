@@ -341,6 +341,8 @@ mod tests {
             "kill",
             "probe",
             "run:--jsonl",
+            "run:--label",
+            "run:--env-file",
             "run:--capture-dir",
             // The `--capture-max-bytes` flag (T-181) appears in the surface
             // automatically too — same derivation as the resource-limit flags below.
@@ -363,11 +365,14 @@ mod tests {
             "run:--cpu-quota",
             "inspect:--json",
             "cancel:--run-id",
+            "cancel:--label",
+            "kill:--label",
             // `wait` (T-197) is derived from the live clap tree like every other
             // subcommand — a new subcommand and its flags enter the surface with no
             // edit to this module's production code at all.
             "wait",
             "wait:--run-id",
+            "wait:--label",
             "wait:--timeout",
             "probe:--json",
             "probe:--require-schema-version",

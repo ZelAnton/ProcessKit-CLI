@@ -857,14 +857,14 @@ fn ack_matches(ack: &ControlAck, action: &str, run_id: &str) -> bool {
 /// [`ControlCommand::Cancel`]) against every run confirmed live in a snapshot taken
 /// the moment this call starts. See [`mutate_all`] for the snapshot, per-run report,
 /// and aggregate exit-code semantics shared with [`kill_all`].
-pub fn cancel_all() -> Result<(), RunnerError> {
-    mutate_all(ControlCommand::Cancel)
+pub fn cancel_all(labels: &[crate::labels::OperatorLabel]) -> Result<(), RunnerError> {
+    mutate_all(ControlCommand::Cancel, labels)
 }
 
 /// Client entry for `kill --all` (T-217): the aggregate counterpart to [`kill`]. See
 /// [`mutate_all`].
-pub fn kill_all() -> Result<(), RunnerError> {
-    mutate_all(ControlCommand::Kill)
+pub fn kill_all(labels: &[crate::labels::OperatorLabel]) -> Result<(), RunnerError> {
+    mutate_all(ControlCommand::Kill, labels)
 }
 
 /// One target's outcome in the aggregate report `cancel --all` / `kill --all` print.
@@ -935,18 +935,25 @@ enum SnapshotMutation {
 /// still in scope, and its per-target mutation fails on its own rather than being
 /// silently excluded from the snapshot up front. Unlike the by-id form, the target
 /// key is the record path, so duplicate `run_id`s remain independently addressable.
-fn mutate_all(command: ControlCommand) -> Result<(), RunnerError> {
+fn mutate_all(
+    command: ControlCommand,
+    labels: &[crate::labels::OperatorLabel],
+) -> Result<(), RunnerError> {
     let runtime = current_thread_runtime()?;
-    runtime.block_on(mutate_all_async(command))
+    runtime.block_on(mutate_all_async(command, labels))
 }
 
 /// The async body of [`mutate_all`]: snapshot, dispatch each record-specific target
 /// sequentially, print the report, then map genuine failures onto the aggregate exit
 /// code. A target that finishes before its turn is successful as `already_gone`.
-async fn mutate_all_async(command: ControlCommand) -> Result<(), RunnerError> {
+async fn mutate_all_async(
+    command: ControlCommand,
+    labels: &[crate::labels::OperatorLabel],
+) -> Result<(), RunnerError> {
     let action = command.verb();
     let registry = registry::open_read_only_for_setup()?;
-    let targets = snapshot_mutation_targets(&registry).map_err(registry::setup_read_error)?;
+    let targets =
+        snapshot_mutation_targets(&registry, labels).map_err(registry::setup_read_error)?;
 
     let mut outcomes = Vec::with_capacity(targets.len());
     for target in targets {
@@ -1000,10 +1007,14 @@ async fn mutate_all_async(command: ControlCommand) -> Result<(), RunnerError> {
 /// Snapshot every entry confirmed live, preserving the unique record path and the
 /// endpoint that exact record advertised. `run_id` is deliberately only report data:
 /// two live records may share it, and `--all` must still reach both.
-fn snapshot_mutation_targets(registry: &registry::Registry) -> io::Result<Vec<MutationTarget>> {
+fn snapshot_mutation_targets(
+    registry: &registry::Registry,
+    labels: &[crate::labels::OperatorLabel],
+) -> io::Result<Vec<MutationTarget>> {
     Ok(registry
         .snapshot_live_entries()?
         .into_iter()
+        .filter(|entry| crate::labels::matches(&entry.record.labels, labels))
         .map(|entry| MutationTarget {
             run_id: entry.record.run_id,
             record_path: entry.path,
@@ -2896,7 +2907,7 @@ mod tests {
         write_stale_entry(&dir, "stale-stem", "stale-run");
         write_unprobeable_entry(&dir, "unprobed-stem", "unprobed-run");
 
-        let targets = snapshot_mutation_targets(&registry).expect("scan the fixture registry");
+        let targets = snapshot_mutation_targets(&registry, &[]).expect("scan the fixture registry");
 
         assert_eq!(
             targets
@@ -2927,7 +2938,7 @@ mod tests {
             .register_plain("endpointless-run", None, SystemTime::now())
             .expect("register a live run that never published an endpoint");
 
-        let targets = snapshot_mutation_targets(&registry).expect("scan the fixture registry");
+        let targets = snapshot_mutation_targets(&registry, &[]).expect("scan the fixture registry");
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].run_id, "endpointless-run");
         assert_eq!(targets[0].endpoint, None);
@@ -3027,7 +3038,7 @@ mod tests {
         let registration = registry
             .register_plain("short-run", Some("endpoint-now-gone"), SystemTime::now())
             .expect("register the live target");
-        let mut targets = snapshot_mutation_targets(&registry).expect("snapshot live targets");
+        let mut targets = snapshot_mutation_targets(&registry, &[]).expect("snapshot live targets");
         let target = targets.pop().expect("the target is in the snapshot");
 
         drop(registration);
@@ -3047,7 +3058,7 @@ mod tests {
         let registration = registry
             .register_plain("short-run", None, SystemTime::now())
             .expect("register the live target without an endpoint");
-        let mut targets = snapshot_mutation_targets(&registry).expect("snapshot live targets");
+        let mut targets = snapshot_mutation_targets(&registry, &[]).expect("snapshot live targets");
         let target = targets.pop().expect("the target is in the snapshot");
 
         drop(registration);
@@ -3091,7 +3102,7 @@ mod tests {
         let registration = registry
             .register_plain("target", Some("endpoint-a"), SystemTime::now())
             .expect("register live target");
-        let mut targets = snapshot_mutation_targets(&registry).expect("snapshot live targets");
+        let mut targets = snapshot_mutation_targets(&registry, &[]).expect("snapshot live targets");
         let target = targets.pop().expect("target is in the snapshot");
 
         let mut replacement: serde_json::Value = serde_json::from_str(
@@ -3121,7 +3132,7 @@ mod tests {
         let registration = registry
             .register_plain("target", Some("endpoint-a"), SystemTime::now())
             .expect("register the live target");
-        let mut targets = snapshot_mutation_targets(&registry).expect("snapshot live targets");
+        let mut targets = snapshot_mutation_targets(&registry, &[]).expect("snapshot live targets");
         let target = targets.pop().expect("the target is in the snapshot");
 
         std::fs::write(&target.record_path, b"not valid JSON")

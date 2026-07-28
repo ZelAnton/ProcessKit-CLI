@@ -53,17 +53,20 @@ before the child starts.
 
 ## Environment
 
-Without environment flags, the child inherits the runner's environment. Three
-repeatable options make the result explicit:
+Without environment flags, the child inherits the runner's environment. Four
+options make the result explicit:
 
 | Flag | Effect |
 | --- | --- |
 | `--env-clear` | Start from an empty environment. |
 | `--env-remove KEY` | Remove one inherited key. |
+| `--env-file FILE` | Read UTF-8 `KEY=VALUE` lines without placing their values in argv; blank lines and `#` comments are ignored. |
 | `--env KEY=VALUE` | Set or replace one key. The value may contain `=`. |
 
-Application order is fixed, regardless of flag order: **clear, remove, set**.
-An explicit `--env` therefore wins over `--env-remove` for the same key.
+Application order is fixed, regardless of flag order: **clear, remove, env-file,
+explicit set**. Repeated files are applied in argument order, and an explicit
+`--env` therefore wins over every file or removal for the same key. A file read,
+UTF-8, or syntax failure is `SETUP` (111) before the child starts.
 
 ```sh
 processkit-cli run \
@@ -97,6 +100,13 @@ Run ids are not operating-system PIDs and are not required to be globally
 unique. Two live runs with the same explicit id make by-id control ambiguous;
 the client fails rather than choosing one. `list` shows every record, and the
 aggregate `--all` commands address records rather than resolving a shared id.
+
+Repeat `--label KEY=VALUE` on `run` to attach non-secret operator metadata. The
+resulting map appears in `run_started.labels` and `list`; later values replace
+earlier values for a duplicate key. Keys are 1-64 ASCII bytes, begin with a letter
+or `_`, and otherwise contain letters, digits, `.`, `-`, or `_`. Values are at most
+256 characters and contain no control characters. Repeated label filters on
+`cancel --all`, `kill --all`, and `wait --all` combine with logical AND.
 
 ## Foreground lifecycle
 

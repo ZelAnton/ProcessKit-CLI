@@ -152,8 +152,8 @@ Example:
 ## `cancel` and `kill`
 
 ```
-processkit-cli cancel (--run-id <id> | --all)
-processkit-cli kill   (--run-id <id> | --all)
+processkit-cli cancel (--run-id <id> | --all [--label <KEY=VALUE>]...)
+processkit-cli kill   (--run-id <id> | --all [--label <KEY=VALUE>]...)
 ```
 
 `--run-id` and `--all` are mutually exclusive and exactly one is required, the same
@@ -223,7 +223,9 @@ See [`docs/schema.md`](schema.md) for these events.
 
 `--all` is the aggregate counterpart to `--run-id`: instead of one named run,
 it acts on **every registry record confirmed live in a snapshot taken the moment the invocation
-starts** — the mutating counterpart to `wait --all` (T-216; see
+starts**. Repeated `--label KEY=VALUE` filters narrow that snapshot with logical AND;
+only records carrying every exact pair remain, and labels are rejected with the
+by-id form. This is the mutating counterpart to `wait --all` (T-216; see
 [`docs/registry.md`](registry.md), "Waiting — `wait`", "The aggregate barrier —
 `wait --all`"), reusing its exact snapshot discipline. The target set is fixed once, before
 the first mutation is dispatched: a run that registers *after* the snapshot is out of

@@ -96,6 +96,7 @@ The run has begun: the child is spawned into the container.
 | Field            | Type              | Notes                                                                 |
 |------------------|-------------------|-----------------------------------------------------------------------|
 | `run_id`         | string            | The `--run-id` value, or a generated `run-<pid>-<unix_nanos>`.         |
+| `labels`         | object            | Operator labels from `run --label`; empty when none were supplied. Keys are sorted for deterministic JSON. |
 | `root_pid`       | integer, nullable | The root child's PID; `null` if the backend exposed none.             |
 | `mechanism`      | string            | Containment mechanism: `job_object`, `cgroup_v2`, or `process_group`. |
 | `abrupt_cleanup` | string            | Cleanup surviving abrupt runner death: `whole_tree`, `direct_child_only`, or `none`. |

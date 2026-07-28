@@ -92,6 +92,8 @@ pub enum Event {
     /// command are known.
     RunStarted {
         run_id: String,
+        /// Operator-provided run labels, sorted by key for deterministic JSON.
+        labels: std::collections::BTreeMap<String, String>,
         /// The root child's PID. `null` if the backend did not expose one.
         root_pid: Option<u32>,
         /// `job_object` | `cgroup_v2` | `process_group` (see [`mechanism_str`]).
@@ -750,6 +752,9 @@ mod tests {
         vec![
             Event::RunStarted {
                 run_id: "run-000".to_string(),
+                labels: [("batch".to_string(), "42".to_string())]
+                    .into_iter()
+                    .collect(),
                 root_pid: Some(4242),
                 mechanism: mechanism_str(Mechanism::JobObject),
                 abrupt_cleanup: "whole_tree",
@@ -758,6 +763,7 @@ mod tests {
             },
             Event::RunStarted {
                 run_id: "run-001".to_string(),
+                labels: std::collections::BTreeMap::new(),
                 root_pid: Some(4242),
                 mechanism: mechanism_str(Mechanism::JobObject),
                 abrupt_cleanup: "whole_tree",

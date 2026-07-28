@@ -1144,6 +1144,136 @@ fn control_plane_kill_all_reaps_every_live_run() {
     );
 }
 
+/// Labels flow through the event and registry discovery surfaces, and all three
+/// aggregate commands apply the same conjunctive filter to their initial snapshot.
+#[test]
+fn operator_labels_scope_wait_cancel_and_kill_all() {
+    let scenario = Scenario::new("e2e-operator-labels");
+    let registry = scenario.path("registry");
+    let mut runners = Vec::new();
+    let mut streams = Vec::new();
+
+    for (run_id, batch) in [("label-target", "target"), ("label-other", "other")] {
+        let jsonl = scenario.path(&format!("{run_id}.jsonl"));
+        let runner = Command::new(bin())
+            .arg("run")
+            .arg("--jsonl")
+            .arg(&jsonl)
+            .args(["--run-id", run_id, "--label", &format!("batch={batch}")])
+            .env("PROCESSKIT_CLI_REGISTRY_DIR", &registry)
+            .arg("--")
+            .args(helper("spin", &["--sleep-secs", "120"]))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a labelled runner");
+        runners.push(ChildGuard::new(runner));
+        streams.push(jsonl);
+        assert!(
+            wait_until(
+                || inspect(&registry, run_id).status.code() == Some(0),
+                Duration::from_secs(20)
+            ),
+            "run `{run_id}` never became reachable"
+        );
+    }
+
+    let listed = Command::new(bin())
+        .args(["list", "--json"])
+        .env("PROCESSKIT_CLI_REGISTRY_DIR", &registry)
+        .output()
+        .expect("list labelled runs");
+    assert!(listed.status.success());
+    let listed: Vec<serde_json::Value> = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("list line is JSON"))
+        .collect();
+    for (run_id, batch) in [("label-target", "target"), ("label-other", "other")] {
+        let row = listed
+            .iter()
+            .find(|row| row["run_id"] == run_id)
+            .unwrap_or_else(|| panic!("list reports `{run_id}`: {listed:?}"));
+        assert_eq!(row["labels"]["batch"], batch);
+    }
+
+    let waiter = Command::new(bin())
+        .args([
+            "wait",
+            "--all",
+            "--label",
+            "batch=target",
+            "--timeout",
+            "20s",
+        ])
+        .env("PROCESSKIT_CLI_REGISTRY_DIR", &registry)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn filtered wait");
+    let mut waiter = ChildGuard::new(waiter);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        waiter
+            .child_mut()
+            .try_wait()
+            .expect("poll waiter")
+            .is_none(),
+        "filtered wait must block while its matching run is live"
+    );
+
+    let cancelled = Command::new(bin())
+        .args(["cancel", "--all", "--label", "batch=target"])
+        .env("PROCESSKIT_CLI_REGISTRY_DIR", &registry)
+        .output()
+        .expect("cancel the matching label");
+    assert!(
+        cancelled.status.success(),
+        "filtered cancel succeeds: {}",
+        String::from_utf8_lossy(&cancelled.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&cancelled.stdout).expect("cancel report is JSON");
+    assert_eq!(report.as_array().map(Vec::len), Some(1));
+    assert_eq!(report[0]["run_id"], "label-target");
+
+    let target_status = wait_child_bounded(runners[0].child_mut(), Duration::from_secs(20))
+        .expect("targeted run exits");
+    assert_eq!(target_status.code(), Some(108));
+    let wait_status = wait_child_bounded(waiter.child_mut(), Duration::from_secs(20))
+        .expect("filtered waiter exits after its target");
+    assert_eq!(wait_status.code(), Some(0));
+    assert_eq!(
+        inspect(&registry, "label-other").status.code(),
+        Some(0),
+        "the nonmatching run remains live"
+    );
+
+    let killed = Command::new(bin())
+        .args(["kill", "--all", "--label", "batch=other"])
+        .env("PROCESSKIT_CLI_REGISTRY_DIR", &registry)
+        .output()
+        .expect("kill the remaining label");
+    assert!(killed.status.success());
+    let report: serde_json::Value =
+        serde_json::from_slice(&killed.stdout).expect("kill report is JSON");
+    assert_eq!(report.as_array().map(Vec::len), Some(1));
+    assert_eq!(report[0]["run_id"], "label-other");
+    let other_status = wait_child_bounded(runners[1].child_mut(), Duration::from_secs(20))
+        .expect("remaining run exits");
+    assert_eq!(other_status.code(), Some(109));
+
+    for (jsonl, batch) in streams.iter().zip(["target", "other"]) {
+        let events = read_events(jsonl);
+        let started = events
+            .iter()
+            .find(|event| event_tag(event) == "run_started")
+            .expect("run_started event");
+        assert_eq!(started["labels"]["batch"], batch);
+    }
+}
+
 /// Windows-only: a `run` launched from an environment that is **already inside a Job
 /// Object** (a terminal, build server, or IDE) still stands up and tears down its own
 /// *nested* container. The `job-parent` helper self-places into an outer, plain Job
@@ -1668,6 +1798,49 @@ fn env_sets_a_new_variable_for_the_child() {
     assert!(
         stdout.contains("set-by-env-flag"),
         "--env must set the variable for the child: {stdout:?}"
+    );
+}
+
+/// Environment files are read before spawn, ignore comments/blank lines, and sit
+/// between removals and explicit `--env` in the override order.
+#[test]
+fn env_file_sets_variables_and_explicit_env_wins() {
+    let scenario = Scenario::new("e2e-env-file");
+    let env_file = scenario.path("child.env");
+    std::fs::write(
+        &env_file,
+        "# child settings\n\nPK_CLI_FROM_FILE=file-secret\nPK_CLI_OVERRIDE=from-file\n",
+    )
+    .expect("write the environment file");
+    let env_file_arg = env_file.to_string_lossy().into_owned();
+    let out = run_with_flags(
+        &scenario.dir,
+        &[],
+        &[
+            "--env-file",
+            &env_file_arg,
+            "--env",
+            "PK_CLI_OVERRIDE=explicit",
+        ],
+        shell_inline(&echo_env_script(&["PK_CLI_FROM_FILE", "PK_CLI_OVERRIDE"])),
+    );
+    assert!(
+        out.status.success(),
+        "the child must exit cleanly; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("file-secret"),
+        "file value reaches child: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("explicit"),
+        "explicit --env wins: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("from-file"),
+        "overridden value is replaced: {stdout:?}"
     );
 }
 

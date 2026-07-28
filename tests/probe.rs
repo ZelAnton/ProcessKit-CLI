@@ -105,18 +105,23 @@ fn probe_reports_a_consistent_compatible_surface() {
         "kill",
         "probe",
         "run:--jsonl",
+        "run:--label",
+        "run:--env-file",
         "run:--capture-dir",
         "run:--inherit-stdio",
         "run:--windows-graceful-ctrl-break",
         "run:--inherit-stdin",
         "run:--stdin-file",
         "inspect:--json",
+        "cancel:--label",
+        "kill:--label",
         "probe:--require-schema-version",
         // The `wait` subcommand and its flags (T-197) appear here automatically too:
         // the surface is derived from the live clap tree, so a new subcommand needs
         // no hand-maintained token list anywhere in production code.
         "wait",
         "wait:--run-id",
+        "wait:--label",
         "wait:--timeout",
         // Same story for the `run --detach` flag (T-198): a new flag on an existing
         // subcommand enters the advertised surface with no production-code edit.

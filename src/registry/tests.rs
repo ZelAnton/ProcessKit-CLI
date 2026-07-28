@@ -287,6 +287,10 @@ fn a_record_without_the_command_fields_still_reads() {
         record.argv_sha256.is_none() && record.hint.is_none(),
         "absent fields read back as absent, never as an error or a fabricated value"
     );
+    assert!(
+        record.labels.is_empty(),
+        "older records default to no labels"
+    );
 
     // …and the whole scan path agrees: the entry is found and probed as usual.
     fs::write(dir.join("legacy.json"), legacy).expect("write the legacy record");
@@ -323,6 +327,21 @@ fn a_record_with_an_unknown_field_still_reads() {
     let record =
         parse_and_validate_record(from_the_future).expect("an unknown field is not corruption");
     assert_eq!(record.run_id, "future");
+}
+
+#[test]
+fn malformed_labels_are_dropped_without_hiding_the_record() {
+    let text = "{\"registry_version\":1,\"run_id\":\"labelled\",\"endpoint\":null,\
+         \"started_at\":\"2026-07-22T00:00:00.000Z\",\"argv_sha256\":null,\"hint\":null,\
+         \"labels\":{\"batch\":\"42\",\"bad key\":\"value\",\"newline\":\"a\\nb\"},\
+         \"liveness\":{\"kind\":\"advisory_lock\",\"lock_file\":\"labelled.lock\"}}";
+    let record = parse_and_validate_record(text).expect("label corruption does not hide a run");
+    assert_eq!(
+        record.labels,
+        [("batch".to_string(), "42".to_string())]
+            .into_iter()
+            .collect()
+    );
 }
 
 /// The Drop-backstop this task adds: a [`ReservedEntry`] that is dropped before
@@ -508,6 +527,7 @@ fn write_record_with_endpoint(
         // covering the "record without it" shape every consumer must handle).
         argv_sha256: None,
         hint: None,
+        labels: BTreeMap::new(),
         liveness: Liveness {
             kind: LIVENESS_ADVISORY_LOCK.to_string(),
             lock_file: lock_file.to_string(),
@@ -589,6 +609,7 @@ fn write_record_with_started_at(dir: &Path, stem: &str, run_id: &str, started_at
         started_at: started_at.to_string(),
         argv_sha256: None,
         hint: None,
+        labels: BTreeMap::new(),
         liveness: Liveness {
             kind: LIVENESS_ADVISORY_LOCK.to_string(),
             lock_file: format!("{stem}.lock"),

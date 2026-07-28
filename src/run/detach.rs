@@ -709,6 +709,7 @@ mod tests {
         // A real `run_started`, written by the real emitter — for a *different* run.
         emitter.emit(&Event::RunStarted {
             run_id: "run-2".to_string(),
+            labels: std::collections::BTreeMap::new(),
             root_pid: Some(4242),
             mechanism: "job_object",
             abrupt_cleanup: "whole_tree",

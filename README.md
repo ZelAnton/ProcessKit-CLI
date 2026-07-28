@@ -176,7 +176,8 @@ tri-state applies only where the runner never gets to run it at all (a crash, a
 ## Command interface
 
 ```text
-processkit-cli run     [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl>
+processkit-cli run     [--run-id <id>] [--label <KEY=VALUE>]... [--cwd <dir>]
+                       --jsonl <events.jsonl>
                        [--create-no-window] [--windows-graceful-ctrl-break]
                        [--timeout <duration>]
                        [--idle-timeout <duration>]
@@ -185,12 +186,13 @@ processkit-cli run     [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl>
                        [--capture-dir <dir>] [--capture-max-bytes <size>]
                        [--no-echo] [--detach] [--argv-raw]
                        [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
-                       [--env-clear] [--env-remove <KEY>]... [--env <KEY=VALUE>]...
+                       [--env-clear] [--env-remove <KEY>]... [--env-file <file>]...
+                       [--env <KEY=VALUE>]...
                        -- <program> <args...>
 processkit-cli inspect --run-id <id> [--json]
-processkit-cli cancel  (--run-id <id> | --all)
-processkit-cli kill    (--run-id <id> | --all)
-processkit-cli wait    (--run-id <id> | --all) [--timeout <duration>]
+processkit-cli cancel  (--run-id <id> | --all [--label <KEY=VALUE>]...)
+processkit-cli kill    (--run-id <id> | --all [--label <KEY=VALUE>]...)
+processkit-cli wait    (--run-id <id> | --all [--label <KEY=VALUE>]...) [--timeout <duration>]
 processkit-cli list    [--json]
 processkit-cli prune   [--json] [--dry-run]
 processkit-cli probe   --json [--require-schema-version <N>]
@@ -294,7 +296,9 @@ currently guarantees the whole tree.
 `cancel --all` / `kill --all` (mutually exclusive with `--run-id`, exactly one
 of the two required, the same clap shape `wait --all` established) are the mutating
 counterpart to `wait --all`: instead of one named run, they act on every run confirmed
-live in a **snapshot** taken the moment the invocation starts. The snapshot keys each
+live in a **snapshot** taken the moment the invocation starts. Repeated `--label
+KEY=VALUE` filters narrow that snapshot using logical AND; runs missing any exact
+pair are outside the invocation. The snapshot keys each
 target by its unique registry-record path and remembered endpoint, not by `run_id`, so
 two concurrent records sharing one explicit id are both reached independently; the
 by-`run-id` form remains an ambiguity failure. Before dispatch the client reconfirms
@@ -339,7 +343,8 @@ wait for it all to be gone, then `prune`" sequence. Its target set is a **snapsh
 fixed once at the moment `--all` starts to exactly the entries **confirmed** live right
 then — an entry that is only unprobed (not confirmed live) *at that instant* is
 excluded from the target set outright, and a run that registers afterward is likewise
-out of scope for that invocation; re-issue `wait --all` to catch either. This is a
+out of scope for that invocation; repeated `--label KEY=VALUE` filters additionally
+require every exact pair (logical AND). Re-issue `wait --all` to catch either. This is a
 deliberate asymmetry with `--run-id`, which has no equivalent "excluded before
 tracking begins" step of its own: a registry holding only unprobeable entries and no
 confirmed-live ones makes `--all` return `0` immediately, the same as an empty
@@ -352,7 +357,7 @@ dropped — the same conservative stance `--run-id` takes. See
 `list` is the discovery counterpart to `inspect`/`cancel`/`kill`: it scans the same
 per-user registry and prints every entry it finds — `run_id`, health (`live`/
 `stale`/`unprobed`), `started_at`, the run's worker-shape `hint` and one-way argv
-fingerprint `argv_sha256`, and `endpoint` — for an operator or orchestrator
+fingerprint `argv_sha256`, operator `labels`, and `endpoint` — for an operator or orchestrator
 that has lost (or never had) a `run_id`. It is read-only and never connects to any
 runner's control transport, so it has none of their unreachable-run failure modes.
 The two command fields are what make several live runs distinguishable without
@@ -625,25 +630,39 @@ inherit one and Windows gives it a fresh console of its own — visible unless
 ## Environment
 
 By default the child inherits the runner's own environment unchanged, exactly as
-launching it directly would. Three flags give control over that, mapping straight
+launching it directly would. Four flags give control over that, mapping straight
 onto `processkit::Command`'s own environment builder (`env`/`env_remove`/
 `env_clear`) — the runner never reimplements this logic itself:
 
 - `--env-clear` clears the child's entire inherited environment, so it starts
   from an empty slate rather than the runner's own environment.
 - `--env-remove <KEY>` (repeatable) removes one inherited variable by name.
+- `--env-file <file>` (repeatable) reads a UTF-8 file of `KEY=VALUE` lines. Empty
+  lines and lines whose first non-whitespace character is `#` are ignored. A missing,
+  unreadable, non-UTF-8, or malformed file is a pre-spawn `SETUP` (111) failure.
 - `--env <KEY=VALUE>` (repeatable) sets one variable for the child, splitting on
   the *first* `=` (so a value that itself contains `=` is preserved verbatim).
 
-**Applied order: clear, then remove, then set** — regardless of the order the
+**Applied order: clear, then remove, then env-file, then explicit set** — regardless of the order the
 flags are given on the command line. Concretely: `--env-clear` first empties the
 slate (or is skipped if absent), `--env-remove` then strips any of the remaining
-inherited variables it names, and `--env` is applied last, so an explicit `--env`
+inherited variables it names, each `--env-file` is applied in argument order, and
+`--env` is applied last, so an explicit `--env`
 always wins over an `--env-remove` of the same key. This is the intuitive "what I
 set is what I get" outcome: combining `--env-clear` with an `--env` for the same
 key still leaves that key set (`--env` fills the slate back in after the clear),
 and combining `--env-remove KEY` with `--env KEY=VALUE` always sets `KEY=VALUE`
 regardless of which flag was written first on the command line.
+
+`--env-file` is the secret-safe path: values live in the file rather than the
+runner's argv (and are never copied into lifecycle events or registry records).
+
+Operator labels are separate, non-secret metadata: repeat `run --label KEY=VALUE`
+to group runs for discovery and aggregate operations. Keys are 1-64 ASCII bytes,
+start with a letter or `_`, and otherwise use letters, digits, `.`, `-`, or `_`;
+values are at most 256 characters with no control characters. A later run label
+replaces an earlier value for the same key. `list` and `run_started.labels` expose
+the resulting map; aggregate label filters combine with logical AND.
 
 ## Bounded output capture
 

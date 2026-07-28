@@ -281,14 +281,18 @@ fn wait_timed_out(run_id: &str, limit: Duration, last: RunStatus) -> RunnerError
 /// body only ever *decides* from the health already established, and the last pass's
 /// findings (`any_unprobed`) are what a timeout reports — never a status the loop
 /// itself never actually observed.
-pub fn run_all(timeout: Option<Duration>) -> Result<(), RunnerError> {
+pub fn run_all(
+    timeout: Option<Duration>,
+    labels: &[crate::labels::OperatorLabel],
+) -> Result<(), RunnerError> {
     let registry = registry::open_read_only_for_setup()?;
     let deadline = timeout.map(WaitDeadline::new);
 
     // The snapshot: one scan, fixed before the first poll, to exactly the entries
     // confirmed live right now. Every later pass only ever *removes* from this set —
     // nothing is ever added to it (see the module doc for why).
-    let mut targets = snapshot_target_paths(&registry).map_err(registry::setup_read_error)?;
+    let mut targets =
+        snapshot_target_paths(&registry, labels).map_err(registry::setup_read_error)?;
     // Whether the most recent pass over `targets` found an entry that could not be
     // re-probed — reported honestly on a timeout instead of a confident "still live"
     // the last pass never actually established for every remaining entry.
@@ -325,10 +329,14 @@ pub fn run_all(timeout: Option<Duration>) -> Result<(), RunnerError> {
 /// entry [`Health::Unprobed`] at snapshot time is **not** included: the target set is
 /// documented as exactly the entries *confirmed* live at that instant, not "anything
 /// that might be" — see the module doc.
-fn snapshot_target_paths(registry: &registry::Registry) -> std::io::Result<HashSet<PathBuf>> {
+fn snapshot_target_paths(
+    registry: &registry::Registry,
+    labels: &[crate::labels::OperatorLabel],
+) -> std::io::Result<HashSet<PathBuf>> {
     Ok(registry
         .snapshot_live_entries()?
         .into_iter()
+        .filter(|entry| crate::labels::matches(&entry.record.labels, labels))
         .map(|entry| entry.path)
         .collect())
 }
@@ -652,7 +660,7 @@ mod tests {
         let stale_path = write_stale_entry(&dir, "stale-run");
         let unprobed_path = write_unprobeable_entry(&dir, "unprobed-run");
 
-        let snapshot = snapshot_target_paths(&registry).expect("scan the fixture registry");
+        let snapshot = snapshot_target_paths(&registry, &[]).expect("scan the fixture registry");
 
         assert!(
             snapshot.contains(&live_path),

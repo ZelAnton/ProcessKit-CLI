@@ -55,6 +55,8 @@ pub mod exit;
 #[doc(hidden)]
 pub mod hash;
 #[doc(hidden)]
+pub mod labels;
+#[doc(hidden)]
 pub mod list;
 #[doc(hidden)]
 pub mod probe;

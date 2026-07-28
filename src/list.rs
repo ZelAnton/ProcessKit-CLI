@@ -44,6 +44,7 @@
 //! and the table gains two columns, the fingerprint abbreviated (see
 //! [`abbreviated_argv_sha256`]) with the full digest reserved for `--json`.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::Serialize;
@@ -95,6 +96,8 @@ struct ListEntry {
     /// list of ids and timestamps — the fingerprint says which of them are running
     /// the *same* command, without disclosing that command to anyone.
     argv_sha256: Option<String>,
+    /// Operator labels in full for machine-readable discovery.
+    labels: BTreeMap<String, String>,
     /// The run's local control-transport endpoint, or `None` when the transport
     /// was never stood up (best-effort degradation — see
     /// [`registry::Record::endpoint`]) — never populated for a stale entry's
@@ -129,6 +132,7 @@ pub fn run(json: bool) -> Result<(), RunnerError> {
                 started_at: entry.record.started_at,
                 hint: entry.record.hint,
                 argv_sha256: entry.record.argv_sha256,
+                labels: entry.record.labels,
                 endpoint: entry.record.endpoint,
             };
             (path, list_entry)
@@ -240,21 +244,39 @@ fn abbreviated_argv_sha256(argv_sha256: Option<&str>) -> String {
     }
 }
 
+fn rendered_labels(labels: &BTreeMap<String, String>) -> String {
+    if labels.is_empty() {
+        return ABSENT_CELL.to_string();
+    }
+    labels
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "{}={}",
+                crate::text::terminal_safe(key),
+                crate::text::terminal_safe(value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Build the lines `print_table` would print, without touching stdout —
 /// split out so alignment can be asserted directly in tests.
 fn render_table_lines(rows: &[ListEntry]) -> Vec<String> {
     if rows.is_empty() {
         return vec!["no runs registered".to_string()];
     }
-    const HEADERS: [&str; 6] = [
+    const HEADERS: [&str; 7] = [
         "RUN_ID",
         "HEALTH",
         "STARTED_AT",
         "HINT",
         "ARGV_SHA256",
+        "LABELS",
         "ENDPOINT",
     ];
-    let cells: Vec<[String; 6]> = rows
+    let cells: Vec<[String; 7]> = rows
         .iter()
         .map(|row| {
             [
@@ -263,6 +285,7 @@ fn render_table_lines(rows: &[ListEntry]) -> Vec<String> {
                 row.started_at.clone(),
                 row.hint.as_deref().unwrap_or(ABSENT_CELL).to_string(),
                 abbreviated_argv_sha256(row.argv_sha256.as_deref()),
+                rendered_labels(&row.labels),
                 crate::text::terminal_safe(row.endpoint.as_deref().unwrap_or(ABSENT_CELL)),
             ]
         })
@@ -297,6 +320,9 @@ mod tests {
             started_at: "2026-07-22T00:00:00.000Z".to_string(),
             hint: Some("msbuild_node_reuse".to_string()),
             argv_sha256: Some(FINGERPRINT.to_string()),
+            labels: [("batch".to_string(), "42".to_string())]
+                .into_iter()
+                .collect(),
             endpoint: Some("/tmp/pkc-x/c.sock".to_string()),
         };
         let json = serde_json::to_string(&entry).expect("a list entry serializes");
@@ -309,6 +335,7 @@ mod tests {
             value["argv_sha256"], FINGERPRINT,
             "--json carries the whole digest, never the table's abbreviation: {value}"
         );
+        assert_eq!(value["labels"]["batch"], "42");
         assert_eq!(value["endpoint"], "/tmp/pkc-x/c.sock");
     }
 
@@ -325,6 +352,7 @@ mod tests {
             started_at: "2026-07-22T00:00:00.000Z".to_string(),
             hint: None,
             argv_sha256: None,
+            labels: BTreeMap::new(),
             endpoint: None,
         };
         let json = serde_json::to_string(&entry).expect("a list entry serializes");
@@ -334,6 +362,7 @@ mod tests {
             value["argv_sha256"].is_null(),
             "an absent fingerprint is null: {value}"
         );
+        assert_eq!(value["labels"], serde_json::json!({}));
     }
 
     /// The table abbreviates a fingerprint to a fixed prefix plus an explicit
@@ -379,6 +408,7 @@ mod tests {
             started_at: "2026-07-22T00:00:00.000Z".to_string(),
             hint: None,
             argv_sha256: Some(FINGERPRINT.to_string()),
+            labels: BTreeMap::new(),
             endpoint: Some(format!("/tmp/pkc-{suffix}.sock")),
         };
         let path = |name: &str| PathBuf::from(name);
@@ -424,6 +454,7 @@ mod tests {
             started_at: "2026-07-22T00:00:00.000Z".to_string(),
             hint: None,
             argv_sha256: Some(FINGERPRINT.to_string()),
+            labels: BTreeMap::new(),
             endpoint: None,
         };
         let json = serde_json::to_string(&entry).expect("a list entry serializes");
@@ -449,6 +480,7 @@ mod tests {
                 started_at: "2026-07-22T00:00:00.000Z".to_string(),
                 hint: Some("msbuild_node_reuse".to_string()),
                 argv_sha256: Some(FINGERPRINT.to_string()),
+                labels: BTreeMap::new(),
                 endpoint: Some("/tmp/pkc-a.sock".to_string()),
             },
             ListEntry {
@@ -457,6 +489,7 @@ mod tests {
                 started_at: "2026-07-22T00:00:00.000Z".to_string(),
                 hint: None,
                 argv_sha256: None,
+                labels: BTreeMap::new(),
                 endpoint: None,
             },
         ];
@@ -464,9 +497,9 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "RUN_ID              HEALTH  STARTED_AT                HINT                ARGV_SHA256      ENDPOINT",
-                "r1                  live    2026-07-22T00:00:00.000Z  msbuild_node_reuse  0123456789ab...  /tmp/pkc-a.sock",
-                "much-longer-run-id  stale   2026-07-22T00:00:00.000Z  -                   -                -",
+                "RUN_ID              HEALTH  STARTED_AT                HINT                ARGV_SHA256      LABELS  ENDPOINT",
+                "r1                  live    2026-07-22T00:00:00.000Z  msbuild_node_reuse  0123456789ab...  -       /tmp/pkc-a.sock",
+                "much-longer-run-id  stale   2026-07-22T00:00:00.000Z  -                   -                -       -",
             ]
         );
         // The actual alignment property: a value starts at the same column in every
@@ -493,6 +526,9 @@ mod tests {
             started_at: "2026-07-22T00:00:00.000Z".to_string(),
             hint: None,
             argv_sha256: None,
+            labels: [("danger".to_string(), "bidi\u{202e}value".to_string())]
+                .into_iter()
+                .collect(),
             endpoint: Some("pipe\tname\u{7}".to_string()),
         };
 
@@ -505,12 +541,14 @@ mod tests {
             "human-readable cells contain no terminal controls: {lines:?}"
         );
         assert!(lines[1].contains("forged ROW [31m"));
+        assert!(!lines[1].contains('\u{202e}'));
         assert!(lines[1].ends_with("pipe name"));
 
         let json = serde_json::to_string(&row).expect("the raw JSON row serializes safely");
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(value["run_id"], "forged\nROW\u{1b}[31m");
         assert_eq!(value["endpoint"], "pipe\tname\u{7}");
+        assert_eq!(value["labels"]["danger"], "bidi\u{202e}value");
     }
 
     /// The property T-215 exists for, at the surface an operator actually reads:
@@ -533,6 +571,7 @@ mod tests {
             started_at: "2026-07-22T00:00:00.000Z".to_string(),
             hint: hint.map(str::to_string),
             argv_sha256: Some(fingerprint.to_string()),
+            labels: BTreeMap::new(),
             endpoint: None,
         };
         let rows = vec![

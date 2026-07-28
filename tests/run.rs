@@ -212,6 +212,38 @@ fn missing_stdin_file_is_a_pre_run_setup_failure() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A malformed environment file is a fail-closed setup error and never spawns the
+/// child with a partially applied environment.
+#[test]
+fn malformed_env_file_is_a_pre_run_setup_failure() {
+    let dir = scratch("env-file-malformed");
+    let env_file = dir.join("bad.env");
+    std::fs::write(&env_file, "GOOD=value\nmissing-separator\n").expect("write fixture");
+    let env_file = path_arg(&env_file);
+
+    let out = run_with_flags(
+        &dir,
+        &[],
+        &["--env-file", &env_file],
+        shell_inline("echo child-must-not-start"),
+    );
+    assert_eq!(out.status.code(), Some(111));
+    assert!(out.stdout.is_empty(), "no child output may be forwarded");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("line 2"),
+        "the diagnostic identifies the malformed line"
+    );
+
+    let events = read_run_events(&dir);
+    assert!(!events.iter().any(|event| event["event"] == "run_started"));
+    let terminal = events.last().expect("terminal runner_exit event");
+    assert_eq!(terminal["source"], "setup");
+    assert_eq!(terminal["code"], 111);
+    assert!(terminal["child_code"].is_null());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A program that cannot be started is a runner-own failure, so the runner exits
 /// with the reserved `SPAWN` code (101) and reports the reason on stderr — never
 /// on stdout.

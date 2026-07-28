@@ -18,7 +18,7 @@ use processkit::{
 };
 
 use crate::capture::{CAPTURE_INFLIGHT_MAX_BYTES, CAPTURE_MAX_BYTES, Capture, IdleClock};
-use crate::cli::RunArgs;
+use crate::cli::{RunArgs, parse_env_kv};
 use crate::control::{self, SnapshotSource};
 use crate::events::{self, Emitter, Event, Member};
 use crate::exit::{self, RunnerError};
@@ -105,6 +105,14 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
         return Err(finish(&mut emitter, "setup", None, error));
     }
 
+    // Environment files are operator-provided setup inputs, so read and validate
+    // all of them before a child exists. Their contents never enter argv, events,
+    // or the registry; only the resulting builder calls below see the values.
+    let file_env = match load_env_files(&args.env_file) {
+        Ok(entries) => entries,
+        Err(error) => return Err(finish(&mut emitter, "setup", None, error)),
+    };
+
     // We own this group; the child — and anything it spawns — is a member. When
     // `group` drops at the end of this scope (every path below), the kernel reaps
     // the whole tree. Containment/teardown is the group's job; we never duplicate
@@ -161,6 +169,7 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     // record, the `run_started` event, and the control snapshot.
     let started = SystemTime::now();
     let run_id = events::resolve_run_id(args.run_id.as_deref());
+    let labels = crate::labels::to_map(&args.labels);
     let registry_handle = open_registry();
     // `open_server` no longer takes the registry directory (it never gated the
     // transport's bind location on either platform, see `control::open_server`'s
@@ -188,6 +197,7 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             // (see `register_run`). Derived here, where it is actually published, so
             // a run whose registry could not be opened at all computes nothing.
             &events::CommandFingerprint::for_argv(&args.command),
+            &labels,
         )
     });
 
@@ -203,18 +213,18 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     if let Some(cwd) = &args.cwd {
         command = command.current_dir(cwd);
     }
-    // `--env-clear`/`--env-remove`/`--env` map onto processkit's own environment
-    // builder, applied in that exact call order: clear first (a clean slate
-    // instead of the runner's own inherited environment), then removals of
-    // specific inherited vars, then explicit sets. `env`/`env_remove` accumulate
-    // into one ordered list where a later entry wins on a duplicated key, so this
-    // order makes an explicit `--env` always win over an `--env-remove` of the
-    // same key — the order documented in README.md, "Environment".
+    // Environment configuration maps onto ProcessKit's builder in the documented
+    // order: clear, remove, file entries, explicit sets. Later calls win for a
+    // duplicate key, so `--env` always overrides every file without exposing a
+    // file's secret values in the runner's command line.
     if args.env_clear {
         command = command.env_clear();
     }
     for key in &args.env_remove {
         command = command.env_remove(key);
+    }
+    for (key, value) in &file_env {
+        command = command.env(key, value);
     }
     for (key, value) in &args.env {
         command = command.env(key, value);
@@ -397,6 +407,7 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
         abrupt_cleanup: events::abrupt_cleanup_str(),
         cwd: resolve_cwd(&args),
         command: events::CommandInfo::for_argv(&args.command, args.argv_raw),
+        labels: labels.clone(),
     });
     emit_members_snapshot(&mut emitter, &group);
 
@@ -919,6 +930,40 @@ async fn drive_to_outcome(running: RunningProcess, capturing: bool) -> processki
     }
 }
 
+/// Read the UTF-8 environment files in argument order and parse their active
+/// lines with the exact `KEY=VALUE` grammar used by `--env`.
+fn load_env_files(paths: &[std::path::PathBuf]) -> Result<Vec<(String, String)>, RunnerError> {
+    let mut entries = Vec::new();
+    for path in paths {
+        let text = std::fs::read_to_string(path).map_err(|err| {
+            RunnerError::new(
+                exit::SETUP,
+                format!(
+                    "could not read environment file `{}`: {err}",
+                    path.display()
+                ),
+            )
+        })?;
+        for (index, line) in text.lines().enumerate() {
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                continue;
+            }
+            let entry = parse_env_kv(line).map_err(|err| {
+                RunnerError::new(
+                    exit::SETUP,
+                    format!(
+                        "invalid environment entry in `{}` at line {}: {err}",
+                        path.display(),
+                        index + 1
+                    ),
+                )
+            })?;
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
 /// Open the per-user run registry so control-plane clients (`inspect`, T-008) can
 /// find the live runner.
 ///
@@ -956,8 +1001,9 @@ fn register_run(
     endpoint: Option<&str>,
     started: SystemTime,
     command: &events::CommandFingerprint,
+    labels: &std::collections::BTreeMap<String, String>,
 ) -> Option<registry::Registration> {
-    match registry.register(run_id, endpoint, started, command) {
+    match registry.register_with_labels(run_id, endpoint, started, command, labels) {
         Ok(registration) => Some(registration),
         Err(err) => {
             eprintln!("processkit-cli: warning: could not create the run registry entry: {err}");

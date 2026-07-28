@@ -68,6 +68,7 @@ file** (`<opaque-stem>.lock`). The record is a single JSON object:
   "started_at": "2026-07-20T21:00:00.000Z",
   "argv_sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
   "hint": null,
+  "labels": { "batch": "42" },
   "liveness": {
     "kind": "advisory_lock",
     "lock_file": "run-000...-0000.lock"
@@ -83,6 +84,7 @@ file** (`<opaque-stem>.lock`). The record is a single JSON object:
 | `started_at`       | Run start time, RFC 3339 UTC with millisecond precision. |
 | `argv_sha256`      | The run's one-way argv fingerprint — lowercase-hex SHA-256 of the canonical argv encoding, byte-identical to the `run_started` event's `command.argv_sha256` for the same run (`docs/schema.md`, "Fingerprint"). `null` on a record written before this field existed, or whose value failed the read-side shape check below. Never argv itself (see "Which run is which" below). |
 | `hint`             | The run's worker-shape category from the same classifier catalog the event stream uses (`docs/schema.md`, "Hint classifier") — e.g. `msbuild_node_reuse` — or `null` when the command matches no known shape (the common case) and on a record predating the field. A fixed category label, never argv content. |
+| `labels`           | Operator metadata from repeated `run --label KEY=VALUE`; an empty object on an unlabeled or older record. Used for discovery and exact-match aggregate filtering, not as a secret store. |
 | `liveness`         | How to decide whether the record is live or stale (see below). |
 
 ### Which run is which — and what a record never carries
@@ -310,6 +312,9 @@ it carries none of the "could not reach the target run" failure modes
     64-character digest, so it can be compared byte-for-byte against the same run's
     `run_started` event — and both are always present, `null` when the record carries
     no value. Additive: a consumer reading the fields it knows is unaffected.
+  - `labels` is the full key/value object in JSON and a comma-separated `LABELS`
+    cell in the table. Human output passes both keys and values through the terminal
+    sanitizer.
 - A single corrupt or unreadable record is skipped by `Registry::entries` itself
   (see "Staleness" and the per-record degradation documented there) and never
   blinds `list` to the other, healthy entries — including a record whose
@@ -654,11 +659,16 @@ entry it could not probe.
 
 ### The aggregate barrier — `wait --all`
 
-`wait --all [--timeout <duration>]` (T-216) is the counterpart for a caller that does
+`wait --all [--label KEY=VALUE]... [--timeout <duration>]` is the counterpart for a caller that does
 not hold one `run_id` but wants a barrier on *every* run — the typical orchestrator
 teardown sequence: cancel everything, wait for it all to be gone, then `prune`. It
 reuses the exact same periodic-probing mechanism (`src/wait.rs::run_all`), differing
 from `--run-id` only in what it tracks.
+
+Repeated label filters combine with logical AND and are applied while forming the
+one initial snapshot: a record must carry every exact pair to enter the target set.
+Conflicting filters for one key therefore match no run. Labels are rejected with
+the by-id form.
 
 **Snapshot semantics, fixed rather than left ambiguous.** At the moment `--all` starts,
 `wait` takes a single [`Registry::entries`] scan and fixes its target set to exactly

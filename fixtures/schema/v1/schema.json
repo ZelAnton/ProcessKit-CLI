@@ -120,6 +120,12 @@
         "time": { "$ref": "#/$defs/time" },
         "event": { "const": "run_started" },
         "run_id": { "type": "string", "description": "The --run-id value, or a generated run-<pid>-<unix_nanos>." },
+        "labels": {
+          "type": "object",
+          "description": "Operator-provided run labels, empty when none were supplied.",
+          "propertyNames": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9._-]{0,63}$" },
+          "additionalProperties": { "type": "string", "maxLength": 256 }
+        },
         "root_pid": { "$ref": "#/$defs/u32OrNull", "description": "The root child's PID; null if the backend exposed none." },
         "mechanism": {
           "type": "string",
@@ -134,7 +140,7 @@
         "cwd": { "type": ["string", "null"], "description": "The child's absolute working directory; null if it could not be resolved." },
         "command": { "$ref": "#/$defs/commandInfo" }
       },
-      "required": ["schema_version", "time", "event", "run_id", "root_pid", "mechanism", "abrupt_cleanup", "cwd", "command"],
+      "required": ["schema_version", "time", "event", "run_id", "labels", "root_pid", "mechanism", "abrupt_cleanup", "cwd", "command"],
       "additionalProperties": false
     },
     "membersSnapshot": {

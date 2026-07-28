@@ -22,6 +22,12 @@ to a dated version section.
   Windows console children before Job Object escalation.
 - Structured `cleanup_finished.shutdown` observations from ProcessKit's pre-stop
   capability probe and `ShutdownReport`.
+- `run --env-file` for pre-spawn UTF-8 environment files whose values stay out of
+  the runner's argv, with explicit `--env` overrides.
+- Operator `run --label` metadata in lifecycle events, registry discovery, and
+  conjunctive `--label` filters for `cancel --all`, `kill --all`, and `wait --all`.
+- A POSIX PTY e2e assertion that verifies foreground process-group restoration
+  after an inherited-stdio run returns.
 
 ### Changed
 - Split the registry into a stable facade, platform-specific implementation files,

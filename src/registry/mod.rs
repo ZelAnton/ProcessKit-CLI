@@ -36,6 +36,7 @@
 //! publishes it here so a client can reach it; it is `None` only when the transport
 //! could not be stood up (best-effort degradation, the run still works).
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -207,6 +208,11 @@ pub struct Record {
     /// validated on read the same way (see [`is_valid_hint`]).
     #[serde(default)]
     pub hint: Option<String>,
+    /// Operator-provided discovery labels. Additive and empty for records written
+    /// before labels existed; values are validated on read before display or
+    /// aggregate filtering.
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
     /// How a client decides whether this record is live or stale — never by the file
     /// merely existing.
     pub liveness: Liveness,
@@ -477,6 +483,20 @@ impl Registry {
         started: SystemTime,
         command: &events::CommandFingerprint,
     ) -> io::Result<Registration> {
+        self.register_with_labels(run_id, endpoint, started, command, &BTreeMap::new())
+    }
+
+    /// Register a run together with its validated operator labels. Kept separate
+    /// from [`Registry::register`] so existing metadata-free internal callers stay
+    /// concise while the production runner cannot forget to publish its labels.
+    pub fn register_with_labels(
+        &self,
+        run_id: &str,
+        endpoint: Option<&str>,
+        started: SystemTime,
+        command: &events::CommandFingerprint,
+        labels: &BTreeMap<String, String>,
+    ) -> io::Result<Registration> {
         // Reserve a unique, opaque entry stem via the filesystem itself (create_new),
         // and take the live lock on the fresh lock file before publishing the record.
         let reserved = self.reserve_entry()?;
@@ -488,6 +508,7 @@ impl Registry {
             started_at: events::format_rfc3339_utc(started),
             argv_sha256: Some(command.argv_sha256.clone()),
             hint: command.hint.map(str::to_string),
+            labels: labels.clone(),
             liveness: Liveness {
                 kind: LIVENESS_ADVISORY_LOCK.to_string(),
                 lock_file: file_name(&reserved.lock_path),
@@ -1474,6 +1495,9 @@ pub fn parse_and_validate_record(text: &str) -> Option<Record> {
         .argv_sha256
         .filter(|value| is_valid_argv_sha256(value));
     record.hint = record.hint.filter(|value| is_valid_hint(value));
+    record
+        .labels
+        .retain(|key, value| crate::labels::valid_key(key) && crate::labels::valid_value(value));
     // `run_id` and `endpoint` remain byte-for-byte identity/address data here:
     // changing either during parsing would make a later resolver target something
     // other than the record actually says. Human-readable renderers pass them

@@ -197,7 +197,7 @@ fn pty_parent(args: &[String]) -> ExitCode {
     }
     #[cfg(unix)]
     {
-        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::process::CommandExt;
 
         let Some(runner) = flag_value(args, "--runner") else {
@@ -239,7 +239,8 @@ fn pty_parent(args: &[String]) -> ExitCode {
         // descriptors for stdout and stderr.
         let slave_out = unsafe { libc::dup(slave) };
         let slave_err = unsafe { libc::dup(slave) };
-        if slave_out < 0 || slave_err < 0 {
+        let slave_probe = unsafe { libc::dup(slave) };
+        if slave_out < 0 || slave_err < 0 || slave_probe < 0 {
             eprintln!(
                 "e2e-helper pty-parent: dup failed: {}",
                 std::io::Error::last_os_error()
@@ -250,6 +251,7 @@ fn pty_parent(args: &[String]) -> ExitCode {
         let slave_in = unsafe { OwnedFd::from_raw_fd(slave) };
         let slave_out = unsafe { OwnedFd::from_raw_fd(slave_out) };
         let slave_err = unsafe { OwnedFd::from_raw_fd(slave_err) };
+        let slave_probe = unsafe { OwnedFd::from_raw_fd(slave_probe) };
 
         let helper = std::env::current_exe().expect("resolve current e2e helper");
         let mut command = Command::new(runner);
@@ -291,6 +293,7 @@ fn pty_parent(args: &[String]) -> ExitCode {
                 return ExitCode::from(4);
             }
         };
+        let runner_pgrp = runner.id() as libc::pid_t;
         let mut master_reader = match master.try_clone() {
             Ok(reader) => reader,
             Err(err) => {
@@ -332,7 +335,21 @@ fn pty_parent(args: &[String]) -> ExitCode {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             match runner.try_wait() {
-                Ok(Some(status)) => return ExitCode::from(status.code().unwrap_or(1) as u8),
+                Ok(Some(status)) => {
+                    // The runner created the PTY session and was its original
+                    // foreground group. Its guard must restore that exact value
+                    // after temporarily handing control to a process-group-backed
+                    // child. Keep a duplicate slave descriptor solely to observe
+                    // the terminal state after the runner has returned.
+                    let restored = unsafe { libc::tcgetpgrp(slave_probe.as_raw_fd()) };
+                    if restored != runner_pgrp {
+                        eprintln!(
+                            "e2e-helper pty-parent: foreground pgrp was {restored}, expected restored runner group {runner_pgrp}"
+                        );
+                        return ExitCode::from(5);
+                    }
+                    return ExitCode::from(status.code().unwrap_or(1) as u8);
+                }
                 Ok(None) if Instant::now() < deadline => sleep(Duration::from_millis(50)),
                 Ok(None) => {
                     let pid = runner.id().to_string();

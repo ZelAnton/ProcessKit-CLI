@@ -10,6 +10,8 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::labels::OperatorLabel;
+
 /// Top-level parser: one required subcommand, no global options.
 #[derive(Debug, Parser)]
 #[command(
@@ -54,7 +56,8 @@ pub enum Command {
 /// [--timeout <duration>] [--idle-timeout <duration>] [--grace <duration>]
 /// [--max-memory <size>] [--max-processes <n>] [--cpu-quota <cores>]
 /// [--capture-dir <dir>] [--capture-max-bytes <size>] [--no-echo] [--detach]
-/// [--argv-raw] [--env-clear] [--env-remove <KEY>] [--env <KEY=VALUE>]
+/// [--argv-raw] [--label <KEY=VALUE>] [--env-clear] [--env-remove <KEY>]
+/// [--env-file <file>] [--env <KEY=VALUE>]
 /// [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
 /// -- <program> <args...>`
 //
@@ -67,12 +70,18 @@ pub enum Command {
 // while capture/idle-timeout keep observing the same bytes (see `src/run/launch.rs`) —
 // `detach` — hand the whole run to a re-spawned, detached copy of this binary and
 // return as soon as it has provably started (see `src/run/detach.rs`) —
-// `env_clear`, `env_remove`, `env`, and `inherit_stdio`/`inherit_stdin`/`stdin_file`.
+// `labels`, `env_clear`, `env_remove`, `env_file`, `env`, and
+// `inherit_stdio`/`inherit_stdin`/`stdin_file`.
 #[derive(Debug, Args)]
 pub struct RunArgs {
     /// Identifier for this run; a value is generated when omitted.
     #[arg(long, value_name = "id")]
     pub run_id: Option<String>,
+
+    /// Attach operator metadata as `KEY=VALUE` (repeatable). Later values replace
+    /// earlier values for the same key in the registry and lifecycle event.
+    #[arg(long = "label", value_name = "KEY=VALUE", value_parser = crate::labels::parse)]
+    pub labels: Vec<OperatorLabel>,
 
     /// Working directory for the child process.
     #[arg(long, value_name = "dir")]
@@ -257,10 +266,17 @@ pub struct RunArgs {
     pub env_clear: bool,
 
     /// Remove an inherited environment variable by name (repeatable). Applied
-    /// after `--env-clear` and before `--env`, so an explicit `--env` for the
-    /// same key still wins. Maps onto `processkit::Command::env_remove()`.
+    /// after `--env-clear` and before `--env-file`/`--env`, so either later source
+    /// can restore the same key. Maps onto `processkit::Command::env_remove()`.
     #[arg(long = "env-remove", value_name = "KEY")]
     pub env_remove: Vec<String>,
+
+    /// Read child environment entries from a UTF-8 `KEY=VALUE` file (repeatable).
+    /// Empty lines and lines whose first non-whitespace character is `#` are
+    /// ignored. Files are applied in argument order after removals and before
+    /// explicit `--env`, keeping their contents out of the runner's argv.
+    #[arg(long = "env-file", value_name = "file")]
+    pub env_file: Vec<PathBuf>,
 
     /// Set an environment variable for the child as `KEY=VALUE` (repeatable).
     /// Applied last — after `--env-clear` and `--env-remove` — so it always wins
@@ -323,6 +339,11 @@ pub struct TargetArgs {
     /// `docs/control-plane.md` for the snapshot and per-run report semantics.
     #[arg(long, conflicts_with = "run_id", required_unless_present = "run_id")]
     pub all: bool,
+
+    /// With `--all`, restrict the snapshot to runs carrying this exact operator
+    /// label (repeatable; multiple filters combine with logical AND).
+    #[arg(long = "label", value_name = "KEY=VALUE", value_parser = crate::labels::parse, requires = "all", conflicts_with = "run_id")]
+    pub labels: Vec<OperatorLabel>,
 }
 
 /// `wait (--run-id <id> | --all) [--timeout <duration>]`
@@ -364,6 +385,11 @@ pub struct WaitArgs {
     /// full snapshot and unprobed-entry semantics.
     #[arg(long, conflicts_with = "run_id", required_unless_present = "run_id")]
     pub all: bool,
+
+    /// With `--all`, restrict the snapshot to runs carrying this exact operator
+    /// label (repeatable; multiple filters combine with logical AND).
+    #[arg(long = "label", value_name = "KEY=VALUE", value_parser = crate::labels::parse, requires = "all", conflicts_with = "run_id")]
+    pub labels: Vec<OperatorLabel>,
 
     /// Give up after this long instead of waiting indefinitely. This is a deadline
     /// on **the wait**, not on any run: when it elapses, the run (or, under `--all`,
@@ -1662,6 +1688,10 @@ mod tests {
             "--env-clear",
             "--env-remove",
             "FOO",
+            "--env-file",
+            "base.env",
+            "--env-file",
+            "secrets.env",
             "--env",
             "BAR=1",
             "--env",
@@ -1675,6 +1705,10 @@ mod tests {
         };
         assert!(args.env_clear);
         assert_eq!(args.env_remove, vec!["FOO".to_string()]);
+        assert_eq!(
+            args.env_file,
+            vec![PathBuf::from("base.env"), PathBuf::from("secrets.env")]
+        );
         assert_eq!(
             args.env,
             vec![
@@ -1700,7 +1734,49 @@ mod tests {
         };
         assert!(!args.env_clear);
         assert!(args.env_remove.is_empty());
+        assert!(args.env_file.is_empty());
         assert!(args.env.is_empty());
+    }
+
+    #[test]
+    fn labels_parse_for_runs_and_only_scope_aggregate_commands() {
+        let cli = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--label",
+            "batch=42",
+            "--label",
+            "lane=test",
+            "--",
+            "true",
+        ])
+        .expect("valid run labels");
+        let Command::Run(args) = cli.command else {
+            panic!("expected run");
+        };
+        assert_eq!(args.labels.len(), 2);
+
+        for sub in ["cancel", "kill", "wait"] {
+            assert!(
+                Cli::try_parse_from(["processkit-cli", sub, "--all", "--label", "batch=42"])
+                    .is_ok(),
+                "{sub} --all accepts a label filter"
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "processkit-cli",
+                    sub,
+                    "--run-id",
+                    "r1",
+                    "--label",
+                    "batch=42"
+                ])
+                .is_err(),
+                "{sub} labels require --all"
+            );
+        }
     }
 
     #[test]
