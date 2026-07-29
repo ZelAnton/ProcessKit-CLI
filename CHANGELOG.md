@@ -38,7 +38,8 @@ to a dated version section.
   and an isolated test module before further record/control-plane growth.
 
 ### Fixed
--
+- Headless Windows integration fixtures no longer leave Windows Terminal error
+  panes open after their contained console processes are torn down.
 
 ## [0.3.1] - 2026-07-26
 

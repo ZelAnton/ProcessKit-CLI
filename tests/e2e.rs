@@ -25,9 +25,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::{
-    ChildGuard, Scenario, bin, command_with_flags, events_path, file_len, helper_bin, pid_is_alive,
-    read_events, read_pid, run_with_flags, shell_inline, wait_child_bounded,
-    wait_for_file_nonempty, wait_until,
+    ChildGuard, Scenario, bin, command_with_flags, events_path, file_len, headless_run_command,
+    helper_bin, pid_is_alive, read_events, read_pid, run_with_flags, shell_inline,
+    wait_child_bounded, wait_for_file_nonempty, wait_until,
 };
 
 /// The `-- <program> <args…>` tail that runs the e2e helper in `mode` with `args`,
@@ -336,8 +336,7 @@ fn rapid_run_churn_does_not_touch_an_unrelated_bystander() {
     let iterations = 40;
     for i in 0..iterations {
         let jsonl = scenario.path(&format!("burst-{i}.jsonl"));
-        let out = Command::new(bin())
-            .arg("run")
+        let out = headless_run_command()
             .arg("--jsonl")
             .arg(&jsonl)
             .arg("--")
@@ -978,9 +977,8 @@ fn control_all_verb_reaps_every_live_run(
         let pidfile = scenario.path(&format!("{run_id}.pid"));
         let pidfile_arg = pidfile.to_string_lossy().into_owned();
 
-        let mut command = Command::new(bin());
+        let mut command = headless_run_command();
         command
-            .arg("run")
             .arg("--jsonl")
             .arg(&jsonl)
             .args(["--run-id", run_id])
@@ -1155,8 +1153,7 @@ fn operator_labels_scope_wait_cancel_and_kill_all() {
 
     for (run_id, batch) in [("label-target", "target"), ("label-other", "other")] {
         let jsonl = scenario.path(&format!("{run_id}.jsonl"));
-        let runner = Command::new(bin())
-            .arg("run")
+        let runner = headless_run_command()
             .arg("--jsonl")
             .arg(&jsonl)
             .args(["--run-id", run_id, "--label", &format!("batch={batch}")])
@@ -1293,9 +1290,10 @@ fn run_nested_in_a_job_object_still_contains_its_tree() {
 
     // Build the inner `run` invocation, then wrap it in `job-parent -- <run …>` so it
     // is launched from inside the wrapper's outer Job Object.
-    let run_command = vec![
-        bin().to_string(),
-        "run".to_string(),
+    let mut run_command = vec![bin().to_string(), "run".to_string()];
+    #[cfg(windows)]
+    run_command.push("--create-no-window".to_string());
+    run_command.extend([
         "--jsonl".to_string(),
         jsonl_arg,
         "--run-id".to_string(),
@@ -1307,7 +1305,7 @@ fn run_nested_in_a_job_object_still_contains_its_tree() {
         pidfile_arg,
         "--grandchild-sleep-secs".to_string(),
         "120".to_string(),
-    ];
+    ]);
     let mut wrapper_args = vec!["job-parent".to_string(), "--".to_string()];
     wrapper_args.extend(run_command);
 

@@ -450,10 +450,13 @@ fn console_parent(args: &[String]) -> ExitCode {
             eprintln!("e2e-helper console-parent: expected --report <path>");
             return ExitCode::from(2);
         };
-        if let Err(err) = allocate_fresh_console() {
-            eprintln!("e2e-helper console-parent: could not allocate a console: {err}");
-            return ExitCode::from(3);
-        }
+        let _console = match allocate_fresh_console() {
+            Ok(console) => console,
+            Err(err) => {
+                eprintln!("e2e-helper console-parent: could not allocate a console: {err}");
+                return ExitCode::from(3);
+            }
+        };
 
         let helper = std::env::current_exe().expect("resolve current e2e helper");
         match Command::new(runner)
@@ -494,10 +497,15 @@ fn graceful_console_parent(args: &[String]) -> ExitCode {
             eprintln!("e2e-helper graceful-console-parent: expected --marker <path>");
             return ExitCode::from(2);
         };
-        if let Err(err) = allocate_fresh_console() {
-            eprintln!("e2e-helper graceful-console-parent: could not allocate a console: {err}");
-            return ExitCode::from(3);
-        }
+        let _console = match allocate_fresh_console() {
+            Ok(console) => console,
+            Err(err) => {
+                eprintln!(
+                    "e2e-helper graceful-console-parent: could not allocate a console: {err}"
+                );
+                return ExitCode::from(3);
+            }
+        };
 
         let helper = std::env::current_exe().expect("resolve current e2e helper");
         match Command::new(runner)
@@ -578,14 +586,44 @@ unsafe extern "system" fn ctrl_break_handler(control_type: u32) -> windows_sys::
     }
 }
 
-/// Replace inherited/redirected handles with `CONIN$`/`CONOUT$` from a newly
-/// allocated console. The short-lived helper deliberately leaves these process
-/// standard handles open until exit.
+/// Own the fresh console and its replacement standard handles until the scenario
+/// returns. Dropping the guard explicitly detaches before the helper exits, so a
+/// delegated Windows Terminal pane closes even when the test runner stays alive.
 #[cfg(windows)]
-fn allocate_fresh_console() -> std::io::Result<()> {
-    use windows_sys::Win32::Foundation::{
-        GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
-    };
+struct FreshConsole {
+    input: Option<std::os::windows::io::OwnedHandle>,
+    output: Option<std::os::windows::io::OwnedHandle>,
+}
+
+#[cfg(windows)]
+impl Drop for FreshConsole {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Console::{
+            FreeConsole, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+        };
+
+        // No child remains when this guard drops. Clear the process standard-handle
+        // table before closing our owned handles, then detach from the console so
+        // the delegated terminal pane is not kept alive by this helper.
+        unsafe {
+            SetStdHandle(STD_INPUT_HANDLE, std::ptr::null_mut());
+            SetStdHandle(STD_OUTPUT_HANDLE, std::ptr::null_mut());
+            SetStdHandle(STD_ERROR_HANDLE, std::ptr::null_mut());
+        }
+        drop(self.input.take());
+        drop(self.output.take());
+        // SAFETY: this dedicated helper owns the console allocated below and no
+        // longer exposes any of its handles as process standard handles.
+        unsafe { FreeConsole() };
+    }
+}
+
+/// Replace inherited/redirected handles with `CONIN$`/`CONOUT$` from a newly
+/// allocated console, returning the guard that closes the console explicitly.
+#[cfg(windows)]
+fn allocate_fresh_console() -> std::io::Result<FreshConsole> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
@@ -603,8 +641,14 @@ fn allocate_fresh_console() -> std::io::Result<()> {
     if unsafe { AllocConsole() } == 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // Own the console immediately: every later `?` must detach it as well as
+    // closing whatever subset of replacement handles was opened successfully.
+    let mut guard = FreshConsole {
+        input: None,
+        output: None,
+    };
 
-    fn open_console(name: &str, access: u32) -> std::io::Result<HANDLE> {
+    fn open_console(name: &str, access: u32) -> std::io::Result<OwnedHandle> {
         let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
         // SAFETY: `wide` is NUL-terminated and lives through the call; all optional
         // pointer parameters use their documented null/default form.
@@ -622,21 +666,29 @@ fn allocate_fresh_console() -> std::io::Result<()> {
         if handle == INVALID_HANDLE_VALUE {
             Err(std::io::Error::last_os_error())
         } else {
-            Ok(handle)
+            // SAFETY: CreateFileW returned a unique, valid handle whose ownership
+            // transfers to this guard and is released exactly once.
+            Ok(unsafe { OwnedHandle::from_raw_handle(handle.cast()) })
         }
     }
 
-    let input = open_console("CONIN$", GENERIC_READ | GENERIC_WRITE)?;
-    let output = open_console("CONOUT$", GENERIC_READ | GENERIC_WRITE)?;
+    guard.input = Some(open_console("CONIN$", GENERIC_READ | GENERIC_WRITE)?);
+    guard.output = Some(open_console("CONOUT$", GENERIC_READ | GENERIC_WRITE)?);
+    let input_handle = guard.input.as_ref().expect("input handle").as_raw_handle();
+    let output_handle = guard
+        .output
+        .as_ref()
+        .expect("output handle")
+        .as_raw_handle();
     // SAFETY: both handles are valid console handles kept open for the remaining
     // lifetime of this helper. SetStdHandle only changes this process's table.
-    if unsafe { SetStdHandle(STD_INPUT_HANDLE, input) } == 0
-        || unsafe { SetStdHandle(STD_OUTPUT_HANDLE, output) } == 0
-        || unsafe { SetStdHandle(STD_ERROR_HANDLE, output) } == 0
+    if unsafe { SetStdHandle(STD_INPUT_HANDLE, input_handle.cast()) } == 0
+        || unsafe { SetStdHandle(STD_OUTPUT_HANDLE, output_handle.cast()) } == 0
+        || unsafe { SetStdHandle(STD_ERROR_HANDLE, output_handle.cast()) } == 0
     {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(())
+    Ok(guard)
 }
 
 /// A wrapper that places **itself** into a fresh Windows Job Object and then runs

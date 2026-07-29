@@ -40,6 +40,35 @@ fn forwards_a_nonzero_exit_code() {
     );
 }
 
+/// Test-only console policy is explicit: ordinary Windows fixtures suppress a
+/// delegated terminal pane, while the CTRL_BREAK proof can still opt into the
+/// caller's real console.
+#[cfg(windows)]
+#[test]
+fn windows_headless_fixtures_request_no_console_unless_explicitly_inherited() {
+    let dir = scratch("windows-test-console-policy");
+    let headless = common::command_with_flags(&dir, &[], &[], shell_inline("exit 0"));
+    assert!(
+        headless.get_args().any(|arg| arg == "--create-no-window"),
+        "ordinary Windows fixtures must not create delegated terminal panes"
+    );
+
+    let inherited =
+        common::command_with_inherited_console_flags(&dir, &[], &[], shell_inline("exit 0"));
+    assert!(
+        inherited.get_args().all(|arg| arg != "--create-no-window"),
+        "the real CTRL_BREAK proof must retain the caller's console"
+    );
+
+    let direct = common::headless_run_command();
+    assert!(
+        direct.get_args().any(|arg| arg == "--create-no-window"),
+        "incrementally assembled Windows fixtures need the same headless policy"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Child stdout and stderr are echoed live and stay strictly separated — child
 /// stdout to our stdout, child stderr to our stderr — and no runner diagnostic
 /// ever leaks into the child's stdout (`AGENTS.md`, "Streams are strictly
@@ -2239,7 +2268,9 @@ fn cancel_via_sighup_is_reported_as_its_own_source() {
 #[test]
 fn cancel_via_ctrl_break_reports_the_cancel_code_and_tears_down_the_tree() {
     use std::os::windows::process::CommandExt;
-    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent, GetConsoleProcessList,
+    };
     use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 
     let dir = scratch("ctrl_break");
@@ -2247,7 +2278,21 @@ fn cancel_via_ctrl_break_reports_the_cancel_code_and_tears_down_the_tree() {
     let grandchild = write_grandchild_script(&dir);
     let root = write_sleeping_root_script(&dir);
 
-    let mut cmd = common::command_with_flags(
+    let mut console_pid = 0;
+    // A headless cargo/IDE/agent process cannot deliver CTRL_BREAK. Detect that
+    // before launching the console child: starting it first would make Windows
+    // Terminal create a delegated pane that survives the intentional test kill as
+    // an error pane. Interactive runs still exercise the real delivery path.
+    if unsafe { GetConsoleProcessList(&mut console_pid, 1) } == 0 {
+        eprintln!(
+            "skipping cancel_via_ctrl_break_reports_the_cancel_code_and_tears_down_the_tree: \
+             this test process has no console to deliver CTRL_BREAK through"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+
+    let mut cmd = common::command_with_inherited_console_flags(
         &dir,
         &[
             ("HB", heartbeat.as_path()),

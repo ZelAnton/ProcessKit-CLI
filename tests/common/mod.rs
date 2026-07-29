@@ -57,15 +57,72 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    command_with_console_policy(dir, envs, flags, program_and_args, false)
+}
+
+/// Build a `run` invocation whose child deliberately shares the caller's Windows
+/// console. Keep this exceptional: headless test children use
+/// [`command_with_flags`] so Windows Terminal cannot retain an error pane after a
+/// contained process is killed.
+#[cfg(windows)]
+pub fn command_with_inherited_console_flags<I, S>(
+    dir: &Path,
+    envs: &[(&str, &Path)],
+    flags: &[&str],
+    program_and_args: I,
+) -> Command
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    command_with_console_policy(dir, envs, flags, program_and_args, true)
+}
+
+fn command_with_console_policy<I, S>(
+    dir: &Path,
+    envs: &[(&str, &Path)],
+    flags: &[&str],
+    program_and_args: I,
+    inherit_windows_console: bool,
+) -> Command
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let jsonl = events_path(dir);
     let mut cmd = Command::new(bin());
     cmd.arg("run").arg("--jsonl").arg(&jsonl);
+    // Cargo's test process can be consoleless under an IDE or agent. Launching a
+    // console-subsystem fixture from there lets Windows Terminal create a new pane;
+    // when ProcessKit intentionally kills the fixture, Terminal keeps that pane
+    // open as a failed launch. Suppress the console for ordinary headless fixtures.
+    // The explicit helper above preserves it only for the CTRL_BREAK contract test.
+    #[cfg(windows)]
+    if !inherit_windows_console
+        && !flags
+            .iter()
+            .any(|flag| matches!(*flag, "--inherit-stdio" | "--windows-graceful-ctrl-break"))
+    {
+        cmd.arg("--create-no-window");
+    }
+    #[cfg(not(windows))]
+    let _ = inherit_windows_console;
     cmd.args(flags);
     cmd.arg("--");
     cmd.args(program_and_args);
     for (key, value) in envs {
         cmd.env(key, value);
     }
+    cmd
+}
+
+/// Start a direct, headless `run` command. This is the equivalent of
+/// [`command_with_flags`] for scenarios that assemble their argv incrementally.
+pub fn headless_run_command() -> Command {
+    let mut cmd = Command::new(bin());
+    cmd.arg("run");
+    #[cfg(windows)]
+    cmd.arg("--create-no-window");
     cmd
 }
 

@@ -70,7 +70,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant, SystemTime};
 
-use common::{bin, scratch, shell_inline};
+use common::{bin, headless_run_command, scratch, shell_inline};
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -319,8 +319,7 @@ fn sleep_child(secs: u32) -> Vec<String> {
 /// runner's own streams, and an unread pipe could stall it).
 fn spawn_run(paths: &Paths, run_id: &str, child_secs: u32) -> RunHandle {
     let jsonl = paths.runs.join(format!("{run_id}.jsonl"));
-    let child = Command::new(bin())
-        .arg("run")
+    let child = headless_run_command()
         .arg("--run-id")
         .arg(run_id)
         .arg("--jsonl")
