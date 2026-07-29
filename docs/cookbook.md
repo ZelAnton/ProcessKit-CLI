@@ -185,10 +185,15 @@ global shutdown or repeat the sequence to catch later registrations.
 ```sh
 processkit-cli list
 processkit-cli list --json
+processkit-cli list --label pipeline=ci --health live
 ```
 
 The human table abbreviates `argv_sha256`; JSON Lines carry the full digest.
 `live`, `stale`, and `unprobed` are intentionally distinct health states.
+Label filters are exact and conjunctive, matching the aggregate control commands.
+New records also expose absolute `jsonl` and optional `capture_dir` locators, so a
+supervisor discovering a detached run can open its artifacts without launch-time
+state.
 
 ## Preview stale-record cleanup
 

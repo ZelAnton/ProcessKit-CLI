@@ -28,7 +28,7 @@ Responsibilities, in the order data flows through a `run`:
 | [`src/hash.rs`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/src/hash.rs) | The one hand-rolled incremental/one-shot SHA-256 (FIPS 180-4) both `events` (argv fingerprint) and `capture` (streamed transcript hashing) build on, so the project has a single digest primitive and rendering style. |
 | [`src/text.rs`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/src/text.rs) | Shared human-output primitives: terminal-safe normalization for untrusted text and the column-aligned table renderer used by both `list` and `inspect`. |
 | [`src/registry/mod.rs`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/src/registry/mod.rs) | The per-user run registry: one record per in-flight run in an owner-only-restricted directory, found by scanning and matching `run_id` (never a PID), carrying the run's redaction-safe command fingerprint/hint for discovery, with staleness detected via an OS advisory lock the live runner holds (see [`docs/registry.md`](registry.md)). The first brick of the control plane. |
-| [`src/control.rs`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/src/control.rs) | The live-run control plane: the per-run local IPC transport (unix domain socket / Windows named pipe, owner-restricted) stood up inside `run`, its line-oriented `inspect`/`cancel`/`kill` wire protocol, and the three clients that speak it (see [`docs/control-plane.md`](control-plane.md)). |
+| [`src/control/`](https://github.com/ZelAnton/ProcessKit-CLI/tree/main/src/control) | The live-run control plane: a stable facade plus platform transports, bounded rendering, and isolated tests for its line-oriented `inspect`/`cancel`/`kill` protocol (see [`docs/control-plane.md`](control-plane.md)). |
 | [`src/list.rs`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/src/list.rs) | The `list` subcommand: a thin, read-only CLI wrapper over `Registry::entries` that renders every registry entry — whatever its health (live/stale/unprobed) — as a table or JSON Lines, for a caller that has lost (or never had) a `run_id`. |
 | [`src/prune.rs`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/src/prune.rs) | The `prune` subcommand: an equally thin wrapper over `Registry::prune`, which owns the whole confirm-before-delete reaping safety rule; this module only opens the registry and reports the tally. |
 | [`src/wait.rs`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/src/wait.rs) | The `wait` subcommand: blocks until a run is no longer live, for a supervisor that is not the runner's parent. Registry-only in both of its modes — it never contacts the runner. `--run-id` polls `Registry::probe_run` and has three outcomes (finished, its own `--timeout` elapsing, an ambiguous `run_id`); `--all` (T-216) instead polls a `Registry::entries` snapshot taken at the moment it starts and has only two — there is no aggregate ambiguity outcome, since `--all` never resolves an id at all. Both are decided entirely from the registry (see [`docs/registry.md`](registry.md), "Waiting — `wait`"). |
@@ -138,7 +138,7 @@ implemented in `run::execute` (`src/run/mod.rs`) and `run::launch::run_async`
    path. `--timeout` elapsing, a local stop signal (interactive `Ctrl-C`, on
    Unix a caught `SIGTERM`/`SIGHUP`, or on Windows a caught `Ctrl-Break`/
    console close/logoff/system shutdown), and a control-plane
-   `cancel` reaching the live runner over `src/control.rs` all drive the
+   `cancel` reaching the live runner over `src/control/mod.rs` all drive the
    *same* graceful path: a soft stop (`SIGTERM` to the tree on Unix; on Windows,
    which has no POSIX signal, a best-effort `WM_CLOSE` to any windowed member —
    nothing at all for the ordinary console child, in which case the grace window
@@ -160,7 +160,7 @@ implemented in `run::execute` (`src/run/mod.rs`) and `run::launch::run_async`
 
 ## Control-plane contour
 
-`inspect`, `cancel`, and `kill` (`src/control.rs`) never address a live `run`
+`inspect`, `cancel`, and `kill` (`src/control/mod.rs`) never address a live `run`
 by PID; they resolve it through the run registry (`src/registry/mod.rs`):
 
 1. **Registry scan.** `registry::Registry::entries` lists every record in the
@@ -219,7 +219,7 @@ Concretely:
   runner-own exit-code band (`src/exit.rs`), bounded diagnostic capture with
   hashing (`src/capture.rs`, `src/hash.rs`), the per-user run registry
   (`src/registry/mod.rs`), and the live-run control plane
-  (`src/control.rs`)/preflight probe (`src/probe.rs`) built on top of it, plus
+  (`src/control/mod.rs`)/preflight probe (`src/probe.rs`) built on top of it, plus
   the temporary POSIX foreground-terminal handoff required by ProcessKit's
   separate process-group mechanism —
   none of which `processkit` itself provides.
@@ -264,7 +264,7 @@ Four tiers, increasing in weight and decreasing in how often they run:
   what the tiers above cannot reach by construction: the invariants that only
   break when many runs contend for the two resources every run *shares* — the
   per-user registry ([`src/registry/mod.rs`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/src/registry/mod.rs)) and the per-run
-  control plane ([`src/control.rs`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/src/control.rs)). Where the `e2e` tier
+  control plane ([`src/control/`](https://github.com/ZelAnton/ProcessKit-CLI/tree/main/src/control)). Where the `e2e` tier
   scripts a fixed handful of processes, this one launches dozens of
   simultaneous `run` invocations against one registry directory and drives
   parallel `list`/`prune`/`wait`/`inspect`/`cancel`/`kill` clients at them,

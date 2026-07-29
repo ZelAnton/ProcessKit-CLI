@@ -1,5 +1,5 @@
 //! Fuzz the control plane's two textual wire-parsing surfaces together
-//! (`src/control.rs`): the server's request-line classifier and the client's
+//! (`src/control/mod.rs`): the server's request-line classifier and the client's
 //! response-line JSON decode.
 //!
 //! Seed/corpus entries are plain text, split on the *first* `\n` (never

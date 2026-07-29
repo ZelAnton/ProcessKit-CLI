@@ -1,6 +1,6 @@
 //! Concurrency stress tier — the invariants that only break under *simultaneous*
 //! load on the two resources this binary shares across every run: the per-user run
-//! registry (`src/registry/mod.rs`) and the per-run control plane (`src/control.rs`).
+//! registry (`src/registry/mod.rs`) and the per-run control plane (`src/control/mod.rs`).
 //!
 //! The other tiers each prove a *functional* path (`AGENTS.md`, "Testing tiers"):
 //! the unit tier proves a helper in isolation, the through-the-binary tier proves
@@ -83,7 +83,7 @@ const REGISTRY_ENV: &str = "PROCESSKIT_CLI_REGISTRY_DIR";
 /// Wall-clock ceiling on one client invocation (`list`/`prune`/`inspect`/`cancel`/
 /// `kill`). Comfortably above every deadline the client itself enforces — the
 /// control plane bounds its connect and its conversation at 5s each
-/// (`src/control.rs`) — so a client that hits *this* bound is hung, not merely slow,
+/// (`src/control/mod.rs`) — so a client that hits *this* bound is hung, not merely slow,
 /// and the harness reports it as such instead of blocking the tier forever.
 const CLIENT_BOUND: Duration = Duration::from_secs(30);
 
@@ -1132,7 +1132,7 @@ fn registry_scans_never_lose_or_duplicate_records_under_churn() {
 // ---------------------------------------------------------------------------
 
 /// The three verbs that reach a live runner over its control transport
-/// (`src/control.rs`) — all three must refuse the same bounded way when it is gone.
+/// (`src/control/mod.rs`) — all three must refuse the same bounded way when it is gone.
 const CONTROL_VERBS: [&str; 3] = ["inspect", "cancel", "kill"];
 
 /// A `run_id` no run in this tier ever registers: the pure "unreachable" case, with

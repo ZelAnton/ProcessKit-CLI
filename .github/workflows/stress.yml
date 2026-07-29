@@ -3,7 +3,7 @@ name: Stress
 # Concurrency stress tier (`tests/stress.rs`, `stress` Cargo feature, T-219): the
 # invariants that only break when many runs contend for the two resources this
 # binary shares across every run — the per-user registry (src/registry.rs) and the
-# per-run control plane (src/control.rs). Dozens of simultaneous `run` invocations
+# per-run control plane (src/control/mod.rs). Dozens of simultaneous `run` invocations
 # plus parallel `list`/`prune`/`wait`/`inspect`/`cancel`/`kill` clients, asserting
 # that `prune` never reaps a live entry, a registry scan never loses or duplicates a
 # record, control clients refuse boundedly (CONTROL 103) instead of hanging on a dead

@@ -48,6 +48,26 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
         .split_first()
         .expect("clap enforces a non-empty command after `--`");
 
+    // Resolve artifact locations once, before any later `--cwd` changes the child
+    // context. The registry and inspect snapshot publish absolute paths so another
+    // process can discover a detached run's observability files without inheriting
+    // the launcher's working directory.
+    let artifact_base = std::env::current_dir().map_err(|err| {
+        RunnerError::new(
+            exit::SETUP,
+            format!("could not resolve the runner's current directory: {err}"),
+        )
+    })?;
+    let jsonl_path = absolute_from(&artifact_base, &args.jsonl);
+    let capture_dir = args
+        .capture_dir
+        .as_deref()
+        .map(|path| absolute_from(&artifact_base, path));
+    let jsonl_locator = jsonl_path.to_string_lossy().into_owned();
+    let capture_locator = capture_dir
+        .as_deref()
+        .map(|path| path.to_string_lossy().into_owned());
+
     // Open the event stream *first*, before anything is spawned. `--jsonl` is a
     // required, first-class output, so a file we cannot even create is a
     // fail-closed setup error reported before the child runs — no child code can
@@ -198,6 +218,10 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             // a run whose registry could not be opened at all computes nothing.
             &events::CommandFingerprint::for_argv(&args.command),
             &labels,
+            registry::ArtifactLocators {
+                jsonl: Some(&jsonl_locator),
+                capture_dir: capture_locator.as_deref(),
+            },
         )
     });
 
@@ -422,8 +446,15 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             .map(|infos| infos.into_iter().map(Member::from_info).collect())
             .unwrap_or_default()
     };
-    let snapshot_source =
-        SnapshotSource::new(&run_id, mechanism, root_pid, started, &members_provider);
+    let snapshot_source = SnapshotSource::new(
+        &run_id,
+        mechanism,
+        root_pid,
+        started,
+        &jsonl_locator,
+        capture_locator.as_deref(),
+        &members_provider,
+    );
 
     // The channel the control server signals a mutating `cancel`/`kill` verb through.
     // The server (in the `select!` below) writes its client ack first, then sends the
@@ -1002,14 +1033,25 @@ fn register_run(
     started: SystemTime,
     command: &events::CommandFingerprint,
     labels: &std::collections::BTreeMap<String, String>,
+    artifacts: registry::ArtifactLocators<'_>,
 ) -> Option<registry::Registration> {
-    match registry.register_with_labels(run_id, endpoint, started, command, labels) {
+    match registry
+        .register_with_labels_and_artifacts(run_id, endpoint, started, command, labels, artifacts)
+    {
         Ok(registration) => Some(registration),
         Err(err) => {
             eprintln!("processkit-cli: warning: could not create the run registry entry: {err}");
             None
         }
     }
+}
+
+fn absolute_from(base: &std::path::Path, path: &std::path::Path) -> std::path::PathBuf {
+    // `std::path::absolute` also handles Windows drive-relative forms (`C:foo`),
+    // whose resolution cannot be reproduced correctly with a plain `base.join`.
+    // `base` is the already-resolved current directory and is only a defensive
+    // fallback for an environment race after the earlier successful lookup.
+    std::path::absolute(path).unwrap_or_else(|_| base.join(path))
 }
 
 /// The child's absolute working directory as recorded in `run_started`: the explicit

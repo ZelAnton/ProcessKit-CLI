@@ -12,7 +12,7 @@ This document is the normative description of the **local transport**, the **wir
 protocol**, and the three clients — **`inspect`** (read-only) and the mutating
 **`cancel`** / **`kill`** — including their behavior when the runner cannot be reached.
 Discovery — how a client *finds* a live runner — is the run registry, described in
-[`docs/registry.md`](registry.md). The in-code source of truth is `src/control.rs`.
+[`docs/registry.md`](registry.md). The in-code source of truth is `src/control/`.
 
 `cancel` and `kill` add verbs to the **same** transport and protocol as `inspect`
 without reshaping either: one request verb line in, one JSON line out, connection
@@ -124,7 +124,7 @@ processkit-cli inspect --run-id <id> [--json]
 `inspect` finds the live runner for `<id>` through the registry, connects to its
 endpoint, sends the `inspect` verb, and prints the snapshot to **stdout** — as a
 single JSON line with `--json`, or, by default, as a human-readable rendering
-(snapshot version, run id, mechanism, root pid, start time, and a member table),
+(snapshot version, run id, mechanism, root pid, start time, artifact locators, and a member table),
 mirroring `list`/`prune`'s optional `--json`. `--json` is optional; `inspect --json`'s
 output is unchanged from before `--json` became optional.
 
@@ -136,17 +136,19 @@ from the JSONL event `schema_version` and the `registry_version`.
 
 | Field              | Type              | Notes                                                                 |
 |--------------------|-------------------|-----------------------------------------------------------------------|
-| `snapshot_version` | integer           | Snapshot format version (currently `1`).                              |
+| `snapshot_version` | integer           | Snapshot format version (currently `2`).                              |
 | `run_id`           | string            | The run's identifier — the key matched in the registry. Not a PID.    |
 | `mechanism`        | string            | Containment mechanism: `job_object`, `cgroup_v2`, or `process_group` (same vocabulary as the JSONL `run_started`). |
 | `root_pid`         | integer, nullable | The root child's PID; `null` if the backend exposed none.             |
 | `started_at`       | string            | Run start time, RFC 3339 UTC, millisecond precision.                  |
+| `jsonl`            | string, nullable  | Absolute path to the JSONL lifecycle stream; `null` only when reading a legacy snapshot. |
+| `capture_dir`      | string, nullable  | Absolute capture directory, or `null` when capture is disabled.       |
 | `members`          | array of member   | The container's members, enriched with `ppid`/executable `name`/`start_time` wherever ProcessKit's `members_info()` can report them — the same shape as the JSONL `members_snapshot` (`docs/schema.md`, "Enriched member fields"), and read through the same call, so the two views never drift. Fields stay `null` on platforms/members that can't report them (e.g. the "bare" BSDs). Queried **at request time**, so it reflects the container's composition *when inspected*, not at start. |
 
 Example:
 
 ```json
-{"snapshot_version":1,"run_id":"build-42","mechanism":"job_object","root_pid":4242,"started_at":"2026-07-20T21:00:00.000Z","members":[{"pid":4242,"ppid":4200,"name":"build.exe","start_time":"133456789000000000"}]}
+{"snapshot_version":2,"run_id":"build-42","mechanism":"job_object","root_pid":4242,"started_at":"2026-07-20T21:00:00.000Z","jsonl":"C:\\runs\\build-42.jsonl","capture_dir":null,"members":[{"pid":4242,"ppid":4200,"name":"build.exe","start_time":"133456789000000000"}]}
 ```
 
 ## `cancel` and `kill`

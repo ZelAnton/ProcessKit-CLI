@@ -175,6 +175,35 @@ fn register_writes_a_record_without_a_pid() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn register_publishes_absolute_artifact_locators() {
+    let dir = scratch("record-artifacts");
+    let registry = Registry::open_in(dir.clone()).expect("open registry");
+    let fingerprint = events::CommandFingerprint::for_argv(["fixture"]);
+    let labels = BTreeMap::new();
+    let registration = registry
+        .register_with_labels_and_artifacts(
+            "run-artifacts",
+            None,
+            SystemTime::now(),
+            &fingerprint,
+            &labels,
+            ArtifactLocators {
+                jsonl: Some("C:\\runs\\events.jsonl"),
+                capture_dir: Some("C:\\runs\\capture"),
+            },
+        )
+        .expect("register run with artifacts");
+
+    let text = fs::read_to_string(registration.record_path()).expect("read record");
+    let record: Record = serde_json::from_str(&text).expect("parse record");
+    assert_eq!(record.jsonl.as_deref(), Some("C:\\runs\\events.jsonl"));
+    assert_eq!(record.capture_dir.as_deref(), Some("C:\\runs\\capture"));
+
+    registration.remove();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// T-215's producer side: a registered run publishes the two redaction-safe
 /// command fields — the fingerprint the JSONL stream carries for the same run,
 /// and the worker-shape hint — and publishes **nothing else** about the command.
@@ -516,6 +545,8 @@ fn write_record_with_endpoint(
         argv_sha256: None,
         hint: None,
         labels: BTreeMap::new(),
+        jsonl: None,
+        capture_dir: None,
         liveness: Liveness {
             kind: LIVENESS_ADVISORY_LOCK.to_string(),
             lock_file: lock_file.to_string(),
@@ -598,6 +629,8 @@ fn write_record_with_started_at(dir: &Path, stem: &str, run_id: &str, started_at
         argv_sha256: None,
         hint: None,
         labels: BTreeMap::new(),
+        jsonl: None,
+        capture_dir: None,
         liveness: Liveness {
             kind: LIVENESS_ADVISORY_LOCK.to_string(),
             lock_file: format!("{stem}.lock"),
@@ -2429,7 +2462,7 @@ fn probe_run_reports_a_stale_leftover_as_finished_without_reaping_it() {
 ///
 /// One of the duplicates deliberately publishes **no endpoint**: liveness is
 /// counted by the identity predicate (`run_id`) alone, before any secondary
-/// attribute, which is exactly the undercount [K-016] found in `src/control.rs`
+/// attribute, which is exactly the undercount [K-016] found in `src/control/mod.rs`
 /// when the two were folded into one filter pass. Here the point is even sharper
 /// than there — `wait` never needs an endpoint at all, so an endpoint-less live
 /// run is an entirely ordinary run to wait for, not a lesser one.

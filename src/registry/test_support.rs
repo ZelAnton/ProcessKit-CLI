@@ -36,6 +36,8 @@ fn write_record(dir: &Path, stem: &str, run_id: &str) -> PathBuf {
         argv_sha256: None,
         hint: None,
         labels: BTreeMap::new(),
+        jsonl: None,
+        capture_dir: None,
         liveness: Liveness {
             kind: "advisory_lock".to_string(),
             lock_file: format!("{stem}.lock"),

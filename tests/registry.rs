@@ -10,7 +10,7 @@
 //! ambiguous id, all without ever contacting a runner. These prove the
 //! *binary's* registry/control lifecycle end-to-end; the fine-grained mechanics —
 //! owner-only permissions, stale detection, concurrency, the wire snapshot, verb
-//! routing — are unit-tested in `src/registry/mod.rs` and `src/control.rs`.
+//! routing — are unit-tested in `src/registry/mod.rs` and `src/control/tests.rs`.
 //!
 //! Each test points the runner *and* the inspect client at an isolated scratch
 //! registry via the `PROCESSKIT_CLI_REGISTRY_DIR` override so they never touch the
@@ -238,10 +238,12 @@ fn inspect(registry: &Path, run_id: &str) -> Output {
 fn inspect_reports_a_live_run() {
     let dir = scratch("inspect-live");
     let registry = registry_dir(&dir);
+    let capture = dir.join("capture");
+    let capture_arg = capture.to_string_lossy().into_owned();
     let mut child = command_with_flags(
         &dir,
         &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
-        &["--run-id", "inspect-me"],
+        &["--run-id", "inspect-me", "--capture-dir", &capture_arg],
         inspectable_child(),
     )
     .spawn()
@@ -298,9 +300,17 @@ fn inspect_reports_a_live_run() {
         "the start-time token is populated on this platform: {root}"
     );
     assert_eq!(
-        snapshot["snapshot_version"], 1,
+        snapshot["snapshot_version"], 2,
         "the snapshot carries its format version: {snapshot}"
     );
+    let jsonl = snapshot["jsonl"]
+        .as_str()
+        .unwrap_or_else(|| panic!("inspect publishes the JSONL locator: {snapshot}"));
+    assert!(
+        std::path::Path::new(jsonl).is_absolute(),
+        "the JSONL locator is absolute: {jsonl}"
+    );
+    assert_eq!(snapshot["capture_dir"], capture_arg);
 
     // Let the run finish cleanly (removing its own entry).
     let _ = child.wait();
@@ -308,7 +318,7 @@ fn inspect_reports_a_live_run() {
 }
 
 /// T-214 regression: without `--json`, `inspect` prints the human-readable rendering,
-/// not JSON — the `if json` branch in `inspect_async` (`src/control.rs`) actually
+/// not JSON — the `if json` branch in `inspect_async` (`src/control/mod.rs`) actually
 /// takes the other arm on a real binary invocation, not just in a unit test of the
 /// pure rendering function.
 #[test]
@@ -349,6 +359,10 @@ fn inspect_reports_a_live_run_in_human_form() {
     assert!(
         stdout.contains("mechanism:"),
         "the human-readable form names the containment mechanism: {stdout}"
+    );
+    assert!(
+        stdout.contains("jsonl:") && stdout.contains("capture_dir:"),
+        "the human-readable form exposes artifact locators: {stdout}"
     );
 
     let _ = child.wait();
@@ -843,14 +857,79 @@ fn cancel_all_and_kill_all_return_at_once_with_no_live_runs() {
 
 /// Run `list [--json]` against `registry` and wait for it to finish.
 fn list(registry: &Path, json: bool) -> Output {
+    let mut flags = Vec::new();
+    if json {
+        flags.push("--json");
+    }
+    list_with_flags(registry, &flags)
+}
+
+fn list_with_flags(registry: &Path, flags: &[&str]) -> Output {
     let mut cmd = Command::new(bin());
     cmd.arg("list");
-    if json {
-        cmd.arg("--json");
-    }
+    cmd.args(flags);
     cmd.env("PROCESSKIT_CLI_REGISTRY_DIR", registry)
         .output()
         .expect("spawn the list client")
+}
+
+#[test]
+fn list_filters_by_labels_and_health_with_shared_semantics() {
+    let dir = scratch("list-filters");
+    let registry = registry_dir(&dir);
+    let ci_dir = dir.join("ci");
+    let local_dir = dir.join("local");
+    fs::create_dir_all(&ci_dir).expect("create CI run scratch directory");
+    fs::create_dir_all(&local_dir).expect("create local run scratch directory");
+    let mut ci = command_with_flags(
+        &ci_dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &[
+            "--run-id",
+            "list-ci",
+            "--label",
+            "pipeline=ci",
+            "--label",
+            "lane=test",
+        ],
+        slow_child(),
+    )
+    .spawn()
+    .expect("spawn labeled CI run");
+    let mut local = command_with_flags(
+        &local_dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "list-local", "--label", "pipeline=local"],
+        slow_child(),
+    )
+    .spawn()
+    .expect("spawn labeled local run");
+    wait_until(|| record_count(&registry) == 2, Duration::from_secs(10));
+    write_stale_entry(&registry, "list-stale", "list-stale");
+
+    let out = list_with_flags(
+        &registry,
+        &["--json", "--label", "pipeline=ci", "--health", "live"],
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let entries: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("filtered list JSON"))
+        .collect();
+    assert_eq!(entries.len(), 1, "only the conjunctive live match remains");
+    assert_eq!(entries[0]["run_id"], "list-ci");
+
+    let out = list_with_flags(&registry, &["--json", "--health", "stale"]);
+    let stale: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("stale list JSON"))
+        .collect();
+    assert_eq!(stale.len(), 1);
+    assert_eq!(stale[0]["run_id"], "list-stale");
+
+    let _ = ci.wait();
+    let _ = local.wait();
+    let _ = fs::remove_dir_all(&dir);
 }
 
 /// An empty registry is not an error: `list` exits `0` either way, printing an
@@ -941,6 +1020,14 @@ fn list_reports_a_live_run() {
         entry["endpoint"].is_string(),
         "a live run has published its control-transport endpoint: {entry}"
     );
+    let jsonl = entry["jsonl"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a live run publishes its JSONL locator: {entry}"));
+    assert!(
+        std::path::Path::new(jsonl).is_absolute(),
+        "the list JSONL locator is absolute: {jsonl}"
+    );
+    assert!(entry["capture_dir"].is_null());
     // T-215, end to end through the real binary: `run` publishes the redaction-safe
     // command fields into the record, and `list --json` reports them at full
     // precision. This is the only place the whole producer→record→client chain is

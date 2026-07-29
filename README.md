@@ -211,7 +211,7 @@ processkit-cli inspect --run-id <id> [--json]
 processkit-cli cancel  (--run-id <id> | --all [--label <KEY=VALUE>]...)
 processkit-cli kill    (--run-id <id> | --all [--label <KEY=VALUE>]...)
 processkit-cli wait    (--run-id <id> | --all [--label <KEY=VALUE>]...) [--timeout <duration>]
-processkit-cli list    [--json]
+processkit-cli list    [--json] [--label <KEY=VALUE>]... [--health <live|stale|unprobed>]
 processkit-cli prune   [--json] [--dry-run]
 processkit-cli probe   --json [--require-schema-version <N>]
                        [--require-exit-code-band <start>-<end>]
@@ -452,6 +452,13 @@ processkit-cli run --detach --run-id build-42 --jsonl build-42.jsonl -- cargo bu
 processkit-cli inspect --run-id build-42 --json
 processkit-cli wait --run-id build-42
 ```
+
+`list --json` and `inspect --json` publish the absolute JSONL locator and the
+optional capture-directory locator from the owner-only registry. A supervisor that
+did not launch the detached run can therefore find its lifecycle stream and
+transcripts using only the discovered `run_id`. These operator-selected paths can
+contain private project names; treat the machine-readable output as private
+operational metadata.
 
 - **"Started" is an observation, not an assumption.** The call returns only once the
   detached runner's `run_started` event is readable in `--jsonl`, which it writes

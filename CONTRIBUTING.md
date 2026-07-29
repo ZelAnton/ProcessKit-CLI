@@ -192,7 +192,7 @@ handful of real processes. [`tests/stress.rs`] covers what none of them can
 reach by construction — the invariants that only break when many runs contend
 for the two resources *every* run shares, the per-user registry
 ([`src/registry/mod.rs`](src/registry/mod.rs)) and the per-run control plane
-([`src/control.rs`](src/control.rs)). It launches dozens of simultaneous `run`
+([`src/control/`](src/control/)). It launches dozens of simultaneous `run`
 invocations against a single scratch registry directory and drives parallel
 `list`/`prune`/`wait`/`inspect`/`cancel`/`kill` clients at them, asserting four
 properties a race would break:
@@ -255,7 +255,7 @@ each linking the crate's library target directly (never the binary):
 - `registry_record` — the run registry's bytes → parse/validate path
   ([`Registry::scan`]'s per-record guards: JSON, `started_at`, `lock_file`).
 - `control_wire` — the control plane's server-side request-line classifier and
-  client-side response-line JSON decode (`src/control.rs`).
+  client-side response-line JSON decode (`src/control/mod.rs`).
 - `cli_parsers` — the CLI's `--timeout`/`--grace`, `--require-exit-code-band`,
   and `--env` value parsers (`src/cli.rs`).
 

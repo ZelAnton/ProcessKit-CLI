@@ -85,12 +85,18 @@ file** (`<opaque-stem>.lock`). The record is a single JSON object:
 | `argv_sha256`      | The run's one-way argv fingerprint — lowercase-hex SHA-256 of the canonical argv encoding, byte-identical to the `run_started` event's `command.argv_sha256` for the same run (`docs/schema.md`, "Fingerprint"). `null` on a record written before this field existed, or whose value failed the read-side shape check below. Never argv itself (see "Which run is which" below). |
 | `hint`             | The run's worker-shape category from the same classifier catalog the event stream uses (`docs/schema.md`, "Hint classifier") — e.g. `msbuild_node_reuse` — or `null` when the command matches no known shape (the common case) and on a record predating the field. A fixed category label, never argv content. |
 | `labels`           | Operator metadata from repeated `run --label KEY=VALUE`; an empty object on an unlabeled or older record. Used for discovery and exact-match aggregate filtering, not as a secret store. |
+| `jsonl`            | Absolute path to the run's JSONL lifecycle stream, or `null` on an older record. |
+| `capture_dir`      | Absolute output-capture directory, or `null` when capture is disabled or the record predates this field. |
 | `liveness`         | How to decide whether the record is live or stale (see below). |
 
 Registry identity and endpoint strings remain byte-for-byte intact for matching
 and JSON output. Human-readable `list` and `inspect` output sanitizes terminal
 formatting and limits each of those untrusted fields to 256 characters plus an
 explicit `...` marker, so a corrupt record cannot create an unbounded terminal row.
+
+`list --label KEY=VALUE` applies the same exact-match, logical-AND label filters as
+the aggregate control and wait commands. `list --health live|stale|unprobed`
+restricts that result to one liveness verdict; the two filter kinds combine.
 
 ### Which run is which — and what a record never carries
 
@@ -102,6 +108,16 @@ entries are running the same command, the hint names a recognized worker shape, 
 neither can disclose a command line (`AGENTS.md`, "Argv is redacted by default").
 Both are produced by exactly the implementation the JSONL stream uses, so the same
 run never fingerprints differently in the two artifacts.
+
+The artifact locators are published on every new run (`capture_dir` only when that
+feature is enabled). This is deliberate: they are operator-selected observability
+locations rather than argv, and the registry is already owner-only because it holds
+the live control endpoint. Publishing them closes the detached-run discovery loop:
+a supervisor with only a `run_id` can find the event stream and transcripts as well
+as inspect, wait for, or stop the run. Paths can still contain a sensitive project or
+user name, so consumers must treat registry JSON as private operational metadata and
+must not copy it into public logs. Human `list`/`inspect` output terminal-sanitizes
+and visibly bounds both paths; JSON preserves the exact strings.
 
 **The raw argv is never written to a record, under any flag.** `--argv-raw` widens
 the `run_started` *event* only; the registry's `register` is handed a
@@ -125,7 +141,8 @@ deliberately **left out**:
 
 ### Reading a record: additive fields, and untrusted values
 
-Both fields are **optional on read**, and that is what makes adding them a
+The command-identification and artifact fields are **optional on read**, and that is
+what makes adding them a
 non-breaking change to `registry_version` (still `1`):
 
 - A record written **before** they existed — or by any writer that publishes none —
@@ -199,7 +216,7 @@ The registry does **not** enforce uniqueness of `run_id` at `register` time: two
 concurrent runs started with the same explicit `--run-id` are both written as
 independent entries (independent opaque file stems — see "No PID addressing" above)
 and both read as live for as long as they run. Resolution is therefore the client's
-job — in `resolve_live_endpoint` (`src/control.rs`) for the control-plane verbs, and
+job — in `resolve_live_endpoint` (`src/control/mod.rs`) for the control-plane verbs, and
 in `Registry::probe_run` (`src/registry/mod.rs`) for the registry-only `wait`, which
 reaches the same verdict from its own scan — and it is deliberately conservative:
 
@@ -249,7 +266,7 @@ the write — a registry redesign this resolver deliberately does not attempt (s
 PID addressing" above). It is not needed for correctness, though: by the time the
 re-check runs, the client has already connected to the target's specific,
 uniquely-tokened transport endpoint (`endpoint_tokens_are_unique` in
-`src/control.rs`), and a later registry write cannot retarget bytes already destined
+`src/control/tests.rs`), and a later registry write cannot retarget bytes already destined
 for an open connection. So the guarantee the re-check actually buys is narrower than
 "no ambiguity can ever exist at write time" (impossible without that cross-process
 lock) and is instead: **the verb can never be misdirected to a different run than the
@@ -257,7 +274,7 @@ one already resolved and reconfirmed.** A duplicate that registers in the residu
 gap is simply invisible to that call — it becomes visible on the *next* one — never a
 wrong-target action. See
 `racing_duplicate_after_reconfirm_does_not_misdirect_the_dispatched_verb` in
-`src/control.rs` for a deterministic proof of this property.
+`src/control/tests.rs` for a deterministic proof of this property.
 
 ## Discovery — `list`
 
@@ -267,14 +284,15 @@ wrong-target action. See
 never touches its permissions — and scans it with [`Registry::entries`], the same
 scan every other client shares, printing every entry it finds, whatever its health:
 `run_id`, health (`live`/`stale`/`unprobed`), `started_at`, `hint`, `argv_sha256`,
-and `endpoint`. It is
+`labels`, `jsonl`, `capture_dir`, and `endpoint`. It is
 deliberately **read-only** and never connects to any runner's control transport, so
 it carries none of the "could not reach the target run" failure modes
 `inspect`/`cancel`/`kill` do — it has no single target to fail to reach.
 
 - **No `--json`** prints a human-readable table (or `no runs registered` for an
   empty registry). Because record files are untrusted input, control characters in
-  `run_id` or `endpoint` are collapsed to spaces at this terminal boundary; they
+  identity, endpoint, or artifact paths are collapsed to spaces and visibly bounded
+  at this terminal boundary; they
   cannot forge another row or inject an ANSI sequence.
 - **`--json`** prints one JSON object per entry, one per line, sorted by `run_id`,
   then `started_at`, then the entry's registry record path (a tertiary tie-break,

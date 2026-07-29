@@ -70,7 +70,7 @@ fn main() -> ExitCode {
                 args.timeout,
             )
         }),
-        Command::List(args) => report(list::run(args.json)),
+        Command::List(args) => report(list::run(args.json, &args.labels, args.health)),
         Command::Prune(args) => report(prune::run(args.json, args.dry_run)),
         Command::Probe(args) => report(probe::run(&args)),
     }

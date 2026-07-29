@@ -32,10 +32,16 @@ to a dated version section.
   prebuilt GitHub Release archives on every published target.
 - A scheduled, manually dispatchable, non-gating canary that builds and tests
   against ProcessKit's current git `main` on Linux and Windows.
+- Exact-match `list --label` filters and `list --health live|stale|unprobed`,
+  composable across human and JSON discovery output.
+- Absolute JSONL and optional capture-directory locators in the owner-only registry,
+  `list`, and inspect snapshot, completing detached-run artifact discovery.
 
 ### Changed
 - Split the registry into a stable facade, platform-specific implementation files,
   and an isolated test module before further record/control-plane growth.
+- Split the live control plane into a stable facade with separate platform,
+  rendering, and test modules before adding further fleet operations.
 - Human-readable registry identity and endpoint fields are visibly truncated at a
   bounded terminal-safe prefix while machine-readable JSON preserves them exactly.
 - Test-only teardown wording no longer contributes a fabricated capability-scope

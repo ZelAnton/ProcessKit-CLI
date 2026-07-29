@@ -213,9 +213,27 @@ pub struct Record {
     /// aggregate filtering.
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// Absolute path to the run's JSONL lifecycle stream. Additive and absent on
+    /// records written by older versions. Paths are operator-selected observability
+    /// locators, not command-line data; the owner-only registry publishes them so a
+    /// supervisor that discovers a detached run can also find its artifacts.
+    #[serde(default)]
+    pub jsonl: Option<String>,
+    /// Absolute output-capture directory, when `--capture-dir` was requested.
+    /// Additive and optional for both compatibility and runs without capture.
+    #[serde(default)]
+    pub capture_dir: Option<String>,
     /// How a client decides whether this record is live or stale — never by the file
     /// merely existing.
     pub liveness: Liveness,
+}
+
+/// Artifact locations a runner may publish with its registry record. Borrowed so
+/// registration never needs an extra clone before constructing the owned record.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ArtifactLocators<'a> {
+    pub jsonl: Option<&'a str>,
+    pub capture_dir: Option<&'a str>,
 }
 
 /// The documented liveness signal embedded in a [`Record`]: which sibling file the
@@ -497,6 +515,28 @@ impl Registry {
         command: &events::CommandFingerprint,
         labels: &BTreeMap<String, String>,
     ) -> io::Result<Registration> {
+        self.register_with_labels_and_artifacts(
+            run_id,
+            endpoint,
+            started,
+            command,
+            labels,
+            ArtifactLocators::default(),
+        )
+    }
+
+    /// Register a run with its labels and absolute artifact locations. Production
+    /// runners use this entry point; the simpler registration helpers retain the
+    /// legacy artifact-free shape for focused registry tests.
+    pub fn register_with_labels_and_artifacts(
+        &self,
+        run_id: &str,
+        endpoint: Option<&str>,
+        started: SystemTime,
+        command: &events::CommandFingerprint,
+        labels: &BTreeMap<String, String>,
+        artifacts: ArtifactLocators<'_>,
+    ) -> io::Result<Registration> {
         // Reserve a unique, opaque entry stem via the filesystem itself (create_new),
         // and take the live lock on the fresh lock file before publishing the record.
         let reserved = self.reserve_entry()?;
@@ -509,6 +549,8 @@ impl Registry {
             argv_sha256: Some(command.argv_sha256.clone()),
             hint: command.hint.map(str::to_string),
             labels: labels.clone(),
+            jsonl: artifacts.jsonl.map(str::to_string),
+            capture_dir: artifacts.capture_dir.map(str::to_string),
             liveness: Liveness {
                 kind: LIVENESS_ADVISORY_LOCK.to_string(),
                 lock_file: file_name(&reserved.lock_path),
@@ -909,7 +951,7 @@ impl Registry {
     /// **Counting.** Matching records are selected by the identity predicate — the
     /// `run_id` field — **first**, and only then classified by health; folding both into
     /// one filter pass is how an ambiguity check silently undercounts (see [K-016], where
-    /// a live-but-endpoint-less duplicate evaded exactly this check in `src/control.rs`).
+    /// a live-but-endpoint-less duplicate evaded exactly this check in `src/control/mod.rs`).
     /// A live entry counts as a duplicate here whether or not it publishes an `endpoint`,
     /// and for a stronger reason than in `control`: `wait` needs no endpoint at all, so a
     /// run whose control transport never came up is still a perfectly ordinary run to

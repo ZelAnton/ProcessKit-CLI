@@ -492,6 +492,15 @@ label), so they are filled on **every** run — redacted or not. `--argv-raw` *a
 the raw `argv` array; it never changes the fingerprint or the hint. A consumer can
 therefore correlate and classify a run without ever seeing its command line.
 
+Artifact paths follow a separate disclosure rule. The public lifecycle stream does
+not add them as event fields: the caller already chose its `--jsonl` and optional
+`--capture-dir` destinations. The private, owner-only run registry does publish
+those locations as absolute paths so a different supervisor can discover a detached
+run's observability artifacts. Paths are not derived from argv, but may contain a
+project or user name; treat `list --json` and `inspect --json` as private operational
+metadata and do not copy them into public logs. See
+[`docs/registry.md`](registry.md#which-run-is-which--and-what-a-record-never-carries).
+
 ### Fingerprint (`argv_sha256`)
 
 `argv_sha256` is the SHA-256 of a canonical encoding of argv, rendered as

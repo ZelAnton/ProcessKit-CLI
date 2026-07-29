@@ -7,7 +7,7 @@
 //! `run_id` can find one. It is read-only: it never connects to a runner's control
 //! transport and never mutates the registry, so it carries none of the
 //! reach-a-live-runner failure modes `inspect`/`cancel`/`kill` do (see
-//! `src/control.rs`) — the only way it can fail is the registry directory itself
+//! `src/control/mod.rs`) — the only way it can fail is the registry directory itself
 //! being unreadable, which is a [`exit::SETUP`] condition (a support/prerequisite
 //! failure), not a [`exit::CONTROL`] one (which is reserved for "could not reach
 //! *this specific target run*", a concept `list` has no single instance of).
@@ -49,7 +49,9 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
+use crate::cli::ListHealth;
 use crate::exit::{self, RunnerError};
+use crate::labels::OperatorLabel;
 use crate::registry::{self, Health};
 
 /// One `list` entry as printed — the client's own display/JSON shape, decoupled
@@ -98,6 +100,10 @@ struct ListEntry {
     argv_sha256: Option<String>,
     /// Operator labels in full for machine-readable discovery.
     labels: BTreeMap<String, String>,
+    /// Absolute path to the JSONL lifecycle stream, when the record publishes it.
+    jsonl: Option<String>,
+    /// Absolute capture directory, when output capture is enabled.
+    capture_dir: Option<String>,
     /// The run's local control-transport endpoint, or `None` when the transport
     /// was never stood up (best-effort degradation — see
     /// [`registry::Record::endpoint`]) — never populated for a stale entry's
@@ -118,12 +124,20 @@ struct ListEntry {
 /// `list` must never create the registry directory or touch its permissions just to
 /// scan it (see the module docs above) — that mutating path exists only for `run`,
 /// which is actually about to write a record.
-pub fn run(json: bool) -> Result<(), RunnerError> {
+pub fn run(
+    json: bool,
+    labels: &[OperatorLabel],
+    health: Option<ListHealth>,
+) -> Result<(), RunnerError> {
     let registry = registry::open_read_only_for_setup()?;
     let entries = registry.entries().map_err(registry::setup_read_error)?;
 
     let mut rows: Vec<(PathBuf, ListEntry)> = entries
         .into_iter()
+        .filter(|entry| {
+            crate::labels::matches(&entry.record.labels, labels)
+                && health.is_none_or(|expected| health_matches(entry.health, expected))
+        })
         .map(|entry| {
             let path = entry.path;
             let list_entry = ListEntry {
@@ -133,6 +147,8 @@ pub fn run(json: bool) -> Result<(), RunnerError> {
                 hint: entry.record.hint,
                 argv_sha256: entry.record.argv_sha256,
                 labels: entry.record.labels,
+                jsonl: entry.record.jsonl,
+                capture_dir: entry.record.capture_dir,
                 endpoint: entry.record.endpoint,
             };
             (path, list_entry)
@@ -147,6 +163,15 @@ pub fn run(json: bool) -> Result<(), RunnerError> {
         print_table(&rows);
         Ok(())
     }
+}
+
+fn health_matches(actual: Health, expected: ListHealth) -> bool {
+    matches!(
+        (actual, expected),
+        (Health::Live, ListHealth::Live)
+            | (Health::Stale, ListHealth::Stale)
+            | (Health::Unprobed, ListHealth::Unprobed)
+    )
 }
 
 /// Order `rows` by `run_id`, then `started_at`, then the entry's registry record
@@ -267,16 +292,18 @@ fn render_table_lines(rows: &[ListEntry]) -> Vec<String> {
     if rows.is_empty() {
         return vec!["no runs registered".to_string()];
     }
-    const HEADERS: [&str; 7] = [
+    const HEADERS: [&str; 9] = [
         "RUN_ID",
         "HEALTH",
         "STARTED_AT",
         "HINT",
         "ARGV_SHA256",
         "LABELS",
+        "JSONL",
+        "CAPTURE_DIR",
         "ENDPOINT",
     ];
-    let cells: Vec<[String; 7]> = rows
+    let cells: Vec<[String; 9]> = rows
         .iter()
         .map(|row| {
             [
@@ -286,6 +313,10 @@ fn render_table_lines(rows: &[ListEntry]) -> Vec<String> {
                 row.hint.as_deref().unwrap_or(ABSENT_CELL).to_string(),
                 abbreviated_argv_sha256(row.argv_sha256.as_deref()),
                 rendered_labels(&row.labels),
+                crate::text::terminal_safe_bounded(row.jsonl.as_deref().unwrap_or(ABSENT_CELL)),
+                crate::text::terminal_safe_bounded(
+                    row.capture_dir.as_deref().unwrap_or(ABSENT_CELL),
+                ),
                 crate::text::terminal_safe_bounded(row.endpoint.as_deref().unwrap_or(ABSENT_CELL)),
             ]
         })
@@ -302,6 +333,19 @@ mod tests {
         assert_eq!(health_str(Health::Live), "live");
         assert_eq!(health_str(Health::Stale), "stale");
         assert_eq!(health_str(Health::Unprobed), "unprobed");
+    }
+
+    #[test]
+    fn health_filter_maps_exactly_to_the_registry_vocabulary() {
+        for (actual, expected) in [
+            (Health::Live, ListHealth::Live),
+            (Health::Stale, ListHealth::Stale),
+            (Health::Unprobed, ListHealth::Unprobed),
+        ] {
+            assert!(health_matches(actual, expected));
+        }
+        assert!(!health_matches(Health::Live, ListHealth::Stale));
+        assert!(!health_matches(Health::Unprobed, ListHealth::Live));
     }
 
     /// The full-length fingerprint of a fixture entry — 64 lowercase hex
@@ -323,6 +367,8 @@ mod tests {
             labels: [("batch".to_string(), "42".to_string())]
                 .into_iter()
                 .collect(),
+            jsonl: Some("/runs/run-1.jsonl".to_string()),
+            capture_dir: Some("/runs/run-1".to_string()),
             endpoint: Some("/tmp/pkc-x/c.sock".to_string()),
         };
         let json = serde_json::to_string(&entry).expect("a list entry serializes");
@@ -336,6 +382,8 @@ mod tests {
             "--json carries the whole digest, never the table's abbreviation: {value}"
         );
         assert_eq!(value["labels"]["batch"], "42");
+        assert_eq!(value["jsonl"], "/runs/run-1.jsonl");
+        assert_eq!(value["capture_dir"], "/runs/run-1");
         assert_eq!(value["endpoint"], "/tmp/pkc-x/c.sock");
     }
 
@@ -353,6 +401,8 @@ mod tests {
             hint: None,
             argv_sha256: None,
             labels: BTreeMap::new(),
+            jsonl: None,
+            capture_dir: None,
             endpoint: None,
         };
         let json = serde_json::to_string(&entry).expect("a list entry serializes");
@@ -409,6 +459,8 @@ mod tests {
             hint: None,
             argv_sha256: Some(FINGERPRINT.to_string()),
             labels: BTreeMap::new(),
+            jsonl: None,
+            capture_dir: None,
             endpoint: Some(format!("/tmp/pkc-{suffix}.sock")),
         };
         let path = |name: &str| PathBuf::from(name);
@@ -455,6 +507,8 @@ mod tests {
             hint: None,
             argv_sha256: Some(FINGERPRINT.to_string()),
             labels: BTreeMap::new(),
+            jsonl: None,
+            capture_dir: None,
             endpoint: None,
         };
         let json = serde_json::to_string(&entry).expect("a list entry serializes");
@@ -481,6 +535,8 @@ mod tests {
                 hint: Some("msbuild_node_reuse".to_string()),
                 argv_sha256: Some(FINGERPRINT.to_string()),
                 labels: BTreeMap::new(),
+                jsonl: None,
+                capture_dir: None,
                 endpoint: Some("/tmp/pkc-a.sock".to_string()),
             },
             ListEntry {
@@ -490,6 +546,8 @@ mod tests {
                 hint: None,
                 argv_sha256: None,
                 labels: BTreeMap::new(),
+                jsonl: None,
+                capture_dir: None,
                 endpoint: None,
             },
         ];
@@ -497,9 +555,9 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "RUN_ID              HEALTH  STARTED_AT                HINT                ARGV_SHA256      LABELS  ENDPOINT",
-                "r1                  live    2026-07-22T00:00:00.000Z  msbuild_node_reuse  0123456789ab...  -       /tmp/pkc-a.sock",
-                "much-longer-run-id  stale   2026-07-22T00:00:00.000Z  -                   -                -       -",
+                "RUN_ID              HEALTH  STARTED_AT                HINT                ARGV_SHA256      LABELS  JSONL  CAPTURE_DIR  ENDPOINT",
+                "r1                  live    2026-07-22T00:00:00.000Z  msbuild_node_reuse  0123456789ab...  -       -      -            /tmp/pkc-a.sock",
+                "much-longer-run-id  stale   2026-07-22T00:00:00.000Z  -                   -                -       -      -            -",
             ]
         );
         // The actual alignment property: a value starts at the same column in every
@@ -529,6 +587,8 @@ mod tests {
             labels: [("danger".to_string(), "bidi\u{202e}value".to_string())]
                 .into_iter()
                 .collect(),
+            jsonl: None,
+            capture_dir: None,
             endpoint: Some("pipe\tname\u{7}".to_string()),
         };
 
@@ -562,6 +622,8 @@ mod tests {
             hint: None,
             argv_sha256: None,
             labels: BTreeMap::new(),
+            jsonl: None,
+            capture_dir: None,
             endpoint: Some(oversized_endpoint.clone()),
         };
 
@@ -601,6 +663,8 @@ mod tests {
             hint: hint.map(str::to_string),
             argv_sha256: Some(fingerprint.to_string()),
             labels: BTreeMap::new(),
+            jsonl: None,
+            capture_dir: None,
             endpoint: None,
         };
         let rows = vec![

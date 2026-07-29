@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::labels::OperatorLabel;
 
@@ -302,7 +302,7 @@ pub struct InspectArgs {
 
     /// Emit the snapshot as JSON instead of a human-readable rendering. Optional,
     /// mirroring `list`/`prune` — `inspect` has a human-readable form of its own
-    /// (see `src/control.rs::render_snapshot_human`).
+    /// (see `src/control/render.rs::render_snapshot_human`).
     #[arg(long)]
     pub json: bool,
 }
@@ -415,7 +415,7 @@ pub struct WaitArgs {
     pub timeout: Option<Duration>,
 }
 
-/// `list [--json]`
+/// `list [--json] [--label <KEY=VALUE>]... [--health <health>]`
 ///
 /// Scans the per-user registry ([`crate::registry::Registry::entries`]) and prints
 /// every entry it finds, whatever its health (live/stale/unprobed) — the discovery counterpart to the
@@ -431,6 +431,22 @@ pub struct ListArgs {
     /// human-readable form of its own.
     #[arg(long)]
     pub json: bool,
+
+    /// Keep only entries carrying this exact operator label. Repeat for logical AND.
+    #[arg(long = "label", value_name = "KEY=VALUE", value_parser = crate::labels::parse)]
+    pub labels: Vec<OperatorLabel>,
+
+    /// Keep only entries with this registry-health verdict.
+    #[arg(long, value_name = "health", value_enum)]
+    pub health: Option<ListHealth>,
+}
+
+/// Registry-health vocabulary accepted by `list --health`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ListHealth {
+    Live,
+    Stale,
+    Unprobed,
 }
 
 /// `prune [--json] [--dry-run]`
@@ -892,12 +908,29 @@ mod tests {
             !args.json,
             "--json is optional and defaults to off for list"
         );
+        assert!(args.labels.is_empty());
+        assert!(args.health.is_none());
 
-        let cli = Cli::try_parse_from(["processkit-cli", "list", "--json"]).expect("list --json");
+        let cli = Cli::try_parse_from([
+            "processkit-cli",
+            "list",
+            "--json",
+            "--label",
+            "pipeline=ci",
+            "--health",
+            "unprobed",
+        ])
+        .expect("list filters");
         let Command::List(args) = cli.command else {
             panic!("expected the list subcommand");
         };
         assert!(args.json);
+        assert_eq!(
+            args.labels,
+            vec![crate::labels::parse("pipeline=ci").unwrap()]
+        );
+        assert_eq!(args.health, Some(ListHealth::Unprobed));
+        assert!(Cli::try_parse_from(["processkit-cli", "list", "--health", "unknown"]).is_err());
     }
 
     #[test]

@@ -19,7 +19,7 @@ accordingly (bounded parsing, validation before use, no blind trust in shape):
   registry directory (see "Closed threats" below for the `lock_file` case).
 - **Control-plane wire strings.** The one request-verb line a client sends,
   and the one JSON reply line the server sends back, over the local
-  `inspect`/`cancel`/`kill` transport (`src/control.rs`), are read as
+  `inspect`/`cancel`/`kill` transport (`src/control/mod.rs`), are read as
   untrusted bytes from whichever local process holds the socket/pipe.
 - **The child's argv and output.** The command line passed to `run` is
   attacker-influenceable in the sense that it ends up in a diagnostic
@@ -57,7 +57,7 @@ code/docs it is implemented and described in.
   directory: each run atomically reserves its own short-lived `0o700`
   directory under `/tmp` (falling back to the platform temp directory) and
   binds the Unix socket inside it, with the socket file itself given `0o600`
-  on a best-effort basis afterward (`src/control.rs`,
+  on a best-effort basis afterward (`src/control/mod.rs`,
   `imp::ControlServer::bind`, `create_private_socket_dir`); the path is kept
   independent of the registry directory specifically so a long registry path
   cannot push the socket path past `sockaddr_un::sun_path` on macOS (see
@@ -83,7 +83,7 @@ code/docs it is implemented and described in.
 - **An unbounded or malformed control-plane wire line.** Both the server's
   request-line read and every client's reply-line read are capped at
   `MAX_LINE_BYTES` (64 KiB) via a shared bounded-read helper
-  (`src/control.rs`, `read_bounded_line`) — an oversized or unterminated line
+  (`src/control/mod.rs`, `read_bounded_line`) — an oversized or unterminated line
   fails deterministically rather than growing an in-memory buffer without
   bound. Separately, a registry record's `lock_file` field is validated as a
   simple file name before it is ever joined onto the registry directory path
