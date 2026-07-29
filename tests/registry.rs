@@ -25,6 +25,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use common::{bin, command_with_flags, scratch, shell_inline};
+use processkit_cli::registry::test_support::{write_stale_entry, write_unprobeable_entry};
 
 /// The registry directory the runner is pointed at, kept separate from the
 /// `--jsonl` events file (which lands in `scratch_dir` itself) so scanning for
@@ -817,7 +818,7 @@ fn cancel_all_and_kill_all_return_at_once_with_no_live_runs() {
         );
 
         // A registry with only a confirmed-stale leftover is likewise nothing to act on.
-        write_stale_entry(&registry, "run-stale-0000");
+        write_stale_entry(&registry, "run-stale-0000", "run-stale-0000");
         let out = control_all_client(&registry, verb);
         assert_eq!(
             out.status.code(),
@@ -1000,8 +1001,8 @@ fn list_reports_an_unprobeable_entry_as_unprobed_not_stale() {
     let dir = scratch("list-unprobed");
     let registry = registry_dir(&dir);
 
-    write_unprobeable_entry(&registry, "run-unprobed-0000");
-    write_stale_entry(&registry, "run-stale-0000");
+    write_unprobeable_entry(&registry, "run-unprobed-0000", "run-unprobed-0000");
+    write_stale_entry(&registry, "run-stale-0000", "run-stale-0000");
 
     let out = list(&registry, true);
     assert_eq!(
@@ -1131,50 +1132,6 @@ fn prune(registry: &Path, json: bool) -> Output {
         .expect("spawn the prune client")
 }
 
-/// Hand-write a confirmed-stale entry into `registry`: a well-formed record plus an
-/// **unlocked** sibling lock file — exactly the `.json`/`.lock` pair an abruptly-killed
-/// runner leaves behind, with no process holding the lock. `register` only ever mints
-/// safe opaque stems, so a test fabricates this leftover directly, the same way the
-/// in-`src` unit tests do.
-fn write_stale_entry(registry: &Path, stem: &str) {
-    fs::create_dir_all(registry).expect("create the registry directory");
-    let lock_name = format!("{stem}.lock");
-    // A minimal valid record: registry_version 1, a well-formed millisecond RFC-3339
-    // `started_at`, and a simple in-directory `lock_file` name — the exact shape a
-    // live runner writes, so the scan treats it as a real (not corrupt) record.
-    let record = format!(
-        "{{\"registry_version\":1,\"run_id\":\"{stem}\",\"endpoint\":null,\
-         \"started_at\":\"2026-07-22T00:00:00.000Z\",\
-         \"liveness\":{{\"kind\":\"advisory_lock\",\"lock_file\":\"{lock_name}\"}}}}"
-    );
-    fs::write(registry.join(format!("{stem}.json")), record).expect("write the stale record");
-    // An unlocked lock file: present on disk, but held by no one, so the prune probe
-    // takes its exclusive lock and confirms the entry stale.
-    fs::write(registry.join(&lock_name), b"").expect("write the unlocked lock file");
-}
-
-/// Hand-write an **unprobeable** entry into `registry` (T-206): a well-formed record
-/// whose `lock_file` name resolves to a *directory* rather than a regular file. The
-/// liveness probe's write-open then fails with a semantic "is a directory" error
-/// (`EISDIR` on Unix) for any user, including root — the cross-platform trick from
-/// [K-014] (`chmod 0o000` is unreliable under a privileged/`CAP_DAC_OVERRIDE` CI
-/// runner) — so this is a record whose health is neither confirmed live nor
-/// confirmed stale, only unknown.
-fn write_unprobeable_entry(registry: &Path, stem: &str) {
-    fs::create_dir_all(registry).expect("create the registry directory");
-    let lock_name = format!("{stem}.lock");
-    let record = format!(
-        "{{\"registry_version\":1,\"run_id\":\"{stem}\",\"endpoint\":null,\
-         \"started_at\":\"2026-07-22T00:00:00.000Z\",\
-         \"liveness\":{{\"kind\":\"advisory_lock\",\"lock_file\":\"{lock_name}\"}}}}"
-    );
-    fs::write(registry.join(format!("{stem}.json")), record).expect("write the record");
-    // A directory in the lock file's place: the probe's write-open fails with a
-    // semantic error, never NotFound, so the entry cannot be classified `Stale`.
-    fs::create_dir(registry.join(&lock_name))
-        .expect("create the directory the lock name resolves to");
-}
-
 /// Spawn `wait --run-id <id> [--timeout <duration>]` against `registry` **without**
 /// waiting for it, so a test can observe whether the client is still blocked while the
 /// run under test is live — the only way to prove blocking rather than infer it from
@@ -1280,7 +1237,7 @@ fn wait_blocks_until_a_live_run_finishes() {
 fn wait_returns_at_once_for_a_stale_entry() {
     let dir = scratch("wait-stale");
     let registry = registry_dir(&dir);
-    write_stale_entry(&registry, "run-stale-0000");
+    write_stale_entry(&registry, "run-stale-0000", "run-stale-0000");
 
     let out = wait_for_run(&registry, "run-stale-0000", Some("10s"));
     assert_eq!(
@@ -1511,7 +1468,7 @@ fn wait_all_returns_at_once_with_no_live_runs() {
     );
 
     // A registry with only confirmed-stale leftovers is likewise nothing to wait for.
-    write_stale_entry(&registry, "run-stale-0000");
+    write_stale_entry(&registry, "run-stale-0000", "run-stale-0000");
     let out = wait_all_for(&registry, Some("10s"));
     assert_eq!(
         out.status.code(),
@@ -1720,7 +1677,7 @@ fn wait_all_returns_at_once_when_the_only_entry_is_unprobed_at_snapshot_time() {
     let dir = scratch("wait-all-unprobed-only");
     let registry = registry_dir(&dir);
 
-    write_unprobeable_entry(&registry, "run-unprobed-0000");
+    write_unprobeable_entry(&registry, "run-unprobed-0000", "run-unprobed-0000");
 
     let out = wait_all_for(&registry, Some("10s"));
     assert_eq!(
@@ -1759,7 +1716,11 @@ fn wait_all_timeout_ignores_an_unprobed_entry_never_in_the_snapshot() {
     .expect("spawn the runner");
 
     wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
-    write_unprobeable_entry(&registry, "run-unprobed-sibling-0000");
+    write_unprobeable_entry(
+        &registry,
+        "run-unprobed-sibling-0000",
+        "run-unprobed-sibling-0000",
+    );
 
     let out = wait_all_for(&registry, Some("1s"));
     assert_eq!(
@@ -1798,7 +1759,7 @@ fn prune_reaps_a_stale_entry_and_keeps_a_live_one() {
     let registry = registry_dir(&dir);
 
     // A hand-written, confirmed-stale entry (record + unlocked lock file).
-    write_stale_entry(&registry, "run-stale-0000");
+    write_stale_entry(&registry, "run-stale-0000", "run-stale-0000");
     assert!(
         registry.join("run-stale-0000.json").exists()
             && registry.join("run-stale-0000.lock").exists(),
@@ -1890,7 +1851,7 @@ fn prune_reaps_an_orphaned_lock_file_alongside_a_stale_pair_and_a_live_run() {
     let registry = registry_dir(&dir);
 
     // A hand-written, confirmed-stale entry (record + unlocked lock file).
-    write_stale_entry(&registry, "run-stale-0000");
+    write_stale_entry(&registry, "run-stale-0000", "run-stale-0000");
 
     // A lone, unlocked `.lock` file with no `.json` sibling at all. Backdated well
     // past `Registry`'s `ORPHAN_LOCK_MIN_AGE` ([R-01]) so it reads as a confirmed,
@@ -1981,7 +1942,7 @@ fn prune_dry_run_previews_without_deleting_and_matches_a_real_prune() {
     let registry = registry_dir(&dir);
 
     // A hand-written, confirmed-stale entry (record + unlocked lock file).
-    write_stale_entry(&registry, "run-stale-0000");
+    write_stale_entry(&registry, "run-stale-0000", "run-stale-0000");
 
     // A lone, unlocked `.lock` file with no `.json` sibling, backdated past the
     // registry's `ORPHAN_LOCK_MIN_AGE` ([R-01]) so it reads as a confirmed orphan.

@@ -404,6 +404,9 @@ fn wait_all_timed_out(outstanding: usize, any_unprobed: bool, limit: Duration) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::test_support::{
+        scratch_registry as scratch, write_stale_entry, write_unprobeable_entry,
+    };
 
     /// The give-up error carries the reserved `WAIT_TIMEOUT` code — never the run's
     /// own `TIMEOUT` — and says, in as many words, that the run survived the wait.
@@ -587,60 +590,6 @@ mod tests {
         );
     }
 
-    /// A unique, empty scratch directory for a fixture registry, mirroring
-    /// `src/registry/mod.rs`'s own `scratch` test helper — there is no cross-module test
-    /// helper to share, so `wait`'s unit tests need their own copy.
-    fn scratch(tag: &str) -> PathBuf {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static SEQ: AtomicU32 = AtomicU32::new(0);
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "processkit-cli-wait-{tag}-{}-{n}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
-    }
-
-    /// Hand-write a confirmed-stale entry directly into `dir`: a well-formed record
-    /// plus an **unlocked** sibling lock file — mirrors `tests/registry.rs`'s
-    /// `write_stale_entry` (no cross-target test helper exists to share). Returns the
-    /// record's path, the same identity [`snapshot_target_paths`]/[`reprobe_targets`]
-    /// track entries by.
-    fn write_stale_entry(dir: &std::path::Path, stem: &str) -> PathBuf {
-        std::fs::create_dir_all(dir).expect("create the registry directory");
-        let lock_name = format!("{stem}.lock");
-        let record = format!(
-            "{{\"registry_version\":1,\"run_id\":\"{stem}\",\"endpoint\":null,\
-             \"started_at\":\"2026-07-22T00:00:00.000Z\",\
-             \"liveness\":{{\"kind\":\"advisory_lock\",\"lock_file\":\"{lock_name}\"}}}}"
-        );
-        let json_path = dir.join(format!("{stem}.json"));
-        std::fs::write(&json_path, record).expect("write the stale record");
-        std::fs::write(dir.join(&lock_name), b"").expect("write the unlocked lock file");
-        json_path
-    }
-
-    /// Hand-write an unprobeable entry (T-206 fixture) directly into `dir`: a
-    /// well-formed record whose `lock_file` name resolves to a **directory** rather
-    /// than a regular file, so the liveness probe's write-open fails with a semantic
-    /// error on every platform and for every user — mirrors `tests/registry.rs`'s
-    /// `write_unprobeable_entry`. Returns the record's path.
-    fn write_unprobeable_entry(dir: &std::path::Path, stem: &str) -> PathBuf {
-        std::fs::create_dir_all(dir).expect("create the registry directory");
-        let lock_name = format!("{stem}.lock");
-        let record = format!(
-            "{{\"registry_version\":1,\"run_id\":\"{stem}\",\"endpoint\":null,\
-             \"started_at\":\"2026-07-22T00:00:00.000Z\",\
-             \"liveness\":{{\"kind\":\"advisory_lock\",\"lock_file\":\"{lock_name}\"}}}}"
-        );
-        let json_path = dir.join(format!("{stem}.json"));
-        std::fs::write(&json_path, record).expect("write the record");
-        std::fs::create_dir(dir.join(&lock_name))
-            .expect("create the directory the lock name resolves to");
-        json_path
-    }
-
     /// [`snapshot_target_paths`]'s projection, proved directly rather than only
     /// through `run_all`'s end-to-end behavior: a confirmed-`Health::Live` entry is in
     /// scope, while a confirmed-`Health::Stale` entry and — the R-02 asymmetry
@@ -657,8 +606,8 @@ mod tests {
             .expect("register a live run");
         let live_path = live.record_path().to_path_buf();
 
-        let stale_path = write_stale_entry(&dir, "stale-run");
-        let unprobed_path = write_unprobeable_entry(&dir, "unprobed-run");
+        let stale_path = write_stale_entry(&dir, "stale-run", "stale-run");
+        let unprobed_path = write_unprobeable_entry(&dir, "unprobed-run", "unprobed-run");
 
         let snapshot = snapshot_target_paths(&registry, &[]).expect("scan the fixture registry");
 
@@ -702,8 +651,8 @@ mod tests {
             .expect("register a live run");
         let live_path = live.record_path().to_path_buf();
 
-        let stale_path = write_stale_entry(&dir, "stale-run");
-        let unprobed_path = write_unprobeable_entry(&dir, "unprobed-run");
+        let stale_path = write_stale_entry(&dir, "stale-run", "stale-run");
+        let unprobed_path = write_unprobeable_entry(&dir, "unprobed-run", "unprobed-run");
         // A target the fixture never wrote at all — the "vanished from the scan" case
         // a clean exit produces (its own record removed).
         let missing_path = dir.join("never-existed.json");

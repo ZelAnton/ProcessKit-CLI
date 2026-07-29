@@ -708,7 +708,7 @@ fn render_snapshot_human(snapshot: &Snapshot) -> Vec<String> {
         format!(
             "{:<LABEL_WIDTH$}{}",
             "run_id:",
-            crate::text::terminal_safe(run_id)
+            crate::text::terminal_safe_bounded(run_id)
         ),
         format!(
             "{:<LABEL_WIDTH$}{}",
@@ -1875,6 +1875,9 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::test_support::{
+        scratch_registry as scratch_registry_dir, write_stale_entry, write_unprobeable_entry,
+    };
 
     /// A snapshot round-trips through JSON: the client parses exactly what the server
     /// serialized, members included — both a fully enriched member and a bare-PID one
@@ -2080,6 +2083,34 @@ mod tests {
         assert!(lines.iter().any(|line| line.contains("run next [31m")));
         assert!(lines.iter().any(|line| line.contains("worker name ")));
         assert!(lines.iter().any(|line| line.contains("start time")));
+    }
+
+    #[test]
+    fn render_snapshot_human_bounds_an_untrusted_run_id() {
+        let raw_run_id = "r".repeat(crate::text::TERMINAL_FIELD_MAX_CHARS + 20);
+        let snapshot = Snapshot {
+            snapshot_version: SNAPSHOT_VERSION,
+            run_id: raw_run_id.clone(),
+            mechanism: "job_object".to_string(),
+            root_pid: None,
+            started_at: "2026-07-20T21:00:00.000Z".to_string(),
+            members: vec![],
+        };
+
+        let human = render_snapshot_human(&snapshot);
+        assert_eq!(
+            human[1],
+            format!(
+                "{:<19}{}...",
+                "run_id:",
+                "r".repeat(crate::text::TERMINAL_FIELD_MAX_CHARS)
+            )
+        );
+        let json = snapshot_output_lines(&snapshot, true).expect("serialize JSON snapshot");
+        assert!(
+            json[0].contains(&raw_run_id),
+            "JSON preserves identity data"
+        );
     }
 
     /// The source builds a snapshot from its facts and queries members live each time.
@@ -2547,23 +2578,6 @@ mod tests {
         );
     }
 
-    /// A unique, empty scratch directory for a test registry — mirrors
-    /// `registry::tests::scratch`, kept local here so these tests drive
-    /// `resolve_in_registry`/`reconfirm_target` against an isolated
-    /// `registry::Registry::open_in` handle and never touch the process-wide
-    /// env-resolved registry `resolve_live_endpoint` uses in production (which would
-    /// be racy across parallel test threads).
-    fn scratch_registry_dir(tag: &str) -> std::path::PathBuf {
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "processkit-cli-control-{tag}-{}-{n}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
-    }
-
     /// The resolve-to-dispatch TOCTOU window this task closes (see the module doc
     /// comment, "Ambiguous run id"; `docs/registry.md`, "Run id resolution"): a
     /// duplicate run can register under the same `run_id` after a mutating verb's
@@ -2632,41 +2646,6 @@ mod tests {
         drop(with_endpoint);
         drop(without_endpoint);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Hand-write a registry record whose `lock_file` is the sibling `<stem>.lock`,
-    /// the exact shape a live runner writes — `register` only ever mints opaque stems
-    /// and always takes the lock, so a test that needs a *non*-live entry fabricates
-    /// the record directly, the same way `registry`'s own unit tests and
-    /// `tests/registry.rs` do.
-    fn write_record(dir: &std::path::Path, stem: &str, run_id: &str) {
-        std::fs::create_dir_all(dir).expect("create the registry directory");
-        let record = format!(
-            "{{\"registry_version\":1,\"run_id\":\"{run_id}\",\"endpoint\":null,\
-             \"started_at\":\"2026-07-25T00:00:00.000Z\",\
-             \"liveness\":{{\"kind\":\"advisory_lock\",\"lock_file\":\"{stem}.lock\"}}}}"
-        );
-        std::fs::write(dir.join(format!("{stem}.json")), record).expect("write the record");
-    }
-
-    /// A **confirmed-stale** entry: the record above plus an *unlocked* sibling lock
-    /// file — what an abruptly-killed runner leaves behind. The probe opens it, takes
-    /// the free lock, and confirms nobody is holding it: `Health::Stale`.
-    fn write_stale_entry(dir: &std::path::Path, stem: &str, run_id: &str) {
-        write_record(dir, stem, run_id);
-        std::fs::write(dir.join(format!("{stem}.lock")), b"")
-            .expect("write the unlocked lock file");
-    }
-
-    /// An **unprobeable** entry (T-206): the record above plus a *directory* where its
-    /// lock file should be. The probe's write-open then fails with a semantic "is a
-    /// directory" error for any user, including root — the cross-platform trick from
-    /// [K-014], never `chmod 0o000`, which a privileged CI runner ignores — so the
-    /// entry is `Health::Unprobed`: neither confirmed live nor confirmed stale.
-    fn write_unprobeable_entry(dir: &std::path::Path, stem: &str, run_id: &str) {
-        write_record(dir, stem, run_id);
-        std::fs::create_dir(dir.join(format!("{stem}.lock")))
-            .expect("create the directory the lock name resolves to");
     }
 
     /// (F-01) The control clients refuse on anything that is not a confirmed-live

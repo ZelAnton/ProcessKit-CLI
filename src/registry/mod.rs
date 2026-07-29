@@ -1758,5 +1758,10 @@ mod platform;
 #[path = "platform/windows.rs"]
 mod platform;
 
+/// Shared in-tree fixtures. Public only so integration tests can use the same
+/// typed record builder as unit tests; this crate's library API is not supported.
+#[doc(hidden)]
+pub mod test_support;
+
 #[cfg(test)]
 mod tests;

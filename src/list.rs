@@ -280,13 +280,13 @@ fn render_table_lines(rows: &[ListEntry]) -> Vec<String> {
         .iter()
         .map(|row| {
             [
-                crate::text::terminal_safe(&row.run_id),
+                crate::text::terminal_safe_bounded(&row.run_id),
                 row.health.to_string(),
                 row.started_at.clone(),
                 row.hint.as_deref().unwrap_or(ABSENT_CELL).to_string(),
                 abbreviated_argv_sha256(row.argv_sha256.as_deref()),
                 rendered_labels(&row.labels),
-                crate::text::terminal_safe(row.endpoint.as_deref().unwrap_or(ABSENT_CELL)),
+                crate::text::terminal_safe_bounded(row.endpoint.as_deref().unwrap_or(ABSENT_CELL)),
             ]
         })
         .collect();
@@ -549,6 +549,35 @@ mod tests {
         assert_eq!(value["run_id"], "forged\nROW\u{1b}[31m");
         assert_eq!(value["endpoint"], "pipe\tname\u{7}");
         assert_eq!(value["labels"]["danger"], "bidi\u{202e}value");
+    }
+
+    #[test]
+    fn human_table_bounds_untrusted_identity_and_endpoint_cells() {
+        let oversized_run_id = "r".repeat(crate::text::TERMINAL_FIELD_MAX_CHARS + 20);
+        let oversized_endpoint = "e".repeat(crate::text::TERMINAL_FIELD_MAX_CHARS + 20);
+        let row = ListEntry {
+            run_id: oversized_run_id.clone(),
+            health: "live",
+            started_at: "2026-07-22T00:00:00.000Z".to_string(),
+            hint: None,
+            argv_sha256: None,
+            labels: BTreeMap::new(),
+            endpoint: Some(oversized_endpoint.clone()),
+        };
+
+        let lines = render_table_lines(std::slice::from_ref(&row));
+        assert!(lines[1].contains(&format!(
+            "{}...",
+            "r".repeat(crate::text::TERMINAL_FIELD_MAX_CHARS)
+        )));
+        assert!(lines[1].ends_with(&format!(
+            "{}...",
+            "e".repeat(crate::text::TERMINAL_FIELD_MAX_CHARS)
+        )));
+
+        let json = serde_json::to_value(&row).expect("the raw JSON row serializes");
+        assert_eq!(json["run_id"], oversized_run_id);
+        assert_eq!(json["endpoint"], oversized_endpoint);
     }
 
     /// The property T-215 exists for, at the surface an operator actually reads:

@@ -1,17 +1,5 @@
+use super::test_support::scratch_registry as scratch;
 use super::*;
-use std::sync::atomic::{AtomicU32, Ordering};
-
-/// A unique, empty scratch directory for a test registry.
-fn scratch(tag: &str) -> PathBuf {
-    static SEQ: AtomicU32 = AtomicU32::new(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "processkit-cli-registry-{tag}-{}-{n}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    dir
-}
 
 #[test]
 fn shared_setup_read_error_pins_the_exit_code_and_diagnostic() {

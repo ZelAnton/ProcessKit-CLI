@@ -87,6 +87,11 @@ file** (`<opaque-stem>.lock`). The record is a single JSON object:
 | `labels`           | Operator metadata from repeated `run --label KEY=VALUE`; an empty object on an unlabeled or older record. Used for discovery and exact-match aggregate filtering, not as a secret store. |
 | `liveness`         | How to decide whether the record is live or stale (see below). |
 
+Registry identity and endpoint strings remain byte-for-byte intact for matching
+and JSON output. Human-readable `list` and `inspect` output sanitizes terminal
+formatting and limits each of those untrusted fields to 256 characters plus an
+explicit `...` marker, so a corrupt record cannot create an unbounded terminal row.
+
 ### Which run is which — and what a record never carries
 
 `argv_sha256` and `hint` exist so an operator (or an orchestrator) staring at

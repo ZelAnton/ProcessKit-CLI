@@ -1,19 +1,33 @@
 //! Shared text normalization for human-readable terminal output.
 
+/// Maximum number of untrusted characters retained in a single terminal field.
+/// The explicit marker added after this prefix makes truncation visible.
+pub(crate) const TERMINAL_FIELD_MAX_CHARS: usize = 256;
+const TRUNCATION_MARKER: &str = "...";
+
 /// Collapse terminal control and invisible formatting characters to ordinary spaces
 /// before interpolating an untrusted string into a human-readable line. JSON
 /// renderers deliberately do not use this helper: `serde_json` escapes controls
 /// without changing the data contract.
 pub(crate) fn terminal_safe(text: &str) -> String {
-    text.chars()
-        .map(|character| {
-            if is_terminal_unsafe(character) {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect()
+    text.chars().map(terminal_safe_char).collect()
+}
+
+/// Sanitize an untrusted terminal field and cap it to a visible, character-safe
+/// prefix. Identity and address values remain untouched in registry/JSON data;
+/// only human output uses this bounded representation.
+pub(crate) fn terminal_safe_bounded(text: &str) -> String {
+    let mut characters = text.chars();
+    let prefix: String = characters
+        .by_ref()
+        .take(TERMINAL_FIELD_MAX_CHARS)
+        .map(terminal_safe_char)
+        .collect();
+    if characters.next().is_some() {
+        format!("{prefix}{TRUNCATION_MARKER}")
+    } else {
+        prefix
+    }
 }
 
 /// Report whether a string contains a character that can control or invisibly
@@ -25,6 +39,14 @@ pub(crate) fn contains_terminal_unsafe(text: &str) -> bool {
 
 fn is_terminal_unsafe(character: char) -> bool {
     character.is_control() || is_terminal_format(character)
+}
+
+fn terminal_safe_char(character: char) -> char {
+    if is_terminal_unsafe(character) {
+        ' '
+    } else {
+        character
+    }
 }
 
 /// Unicode's formatting characters are not covered by [`char::is_control`], but
@@ -135,6 +157,20 @@ mod tests {
             safe.chars().all(|character| !is_terminal_format(character)),
             "no invisible formatting character survives: {safe:?}"
         );
+    }
+
+    #[test]
+    fn terminal_safe_bounded_marks_character_safe_truncation() {
+        let exact = "α".repeat(TERMINAL_FIELD_MAX_CHARS);
+        assert_eq!(terminal_safe_bounded(&exact), exact);
+
+        let oversized = format!("{}\nTAIL", "β".repeat(TERMINAL_FIELD_MAX_CHARS));
+        let bounded = terminal_safe_bounded(&oversized);
+        assert_eq!(
+            bounded,
+            format!("{}...", "β".repeat(TERMINAL_FIELD_MAX_CHARS))
+        );
+        assert!(!bounded.chars().any(char::is_control));
     }
 
     #[test]

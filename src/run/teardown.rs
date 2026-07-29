@@ -353,6 +353,10 @@ pub(super) trait TeardownDescription {
     fn soft_stop_scope(&self) -> &'static str;
 }
 
+// Unit tests exercise isolated wording without a ProcessGroup. Keep their compact
+// adapter out of production: real call sites always carry the observed
+// `GracefulTeardown` and must never infer a capability scope from an outcome.
+#[cfg(test)]
 impl TeardownDescription for SoftTerminate {
     fn soft(&self) -> SoftTerminate {
         *self

@@ -36,6 +36,12 @@ to a dated version section.
 ### Changed
 - Split the registry into a stable facade, platform-specific implementation files,
   and an isolated test module before further record/control-plane growth.
+- Human-readable registry identity and endpoint fields are visibly truncated at a
+  bounded terminal-safe prefix while machine-readable JSON preserves them exactly.
+- Test-only teardown wording no longer contributes a fabricated capability-scope
+  adapter to production builds.
+- Registry stale/unprobeable test fixtures now share one typed `Record` serializer
+  and scratch-path factory across unit and through-binary tests.
 
 ### Fixed
 - Headless Windows integration fixtures no longer leave Windows Terminal error
