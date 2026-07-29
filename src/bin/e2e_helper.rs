@@ -198,6 +198,7 @@ fn pty_parent(args: &[String]) -> ExitCode {
     #[cfg(unix)]
     {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
 
         let Some(runner) = flag_value(args, "--runner") else {
             eprintln!("e2e-helper pty-parent: expected --runner <path>");
@@ -281,6 +282,24 @@ fn pty_parent(args: &[String]) -> ExitCode {
             return ExitCode::from(3);
         }
 
+        // Restoring the runner's foreground group happens while this host is a
+        // background member of that same group. Linux directs the resulting
+        // SIGTTOU to the group, not only to the tcsetpgrp caller, so model an
+        // interactive shell and ignore it in the host. Reset the disposition in
+        // the runner's pre-exec hook: the test-only ignore must not leak into the
+        // runner or the payload it subsequently spawns.
+        let mut ignored: libc::sigaction = unsafe { std::mem::zeroed() };
+        ignored.sa_sigaction = libc::SIG_IGN;
+        if unsafe { libc::sigemptyset(&mut ignored.sa_mask) } != 0
+            || unsafe { libc::sigaction(libc::SIGTTOU, &ignored, std::ptr::null_mut()) } != 0
+        {
+            eprintln!(
+                "e2e-helper pty-parent: could not ignore SIGTTOU: {}",
+                std::io::Error::last_os_error()
+            );
+            return ExitCode::from(3);
+        }
+
         let helper = std::env::current_exe().expect("resolve current e2e helper");
         let mut command = Command::new(runner);
         command
@@ -298,6 +317,21 @@ fn pty_parent(args: &[String]) -> ExitCode {
             .stdin(Stdio::from(slave_in))
             .stdout(Stdio::from(slave_out))
             .stderr(Stdio::from(slave_err));
+        // SAFETY: the hook runs after fork and before exec, touches only a local
+        // sigaction value, and calls the async-signal-safe sigemptyset/sigaction
+        // functions. Resetting here happens before the runner can spawn payloads.
+        unsafe {
+            command.pre_exec(|| {
+                let mut default_action: libc::sigaction = std::mem::zeroed();
+                default_action.sa_sigaction = libc::SIG_DFL;
+                if libc::sigemptyset(&mut default_action.sa_mask) != 0
+                    || libc::sigaction(libc::SIGTTOU, &default_action, std::ptr::null_mut()) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         let mut runner = match command.spawn() {
             Ok(child) => child,
             Err(err) => {
