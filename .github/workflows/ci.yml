@@ -57,6 +57,39 @@ jobs:
             exit 1
           }
 
+  examples-smoke:
+    name: runnable examples (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@stable # rolling toolchain selector — intentionally unpinned
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo build --bin processkit-cli
+      - name: Run POSIX examples
+        if: ${{ runner.os != 'Windows' }}
+        shell: bash
+        env:
+          PROCESSKIT_CLI_BIN: ${{ github.workspace }}/target/debug/processkit-cli
+        run: |
+          examples/preflight.sh
+          examples/run-and-read-events.sh
+          examples/detach-inspect-wait.sh
+          examples/fleet-cancel.sh
+      - name: Run PowerShell examples
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        env:
+          PROCESSKIT_CLI_BIN: ${{ github.workspace }}\target\debug\processkit-cli.exe
+        run: |
+          ./examples/preflight.ps1
+          ./examples/run-and-read-events.ps1
+          ./examples/detach-inspect-wait.ps1
+          ./examples/fleet-cancel.ps1
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest

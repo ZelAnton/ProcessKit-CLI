@@ -46,6 +46,10 @@ to a dated version section.
   platform detection, version pinning, custom destinations, and safe overwrite refusal.
 - An installable `using-processkit-cli` agent skill with Codex metadata, a Claude
   Code marketplace entry, contained-run recipes, and live contract drift tests.
+- An indexed ADR journal with a reusable template and six retrospective records for
+  the project's settled stream, redaction, control, cleanup, shell, and wait choices.
+- Cross-platform runnable examples for compatibility preflight, foreground event
+  parsing, detached supervision, and label-scoped fleet cancellation, smoke-tested in CI.
 
 ### Changed
 - Split the registry into a stable facade, platform-specific implementation files,
@@ -68,6 +72,8 @@ to a dated version section.
   treating it like a broken echo instead of disabling the transcript pump.
 - Explicit run ids are validated consistently across every by-id command: they
   must contain 1-256 characters and no terminal control or formatting characters.
+- The POSIX installer smoke test now accepts either `python3` or `python` for its
+  local fixture server instead of assuming the legacy executable name exists.
 
 ## [0.3.1] - 2026-07-26
 

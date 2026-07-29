@@ -4,6 +4,9 @@ Task-oriented command shapes for ProcessKit CLI. Each recipe keeps the JSONL
 destination explicit and places the child after `--`, so the boundary between
 runner options and child argv remains visible.
 
+For copyable scripts exercised on Linux and Windows in CI, see the
+[runnable examples](runnable-examples.md).
+
 ## Run a command and preserve its exit code
 
 ```sh
@@ -352,5 +355,6 @@ is writable and the orchestrator's termination grace exceeds the CLI's grace.
 | memory/process/CPU caps | [Resource limits](resource-limits.md) |
 | OS differences | [Platform support](platform-support.md) |
 | agent tool execution | [Agent and automation workflows](agent-workflows.md) |
+| copyable end-to-end scripts | [Runnable examples](runnable-examples.md) |
 | adapter design | [Integration guide](integration.md) |
 | event fields | [JSONL event schema](schema.md) |

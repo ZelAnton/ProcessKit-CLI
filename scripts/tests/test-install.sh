@@ -17,6 +17,16 @@ target=x86_64-unknown-linux-gnu
 archive="processkit-cli-v${version}-${target}.tar.gz"
 release="$root/v$version"
 payload="$root/payload"
+
+if command -v python3 >/dev/null 2>&1; then
+  python_bin=python3
+elif command -v python >/dev/null 2>&1; then
+  python_bin=python
+else
+  echo "python3 or python is required for the fixture server" >&2
+  exit 1
+fi
+
 mkdir -p "$release" "$payload"
 cat > "$payload/processkit-cli" <<'EOF'
 #!/bin/sh
@@ -30,8 +40,8 @@ chmod +x "$payload/processkit-cli"
 tar -czf "$release/$archive" -C "$payload" processkit-cli
 sha256sum "$release/$archive" > "$release/$archive.sha256"
 
-port=$(python -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
-python -m http.server "$port" --bind 127.0.0.1 --directory "$root" >/dev/null 2>&1 &
+port=$("$python_bin" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+"$python_bin" -m http.server "$port" --bind 127.0.0.1 --directory "$root" >/dev/null 2>&1 &
 server_pid=$!
 attempt=0
 until curl -fsS "http://127.0.0.1:$port/v$version/$archive.sha256" >/dev/null; do

@@ -19,6 +19,7 @@
 
 - [Installation and distribution](installation.md)
 - [Cookbook](cookbook.md)
+- [Runnable examples](runnable-examples.md)
 - [Agent and automation workflows](agent-workflows.md)
 - [Running commands](running-commands.md)
 - [Standard I/O and capture](io-and-capture.md)
@@ -45,5 +46,12 @@
 # Project
 
 - [Architecture](architecture.md)
+- [Architecture decision records](adr/README.md)
+  - [Strict stream separation](adr/0001-strict-stream-separation.md)
+  - [Redact argv by default](adr/0002-redact-argv-by-default.md)
+  - [Keep control in the live runner](adr/0003-live-runner-control-plane.md)
+  - [Scope cleanup to owned containers](adr/0004-container-scoped-cleanup.md)
+  - [Keep command execution shell-free](adr/0005-shell-free-command-contract.md)
+  - [Poll the registry for wait](adr/0006-registry-polled-wait.md)
 - [Release process](release-process.md)
 - [Roadmap](ROADMAP.md)
