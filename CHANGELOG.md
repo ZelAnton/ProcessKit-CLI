@@ -52,6 +52,8 @@ to a dated version section.
   parsing, detached supervision, and label-scoped fleet cancellation, smoke-tested in CI.
 
 ### Changed
+- Update the contained-run backend to ProcessKit 3.1.0 while retaining the
+  existing public CLI, lifecycle schema, and MSRV contracts.
 - Split the registry into a stable facade, platform-specific implementation files,
   and an isolated test module before further record/control-plane growth.
 - Split the live control plane into a stable facade with separate platform,
