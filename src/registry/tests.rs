@@ -44,6 +44,32 @@ fn point_probe_reads_only_the_requested_validated_record() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn oversized_records_are_skipped_by_scans_and_rejected_by_point_probes() {
+    let dir = scratch("oversized-record");
+    let registry = Registry::open_in(dir.clone()).expect("open registry");
+    let registration = registry
+        .register_plain("healthy", None, SystemTime::now())
+        .expect("register healthy entry");
+    let oversized_path = dir.join("oversized.json");
+    fs::write(&oversized_path, "x".repeat(MAX_RECORD_BYTES as usize + 1))
+        .expect("write oversized record");
+
+    let entries = registry.entries().expect("scan ignores corrupt record");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].record.run_id, "healthy");
+    assert_eq!(
+        registry
+            .probe_entry(&oversized_path)
+            .expect_err("point probe preserves corrupt-record failure")
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+
+    drop(registration);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Test-only: set `path`'s mtime `age` in the past, without a real sleep — used
 /// to age an orphan-lock fixture past [`ORPHAN_LOCK_MIN_AGE`] so `prune`'s second
 /// pass actually considers it a candidate (see [R-01]). Works for both a regular
@@ -344,6 +370,32 @@ fn a_record_with_an_unknown_field_still_reads() {
     let record =
         parse_and_validate_record(from_the_future).expect("an unknown field is not corruption");
     assert_eq!(record.run_id, "future");
+}
+
+/// Registry-version and liveness tags describe how a reader may probe a record, not
+/// optional decoration. An unknown value must never be interpreted as this binary's
+/// advisory-lock format and thereby become a reapable stale entry.
+#[test]
+fn records_with_an_unsupported_version_or_liveness_kind_are_skipped() {
+    for (name, text) in [
+        (
+            "future-version",
+            "{\"registry_version\":2,\"run_id\":\"future\",\"endpoint\":null,\
+             \"started_at\":\"2026-07-22T00:00:00.000Z\",\
+             \"liveness\":{\"kind\":\"advisory_lock\",\"lock_file\":\"future.lock\"}}",
+        ),
+        (
+            "future-liveness",
+            "{\"registry_version\":1,\"run_id\":\"future\",\"endpoint\":null,\
+             \"started_at\":\"2026-07-22T00:00:00.000Z\",\
+             \"liveness\":{\"kind\":\"future_lock\",\"lock_file\":\"future.lock\"}}",
+        ),
+    ] {
+        assert!(
+            parse_and_validate_record(text).is_none(),
+            "{name} record is not safe for this reader to probe"
+        );
+    }
 }
 
 #[test]

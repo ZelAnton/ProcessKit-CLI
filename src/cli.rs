@@ -183,14 +183,18 @@ pub struct RunArgs {
     /// Per-**stream** ceiling on bytes written to a `--capture-dir` file — the
     /// same value that otherwise defaults to `crate::capture::CAPTURE_MAX_BYTES`
     /// (8 MiB). Same grammar as `--max-memory` (see [`parse_size`]): a byte count
-    /// with an optional binary unit — `1048576`, `512k`, `256m`, `2g`. Only takes
-    /// effect together with `--capture-dir`; omitting it leaves the default
-    /// ceiling in place, so a bare `run` (with or without `--capture-dir`) stays
-    /// byte-for-byte unchanged. Does not change the `output_captured` event's
+    /// with an optional binary unit — `1048576`, `512k`, `256m`, `2g`. Requires
+    /// `--capture-dir`; omitting it leaves the default ceiling in place. Does not
+    /// change the `output_captured` event's
     /// shape or the meaning of its `truncated` flag, which still just means "the
     /// stream outran whatever per-stream ceiling was in effect" (see
     /// `src/capture.rs` and `README.md`, "Bounded output capture").
-    #[arg(long, value_name = "size", value_parser = parse_size)]
+    #[arg(
+        long,
+        value_name = "size",
+        value_parser = parse_size,
+        requires = "capture_dir"
+    )]
     pub capture_max_bytes: Option<u64>,
 
     /// What to do when either capture stream exceeds `--capture-max-bytes`.
@@ -2218,6 +2222,24 @@ mod tests {
                 "a malformed `--capture-max-bytes {bad}` must fail at parse time"
             );
         }
+    }
+
+    #[test]
+    fn run_requires_capture_dir_for_capture_max_bytes() {
+        assert!(
+            Cli::try_parse_from([
+                "processkit-cli",
+                "run",
+                "--jsonl",
+                "events.jsonl",
+                "--capture-max-bytes",
+                "64k",
+                "--",
+                "true",
+            ])
+            .is_err(),
+            "a capture ceiling without a capture destination is never silently inert"
+        );
     }
 
     #[test]

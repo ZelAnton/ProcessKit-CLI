@@ -370,6 +370,11 @@ fn await_started(detached: &mut Child, jsonl: &Path, run_id: &str) -> Result<(),
             }
         }
         if Instant::now() >= deadline {
+            // The stream may have gained `run_started` after this iteration's first
+            // check. Do not kill a run whose durable start is now observable.
+            if run_started_recorded(jsonl, run_id) {
+                return Ok(());
+            }
             abandon(detached);
             return Err(RunnerError::new(
                 exit::SETUP,

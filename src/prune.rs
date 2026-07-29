@@ -282,17 +282,17 @@ fn dry_run_summary_lines(preview: &PrunePreview) -> Vec<String> {
             } => {
                 let socket = socket_dir
                     .as_ref()
-                    .map(|dir| format!(" socket_dir={}", crate::text::terminal_safe(dir)))
+                    .map(|dir| format!(" socket_dir={}", crate::text::terminal_safe_bounded(dir)))
                     .unwrap_or_default();
                 lines.push(format!(
                     "would prune entry run_id={} started_at={started_at}{socket}",
-                    crate::text::terminal_safe(run_id)
+                    crate::text::terminal_safe_bounded(run_id)
                 ));
             }
             PruneCandidate::OrphanedLock { lock_file_name } => {
                 lines.push(format!(
                     "would prune orphaned lock {}",
-                    crate::text::terminal_safe(lock_file_name)
+                    crate::text::terminal_safe_bounded(lock_file_name)
                 ));
             }
         }
@@ -438,6 +438,33 @@ mod tests {
         assert!(!lines[0].contains('\u{202e}'));
         assert!(!lines[0].contains('\u{200b}'));
         assert!(lines[1].contains("orphan lock .lock"));
+    }
+
+    #[test]
+    fn dry_run_human_output_bounds_untrusted_fields() {
+        let oversized = "x".repeat(300);
+        let preview = PrunePreview {
+            outcome: PruneOutcome {
+                pruned: 1,
+                orphaned_locks: 1,
+                ..PruneOutcome::default()
+            },
+            candidates: vec![
+                PruneCandidate::Entry {
+                    run_id: oversized.clone(),
+                    started_at: "2026-07-22T00:00:00.000Z".to_string(),
+                    socket_dir: Some(oversized.clone()),
+                },
+                PruneCandidate::OrphanedLock {
+                    lock_file_name: oversized,
+                },
+            ],
+        };
+
+        let lines = dry_run_summary_lines(&preview);
+        assert!(lines[0].contains("..."));
+        assert!(lines[1].contains("..."));
+        assert!(lines.iter().take(2).all(|line| line.len() < 600));
     }
 
     /// A dry run over an empty registry reports an empty `candidates` array — not a

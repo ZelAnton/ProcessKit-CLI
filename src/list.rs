@@ -273,7 +273,7 @@ fn rendered_labels(labels: &BTreeMap<String, String>) -> String {
     if labels.is_empty() {
         return ABSENT_CELL.to_string();
     }
-    labels
+    let rendered = labels
         .iter()
         .map(|(key, value)| {
             format!(
@@ -283,7 +283,8 @@ fn rendered_labels(labels: &BTreeMap<String, String>) -> String {
             )
         })
         .collect::<Vec<_>>()
-        .join(",")
+        .join(",");
+    crate::text::terminal_safe_bounded(&rendered)
 }
 
 /// Build the lines `print_table` would print, without touching stdout —
@@ -615,13 +616,18 @@ mod tests {
     fn human_table_bounds_untrusted_identity_and_endpoint_cells() {
         let oversized_run_id = "r".repeat(crate::text::TERMINAL_FIELD_MAX_CHARS + 20);
         let oversized_endpoint = "e".repeat(crate::text::TERMINAL_FIELD_MAX_CHARS + 20);
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            "batch".to_string(),
+            "l".repeat(crate::text::TERMINAL_FIELD_MAX_CHARS + 20),
+        );
         let row = ListEntry {
             run_id: oversized_run_id.clone(),
             health: "live",
             started_at: "2026-07-22T00:00:00.000Z".to_string(),
             hint: None,
             argv_sha256: None,
-            labels: BTreeMap::new(),
+            labels: labels.clone(),
             jsonl: None,
             capture_dir: None,
             endpoint: Some(oversized_endpoint.clone()),
@@ -636,10 +642,15 @@ mod tests {
             "{}...",
             "e".repeat(crate::text::TERMINAL_FIELD_MAX_CHARS)
         )));
+        assert!(lines[1].contains(&format!(
+            "batch={}...",
+            "l".repeat(crate::text::TERMINAL_FIELD_MAX_CHARS - "batch=".len())
+        )));
 
         let json = serde_json::to_value(&row).expect("the raw JSON row serializes");
         assert_eq!(json["run_id"], oversized_run_id);
         assert_eq!(json["endpoint"], oversized_endpoint);
+        assert_eq!(json["labels"]["batch"], labels["batch"]);
     }
 
     /// The property T-215 exists for, at the surface an operator actually reads:

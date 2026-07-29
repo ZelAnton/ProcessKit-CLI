@@ -38,7 +38,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -86,13 +86,11 @@ pub(crate) fn setup_read_error(err: io::Error) -> RunnerError {
 ///   a record written before they existed reads back with them `None` — "not
 ///   reported", the same value a run whose argv matched no hint rule writes today.
 ///
-/// Nothing acts on either field either: no file is opened, no deletion gated, no run
-/// resolved through them (see [`parse_and_validate_record`]), so no reader can be led
-/// into a wrong *action* by a value it does not understand. That is exactly the
-/// additive case `docs/schema.md`'s own "Versioning" section describes for the event
-/// stream, applied on this axis. A bump would be required for the opposite kind of
-/// change: renaming/removing/retyping an existing field, changing what a value means,
-/// or adding a field a reader must understand to behave correctly.
+/// The version and mechanism tags gate every action that probes or reaps a record.
+/// An older reader may ignore additive fields, but it must skip a record whose
+/// liveness semantics it cannot interpret rather than treating its `lock_file` as an
+/// advisory lock and falsely declaring a live run stale. A bump is therefore required
+/// whenever a writer changes the meaning of an existing field or liveness mechanism.
 pub const REGISTRY_VERSION: u32 = 1;
 
 /// The only liveness mechanism today: an OS advisory lock held for the run's life.
@@ -121,6 +119,11 @@ const REGISTRY_DIR_ENV: &str = "PROCESSKIT_CLI_REGISTRY_DIR";
 /// `reserve_entry` performs after taking its lock. See docs/registry.md, "The
 /// reaping safety invariant".
 const ORPHAN_LOCK_MIN_AGE: Duration = Duration::from_secs(5);
+
+/// Largest registry record accepted from disk. Records are small JSON metadata, so
+/// this leaves generous room for legitimate labels while preventing one corrupt file
+/// from making every discovery or polling pass allocate without bound.
+const MAX_RECORD_BYTES: u64 = 64 * 1024;
 
 /// The registry record a runner writes at start and removes on a clean exit.
 ///
@@ -680,7 +683,7 @@ impl Registry {
     /// corrupt or unreadable content remains an error so a caller cannot mistake an
     /// unvalidated replacement for a run that is confirmed gone.
     pub(crate) fn probe_entry(&self, record_path: &Path) -> io::Result<Option<Entry>> {
-        let text = match fs::read_to_string(record_path) {
+        let text = match read_record_text(record_path) {
             Ok(text) => text,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err),
@@ -1136,7 +1139,7 @@ impl Registry {
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(text) = fs::read_to_string(&path) else {
+            let Ok(text) = read_record_text(&path) else {
                 continue;
             };
             let Some(record) = parse_and_validate_record(&text) else {
@@ -1224,6 +1227,22 @@ impl Registry {
             "could not allocate a unique registry entry after many attempts",
         ))
     }
+}
+
+/// Read one untrusted registry record with a strict byte ceiling. The extra byte
+/// distinguishes an exact ceiling-sized file from an oversized one without trusting
+/// metadata that could race with a concurrent writer.
+fn read_record_text(path: &Path) -> io::Result<String> {
+    let file = File::open(path)?;
+    let mut bytes = Vec::with_capacity(MAX_RECORD_BYTES as usize + 1);
+    file.take(MAX_RECORD_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_RECORD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "registry record exceeds the maximum supported size",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
 /// A newly-created lock before it becomes a full [`ReservedEntry`]. Field order is
@@ -1497,7 +1516,10 @@ pub fn parse_and_validate_record(text: &str) -> Option<Record> {
     // will accept into a `String` field. A malformed value is corrupt-record
     // noise, not a real start time — reject it like any other corrupt entry
     // rather than listing (and sorting) garbage as if it were valid.
-    if !is_valid_rfc3339_millis_utc(&record.started_at) {
+    if record.registry_version != REGISTRY_VERSION
+        || record.liveness.kind != LIVENESS_ADVISORY_LOCK
+        || !is_valid_rfc3339_millis_utc(&record.started_at)
+    {
         return None;
     }
     // The `lock_file` field is untrusted deserialized data. Validate it as a

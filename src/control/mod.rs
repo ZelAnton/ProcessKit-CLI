@@ -677,9 +677,9 @@ async fn inspect_async(run_id: &str, json: bool) -> Result<(), RunnerError> {
 }
 
 /// Inspect every run confirmed live in one registry snapshot, optionally restricted
-/// by conjunctive labels. The report is always one JSON array: each target carries
-/// either its snapshot or an honest per-run reachability error, and any error makes
-/// the aggregate command return [`exit::CONTROL`] after printing the full report.
+/// by conjunctive labels. The report is always one JSON array: each target is either
+/// inspected, already gone, or failed; only a genuine failure makes the aggregate
+/// command return [`exit::CONTROL`] after printing the full report.
 pub fn inspect_all(labels: &[crate::labels::OperatorLabel]) -> Result<(), RunnerError> {
     let runtime = current_thread_runtime()?;
     runtime.block_on(inspect_all_async(labels))
@@ -688,25 +688,42 @@ pub fn inspect_all(labels: &[crate::labels::OperatorLabel]) -> Result<(), Runner
 #[derive(Debug, Serialize)]
 pub struct InspectAllOutcome {
     pub run_id: String,
+    pub status: InspectAllStatus,
     pub snapshot: Option<Snapshot>,
     pub error: Option<String>,
 }
 
+/// The honest result of inspecting one aggregate snapshot target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InspectAllStatus {
+    Inspected,
+    AlreadyGone,
+    Failed,
+}
+
 async fn inspect_all_async(labels: &[crate::labels::OperatorLabel]) -> Result<(), RunnerError> {
     let registry = registry::open_read_only_for_setup()?;
-    let targets =
-        snapshot_mutation_targets(&registry, labels).map_err(registry::setup_read_error)?;
+    let targets = snapshot_live_targets(&registry, labels).map_err(registry::setup_read_error)?;
 
     let mut outcomes = Vec::with_capacity(targets.len());
     for target in targets {
         match inspect_snapshot_target(&registry, &target).await {
-            Ok(snapshot) => outcomes.push(InspectAllOutcome {
+            Ok(InspectSnapshot::Inspected(snapshot)) => outcomes.push(InspectAllOutcome {
                 run_id: target.run_id,
+                status: InspectAllStatus::Inspected,
                 snapshot: Some(snapshot),
+                error: None,
+            }),
+            Ok(InspectSnapshot::AlreadyGone) => outcomes.push(InspectAllOutcome {
+                run_id: target.run_id,
+                status: InspectAllStatus::AlreadyGone,
+                snapshot: None,
                 error: None,
             }),
             Err(err) => outcomes.push(InspectAllOutcome {
                 run_id: target.run_id,
+                status: InspectAllStatus::Failed,
                 snapshot: None,
                 error: Some(err.to_string()),
             }),
@@ -723,7 +740,7 @@ async fn inspect_all_async(labels: &[crate::labels::OperatorLabel]) -> Result<()
 
     let failed = outcomes
         .iter()
-        .filter(|outcome| outcome.error.is_some())
+        .filter(|outcome| outcome.status == InspectAllStatus::Failed)
         .count();
     if failed > 0 {
         return Err(RunnerError::new(
@@ -739,14 +756,10 @@ async fn inspect_all_async(labels: &[crate::labels::OperatorLabel]) -> Result<()
 
 async fn inspect_snapshot_target(
     registry: &registry::Registry,
-    target: &MutationTarget,
-) -> Result<Snapshot, RunnerError> {
+    target: &SnapshotTarget,
+) -> Result<InspectSnapshot, RunnerError> {
     if snapshot_target_state(registry, target, "inspect")? == SnapshotTargetState::AlreadyGone {
-        return Err(unreachable_run(
-            "inspect",
-            &target.run_id,
-            "the snapshotted run finished before it could be inspected".to_string(),
-        ));
+        return Ok(InspectSnapshot::AlreadyGone);
     }
     let endpoint = target.endpoint.as_deref().ok_or_else(|| {
         unreachable_run(
@@ -755,16 +768,28 @@ async fn inspect_snapshot_target(
             "the run is live but exposes no control endpoint".to_string(),
         )
     })?;
-    let stream = connect_live(endpoint, "inspect", &target.run_id).await?;
+    let stream = match connect_live(endpoint, "inspect", &target.run_id).await {
+        Ok(stream) => stream,
+        Err(err) => {
+            return match snapshot_target_state(registry, target, "inspect")? {
+                SnapshotTargetState::AlreadyGone => Ok(InspectSnapshot::AlreadyGone),
+                SnapshotTargetState::Live => Err(err),
+            };
+        }
+    };
     if snapshot_target_state(registry, target, "inspect")? == SnapshotTargetState::AlreadyGone {
-        return Err(unreachable_run(
-            "inspect",
-            &target.run_id,
-            "the snapshotted run finished before it could answer".to_string(),
-        ));
+        return Ok(InspectSnapshot::AlreadyGone);
     }
     let snapshot: Snapshot =
-        converse_under_deadline(stream, INSPECT_REQUEST, "inspect", &target.run_id).await?;
+        match converse_under_deadline(stream, INSPECT_REQUEST, "inspect", &target.run_id).await {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                return match snapshot_target_state(registry, target, "inspect")? {
+                    SnapshotTargetState::AlreadyGone => Ok(InspectSnapshot::AlreadyGone),
+                    SnapshotTargetState::Live => Err(err),
+                };
+            }
+        };
     if snapshot.run_id != target.run_id {
         return Err(unreachable_run(
             "inspect",
@@ -772,7 +797,7 @@ async fn inspect_snapshot_target(
             "the runner returned a snapshot for a different run".to_string(),
         ));
     }
-    Ok(snapshot)
+    Ok(InspectSnapshot::Inspected(snapshot))
 }
 
 /// Client entry for `cancel --run-id <id>`: reach the live runner through the
@@ -915,7 +940,7 @@ pub enum ControlAllStatus {
 /// address duplicate ids independently, while the endpoint is the transport address
 /// the same record advertised at snapshot time.
 #[derive(Debug)]
-struct MutationTarget {
+struct SnapshotTarget {
     run_id: String,
     record_path: PathBuf,
     endpoint: Option<String>,
@@ -930,6 +955,12 @@ enum SnapshotTargetState {
 #[derive(Debug)]
 enum SnapshotMutation {
     Accepted(ControlAck),
+    AlreadyGone,
+}
+
+#[derive(Debug)]
+enum InspectSnapshot {
+    Inspected(Snapshot),
     AlreadyGone,
 }
 
@@ -965,8 +996,7 @@ async fn mutate_all_async(
 ) -> Result<(), RunnerError> {
     let action = command.verb();
     let registry = registry::open_read_only_for_setup()?;
-    let targets =
-        snapshot_mutation_targets(&registry, labels).map_err(registry::setup_read_error)?;
+    let targets = snapshot_live_targets(&registry, labels).map_err(registry::setup_read_error)?;
 
     let mut outcomes = Vec::with_capacity(targets.len());
     for target in targets {
@@ -1020,15 +1050,15 @@ async fn mutate_all_async(
 /// Snapshot every entry confirmed live, preserving the unique record path and the
 /// endpoint that exact record advertised. `run_id` is deliberately only report data:
 /// two live records may share it, and `--all` must still reach both.
-fn snapshot_mutation_targets(
+fn snapshot_live_targets(
     registry: &registry::Registry,
     labels: &[crate::labels::OperatorLabel],
-) -> io::Result<Vec<MutationTarget>> {
+) -> io::Result<Vec<SnapshotTarget>> {
     Ok(registry
         .snapshot_live_entries()?
         .into_iter()
         .filter(|entry| crate::labels::matches(&entry.record.labels, labels))
-        .map(|entry| MutationTarget {
+        .map(|entry| SnapshotTarget {
             run_id: entry.record.run_id,
             record_path: entry.path,
             endpoint: entry.record.endpoint,
@@ -1044,7 +1074,7 @@ fn snapshot_mutation_targets(
 /// unprobeable or identity-changed record remains a hard failure.
 async fn mutate_snapshot_target(
     registry: &registry::Registry,
-    target: &MutationTarget,
+    target: &SnapshotTarget,
     command: ControlCommand,
 ) -> Result<SnapshotMutation, RunnerError> {
     let action = command.verb();
@@ -1094,12 +1124,13 @@ async fn mutate_snapshot_target(
     Ok(SnapshotMutation::Accepted(ack))
 }
 
-/// Reconfirm the exact registry record captured by [`snapshot_mutation_targets`].
-/// Missing and confirmed-stale records are successful terminal states for `--all`;
-/// unprobeable records and identity changes are not evidence that the target ended.
+/// Reconfirm the exact registry record captured by [`snapshot_live_targets`].
+/// Aggregate control and aggregate inspect share this step: missing and
+/// confirmed-stale records are successful terminal states, while unprobeable records
+/// and identity changes are not evidence that the target ended.
 fn snapshot_target_state(
     registry: &registry::Registry,
-    target: &MutationTarget,
+    target: &SnapshotTarget,
     action: &str,
 ) -> Result<SnapshotTargetState, RunnerError> {
     let entry = registry.probe_entry(&target.record_path).map_err(|err| {

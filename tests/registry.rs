@@ -426,6 +426,7 @@ fn inspect_all_snapshots_live_runs_with_conjunctive_labels() {
     let outcomes = report.as_array().expect("report is an array");
     assert_eq!(outcomes.len(), 1, "only the conjunctive match is inspected");
     assert_eq!(outcomes[0]["run_id"], "inspect-ci");
+    assert_eq!(outcomes[0]["status"], "inspected");
     assert_eq!(outcomes[0]["snapshot"]["run_id"], "inspect-ci");
     assert!(outcomes[0]["error"].is_null());
 
