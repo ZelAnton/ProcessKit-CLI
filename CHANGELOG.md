@@ -74,6 +74,8 @@ to a dated version section.
   must contain 1-256 characters and no terminal control or formatting characters.
 - The POSIX installer smoke test now accepts either `python3` or `python` for its
   local fixture server instead of assuming the legacy executable name exists.
+- Unix registry test fixtures use the shared atomic counter type, restoring
+  non-Windows all-target, Clippy, musl, and MSRV builds.
 
 ## [0.3.1] - 2026-07-26
 

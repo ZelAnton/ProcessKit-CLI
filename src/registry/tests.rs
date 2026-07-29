@@ -568,7 +568,7 @@ fn write_record_with_endpoint(
 /// [K-009]). Keep the tags short for the same reason.
 #[cfg(unix)]
 fn socket_dir_path(tag: &str) -> PathBuf {
-    static SEQ: AtomicU32 = AtomicU32::new(0);
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
         "{}t{tag}-{}-{n}",
@@ -584,7 +584,7 @@ fn socket_dir_path(tag: &str) -> PathBuf {
 /// reason [`socket_dir_path`] is.
 #[cfg(unix)]
 fn off_base_dir(tag: &str) -> PathBuf {
-    static SEQ: AtomicU32 = AtomicU32::new(0);
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("pkt{tag}-{}-{n}", std::process::id()))
 }
