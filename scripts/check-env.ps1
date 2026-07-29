@@ -1,8 +1,7 @@
 #!/usr/bin/env pwsh
 <#
 .SYNOPSIS
-    Checks this machine can build and test this Rust crate before you initialize
-    the template.
+    Checks this machine can build and test ProcessKit-CLI.
 
 .DESCRIPTION
     Verifies the Rust toolchain (cargo + rustc) is on PATH. rust-toolchain.toml
@@ -11,7 +10,7 @@
     Prints "Environment ready" and exits 0 on success; if the toolchain is missing
     it prints per-OS install commands and exits 1 — install it, then re-run.
 
-    Run it first, before scripts/init.ps1:
+    Run it before local development commands:
 
         pwsh ./scripts/check-env.ps1
 #>
@@ -37,7 +36,7 @@ if ($problems.Count -eq 0) {
 
 if ($problems.Count -eq 0) {
     Write-Host ""
-    Write-Host "Environment ready. Next: pwsh ./scripts/init.ps1 -ProjectName ..." -ForegroundColor Green
+    Write-Host "Environment ready. Next: just test" -ForegroundColor Green
     Write-Host "(rustup installs the pinned stable + rustfmt/clippy on the first cargo build.)" -ForegroundColor DarkGray
     exit 0
 }

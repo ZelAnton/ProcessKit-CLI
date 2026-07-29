@@ -149,7 +149,7 @@ failure. JSONL still provides the lifecycle and terminal result.
 processkit-cli list --json
 processkit-cli inspect --run-id agent-build-42 --json
 processkit-cli cancel --run-id agent-build-42
-processkit-cli wait --run-id agent-build-42 --timeout 30s
+processkit-cli wait --run-id agent-build-42 --timeout 30s --report-outcome
 ```
 
 If the bounded wait expires and the run must stop immediately:
@@ -159,7 +159,10 @@ processkit-cli kill --run-id agent-build-42
 ```
 
 Control commands resolve the registry identity and live IPC endpoint. They do
-not target the root PID printed by an earlier observation.
+not target the root PID printed by an earlier observation. The reporting wait
+keeps its own exit-code contract and emits the remembered run's terminal
+`runner_exit` fields as JSON; `status:"unknown"` means the waiter could not
+recover that event and must not guess the outcome.
 
 ### Apply a policy to expensive tools
 
@@ -217,7 +220,9 @@ order:
 4. If the run may still be live, call `inspect --json` for the current member
    snapshot and containment mechanism.
 5. Use `cancel` followed by bounded `wait`; escalate to `kill` only when needed.
-6. Use `prune --dry-run --json` before removing confirmed-stale registry state.
+6. Use `prune --dry-run --json` before removing confirmed-stale registry state;
+   add the same `--label KEY=VALUE` filters to preview and reap when the registry
+   is shared with other projects or orchestrators.
 
 This separates program failure, runner failure, policy failure, and ambiguous
 external interruption instead of collapsing them into “the command hung.”

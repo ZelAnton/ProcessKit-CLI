@@ -36,7 +36,7 @@ fn main() -> ExitCode {
     match cli.command {
         Command::Run(args) => run::execute(*args),
         Command::Inspect(args) => report(if args.all {
-            control::inspect_all(&args.labels)
+            control::inspect_all(&args.labels, args.json)
         } else {
             control::inspect(
                 args.run_id
@@ -77,10 +77,11 @@ fn main() -> ExitCode {
                     .as_deref()
                     .expect("clap requires --run-id when --all is absent"),
                 args.timeout,
+                args.report_outcome,
             )
         }),
         Command::List(args) => report(list::run(args.json, &args.labels, args.health)),
-        Command::Prune(args) => report(prune::run(args.json, args.dry_run)),
+        Command::Prune(args) => report(prune::run(args.json, args.dry_run, &args.labels)),
         Command::Probe(args) => report(probe::run(&args)),
     }
 }

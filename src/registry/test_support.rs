@@ -26,7 +26,7 @@ pub fn scratch_registry(tag: &str) -> PathBuf {
 
 /// Write the record half of a fixture through the real serializable type, so a
 /// format change cannot leave a hand-written JSON template silently stale.
-fn write_record(dir: &Path, stem: &str, run_id: &str) -> PathBuf {
+fn write_record(dir: &Path, stem: &str, run_id: &str, labels: BTreeMap<String, String>) -> PathBuf {
     fs::create_dir_all(dir).expect("create the registry fixture directory");
     let record = Record {
         registry_version: REGISTRY_VERSION,
@@ -35,7 +35,7 @@ fn write_record(dir: &Path, stem: &str, run_id: &str) -> PathBuf {
         started_at: "2026-07-22T00:00:00.000Z".to_string(),
         argv_sha256: None,
         hint: None,
-        labels: BTreeMap::new(),
+        labels,
         jsonl: None,
         capture_dir: None,
         liveness: Liveness {
@@ -51,7 +51,17 @@ fn write_record(dir: &Path, stem: &str, run_id: &str) -> PathBuf {
 
 /// Write a confirmed-stale record and unlocked sibling lock file.
 pub fn write_stale_entry(dir: &Path, stem: &str, run_id: &str) -> PathBuf {
-    let path = write_record(dir, stem, run_id);
+    write_stale_entry_with_labels(dir, stem, run_id, BTreeMap::new())
+}
+
+/// Write a confirmed-stale record carrying a validated label map.
+pub fn write_stale_entry_with_labels(
+    dir: &Path,
+    stem: &str,
+    run_id: &str,
+    labels: BTreeMap<String, String>,
+) -> PathBuf {
+    let path = write_record(dir, stem, run_id, labels);
     fs::write(dir.join(format!("{stem}.lock")), b"").expect("write the unlocked fixture lock file");
     path
 }
@@ -59,7 +69,7 @@ pub fn write_stale_entry(dir: &Path, stem: &str, run_id: &str) -> PathBuf {
 /// Write a record whose lock path is a directory, making its liveness
 /// deterministically unprobeable on every supported platform.
 pub fn write_unprobeable_entry(dir: &Path, stem: &str, run_id: &str) -> PathBuf {
-    let path = write_record(dir, stem, run_id);
+    let path = write_record(dir, stem, run_id, BTreeMap::new());
     fs::create_dir(dir.join(format!("{stem}.lock")))
         .expect("create the directory at the fixture lock path");
     path

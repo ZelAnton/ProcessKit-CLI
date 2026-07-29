@@ -3,6 +3,7 @@ Reap the registry's confirmed-stale entries — the leftover records of runners 
 Usage: processkit-cli prune [OPTIONS]
 
 Options:
-      --json     Emit the prune tally as a single JSON object instead of a human-readable summary line. Optional, mirroring `list` — prune has a human-readable form of its own. Combines with `--dry-run`
-      --dry-run  Preview what a real prune pass would reap without deleting anything: [`crate::registry::Registry::preview_prune`] runs the exact same scan and the exact same liveness classification as a real prune, but never deletes a file — it reports the same aggregate tally a following real prune would produce, plus the confirmed-stale candidates it would reap. Combines with `--json`
-  -h, --help     Print help
+      --json               Emit the prune tally as a single JSON object instead of a human-readable summary line. Optional, mirroring `list` — prune has a human-readable form of its own. Combines with `--dry-run`
+      --dry-run            Preview what a real prune pass would reap without deleting anything: [`crate::registry::Registry::preview_prune`] runs the exact same scan and the exact same liveness classification as a real prune, but never deletes a file — it reports the same aggregate tally a following real prune would produce, plus the confirmed-stale candidates it would reap. Combines with `--json`
+      --label <KEY=VALUE>  Restrict paired registry entries to runs carrying every `KEY=VALUE` label. Repeatable; filters combine with logical AND. An explicit filter leaves record-less orphan locks alone because their ownership cannot be established
+  -h, --help               Print help

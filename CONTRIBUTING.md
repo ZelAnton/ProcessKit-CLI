@@ -25,10 +25,9 @@ with the `processkit` crate.
   complete, though: three **gating** `ci.yml` jobs have no `just` equivalent —
   `yaml-lint` (`yamllint .`), `msrv` (`cargo check --all-targets` on the
   toolchain the `msrv` job pins, with `rust-toolchain.toml` removed first —
-  see the job for why), and `target-check` (`cargo check --all-targets
-  --target <triplet>`, now covering only the one release triplet with no
-  native GitHub-hosted runner — `x86_64-unknown-linux-musl`, needing a cross
-  toolchain this machine likely lacks; the two aarch64 triplets it used to
+  see the job for why), and `target-check` (the default and E2E test tiers via
+  `cargo test --target x86_64-unknown-linux-musl`, needing `musl-tools` on a
+  Linux host; the two aarch64 triplets it used to
   cross-compile-check are now covered by real, executed runs of the `test`
   job below instead — see that job's comment) — so a clean run of every `just`
   target does not by itself guarantee a green CI run; run those three
@@ -65,15 +64,30 @@ The `test` job's matrix runs on `ubuntu-latest`, `windows-latest`,
 `macos-latest` (already aarch64 — Apple Silicon), and the GitHub-hosted
 arm64 runners `ubuntu-24.04-arm` and `windows-11-arm`, so every aarch64
 release target (see README.md's [platform
-matrix](README.md#platform-matrix)) gets real, executed test coverage, not
-just the compile-only check `target-check` still runs for the one release
-triplet with no native runner (`x86_64-unknown-linux-musl`). The two arm64
+matrix](README.md#platform-matrix)) gets real, executed test coverage. The
+required `target-check` job additionally runs both the default and E2E suites
+as statically linked `x86_64-unknown-linux-musl` binaries on `ubuntu-latest`;
+musl does not need to be the host libc for those binaries to execute. The two
+arm64
 entries are **required** checks from the start, same as the three
 pre-existing entries in this matrix — there is no non-gating grace period
 for them (unlike the informational `coverage`/`perf` jobs, which use
 `continue-on-error` deliberately); if you administer branch protection,
 add `test (ubuntu-24.04-arm)` and `test (windows-11-arm)` to the required
 status checks list alongside the existing `test (*)` entries.
+
+On a Linux development host with `musl-tools` installed, reproduce the musl
+job with:
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+cargo test --target x86_64-unknown-linux-musl
+cargo test --target x86_64-unknown-linux-musl --features e2e --test e2e -- --nocapture
+```
+
+There is intentionally no cross-platform `just` recipe for this host-specific
+toolchain lane. The stress tier remains in its separate scheduled/manual
+workflow rather than extending this required compatibility gate.
 
 Before opening a pull request or publishing directly to `main`, make sure the
 same gates CI enforces pass locally — CI treats clippy warnings as errors, so a
@@ -269,13 +283,14 @@ each linking the crate's library target directly (never the binary):
   ([`Registry::scan`]'s per-record guards: JSON, `started_at`, `lock_file`).
 - `control_wire` — the control plane's server-side request-line classifier and
   client-side response-line JSON decode (`src/control/mod.rs`).
-- `cli_parsers` — the CLI's `--timeout`/`--grace`, `--require-exit-code-band`,
-  and `--env` value parsers (`src/cli.rs`).
+- `cli_parsers` — the CLI's scalar value parsers, operator-label grammar, and
+  raw `--env-file` contents (including invalid UTF-8 and the invariant that a
+  rejected entry never repeats its secret value).
 
 Each target ships a small seed corpus under `fuzz/corpus/<target>/`, including
 historically found edge cases (a NUL/control byte or a Windows reserved device
 name in a registry `lock_file`, a calendar-invalid `started_at` like
-`2026-02-31`).
+`2026-02-31`, and valid/commented/malformed environment and label inputs).
 
 Requires a nightly toolchain (`rustup toolchain install nightly` — the pinned
 `stable` from [Prerequisites](#prerequisites) is not enough, since `cargo-fuzz`
@@ -385,6 +400,12 @@ python scripts/criterion_history.py summarize target/criterion current.json
 python scripts/criterion_history.py compare baseline.json current.json \
   --threshold-percent 20 --markdown comparison.md
 python -m unittest scripts/tests/test_criterion_history.py
+```
+
+Release package-manager manifests have a separate standard-library-only test:
+
+```sh
+python -m unittest scripts/tests/test_generate_package_manifests.py
 ```
 
 [criterion]: https://github.com/bheisler/criterion.rs

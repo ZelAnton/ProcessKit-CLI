@@ -5,6 +5,7 @@ bin=${PROCESSKIT_CLI_BIN:-processkit-cli}
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/processkit-cli-example.XXXXXX")
 run_id="example-detached-$$"
 events=$scratch/events.jsonl
+release=$scratch/release-child
 cleanup() {
   "$bin" cancel --run-id "$run_id" >/dev/null 2>&1 || true
   "$bin" wait --run-id "$run_id" --timeout 5s >/dev/null 2>&1 || true
@@ -12,10 +13,12 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-"$bin" run --detach --run-id "$run_id" --timeout 10s --jsonl "$events" \
-  -- /bin/sh -c 'sleep 2'
+"$bin" run --detach --run-id "$run_id" --timeout 30s \
+  --env "PROCESSKIT_EXAMPLE_RELEASE=$release" --jsonl "$events" \
+  -- /bin/sh -c 'while [ ! -e "$PROCESSKIT_EXAMPLE_RELEASE" ]; do sleep 0.05; done'
 "$bin" inspect --run-id "$run_id" --json |
   python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["run_id"] == sys.argv[1]' "$run_id"
+: >"$release"
 "$bin" wait --run-id "$run_id" --timeout 10s
 
 python3 - "$events" <<'PY'

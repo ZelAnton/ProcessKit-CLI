@@ -117,6 +117,101 @@ fn snapshot_output_lines_without_json_is_the_human_rendering() {
     );
 }
 
+#[test]
+fn inspect_all_human_output_summarizes_every_status_and_reuses_snapshot_rendering() {
+    let snapshot = Snapshot {
+        snapshot_version: SNAPSHOT_VERSION,
+        run_id: "run-live".to_string(),
+        mechanism: "job_object".to_string(),
+        root_pid: Some(42),
+        started_at: "2026-07-20T21:00:00.000Z".to_string(),
+        jsonl: None,
+        capture_dir: None,
+        members: vec![Member::from_pid(42)],
+    };
+    let expected: Vec<String> = render_snapshot_human(&snapshot)
+        .into_iter()
+        .map(|line| format!("  {line}"))
+        .collect();
+    let outcomes = vec![
+        InspectAllOutcome {
+            run_id: "run-live".to_string(),
+            status: InspectAllStatus::Inspected,
+            snapshot: Some(snapshot),
+            error: None,
+        },
+        InspectAllOutcome {
+            run_id: "run-gone".to_string(),
+            status: InspectAllStatus::AlreadyGone,
+            snapshot: None,
+            error: None,
+        },
+        InspectAllOutcome {
+            run_id: "run-failed\nnext".to_string(),
+            status: InspectAllStatus::Failed,
+            snapshot: None,
+            error: Some("peer failed\rretry".to_string()),
+        },
+    ];
+
+    let lines = inspect_all_output_lines(&outcomes, false).expect("render the human report");
+    assert!(lines[0].contains("RUN_ID") && lines[0].contains("STATUS"));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("run-live") && line.contains("inspected"))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("run-gone") && line.contains("already_gone"))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("run-failed next") && line.contains("failed"))
+    );
+    assert!(lines.iter().any(|line| line.contains("peer failed retry")));
+    assert!(
+        lines
+            .iter()
+            .all(|line| !line.contains('\r') && !line.contains('\n'))
+    );
+
+    let heading = lines
+        .iter()
+        .position(|line| line == "snapshot for run-live:")
+        .expect("the inspected target gets a detail block");
+    assert_eq!(&lines[heading + 1..], expected.as_slice());
+}
+
+#[test]
+fn inspect_all_json_output_is_the_original_single_array() {
+    let outcomes = vec![InspectAllOutcome {
+        run_id: "run-gone".to_string(),
+        status: InspectAllStatus::AlreadyGone,
+        snapshot: None,
+        error: None,
+    }];
+    let lines = inspect_all_output_lines(&outcomes, true).expect("serialize aggregate JSON");
+    assert_eq!(
+        lines,
+        vec![r#"[{"run_id":"run-gone","status":"already_gone","snapshot":null,"error":null}]"#]
+    );
+}
+
+#[test]
+fn inspect_all_human_output_handles_an_empty_snapshot() {
+    assert_eq!(
+        inspect_all_output_lines(&[], false).expect("render an empty report"),
+        vec!["no live runs to inspect"]
+    );
+    assert_eq!(
+        inspect_all_output_lines(&[], true).expect("serialize an empty report"),
+        vec!["[]"]
+    );
+}
+
 /// The human-readable rendering (`inspect` without `--json`) shows every field a
 /// JSON snapshot carries — including `snapshot_version`, not just the five
 /// operator-facing ones — plus the member table, column-aligned the same way
@@ -230,15 +325,24 @@ fn render_snapshot_human_sanitizes_untrusted_strings() {
 #[test]
 fn render_snapshot_human_bounds_an_untrusted_run_id() {
     let raw_run_id = "r".repeat(crate::text::TERMINAL_FIELD_MAX_CHARS + 20);
+    let raw_mechanism = "m".repeat(crate::text::TERMINAL_FIELD_MAX_CHARS + 20);
+    let raw_started_at = "s".repeat(crate::text::TERMINAL_FIELD_MAX_CHARS + 20);
+    let raw_name = "n".repeat(crate::text::TERMINAL_FIELD_MAX_CHARS + 20);
+    let raw_member_start = "t".repeat(crate::text::TERMINAL_FIELD_MAX_CHARS + 20);
     let snapshot = Snapshot {
         snapshot_version: SNAPSHOT_VERSION,
         run_id: raw_run_id.clone(),
-        mechanism: "job_object".to_string(),
+        mechanism: raw_mechanism.clone(),
         root_pid: None,
-        started_at: "2026-07-20T21:00:00.000Z".to_string(),
+        started_at: raw_started_at.clone(),
         jsonl: None,
         capture_dir: None,
-        members: vec![],
+        members: vec![Member {
+            pid: 1,
+            ppid: None,
+            name: Some(raw_name.clone()),
+            start_time: Some(raw_member_start.clone()),
+        }],
     };
 
     let human = render_snapshot_human(&snapshot);
@@ -250,11 +354,43 @@ fn render_snapshot_human_bounds_an_untrusted_run_id() {
             "r".repeat(crate::text::TERMINAL_FIELD_MAX_CHARS)
         )
     );
+    for prefix in ['m', 's', 'n', 't'] {
+        assert!(human.iter().any(|line| line.contains(&format!(
+            "{}...",
+            prefix.to_string().repeat(crate::text::TERMINAL_FIELD_MAX_CHARS)
+        ))));
+    }
     let json = snapshot_output_lines(&snapshot, true).expect("serialize JSON snapshot");
     assert!(
-        json[0].contains(&raw_run_id),
-        "JSON preserves identity data"
+        [
+            &raw_run_id,
+            &raw_mechanism,
+            &raw_started_at,
+            &raw_name,
+            &raw_member_start
+        ]
+        .iter()
+        .all(|raw| json[0].contains(raw.as_str())),
+        "JSON preserves untrusted wire data"
     );
+}
+
+#[test]
+fn inspect_snapshot_identity_rejects_a_foreign_run() {
+    let snapshot = Snapshot {
+        snapshot_version: SNAPSHOT_VERSION,
+        run_id: "run-b".to_string(),
+        mechanism: "job_object".to_string(),
+        root_pid: None,
+        started_at: "2026-07-20T21:00:00.000Z".to_string(),
+        jsonl: None,
+        capture_dir: None,
+        members: vec![],
+    };
+    let err = verify_snapshot_identity(&snapshot, "run-a")
+        .expect_err("a different run's snapshot is never accepted");
+    assert_eq!(err.code(), exit::CONTROL);
+    assert!(err.to_string().contains("different run"));
 }
 
 /// The source builds a snapshot from its facts and queries members live each time.
@@ -1083,11 +1219,9 @@ fn snapshot_live_targets_include_a_live_entry_with_no_endpoint() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// (T-217) The aggregate `--all` report's JSON shape: a successful outcome omits
-/// `error` entirely (not `null`), and a failed one carries it — the per-run
-/// detail an aggregate exit code alone cannot convey.
+/// Aggregate reports always carry `error`, using null when the target did not fail.
 #[test]
-fn control_all_outcome_serializes_error_only_on_failure() {
+fn control_all_outcome_serializes_an_always_present_error_field() {
     let ok = ControlAllOutcome {
         run_id: "run-a".to_string(),
         accepted: true,
@@ -1100,8 +1234,8 @@ fn control_all_outcome_serializes_error_only_on_failure() {
     assert_eq!(ok_value["accepted"], true);
     assert_eq!(ok_value["status"], "accepted");
     assert!(
-        ok_value.get("error").is_none(),
-        "a successful outcome omits `error` entirely: {ok_json}"
+        ok_value["error"].is_null(),
+        "a successful outcome carries `error: null`: {ok_json}"
     );
 
     let failed = ControlAllOutcome {
@@ -1131,7 +1265,7 @@ fn control_all_outcome_serializes_error_only_on_failure() {
     let gone_value: serde_json::Value = serde_json::from_str(&gone_json).expect("valid JSON");
     assert_eq!(gone_value["accepted"], false);
     assert_eq!(gone_value["status"], "already_gone");
-    assert!(gone_value.get("error").is_none());
+    assert!(gone_value["error"].is_null());
 }
 
 /// (T-217) A whole array of [`ControlAllOutcome`]s — the exact shape

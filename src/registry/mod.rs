@@ -426,6 +426,15 @@ pub enum RunStatus {
     Unprobed,
 }
 
+/// One by-id liveness probe plus the terminal-event locator published by its sole
+/// confirmed-live record. `wait --report-outcome` remembers the locator while the
+/// record still exists; once a clean exit removes it, the registry has no history
+/// from which to recover the path.
+pub(crate) struct RunProbe {
+    pub status: RunStatus,
+    pub jsonl: Option<PathBuf>,
+}
+
 /// A handle onto the per-user run registry directory.
 pub struct Registry {
     dir: PathBuf,
@@ -800,6 +809,17 @@ impl Registry {
     /// it is even probed — see that constant's doc for why a bare lock-probe-safety
     /// guarantee is not, on its own, enough for a record-less lock file (R-01).
     pub fn prune(&self) -> io::Result<PruneOutcome> {
+        self.prune_matching(&[])
+    }
+
+    /// Reap only paired entries carrying every requested operator label. With no
+    /// filters this is exactly [`Registry::prune`], including its orphan-lock pass.
+    /// With an explicit filter, record-less orphan locks stay out of scope because
+    /// no record remains from which their ownership labels could be established.
+    pub fn prune_matching(
+        &self,
+        filters: &[crate::labels::OperatorLabel],
+    ) -> io::Result<PruneOutcome> {
         let mut outcome = PruneOutcome::default();
         for ScannedRecord {
             record,
@@ -807,6 +827,9 @@ impl Registry {
             lock_path,
         } in self.scan()?
         {
+            if !crate::labels::matches(&record.labels, filters) {
+                continue;
+            }
             match probe_for_prune(&lock_path) {
                 // Confirmed stale: reap the entry's leftovers while still holding the
                 // acquired lock (when there was one). The socket the record published
@@ -838,16 +861,18 @@ impl Registry {
             }
         }
 
-        for lock_path in self.orphaned_lock_paths()? {
-            match probe_for_prune(&lock_path) {
-                // Confirmed stale: there is no `.json` sibling to delete, only the
-                // lock file itself.
-                Ok(PruneProbe::Reapable(_held_lock)) => {
-                    let _ = fs::remove_file(&lock_path);
-                    outcome.orphaned_locks += 1;
+        if filters.is_empty() {
+            for lock_path in self.orphaned_lock_paths()? {
+                match probe_for_prune(&lock_path) {
+                    // Confirmed stale: there is no `.json` sibling to delete, only the
+                    // lock file itself.
+                    Ok(PruneProbe::Reapable(_held_lock)) => {
+                        let _ = fs::remove_file(&lock_path);
+                        outcome.orphaned_locks += 1;
+                    }
+                    Ok(PruneProbe::Live) => outcome.live += 1,
+                    Err(_) => outcome.unprobed += 1,
                 }
-                Ok(PruneProbe::Live) => outcome.live += 1,
-                Err(_) => outcome.unprobed += 1,
             }
         }
 
@@ -877,6 +902,16 @@ impl Registry {
     /// about one it would delete. Classification is purely lexical there too, so this
     /// still stats nothing and still removes nothing.
     pub fn preview_prune(&self) -> io::Result<PrunePreview> {
+        self.preview_prune_matching(&[])
+    }
+
+    /// Preview the same label-scoped operation as [`Registry::prune_matching`].
+    /// The filter is applied before probing, and an explicit filter excludes the
+    /// ownerless orphan-lock pass exactly as the real operation does.
+    pub fn preview_prune_matching(
+        &self,
+        filters: &[crate::labels::OperatorLabel],
+    ) -> io::Result<PrunePreview> {
         let mut outcome = PruneOutcome::default();
         let mut candidates = Vec::new();
 
@@ -884,6 +919,9 @@ impl Registry {
             record, lock_path, ..
         } in self.scan()?
         {
+            if !crate::labels::matches(&record.labels, filters) {
+                continue;
+            }
             match probe_for_prune(&lock_path) {
                 // Confirmed stale: unlike `prune`, nothing is reclaimed under the
                 // lock — release it immediately and record the candidate instead of
@@ -912,17 +950,19 @@ impl Registry {
             }
         }
 
-        for lock_path in self.orphaned_lock_paths()? {
-            match probe_for_prune(&lock_path) {
-                Ok(PruneProbe::Reapable(held_lock)) => {
-                    drop(held_lock);
-                    candidates.push(PruneCandidate::OrphanedLock {
-                        lock_file_name: file_name(&lock_path),
-                    });
-                    outcome.orphaned_locks += 1;
+        if filters.is_empty() {
+            for lock_path in self.orphaned_lock_paths()? {
+                match probe_for_prune(&lock_path) {
+                    Ok(PruneProbe::Reapable(held_lock)) => {
+                        drop(held_lock);
+                        candidates.push(PruneCandidate::OrphanedLock {
+                            lock_file_name: file_name(&lock_path),
+                        });
+                        outcome.orphaned_locks += 1;
+                    }
+                    Ok(PruneProbe::Live) => outcome.live += 1,
+                    Err(_) => outcome.unprobed += 1,
                 }
-                Ok(PruneProbe::Live) => outcome.live += 1,
-                Err(_) => outcome.unprobed += 1,
             }
         }
 
@@ -975,8 +1015,17 @@ impl Registry {
     /// already skips are invisible here too, exactly as they are to `entries`/`prune`.
     /// Only a wholesale-unreadable registry directory is an `Err` (see [`Registry::scan`]).
     pub fn probe_run(&self, run_id: &str) -> io::Result<RunStatus> {
+        self.probe_run_with_jsonl(run_id).map(|probe| probe.status)
+    }
+
+    /// The same one-scan verdict as [`Registry::probe_run`], additionally retaining
+    /// the JSONL locator from the sole live record. The locator is deliberately
+    /// absent for ambiguous, unprobed, stale, and missing observations: only a
+    /// confirmed single live run is safe to associate with one outcome stream.
+    pub(crate) fn probe_run_with_jsonl(&self, run_id: &str) -> io::Result<RunProbe> {
         let mut live = 0usize;
         let mut unprobed = 0usize;
+        let mut jsonl = None;
         for ScannedRecord {
             record, lock_path, ..
         } in self.scan()?
@@ -987,7 +1036,14 @@ impl Registry {
                 continue;
             }
             match probe_health(&lock_path) {
-                Ok(LivenessProbe::Live) => live += 1,
+                Ok(LivenessProbe::Live) => {
+                    live += 1;
+                    jsonl = if live == 1 {
+                        record.jsonl.map(PathBuf::from)
+                    } else {
+                        None
+                    };
+                }
                 // Confirmed stale: this record is a leftover, not a running run, and
                 // contributes nothing to either count.
                 Ok(LivenessProbe::Stale) => {}
@@ -1000,17 +1056,29 @@ impl Registry {
             // guessing would silently wait on whichever entry the scan happened to yield
             // first. Reported ahead of the `unprobed` tally below because a *confirmed*
             // ambiguity is a stronger fact than an unconfirmed liveness.
-            return Ok(RunStatus::Ambiguous { live });
+            return Ok(RunProbe {
+                status: RunStatus::Ambiguous { live },
+                jsonl: None,
+            });
         }
         if live == 1 {
-            return Ok(RunStatus::Live);
+            return Ok(RunProbe {
+                status: RunStatus::Live,
+                jsonl,
+            });
         }
         if unprobed > 0 {
             // Nothing is confirmed live, but something could not be probed — so
             // "finished" is unconfirmed, and saying it would be a fabrication.
-            return Ok(RunStatus::Unprobed);
+            return Ok(RunProbe {
+                status: RunStatus::Unprobed,
+                jsonl: None,
+            });
         }
-        Ok(RunStatus::Finished)
+        Ok(RunProbe {
+            status: RunStatus::Finished,
+            jsonl: None,
+        })
     }
 
     /// The `.lock` files in the registry directory that have no sibling `.json`

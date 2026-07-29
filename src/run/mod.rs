@@ -64,6 +64,9 @@ mod launch;
 mod signals;
 mod teardown;
 
+#[doc(hidden)]
+pub use launch::parse_env_file_contents;
+
 use std::process::ExitCode;
 use std::time::Duration;
 

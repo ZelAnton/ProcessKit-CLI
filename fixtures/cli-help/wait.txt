@@ -12,6 +12,9 @@ Options:
       --label <KEY=VALUE>
           With `--all`, restrict the snapshot to runs carrying this exact operator label (repeatable; multiple filters combine with logical AND)
 
+      --report-outcome
+          After a single observed-live run finishes, print one JSON outcome object containing the terminal `runner_exit` source, runner code, and child code. The wait command's own exit status remains unchanged. If the run was already gone when waiting began, its registry record and JSONL locator are no longer knowable, so the object reports `status: "unknown"` with null outcome fields. Restricted to `--run-id`; aggregate outcome reporting can be added later with an explicit per-target contract
+
       --timeout <duration>
           Give up after this long instead of waiting indefinitely. This is a deadline on **the wait**, not on any run: when it elapses, the run (or, under `--all`, every still-outstanding run) is left running, completely untouched, and `wait` exits with its own reserved [`crate::exit::WAIT_TIMEOUT`] (112) — never a run's own [`crate::exit::TIMEOUT`] (106), which would claim the runner tore the tree down. Omit it to block until the target(s) actually finish.
           

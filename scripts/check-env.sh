@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 #
-# Checks this machine can build and test this Rust crate before you initialize
-# the template (POSIX counterpart of check-env.ps1 — use whichever matches your
+# Checks this machine can build and test ProcessKit-CLI (POSIX counterpart of check-env.ps1 — use whichever matches your
 # shell; both do the same thing).
 #
 # Verifies the Rust toolchain (cargo + rustc) is on PATH. rust-toolchain.toml
@@ -27,7 +26,7 @@ fi
 
 if [ ${#problems[@]} -eq 0 ]; then
   echo
-  echo "Environment ready. Next: bash ./scripts/init.sh --project-name ..."
+  echo "Environment ready. Next: just test"
   echo "(rustup installs the pinned stable + rustfmt/clippy on the first cargo build.)"
   exit 0
 fi

@@ -107,6 +107,34 @@ Both checks are useful in automation: the checksum is portable and offline once
 downloaded, while attestation verification ties the bytes to the release
 workflow and repository identity.
 
+## Package-manager manifests
+
+After the release-archive matrix settles, the release workflow reads the
+published `.sha256` sidecars for each archive the channels use and attaches
+distributor-ready manifests for
+[winget](https://learn.microsoft.com/en-us/windows/package-manager/package/manifest),
+[Scoop](https://github.com/ScoopInstaller/Scoop/wiki/App-Manifests), and a
+[Homebrew tap](https://docs.brew.sh/How-to-Create-and-Maintain-a-Tap). The same
+files are collected in
+`processkit-cli-v<version>-package-manifests.tar.gz`, with a neighboring bundle
+checksum. The generator rejects a sidecar unless it names the exact archive the
+manifest will download, so URLs and digests cannot be paired accidentally.
+
+Package managers need a repository of their own; a manifest attached to this
+project's GitHub Release is distributor input, not a public package source. The
+current publication boundary is explicit:
+
+| Channel | Generated release asset | Availability |
+| --- | --- | --- |
+| winget | Three-file `ZelAnton.ProcessKitCLI` manifest for x86_64 and Arm64 | Submit all three files to `microsoft/winget-pkgs`; installation is available only after Microsoft's external review accepts the version. |
+| Scoop | `processkit-cli.json` for x86_64 and Arm64 | Ready for `bucket/processkit-cli.json` in an account-owned bucket; no canonical public bucket is advertised yet. |
+| Homebrew | `processkit-cli.rb` for macOS Arm64 and Linux x86_64 | Ready for `Formula/processkit-cli.rb` in an account-owned tap; Linux uses the static musl archive so the formula does not inherit the release runner's glibc floor. No compatible Linux Arm64 formula is generated until a static Arm64 archive exists, and no canonical public tap is advertised yet. |
+
+Once a source is actually published, that package manager provides its normal
+install and upgrade lifecycle. Until its availability row changes, use the
+verified installer, `cargo-binstall`, or `cargo install`; do not paste a future
+bucket/tap name into automation and assume it exists.
+
 ## Install with cargo-binstall
 
 If [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall) is already

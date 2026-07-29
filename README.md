@@ -13,6 +13,10 @@ The CLI ensures a completed or failed command cannot leave descendants behind.
 It never kills processes by name; cleanup is restricted to the current run's
 ProcessKit container.
 
+Evaluating it against `timeout`, process groups, systemd, containers, Tini, or
+PowerShell? Start with [Why ProcessKit CLI?](docs/why-processkit-cli.md), which
+also calls out where those alternatives are the better fit.
+
 The project owns the versioned JSONL event contract used by runner clients and
 future adapters, including `processkit-py`. ProcessKit-rs remains the sole
 owner of containment, teardown, PID-reuse discipline, and lifecycle semantics.
@@ -76,6 +80,13 @@ tar -xzf "$archive"
 Archives are named `processkit-cli-v<version>-<target-triple>.<ext>` — `.tar.gz`
 for Linux and macOS, `.zip` for Windows — and each ships a matching
 `<archive>.sha256`.
+
+Each release also attaches checksum-derived distributor manifests for winget,
+Scoop, and a Homebrew tap. They are ready for the channels' external
+publication workflows, but an attached manifest is not a claim that the public
+channel has accepted that release. See the [package-manager availability
+table](docs/installation.md#package-manager-manifests) before using a `winget`,
+`scoop`, or `brew` install command.
 
 Every archive also carries a signed [build-provenance
 attestation](https://docs.github.com/actions/security-guides/using-artifact-attestations).
@@ -233,12 +244,13 @@ processkit-cli run     [--run-id <id>] [--label <KEY=VALUE>]... [--cwd <dir>]
                        [--env-clear] [--env-remove <KEY>]... [--env-file <file>]...
                        [--env <KEY=VALUE>]...
                        -- <program> <args...>
-processkit-cli inspect (--run-id <id> [--json] | --all --json [--label <KEY=VALUE>]...)
+processkit-cli inspect (--run-id <id> | --all [--label <KEY=VALUE>]...) [--json]
 processkit-cli cancel  (--run-id <id> | --all [--label <KEY=VALUE>]...)
 processkit-cli kill    (--run-id <id> | --all [--label <KEY=VALUE>]...)
-processkit-cli wait    (--run-id <id> | --all [--label <KEY=VALUE>]...) [--timeout <duration>]
+processkit-cli wait    --run-id <id> [--timeout <duration>] [--report-outcome]
+processkit-cli wait    --all [--label <KEY=VALUE>]... [--timeout <duration>]
 processkit-cli list    [--json] [--label <KEY=VALUE>]... [--health <live|stale|unprobed>]
-processkit-cli prune   [--json] [--dry-run]
+processkit-cli prune   [--json] [--dry-run] [--label <KEY=VALUE>]...
 processkit-cli probe   --json [--require-schema-version <N>]
                        [--require-exit-code-band <start>-<end>]
                        [--require-surface <token>]...
@@ -337,11 +349,14 @@ after an abrupt runner
 death follows the platform-specific `abrupt_cleanup` guarantee above; only Windows
 currently guarantees the whole tree.
 
-`inspect --all --json` snapshots the confirmed-live registry entries once, then
-inspects those exact record paths and endpoints. Repeated `--label KEY=VALUE`
-filters are conjunctive. Its single JSON array preserves one result per snapshot
-target: either `snapshot` or an explicit per-run `error`, so a disappearing runner
-cannot silently vanish from a fleet observation.
+`inspect --all` snapshots the confirmed-live registry entries once, then inspects
+those exact record paths and endpoints. Repeated `--label KEY=VALUE` filters are
+conjunctive. The default human view starts with one terminal-safe summary row per
+target (`inspected`, `already_gone`, or `failed`) and expands every inspected target
+through the same detailed snapshot renderer as single-run `inspect`. With `--json`,
+the original single array remains byte-for-byte unchanged: each target carries
+either `snapshot` or an explicit per-run `error`, so a disappearing runner cannot
+silently vanish from a fleet observation.
 
 `cancel --all` / `kill --all` (mutually exclusive with `--run-id`, exactly one
 of the two required, the same clap shape `wait --all` established) are the mutating
@@ -379,11 +394,20 @@ probing, not a notification. `--timeout` bounds **the wait**, not the run: when 
 elapses the run is left running and `wait` exits with its own reserved code `112`,
 never the run's `TIMEOUT` (`106`) — and an ambiguous `run_id` (more than one live run
 under it) is the same `CONTROL` (103) refusal every other by-`run-id` command gives.
-Nothing is printed on success; the exit code is the answer. One deliberate design
-choice deserves a caller's attention: since a clean exit deletes its own registry
-entry, an **unknown** `run_id` is indistinguishable from one that already finished and
-was cleaned up, so both exit `0` — meaning a typo'd `run_id` returns success
-immediately, and `wait`'s `0` must never be read as proof the run existed. See
+Nothing is printed on ordinary success; the exit code is the answer. With the
+single-run-only `--report-outcome` opt-in, `wait` remembers the live registry
+record's JSONL locator and prints one JSON object after completion:
+`run_id`, `status` (`reported` or `unknown`), and always-present `code`, `source`,
+and `child_code` fields. The latter three mirror terminal `runner_exit` when it is
+available and are `null` when it is not. This is data only — `wait` still exits `0`
+for a completed target rather than forwarding the child or runner code.
+
+One deliberate design choice deserves a caller's attention: since a clean exit
+deletes its own registry entry, an **unknown** `run_id` is indistinguishable from one
+that already finished and was cleaned up, so both exit `0` — meaning a typo'd
+`run_id` returns success immediately, and a reporting wait that never observed the
+run live honestly emits `status:"unknown"`. Neither form of success proves the run
+existed. See
 [`docs/registry.md`](docs/registry.md), "Waiting — `wait`".
 
 `wait --all` (mutually exclusive with `--run-id`; exactly one of the two is required)
@@ -429,8 +453,8 @@ runner is gone" — the same distinction `prune --json`'s `unprobed` tally, `wai
 an `inspect`/`cancel`/`kill` refusal against such an entry all make. See
 [`docs/registry.md`](docs/registry.md), "Discovery — `list`".
 
-`list` shows those stale leftovers; `prune` removes them. It reaps every registry
-entry it can **confirm** is stale — the `.json`/`.lock` pair a runner that died
+`list` shows those stale leftovers; `prune` removes them. By default it reaps every
+registry entry it can **confirm** is stale — the `.json`/`.lock` pair a runner that died
 abruptly never cleaned up — and leaves every other entry alone. The safety rule is
 strict and one-directional: prune deletes **only** an entry whose liveness probe
 *succeeded and reported stale*. A **live** entry is never touched; an entry whose
@@ -452,6 +476,12 @@ was nothing to do); with `--json` it prints a single JSON object
 socket is counted by its own entry. An empty or never-created registry is not an error
 — `prune` reports a zero tally and exits `0`, and pruning a missing registry does not
 create it. See [`docs/registry.md`](docs/registry.md), "Reaping — `prune`".
+
+Repeatable `prune --label KEY=VALUE` filters use the same exact-match, logical-AND
+semantics as the other fleet commands. Only paired records carrying every filter are
+counted or reaped. An explicit filter leaves lone orphaned `.lock` files untouched:
+without their record, their labels and ownership are unknowable. The same rule applies
+to `--dry-run`, so a filtered preview remains an exact preview of the filtered reap.
 
 `prune --dry-run` previews that same reap without deleting anything: the identical
 scan and the identical liveness classification, just never a `fs::remove_file`, so an
@@ -958,16 +988,23 @@ tracked trend.
 | Incremental SHA-256, 64KiB chunks (256KiB total) | ~116 MiB/s |
 | `StreamCapture::absorb`, 64KiB chunks (256KiB total) | ~98 MiB/s |
 | Hint classifier, no match / MSBuild match | ~520 ns / ~830 ns |
-| Echo overhead, 4MiB payload: direct vs. under `run` (no capture) | ~16 ms vs. ~3.8 s |
-| Echo overhead, 4MiB payload: under `run` with `--capture-dir` | ~3.3 s |
-| Startup latency, call to `run_started` | ~430 ms (median) |
+| Echo overhead, 4MiB payload: direct vs. under `run` (no capture) | ~19 ms vs. ~224 ms |
+| Echo overhead, 4MiB payload: under `run` with `--capture-dir` | ~801 ms |
+| Startup latency, call to `run_started` | ~181 ms (median) |
 
-The echo-overhead and startup-latency figures are dominated by this run's own
-per-invocation costs (container creation, the registry record, the control-
-plane endpoint, and the async pump/echo path) rather than by the child's own
-payload size — a multi-hundred-millisecond-to-low-seconds cost per `run`
-invocation on this host, worth keeping an eye on as the regression lane
-accumulates history, but not (yet) a claim about where the time goes.
+The live-output figures use ProcessKit's raw byte tee. Profiling the former
+decoded-line path found that its two awaited writes and mutex acquisition per
+line dominated a chatty payload; chunk-based raw forwarding reduced the 4MiB
+no-capture median by about 96% while preserving the runner's byte-for-byte
+passthrough contract. Capture deliberately remains on its established decoded
+sink so its counters, hashes, and truncation boundary do not change.
+
+A release-build phase trace of short Windows runs attributed less than 1 ms to
+opening JSONL plus creating the container, about 36-41 ms to re-asserting the
+registry directory's owner-only ACL, and another 166-228 ms to
+`ProcessGroup::start`. The last phase is inside ProcessKit's public API; it has
+been reported upstream for profiling rather than worked around here. Treat all
+figures as host snapshots and the CI history as the regression signal.
 
 [criterion]: https://github.com/bheisler/criterion.rs
 

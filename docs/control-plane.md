@@ -118,7 +118,7 @@ run.
 ## `inspect`
 
 ```
-processkit-cli inspect (--run-id <id> [--json] | --all --json [--label <KEY=VALUE>]...)
+processkit-cli inspect (--run-id <id> | --all [--label <KEY=VALUE>]...) [--json]
 ```
 
 `inspect` finds the live runner for `<id>` through the registry, connects to its
@@ -128,14 +128,20 @@ single JSON line with `--json`, or, by default, as a human-readable rendering
 mirroring `list`/`prune`'s optional `--json`. `--json` is optional; `inspect --json`'s
 output is unchanged from before `--json` became optional.
 
-The aggregate form requires `--json`. It takes one snapshot of all confirmed-live
-registry records, optionally filters them by repeated exact `--label KEY=VALUE`
-matches (logical AND), and addresses each target by the record path and endpoint
-captured in that snapshot. It prints one JSON array. Each element has `run_id` and
-either a `snapshot` with `error: null`, or `snapshot: null` with a bounded error
-string. If any target fails, the command returns `CONTROL` (103) after printing the
-complete array; an empty matching fleet is a successful empty array. This preserves
-partial fleet visibility without turning registry churn into silent omission.
+The aggregate form takes one snapshot of all confirmed-live registry records,
+optionally filters them by repeated exact `--label KEY=VALUE` matches (logical AND),
+and addresses each target by the record path and endpoint captured in that snapshot.
+Without `--json`, it prints a terminal-safe table with one row per target and the
+three-way status `inspected` / `already_gone` / `failed`, followed by a detailed
+snapshot block for each inspected target. Those blocks reuse the single-run renderer,
+including its member table and bounded handling of every untrusted string. An empty
+matching fleet prints `no live runs to inspect`.
+
+With `--json`, the original output remains one byte-compatible JSON array. Each
+element has `run_id` and either a `snapshot` with `error: null`, or `snapshot: null`
+with a bounded error string. If any target fails, either output form returns `CONTROL`
+(103) after printing the complete report. This preserves partial fleet visibility
+without turning registry churn into silent omission.
 
 ### The inspect snapshot
 

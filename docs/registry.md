@@ -348,8 +348,8 @@ it carries none of the "could not reach the target run" failure modes
 
 ## Reaping — `prune`
 
-`processkit-cli prune [--json]` is the cleanup counterpart to `list`. Where `list`
-shows a stale leftover, `prune` deletes it: it opens the registry through
+`processkit-cli prune [--json] [--label KEY=VALUE]...` is the cleanup counterpart to
+`list`. Where `list` shows a stale leftover, `prune` deletes it: it opens the registry through
 [`Registry::open_read_only`] (`src/registry/mod.rs`) — like `list`, so it never creates
 the directory or touches its permissions; a missing or empty registry simply has
 nothing to prune — scans it with the same shared scan `list` uses, and for each
@@ -357,6 +357,13 @@ scanned record deletes **both** its files (`<stem>.json` then `<stem>.lock`, the
 order [`Registration::remove`] uses) only when it can *confirm* the record is stale.
 On unix it deletes a third leftover of the same death — the control socket that
 record published, see "Reaping the control socket" below.
+
+Repeated `--label KEY=VALUE` filters use the shared label parser and combine with
+logical AND. When filters are present, only paired records carrying every requested
+label enter the prune tally or liveness probe. Lone orphaned `.lock` files have no
+record from which labels or ownership can be recovered, so an explicitly filtered
+prune leaves them out of scope entirely. With no filter, the original registry-wide
+paired-record and orphan-lock passes are unchanged.
 
 It then makes a second pass over any **orphaned lock files** — a `.lock` with no
 `.json` sibling at all. Such a `.lock` is invisible to the shared scan (which only
@@ -522,7 +529,7 @@ a no-op that exits `0`.
 
 ### Previewing a reap — `prune --dry-run`
 
-`processkit-cli prune --dry-run [--json]` (T-199) answers "what would `prune` reap
+`processkit-cli prune --dry-run [--json] [--label KEY=VALUE]...` answers "what would `prune` reap
 right now?" without reaping anything. It is [`Registry::preview_prune`]
 (`src/registry/mod.rs`), the non-destructive sibling of [`Registry::prune`]: the exact
 same two-pass scan (paired records via `Registry::scan`, then orphaned locks via
@@ -538,6 +545,10 @@ candidate instead. `Live` and probe-`Err` verdicts are handled identically to
 following, untouched `prune` pass over the same on-disk registry state would
 report, and the preview itself never calls `fs::remove_file` on anything, so the
 registry is left byte-for-byte as it was.
+
+Label filters are applied before the same liveness probes in both paths. A filtered
+preview therefore lists and counts exactly what a real prune with the identical
+filters would reap; it also excludes ownerless orphan locks by the same rule.
 
 Because a paired record carries `run_id`/`started_at` but an orphaned `.lock` file
 has no record to pull identifying fields from at all, each candidate is described
@@ -581,7 +592,7 @@ gone (reaping it is best-effort, exactly like the record/lock deletions).
 
 ## Waiting — `wait`
 
-`processkit-cli wait (--run-id <id> | --all) [--timeout <duration>]` is the *lifetime*
+`processkit-cli wait (--run-id <id> [--report-outcome] | --all) [--timeout <duration>]` is the *lifetime*
 counterpart to `list`'s discovery and `prune`'s cleanup: it blocks while its target is
 live and returns as soon as it is not. `--run-id` and `--all` are mutually exclusive
 (clap rejects both together) and exactly one is required — see "The aggregate barrier
@@ -597,8 +608,10 @@ came up (a `null` `endpoint`, see "Record format" above) is still perfectly wait
 `wait` needs no endpoint.
 
 A run started with `run --detach` is the case this was written for: that call returns
-once the run has started and is *never* the runner's parent, so `wait` (plus the run's
-`--jsonl` stream for the outcome itself) is how its caller learns the run is over. A
+once the run has started and is *never* the runner's parent, so `wait` is how its
+caller learns the run is over. `wait --report-outcome` also consumes the run's
+published `--jsonl` locator and terminal event for callers that want the outcome in
+the same supervision step. A
 detached run publishes an ordinary record here — nothing about the entry, its liveness
 lock, or its removal on a clean exit differs — so `list`, `prune`, and `wait` treat it
 exactly like any other.
@@ -627,9 +640,30 @@ clean exit, which deletes both files rather than handing the lock over.
   Re-checked on every probe, not just the first, since a duplicate can register at any
   moment.
 
-Nothing is printed on success — the exit code is the whole answer, so `wait` has no
-output format to keep stable and no `--json` to add one. A registry that cannot be
-opened or read at all is a `SETUP` (111) failure, exactly as it is for `list`/`prune`.
+Nothing is printed on ordinary success. `--report-outcome`, restricted to
+`--run-id`, instead prints exactly one JSON object while leaving all exit-code
+semantics above untouched:
+
+```json
+{"run_id":"build-42","status":"reported","code":7,"source":"child_exit","child_code":7}
+```
+
+The waiter remembers the sole confirmed-live record's absolute `jsonl` locator on
+its polling passes. Once that record disappears, it reads the terminal
+`runner_exit`; `code`, `source`, and `child_code` use that event's vocabulary. A
+short bounded retry bridges the runner's normal teardown ordering, where record
+removal can precede the final flushed event by a few instructions. If the waiter
+never observed the run live, an older record published no locator, the runner died
+without a terminal event, or the stream cannot be read, success remains honest data:
+
+```json
+{"run_id":"build-42","status":"unknown","code":null,"source":null,"child_code":null}
+```
+
+The mode does not forward `code` as the wait process's exit status. Aggregate
+reporting is deliberately out of scope until it has an explicit per-target shape;
+clap therefore rejects `wait --all --report-outcome`. A registry that cannot be
+opened or read at all remains a `SETUP` (111) failure, exactly as for `list`/`prune`.
 
 ### An unknown `run_id` reads as "finished"
 

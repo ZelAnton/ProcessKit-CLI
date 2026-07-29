@@ -4,8 +4,8 @@ name: Fuzz
 # of untrusted/semi-trusted input: the registry record bytes -> parse/validate
 # path (`registry_record`), the control plane's server-side request-line
 # classifier and client-side response-line JSON decode together
-# (`control_wire`), and the CLI's `--timeout`/`--grace`/`--require-exit-code-band`/
-# `--env` value parsers (`cli_parsers`) — see fuzz/fuzz_targets/*.rs and
+# (`control_wire`), and the CLI's scalar, label, and raw environment-file
+# parsers (`cli_parsers`) — see fuzz/fuzz_targets/*.rs and
 # CONTRIBUTING.md, "Fuzzing".
 #
 # Deliberately scheduled + manual-only (no `push:`/`pull_request:` trigger) and

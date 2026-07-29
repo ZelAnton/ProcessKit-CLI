@@ -17,6 +17,7 @@
 
 # Start here
 
+- [Why ProcessKit CLI?](why-processkit-cli.md)
 - [Installation and distribution](installation.md)
 - [Cookbook](cookbook.md)
 - [Runnable examples](runnable-examples.md)

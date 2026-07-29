@@ -18,6 +18,7 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -25,7 +26,9 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use common::{bin, command_with_flags, scratch, shell_inline};
-use processkit_cli::registry::test_support::{write_stale_entry, write_unprobeable_entry};
+use processkit_cli::registry::test_support::{
+    write_stale_entry, write_stale_entry_with_labels, write_unprobeable_entry,
+};
 
 /// The registry directory the runner is pointed at, kept separate from the
 /// `--jsonl` events file (which lands in `scratch_dir` itself) so scanning for
@@ -429,6 +432,40 @@ fn inspect_all_snapshots_live_runs_with_conjunctive_labels() {
     assert_eq!(outcomes[0]["status"], "inspected");
     assert_eq!(outcomes[0]["snapshot"]["run_id"], "inspect-ci");
     assert!(outcomes[0]["error"].is_null());
+
+    let human = Command::new(bin())
+        .args([
+            "inspect",
+            "--all",
+            "--label",
+            "pipeline=ci",
+            "--label",
+            "lane=test",
+        ])
+        .env("PROCESSKIT_CLI_REGISTRY_DIR", &registry)
+        .output()
+        .expect("run human-readable aggregate inspect");
+    assert_eq!(
+        human.status.code(),
+        Some(0),
+        "human aggregate inspect succeeds: {}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        text.contains("RUN_ID") && text.contains("STATUS") && text.contains("inspect-ci"),
+        "the summary table identifies the target: {text}"
+    );
+    assert!(
+        text.contains("snapshot for inspect-ci:")
+            && text.contains("snapshot_version:")
+            && text.contains("members:"),
+        "the inspected target reuses the detailed snapshot rendering: {text}"
+    );
+    assert!(
+        !text.contains("inspect-local"),
+        "the same conjunctive filters apply in human mode: {text}"
+    );
 
     let _ = ci.wait();
     let _ = local.wait();
@@ -1275,10 +1312,20 @@ fn list_does_not_create_the_registry_directory() {
 
 /// Run `prune [--json]` against `registry` and wait for it to finish.
 fn prune(registry: &Path, json: bool) -> Output {
+    prune_with(registry, json, false, &[])
+}
+
+fn prune_with(registry: &Path, json: bool, dry_run: bool, labels: &[&str]) -> Output {
     let mut cmd = Command::new(bin());
     cmd.arg("prune");
+    if dry_run {
+        cmd.arg("--dry-run");
+    }
     if json {
         cmd.arg("--json");
+    }
+    for label in labels {
+        cmd.args(["--label", label]);
     }
     cmd.env("PROCESSKIT_CLI_REGISTRY_DIR", registry)
         .output()
@@ -1307,6 +1354,14 @@ fn wait_for_run(registry: &Path, run_id: &str, timeout: Option<&str>) -> Output 
     spawn_wait(registry, run_id, timeout)
         .wait_with_output()
         .expect("the wait client exits")
+}
+
+fn wait_for_run_outcome(registry: &Path, run_id: &str) -> Output {
+    Command::new(bin())
+        .args(["wait", "--run-id", run_id, "--report-outcome"])
+        .env("PROCESSKIT_CLI_REGISTRY_DIR", registry)
+        .output()
+        .expect("the reporting wait client exits")
 }
 
 /// The core `wait` contract, proved by *observation* rather than by timing: while the
@@ -1376,6 +1431,45 @@ fn wait_blocks_until_a_live_run_finishes() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn wait_report_outcome_reads_the_observed_runs_terminal_event() {
+    let dir = scratch("wait-reported-outcome");
+    let registry = registry_dir(&dir);
+    let mut runner = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "wait-outcome"],
+        inspectable_child(),
+    )
+    .spawn()
+    .expect("spawn the runner");
+
+    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+    let waiter = std::thread::spawn({
+        let registry = registry.clone();
+        move || wait_for_run_outcome(&registry, "wait-outcome")
+    });
+    let status = runner.wait().expect("the runner exits");
+    assert!(status.success());
+
+    let out = waiter.join().expect("the waiter thread completes");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        out.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("one JSON outcome line");
+    assert_eq!(report["run_id"], "wait-outcome");
+    assert_eq!(report["status"], "reported");
+    assert_eq!(report["code"], 0);
+    assert_eq!(report["source"], "child_exit");
+    assert_eq!(report["child_code"], 0);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A stale entry (a leftover `.json`/`.lock` pair from a runner that died abruptly, with
 /// nobody holding the lock) is not a run to wait for: `wait` classifies it through the
 /// same liveness probe every other client uses and returns at once.
@@ -1419,6 +1513,15 @@ fn wait_returns_at_once_for_a_stale_entry() {
         "an unknown run id reads as finished, not as an error; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+
+    let reported = wait_for_run_outcome(&registry, "never-registered");
+    assert_eq!(reported.status.code(), Some(0));
+    let report: serde_json::Value =
+        serde_json::from_slice(&reported.stdout).expect("one unknown outcome line");
+    assert_eq!(report["status"], "unknown");
+    assert!(report["code"].is_null());
+    assert!(report["source"].is_null());
+    assert!(report["child_code"].is_null());
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -2074,14 +2177,53 @@ fn prune_reaps_an_orphaned_lock_file_alongside_a_stale_pair_and_a_live_run() {
 
 /// Run `prune --dry-run [--json]` against `registry` and wait for it to finish.
 fn prune_dry_run(registry: &Path, json: bool) -> Output {
-    let mut cmd = Command::new(bin());
-    cmd.args(["prune", "--dry-run"]);
-    if json {
-        cmd.arg("--json");
-    }
-    cmd.env("PROCESSKIT_CLI_REGISTRY_DIR", registry)
-        .output()
-        .expect("spawn the prune --dry-run client")
+    prune_with(registry, json, true, &[])
+}
+
+#[test]
+fn prune_label_filter_scopes_preview_and_reap_and_excludes_orphan_locks() {
+    let dir = scratch("prune-label-filter");
+    let registry = registry_dir(&dir);
+    let ci_labels = BTreeMap::from([
+        ("pipeline".to_string(), "ci".to_string()),
+        ("lane".to_string(), "test".to_string()),
+    ]);
+    let local_labels = BTreeMap::from([
+        ("pipeline".to_string(), "local".to_string()),
+        ("lane".to_string(), "test".to_string()),
+    ]);
+    write_stale_entry_with_labels(&registry, "ci-stale", "ci-stale", ci_labels);
+    write_stale_entry_with_labels(&registry, "local-stale", "local-stale", local_labels);
+
+    let orphan_lock = registry.join("owner-unknown.lock");
+    fs::write(&orphan_lock, b"").expect("write an ownerless orphan lock");
+    backdate(&orphan_lock, Duration::from_secs(30));
+
+    let preview = prune_with(&registry, true, true, &["pipeline=ci", "lane=test"]);
+    assert_eq!(preview.status.code(), Some(0));
+    let preview_report: serde_json::Value =
+        serde_json::from_slice(&preview.stdout).expect("filtered dry-run JSON");
+    assert_eq!(preview_report["pruned"], 1);
+    assert_eq!(preview_report["orphaned_locks"], 0);
+    assert_eq!(preview_report["candidates"].as_array().unwrap().len(), 1);
+    assert_eq!(preview_report["candidates"][0]["run_id"], "ci-stale");
+    assert!(registry.join("ci-stale.json").exists());
+    assert!(registry.join("local-stale.json").exists());
+    assert!(orphan_lock.exists());
+
+    let reaped = prune_with(&registry, true, false, &["pipeline=ci", "lane=test"]);
+    assert_eq!(reaped.status.code(), Some(0));
+    let reap_report: serde_json::Value =
+        serde_json::from_slice(&reaped.stdout).expect("filtered prune JSON");
+    assert_eq!(reap_report["pruned"], 1);
+    assert_eq!(reap_report["orphaned_locks"], 0);
+    assert!(!registry.join("ci-stale.json").exists());
+    assert!(!registry.join("ci-stale.lock").exists());
+    assert!(registry.join("local-stale.json").exists());
+    assert!(registry.join("local-stale.lock").exists());
+    assert!(orphan_lock.exists());
+
+    let _ = fs::remove_dir_all(&dir);
 }
 
 /// T-199, end to end through the real binary: `prune --dry-run --json` over the

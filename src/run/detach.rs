@@ -359,6 +359,11 @@ fn await_started(detached: &mut Child, jsonl: &Path, run_id: &str) -> Result<(),
             }
             Ok(None) => {}
             Err(err) => {
+                // A start event may have landed after this iteration's initial
+                // observation. Never abandon a run whose durable start is visible.
+                if run_started_recorded(jsonl, run_id) {
+                    return Ok(());
+                }
                 abandon(detached);
                 return Err(RunnerError::new(
                     exit::SETUP,

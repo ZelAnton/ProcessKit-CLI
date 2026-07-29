@@ -20,6 +20,11 @@ family; this CLI deliberately focuses on one contained run and its control
 plane rather than exposing the core crate's pipelines, retries, or scheduling
 APIs.
 
+For an adoption-oriented comparison with `timeout`, process groups, systemd,
+containers, Tini, and PowerShell, see [Why ProcessKit CLI?](why-processkit-cli.md).
+The guide explicitly identifies the cases where a smaller or wider supervisor
+is the better fit.
+
 ## Install
 
 Download a platform archive from the
@@ -149,7 +154,7 @@ cleanup path. See the [architecture](architecture.md) and
 
 | Guide | Covers |
 | --- | --- |
-| [Installation and distribution](installation.md) | Archives, target selection, checksums, attestations, Cargo, completions, man pages. |
+| [Installation and distribution](installation.md) | Archives, package-manager manifests, target selection, checksums, attestations, Cargo, completions, man pages. |
 | [Cookbook](cookbook.md) | Task → command recipes for common foreground, detached, capture, control, and container workflows. |
 | [Agent and automation workflows](agent-workflows.md) | A drop-in agent instruction, bounded execution strategies, recovery, and honest agent-stop guarantees. |
 | [Running commands](running-commands.md) | Shell-free argv, cwd, environment, run ids, foreground lifecycle, and flag interactions. |

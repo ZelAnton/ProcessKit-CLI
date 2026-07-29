@@ -175,12 +175,16 @@ impl From<PrunePreview> for PruneDryRunReport {
 /// above). A missing or empty registry has nothing to prune or preview and exits `0`
 /// either way; the only failure is the registry directory itself being unreadable, an
 /// [`exit::SETUP`] condition (a support/prerequisite failure).
-pub fn run(json: bool, dry_run: bool) -> Result<(), RunnerError> {
+pub fn run(
+    json: bool,
+    dry_run: bool,
+    labels: &[crate::labels::OperatorLabel],
+) -> Result<(), RunnerError> {
     let registry = registry::open_read_only_for_setup()?;
 
     if dry_run {
         let preview = registry
-            .preview_prune()
+            .preview_prune_matching(labels)
             .map_err(registry::setup_read_error)?;
         if json {
             print_dry_run_json(preview)
@@ -189,7 +193,9 @@ pub fn run(json: bool, dry_run: bool) -> Result<(), RunnerError> {
             Ok(())
         }
     } else {
-        let outcome = registry.prune().map_err(registry::setup_read_error)?;
+        let outcome = registry
+            .prune_matching(labels)
+            .map_err(registry::setup_read_error)?;
         if json {
             print_json(outcome)
         } else {

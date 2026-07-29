@@ -38,6 +38,15 @@ name: Release
 # attestation are computed per target, inside each already-non-critical
 # matrix leg, so they never become a blocking/critical path. This does not
 # change the release ordering above.
+#
+# Package managers: after the archive matrix settles, `package-manifests`
+# downloads the published checksum sidecars and generates winget, Scoop, and
+# Homebrew distributor inputs from those exact digests. It attaches the files
+# and a checksumed bundle to the existing Release. No external package repo is
+# mutated here: winget keeps its required external review, while the Scoop and
+# Homebrew files are ready to copy into an account-owned bucket/tap. The job is
+# downstream of crates.io, the tag, the Release, and all archive uploads, so it
+# cannot alter or strand the established release path.
 
 on:
   workflow_dispatch:
@@ -631,3 +640,63 @@ jobs:
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: ${{ env.ASSET }}
+
+  # Build distributor inputs only after every archive leg has had a chance to
+  # upload its checksum. `always()` semantics are intentional: an attestation
+  # failure happens after the archive upload and must not suppress generation;
+  # a genuinely missing required sidecar instead makes the generator fail with
+  # a precise error. Like `build-artifacts`, this job only adds assets to an
+  # already-published Release and never updates an external package repository.
+  package-manifests:
+    needs: [release, build-artifacts]
+    if: ${{ !cancelled() && needs.release.result == 'success' }}
+    name: package-manager manifests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.x'
+
+      - name: Download release checksum sidecars
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          mkdir checksums
+          gh release download "$TAG" --pattern 'processkit-cli-v*.sha256' --dir checksums
+
+      - name: Generate and validate package manifests
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/package-manifests-v${VERSION}"
+          python scripts/generate_package_manifests.py \
+            --version "$VERSION" \
+            --checksums-dir checksums \
+            --output-dir "$output"
+          python -m json.tool "$output/scoop/processkit-cli.json" >/dev/null
+          ruby -c "$output/homebrew/processkit-cli.rb"
+          bundle="processkit-cli-v${VERSION}-package-manifests.tar.gz"
+          tar -czf "$bundle" -C "$output" .
+          sha256sum "$bundle" > "$bundle.sha256"
+          echo "MANIFEST_OUTPUT=$output" >> "$GITHUB_ENV"
+          echo "MANIFEST_BUNDLE=$bundle" >> "$GITHUB_ENV"
+
+      - name: Upload package manifests to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          gh release upload "$TAG" \
+            "$MANIFEST_BUNDLE" "$MANIFEST_BUNDLE.sha256" \
+            "$MANIFEST_OUTPUT"/winget/*.yaml \
+            "$MANIFEST_OUTPUT"/scoop/processkit-cli.json \
+            "$MANIFEST_OUTPUT"/homebrew/processkit-cli.rb \
+            --clobber

@@ -296,17 +296,19 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     // is no echo to suppress under inheritance — and `--idle-timeout`, which has no
     // output pump to observe under inheritance, all conflict with it at parse time.
     //
-    // Otherwise pipe + echo remains the compatibility default: ProcessKit's pump
-    // reads each stream and tees it to the corresponding runner stream. With
-    // `--capture-dir` that same tee also mirrors into bounded files. When
-    // `--idle-timeout` is armed, an [`IdleClock`] tee wraps the *outermost* sink on
-    // whichever of those two paths is active, so every observed chunk re-arms the
-    // idle window regardless of capture mode; without it the sinks are exactly as
-    // before. `--no-echo` swaps only the innermost echo sink
-    // (`tokio::io::stdout()`/`stderr()`) for a discarding [`tokio::io::sink()`] —
-    // the pipe, the pump, the `--capture-dir` tee, and the `IdleClock` re-arm all
-    // stay wired exactly as without it (K-050, K-007). Every branch below that does
-    // *not* test `args.no_echo` is byte-for-byte the pre-`--no-echo` code.
+    // Otherwise pipe + echo remains the compatibility default. Live echo uses
+    // ProcessKit's raw tee: one awaited write per pipe-read chunk instead of two
+    // writes plus a mutex round-trip for every decoded line. Besides removing the
+    // measured per-line cost, this is the public API that preserves the settled
+    // byte-for-byte passthrough contract (invalid UTF-8, CRLF, and unterminated
+    // tails included). `--no-echo` simply omits that raw sink unless an idle clock
+    // still needs to observe the stream.
+    //
+    // Capture deliberately remains on the decoded tee. Its counters, hashes, and
+    // truncation boundary therefore stay byte-compatible with the established
+    // capture contract; it is a second observation sink and never feeds live echo.
+    // The idle clock belongs on the raw path so an unterminated prompt re-arms the
+    // timeout immediately rather than waiting for a line boundary.
     command = if args.inherit_stdio {
         command
             .stdout(StdioMode::Inherit)
@@ -318,12 +320,16 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
         if idle_timeout.is_some() {
             if args.no_echo {
                 command
-                    .stdout_tee(idle_clock.tee(capture.stdout_tee(tokio::io::sink())))
-                    .stderr_tee(idle_clock.tee(capture.stderr_tee(tokio::io::sink())))
+                    .stdout_tee(capture.stdout_tee(tokio::io::sink()))
+                    .stderr_tee(capture.stderr_tee(tokio::io::sink()))
+                    .stdout_raw_tee(idle_clock.tee(tokio::io::sink()))
+                    .stderr_raw_tee(idle_clock.tee(tokio::io::sink()))
             } else {
                 command
-                    .stdout_tee(idle_clock.tee(capture.stdout_tee(tokio::io::stdout())))
-                    .stderr_tee(idle_clock.tee(capture.stderr_tee(tokio::io::stderr())))
+                    .stdout_tee(capture.stdout_tee(tokio::io::sink()))
+                    .stderr_tee(capture.stderr_tee(tokio::io::sink()))
+                    .stdout_raw_tee(idle_clock.tee(tokio::io::stdout()))
+                    .stderr_raw_tee(idle_clock.tee(tokio::io::stderr()))
             }
         } else if args.no_echo {
             command
@@ -331,27 +337,27 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
                 .stderr_tee(capture.stderr_tee(tokio::io::sink()))
         } else {
             command
-                .stdout_tee(capture.stdout_tee(tokio::io::stdout()))
-                .stderr_tee(capture.stderr_tee(tokio::io::stderr()))
+                .stdout_tee(capture.stdout_tee(tokio::io::sink()))
+                .stderr_tee(capture.stderr_tee(tokio::io::sink()))
+                .stdout_raw_tee(tokio::io::stdout())
+                .stderr_raw_tee(tokio::io::stderr())
         }
     } else if idle_timeout.is_some() {
         if args.no_echo {
             command
-                .stdout_tee(idle_clock.tee(tokio::io::sink()))
-                .stderr_tee(idle_clock.tee(tokio::io::sink()))
+                .stdout_raw_tee(idle_clock.tee(tokio::io::sink()))
+                .stderr_raw_tee(idle_clock.tee(tokio::io::sink()))
         } else {
             command
-                .stdout_tee(idle_clock.tee(tokio::io::stdout()))
-                .stderr_tee(idle_clock.tee(tokio::io::stderr()))
+                .stdout_raw_tee(idle_clock.tee(tokio::io::stdout()))
+                .stderr_raw_tee(idle_clock.tee(tokio::io::stderr()))
         }
     } else if args.no_echo {
         command
-            .stdout_tee(tokio::io::sink())
-            .stderr_tee(tokio::io::sink())
     } else {
         command
-            .stdout_tee(tokio::io::stdout())
-            .stderr_tee(tokio::io::stderr())
+            .stdout_raw_tee(tokio::io::stdout())
+            .stderr_raw_tee(tokio::io::stderr())
     };
 
     // `ProcessGroup::start` joins the child to the group *we* own and hands back a
@@ -987,12 +993,33 @@ async fn drive_to_outcome(running: RunningProcess, capturing: bool) -> processki
     }
 }
 
-/// Read the UTF-8 environment files in argument order and parse their active
-/// lines with the exact `KEY=VALUE` grammar used by `--env`.
+/// Parse one environment file's bytes with the exact `KEY=VALUE` grammar used
+/// by `--env`. This is public only so the fuzz target can drive the real parser
+/// with arbitrary bytes; it is not part of the CLI compatibility surface.
+///
+/// Errors identify the malformed line or encoding without repeating values,
+/// because environment files routinely carry secrets.
+#[doc(hidden)]
+pub fn parse_env_file_contents(contents: &[u8]) -> Result<Vec<(String, String)>, String> {
+    let text = std::str::from_utf8(contents)
+        .map_err(|_| "environment file must contain valid UTF-8".to_string())?;
+    let mut entries = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let entry = parse_env_kv(line).map_err(|err| format!("line {}: {err}", index + 1))?;
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+/// Read environment files in argument order before applying their parsed
+/// entries to the child command.
 fn load_env_files(paths: &[std::path::PathBuf]) -> Result<Vec<(String, String)>, RunnerError> {
     let mut entries = Vec::new();
     for path in paths {
-        let text = std::fs::read_to_string(path).map_err(|err| {
+        let contents = std::fs::read(path).map_err(|err| {
             RunnerError::new(
                 exit::SETUP,
                 format!(
@@ -1001,22 +1028,13 @@ fn load_env_files(paths: &[std::path::PathBuf]) -> Result<Vec<(String, String)>,
                 ),
             )
         })?;
-        for (index, line) in text.lines().enumerate() {
-            if line.trim().is_empty() || line.trim_start().starts_with('#') {
-                continue;
-            }
-            let entry = parse_env_kv(line).map_err(|err| {
-                RunnerError::new(
-                    exit::SETUP,
-                    format!(
-                        "invalid environment entry in `{}` at line {}: {err}",
-                        path.display(),
-                        index + 1
-                    ),
-                )
-            })?;
-            entries.push(entry);
-        }
+        let parsed = parse_env_file_contents(&contents).map_err(|err| {
+            RunnerError::new(
+                exit::SETUP,
+                format!("invalid environment file `{}`: {err}", path.display()),
+            )
+        })?;
+        entries.extend(parsed);
     }
     Ok(entries)
 }
@@ -1080,16 +1098,16 @@ fn absolute_from(base: &std::path::Path, path: &std::path::Path) -> std::path::P
     std::path::absolute(path).unwrap_or_else(|_| base.join(path))
 }
 
-/// The child's absolute working directory as recorded in `run_started`: the explicit
-/// `--cwd` resolved against the runner's current directory by the same rule child
-/// spawn uses, else that current directory itself. Rendered lossily to a string, or
-/// `None` if it cannot be resolved.
+/// The child's absolute working directory as recorded in `run_started`. This shares
+/// artifact locators' absolute-path rule, including Windows drive-relative paths.
+/// Rendered lossily to a string, or `None` if the runner directory cannot be read.
 fn resolve_cwd(args: &RunArgs) -> Option<String> {
-    let path = match args.cwd.as_ref() {
-        Some(path) if path.is_absolute() => path.clone(),
-        Some(path) => std::env::current_dir().ok()?.join(path),
-        None => std::env::current_dir().ok()?,
-    };
+    let base = std::env::current_dir().ok()?;
+    let path = args
+        .cwd
+        .as_deref()
+        .map(|path| absolute_from(&base, path))
+        .unwrap_or(base);
     Some(path.to_string_lossy().into_owned())
 }
 
@@ -1153,7 +1171,10 @@ mod tests {
     #[test]
     fn resolve_cwd_makes_a_relative_flag_absolute() {
         let runner_cwd = std::env::current_dir().expect("resolve the test runner cwd");
-        let expected = runner_cwd.join("../processkit-cli-cwd-target");
+        let expected = absolute_from(
+            &runner_cwd,
+            std::path::Path::new("../processkit-cli-cwd-target"),
+        );
         let resolved = resolve_cwd(&run_args(&["--cwd", "../processkit-cli-cwd-target"]))
             .expect("resolve the relative cwd");
 
@@ -1169,5 +1190,29 @@ mod tests {
             PathBuf::from(resolved),
             std::env::current_dir().expect("resolve the test runner cwd")
         );
+    }
+
+    #[test]
+    fn env_file_content_parser_accepts_comments_blanks_and_first_equals_split() {
+        assert_eq!(
+            parse_env_file_contents(b"# settings\r\n\r\nTOKEN=left=right\nEMPTY=\n").unwrap(),
+            vec![
+                ("TOKEN".to_string(), "left=right".to_string()),
+                ("EMPTY".to_string(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_file_content_errors_reject_non_utf8_and_never_repeat_values() {
+        assert_eq!(
+            parse_env_file_contents(&[0xff]).unwrap_err(),
+            "environment file must contain valid UTF-8"
+        );
+
+        let error = parse_env_file_contents(b"GOOD=ok\nBAD KEY=SUPER_SECRET_VALUE\n")
+            .expect_err("whitespace in a key must fail closed");
+        assert!(error.contains("line 2"));
+        assert!(!error.contains("SUPER_SECRET_VALUE"));
     }
 }

@@ -148,6 +148,7 @@ use crate::registry::{self, Health};
 mod render;
 
 pub use imp::ControlServer;
+use render::inspect_all_output_lines;
 #[cfg(test)]
 use render::render_snapshot_human;
 use render::snapshot_output_lines;
@@ -669,6 +670,7 @@ async fn inspect_async(run_id: &str, json: bool) -> Result<(), RunnerError> {
     // answers, is bounded here — a distinguishable CONTROL result, not a hang.
     let snapshot: Snapshot =
         converse_under_deadline(stream, INSPECT_REQUEST, "inspect", run_id).await?;
+    verify_snapshot_identity(&snapshot, run_id)?;
 
     for line in snapshot_output_lines(&snapshot, json)? {
         println!("{line}");
@@ -677,12 +679,13 @@ async fn inspect_async(run_id: &str, json: bool) -> Result<(), RunnerError> {
 }
 
 /// Inspect every run confirmed live in one registry snapshot, optionally restricted
-/// by conjunctive labels. The report is always one JSON array: each target is either
-/// inspected, already gone, or failed; only a genuine failure makes the aggregate
-/// command return [`exit::CONTROL`] after printing the full report.
-pub fn inspect_all(labels: &[crate::labels::OperatorLabel]) -> Result<(), RunnerError> {
+/// by conjunctive labels. The default report is a terminal-safe human summary with
+/// expanded inspected snapshots; `json` retains the original one-array report. Each
+/// target is either inspected, already gone, or failed; only a genuine failure makes
+/// the aggregate command return [`exit::CONTROL`] after printing the full report.
+pub fn inspect_all(labels: &[crate::labels::OperatorLabel], json: bool) -> Result<(), RunnerError> {
     let runtime = current_thread_runtime()?;
-    runtime.block_on(inspect_all_async(labels))
+    runtime.block_on(inspect_all_async(labels, json))
 }
 
 #[derive(Debug, Serialize)]
@@ -702,7 +705,10 @@ pub enum InspectAllStatus {
     Failed,
 }
 
-async fn inspect_all_async(labels: &[crate::labels::OperatorLabel]) -> Result<(), RunnerError> {
+async fn inspect_all_async(
+    labels: &[crate::labels::OperatorLabel],
+    json: bool,
+) -> Result<(), RunnerError> {
     let registry = registry::open_read_only_for_setup()?;
     let targets = snapshot_live_targets(&registry, labels).map_err(registry::setup_read_error)?;
 
@@ -730,13 +736,9 @@ async fn inspect_all_async(labels: &[crate::labels::OperatorLabel]) -> Result<()
         }
     }
 
-    let line = serde_json::to_string(&outcomes).map_err(|err| {
-        RunnerError::new(
-            exit::SETUP,
-            format!("could not render the inspect --all report: {err}"),
-        )
-    })?;
-    println!("{line}");
+    for line in inspect_all_output_lines(&outcomes, json)? {
+        println!("{line}");
+    }
 
     let failed = outcomes
         .iter()
@@ -790,14 +792,19 @@ async fn inspect_snapshot_target(
                 };
             }
         };
-    if snapshot.run_id != target.run_id {
-        return Err(unreachable_run(
-            "inspect",
-            &target.run_id,
-            "the runner returned a snapshot for a different run".to_string(),
-        ));
-    }
+    verify_snapshot_identity(&snapshot, &target.run_id)?;
     Ok(InspectSnapshot::Inspected(snapshot))
+}
+
+fn verify_snapshot_identity(snapshot: &Snapshot, expected_run_id: &str) -> Result<(), RunnerError> {
+    if snapshot.run_id == expected_run_id {
+        return Ok(());
+    }
+    Err(unreachable_run(
+        "inspect",
+        expected_run_id,
+        "the runner returned a snapshot for a different run".to_string(),
+    ))
 }
 
 /// Client entry for `cancel --run-id <id>`: reach the live runner through the
@@ -916,7 +923,6 @@ pub struct ControlAllOutcome {
     /// The aggregate result. `already_gone` is successful without claiming an ack.
     pub status: ControlAllStatus,
     /// Why a failed target was not accepted. `None` for both successful statuses.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 

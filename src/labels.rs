@@ -16,10 +16,12 @@ pub struct OperatorLabel {
 }
 
 /// Parse the common label grammar used by `run --label` and aggregate filters.
+/// Public so the CLI fuzz target can exercise the real parser with arbitrary
+/// operator text; this is not a separate compatibility surface.
 pub fn parse(raw: &str) -> Result<OperatorLabel, String> {
     let (key, value) = raw
         .split_once('=')
-        .ok_or_else(|| format!("label `{raw}` must be `KEY=VALUE`"))?;
+        .ok_or_else(|| "label must be `KEY=VALUE`".to_string())?;
     if !valid_key(key) {
         return Err(format!(
             "label key `{key}` must be 1-{MAX_KEY_BYTES} ASCII bytes, start with a letter or `_`, and contain only letters, digits, `.`, `-`, or `_`"

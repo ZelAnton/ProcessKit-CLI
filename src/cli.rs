@@ -323,14 +323,10 @@ pub struct InspectArgs {
     #[arg(long, value_name = "id", value_parser = parse_run_id, conflicts_with = "all", required_unless_present = "all")]
     pub run_id: Option<String>,
 
-    /// Inspect every run confirmed live in one registry snapshot. Aggregate output
-    /// is a single JSON array, so this form requires `--json`.
-    #[arg(
-        long,
-        conflicts_with = "run_id",
-        required_unless_present = "run_id",
-        requires = "json"
-    )]
+    /// Inspect every run confirmed live in one registry snapshot. Defaults to a
+    /// human-readable summary plus snapshot blocks; `--json` preserves the original
+    /// single-array machine report.
+    #[arg(long, conflicts_with = "run_id", required_unless_present = "run_id")]
     pub all: bool,
 
     /// With `--all`, restrict the snapshot to runs carrying this exact operator
@@ -433,6 +429,16 @@ pub struct WaitArgs {
     #[arg(long = "label", value_name = "KEY=VALUE", value_parser = crate::labels::parse, requires = "all", conflicts_with = "run_id")]
     pub labels: Vec<OperatorLabel>,
 
+    /// After a single observed-live run finishes, print one JSON outcome object
+    /// containing the terminal `runner_exit` source, runner code, and child code.
+    /// The wait command's own exit status remains unchanged. If the run was already
+    /// gone when waiting began, its registry record and JSONL locator are no longer
+    /// knowable, so the object reports `status: "unknown"` with null outcome fields.
+    /// Restricted to `--run-id`; aggregate outcome reporting can be added later with
+    /// an explicit per-target contract.
+    #[arg(long, requires = "run_id", conflicts_with = "all")]
+    pub report_outcome: bool,
+
     /// Give up after this long instead of waiting indefinitely. This is a deadline
     /// on **the wait**, not on any run: when it elapses, the run (or, under `--all`,
     /// every still-outstanding run) is left running, completely untouched, and
@@ -487,7 +493,7 @@ pub enum ListHealth {
     Unprobed,
 }
 
-/// `prune [--json] [--dry-run]`
+/// `prune [--json] [--dry-run] [--label <KEY=VALUE>]...`
 ///
 /// Scans the per-user registry ([`crate::registry::Registry::prune`]) and reaps every
 /// entry it can **confirm** is stale — a leftover `.json`/`.lock` pair from a runner
@@ -512,6 +518,11 @@ pub struct PruneArgs {
     /// `--json`.
     #[arg(long)]
     pub dry_run: bool,
+    /// Restrict paired registry entries to runs carrying every `KEY=VALUE` label.
+    /// Repeatable; filters combine with logical AND. An explicit filter leaves
+    /// record-less orphan locks alone because their ownership cannot be established.
+    #[arg(long = "label", value_name = "KEY=VALUE", value_parser = crate::labels::parse)]
+    pub labels: Vec<crate::labels::OperatorLabel>,
 }
 
 /// `probe --json [--require-schema-version <N>] [--require-exit-code-band <s>-<e>]
@@ -950,10 +961,12 @@ mod tests {
         };
         assert!(args.all && args.json && args.run_id.is_none());
         assert_eq!(args.labels.len(), 1);
-        assert!(
-            Cli::try_parse_from(["processkit-cli", "inspect", "--all"]).is_err(),
-            "aggregate inspect requires machine-readable output"
-        );
+        let cli = Cli::try_parse_from(["processkit-cli", "inspect", "--all"])
+            .expect("aggregate inspect defaults to human output");
+        let Command::Inspect(args) = cli.command else {
+            panic!("expected inspect");
+        };
+        assert!(args.all && !args.json && args.run_id.is_none());
     }
 
     #[test]
@@ -1009,6 +1022,32 @@ mod tests {
         assert!(args.json);
     }
 
+    #[test]
+    fn prune_labels_use_the_shared_repeatable_parser() {
+        let cli = Cli::try_parse_from([
+            "processkit-cli",
+            "prune",
+            "--label",
+            "pipeline=ci",
+            "--label",
+            "lane=test",
+        ])
+        .expect("prune accepts conjunctive label filters");
+        let Command::Prune(args) = cli.command else {
+            panic!("expected the prune subcommand");
+        };
+        assert_eq!(
+            args.labels,
+            vec![
+                crate::labels::parse("pipeline=ci").unwrap(),
+                crate::labels::parse("lane=test").unwrap(),
+            ]
+        );
+        assert!(
+            Cli::try_parse_from(["processkit-cli", "prune", "--label", "not-a-label"]).is_err()
+        );
+    }
+
     /// T-199: `--dry-run` defaults to off, is accepted on its own, and combines
     /// freely with `--json` — mirroring `prune_defaults_to_no_json_and_accepts_the_flag`
     /// for the new flag.
@@ -1049,6 +1088,7 @@ mod tests {
         };
         assert_eq!(args.run_id.as_deref(), Some("r1"));
         assert!(!args.all, "--run-id alone must not imply --all");
+        assert!(!args.report_outcome, "outcome reporting is opt-in");
         assert!(
             args.timeout.is_none(),
             "omitting --timeout means wait blocks until the run finishes"
@@ -1095,6 +1135,26 @@ mod tests {
         };
         assert!(args.all);
         assert_eq!(args.timeout, Some(Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn wait_report_outcome_is_single_run_only() {
+        let cli = Cli::try_parse_from([
+            "processkit-cli",
+            "wait",
+            "--run-id",
+            "r1",
+            "--report-outcome",
+        ])
+        .expect("a named wait may request its terminal outcome");
+        let Command::Wait(args) = cli.command else {
+            panic!("expected the wait subcommand");
+        };
+        assert!(args.report_outcome);
+        assert!(
+            Cli::try_parse_from(["processkit-cli", "wait", "--all", "--report-outcome"]).is_err(),
+            "aggregate reporting has no per-target wire contract yet"
+        );
     }
 
     #[test]

@@ -10,6 +10,7 @@
 //!
 //! ```text
 //! processkit-cli wait --run-id build-42 [--timeout 10m]
+//! processkit-cli wait --run-id build-42 --report-outcome
 //! processkit-cli wait --all             [--timeout 10m]
 //! ```
 //!
@@ -53,9 +54,11 @@
 //! | [`exit::WAIT_TIMEOUT`] (112) | `--timeout` elapsed while the run was still live. **The waiter** gave up; the run was untouched and is still going. |
 //! | [`exit::CONTROL`] (103) | More than one live run is registered under that `run_id`, so there is no single run to wait for. |
 //!
-//! Nothing is printed on success: the exit code *is* the answer, so `wait` has no
-//! output format to keep stable (and no `--json` to add one). A failure explains
-//! itself on stderr, like every other subcommand.
+//! Nothing is printed on ordinary success: the exit code *is* the answer. The
+//! single-run-only `--report-outcome` opt-in prints one JSON object after success,
+//! without changing that exit code. It remembers the live record's JSONL locator
+//! before clean teardown deletes the record, then reads the terminal `runner_exit`.
+//! A failure explains itself on stderr, like every other subcommand.
 //!
 //! # An unknown `run_id` reads as "finished"
 //!
@@ -117,9 +120,13 @@
 //!   question [`RunStatus::Ambiguous`] answers for `--run-id` does not arise.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
+
+use serde::Serialize;
 
 use crate::control;
 use crate::duration_fmt::format_duration;
@@ -134,6 +141,42 @@ use crate::registry::{self, Health, RunStatus};
 /// of directory scans. It bounds only the *detection* latency — the moment the run
 /// actually ends is unaffected, since `wait` never touches the run.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Once a remembered live record disappears, its runner is in the tiny teardown
+/// window between registry removal and the flushed terminal event. Retry only the
+/// opt-in report for a short bounded period; an abruptly killed runner then yields
+/// an honest unknown outcome instead of making `wait` hang.
+const OUTCOME_SETTLE_TIMEOUT: Duration = Duration::from_millis(500);
+const OUTCOME_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Only the tail can contain the terminal event. Bounding this read prevents a
+/// large lifecycle stream from becoming `wait`'s memory cost.
+const OUTCOME_TAIL_MAX_BYTES: u64 = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WaitOutcomeStatus {
+    Reported,
+    Unknown,
+}
+
+/// The one-line machine result emitted by `wait --report-outcome`. Null fields are
+/// always present so a consumer never has to distinguish absent from unknown.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct WaitOutcome<'a> {
+    run_id: &'a str,
+    status: WaitOutcomeStatus,
+    code: Option<i32>,
+    source: Option<String>,
+    child_code: Option<i32>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TerminalOutcome {
+    code: i32,
+    source: String,
+    child_code: Option<i32>,
+}
 
 /// The `--timeout` a caller asked for, paired with the instant it expires — kept
 /// together so the give-up path can report the requested duration without an
@@ -202,21 +245,39 @@ impl WaitDeadline {
 /// it is for `list`/`prune`: a support/prerequisite problem the caller can usually act
 /// on (a bad `PROCESSKIT_CLI_REGISTRY_DIR`, denied permissions), and emphatically not
 /// an answer about the run.
-pub fn run(run_id: &str, timeout: Option<Duration>) -> Result<(), RunnerError> {
+pub fn run(
+    run_id: &str,
+    timeout: Option<Duration>,
+    report_outcome: bool,
+) -> Result<(), RunnerError> {
     let registry = registry::open_read_only_for_setup()?;
     let deadline = timeout.map(WaitDeadline::new);
+    let mut observed_live = false;
+    let mut jsonl = None;
 
     loop {
-        let status = registry
-            .probe_run(run_id)
+        let probe = registry
+            .probe_run_with_jsonl(run_id)
             .map_err(registry::setup_read_error)?;
+        let status = probe.status;
         match status {
-            RunStatus::Finished => return Ok(()),
+            RunStatus::Finished => {
+                if report_outcome {
+                    print_outcome(run_id, observed_live.then_some(jsonl).flatten())?;
+                }
+                return Ok(());
+            }
             RunStatus::Ambiguous { live } => {
                 return Err(control::ambiguous_run("wait for", run_id, live));
             }
+            RunStatus::Live => {
+                observed_live = true;
+                if jsonl.is_none() {
+                    jsonl = probe.jsonl;
+                }
+            }
             // Still going, or not confirmed over — either way, keep waiting.
-            RunStatus::Live | RunStatus::Unprobed => {}
+            RunStatus::Unprobed => {}
         }
 
         match &deadline {
@@ -227,6 +288,144 @@ pub fn run(run_id: &str, timeout: Option<Duration>) -> Result<(), RunnerError> {
             },
         }
     }
+}
+
+fn print_outcome(run_id: &str, jsonl: Option<PathBuf>) -> Result<(), RunnerError> {
+    let terminal = jsonl
+        .as_deref()
+        .and_then(|path| await_terminal_outcome(path, run_id));
+    let report = match terminal {
+        Some(terminal) => WaitOutcome {
+            run_id,
+            status: WaitOutcomeStatus::Reported,
+            code: Some(terminal.code),
+            source: Some(terminal.source),
+            child_code: terminal.child_code,
+        },
+        None => WaitOutcome {
+            run_id,
+            status: WaitOutcomeStatus::Unknown,
+            code: None,
+            source: None,
+            child_code: None,
+        },
+    };
+    let line = serde_json::to_string(&report).map_err(|err| {
+        RunnerError::new(
+            exit::SETUP,
+            format!("could not render the wait outcome report: {err}"),
+        )
+    })?;
+    println!("{line}");
+    Ok(())
+}
+
+/// Read the terminal event after the live record disappears. Normal teardown
+/// removes the record immediately before emitting `runner_exit`, so retry across
+/// that bounded handoff; an absent/malformed stream after the window is simply an
+/// unknown outcome, not a different wait exit code.
+fn await_terminal_outcome(path: &std::path::Path, run_id: &str) -> Option<TerminalOutcome> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let deadline = Instant::now() + OUTCOME_SETTLE_TIMEOUT;
+    loop {
+        if let Ok(Some(outcome)) = read_terminal_outcome(path, run_id) {
+            return Some(outcome);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        sleep(OUTCOME_RETRY_INTERVAL);
+    }
+}
+
+fn read_terminal_outcome(
+    path: &std::path::Path,
+    expected_run_id: &str,
+) -> std::io::Result<Option<TerminalOutcome>> {
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut head = Vec::with_capacity(len.min(OUTCOME_TAIL_MAX_BYTES) as usize);
+    (&mut file)
+        .take(OUTCOME_TAIL_MAX_BYTES)
+        .read_to_end(&mut head)?;
+    let stream_matches = head.split(|byte| *byte == b'\n').any(|line| {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+            return false;
+        };
+        value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            == Some(u64::from(crate::events::SCHEMA_VERSION))
+            && value.get("event").and_then(serde_json::Value::as_str) == Some("run_started")
+            && value.get("run_id").and_then(serde_json::Value::as_str) == Some(expected_run_id)
+    });
+    if !stream_matches {
+        return Ok(None);
+    }
+
+    let start = len.saturating_sub(OUTCOME_TAIL_MAX_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+
+    let mut bytes = Vec::with_capacity((len - start).min(OUTCOME_TAIL_MAX_BYTES) as usize);
+    file.take(OUTCOME_TAIL_MAX_BYTES).read_to_end(&mut bytes)?;
+    let usable = if start == 0 {
+        bytes.as_slice()
+    } else {
+        match bytes.iter().position(|byte| *byte == b'\n') {
+            Some(index) => &bytes[index + 1..],
+            None => return Ok(None),
+        }
+    };
+
+    for line in usable.split(|byte| *byte == b'\n').rev() {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("event").and_then(serde_json::Value::as_str) != Some("runner_exit") {
+            continue;
+        }
+        if value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(u64::from(crate::events::SCHEMA_VERSION))
+        {
+            continue;
+        }
+        let Some(code) = value
+            .get("code")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|code| i32::try_from(code).ok())
+        else {
+            continue;
+        };
+        let Some(source) = value
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let child_code = match value.get("child_code") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => {
+                let Some(code) = value.as_i64().and_then(|code| i32::try_from(code).ok()) else {
+                    continue;
+                };
+                Some(code)
+            }
+        };
+        return Ok(Some(TerminalOutcome {
+            code,
+            source,
+            child_code,
+        }));
+    }
+    Ok(None)
 }
 
 /// The give-up error: `--timeout` elapsed without the run being confirmed finished.
@@ -479,6 +678,74 @@ mod tests {
             "reads as a sentence about waiting: {message}"
         );
         assert!(message.contains("ambiguous"), "names the reason: {message}");
+    }
+
+    #[test]
+    fn terminal_outcome_reader_finds_the_last_runner_exit_in_a_bounded_tail() {
+        let dir = scratch("wait-outcome-tail");
+        let path = dir.join("events.jsonl");
+        std::fs::create_dir_all(&dir).expect("create the fixture directory");
+        let mut contents =
+            br#"{"schema_version":1,"event":"run_started","run_id":"run-7"}"#.to_vec();
+        contents.push(b'\n');
+        contents.extend(vec![b'x'; OUTCOME_TAIL_MAX_BYTES as usize + 1024]);
+        contents.push(b'\n');
+        contents.extend_from_slice(
+            br#"{"schema_version":1,"event":"runner_exit","code":7,"source":"child_exit","child_code":7}"#,
+        );
+        contents.push(b'\n');
+        std::fs::write(&path, contents).expect("write the JSONL fixture");
+
+        let outcome = read_terminal_outcome(&path, "run-7")
+            .expect("read the bounded tail")
+            .expect("find runner_exit");
+        assert_eq!(
+            outcome,
+            TerminalOutcome {
+                code: 7,
+                source: "child_exit".to_string(),
+                child_code: Some(7),
+            }
+        );
+        assert!(
+            read_terminal_outcome(&path, "different-run")
+                .expect("read the same stream")
+                .is_none(),
+            "a reused locator cannot be attributed to a different run id"
+        );
+
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"schema_version\":1,\"event\":\"run_started\",\"run_id\":\"run-7\"}\n",
+                "{\"schema_version\":1,\"event\":\"runner_exit\",\"code\":7,",
+                "\"source\":\"child_exit\",\"child_code\":\"seven\"}\n"
+            ),
+        )
+        .expect("replace the fixture with a malformed terminal event");
+        assert!(
+            read_terminal_outcome(&path, "run-7")
+                .expect("read the malformed stream")
+                .is_none(),
+            "invalid terminal field types must yield unknown, never reported"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wait_outcome_keeps_unknown_fields_explicitly_null() {
+        let report = WaitOutcome {
+            run_id: "already-gone",
+            status: WaitOutcomeStatus::Unknown,
+            code: None,
+            source: None,
+            child_code: None,
+        };
+        let value = serde_json::to_value(report).expect("serialize the report");
+        assert_eq!(value["status"], "unknown");
+        assert!(value["code"].is_null());
+        assert!(value["source"].is_null());
+        assert!(value["child_code"].is_null());
     }
 
     /// The `--all` give-up error carries the same reserved `WAIT_TIMEOUT` code as the

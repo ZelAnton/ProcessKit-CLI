@@ -2,7 +2,7 @@
 
 use crate::exit::{self, RunnerError};
 
-use super::Snapshot;
+use super::{InspectAllOutcome, InspectAllStatus, Snapshot};
 
 /// Choose `inspect`'s output form: exact JSON when requested, otherwise the
 /// bounded terminal-safe human rendering.
@@ -49,7 +49,7 @@ pub(super) fn render_snapshot_human(snapshot: &Snapshot) -> Vec<String> {
         format!(
             "{:<LABEL_WIDTH$}{}",
             "mechanism:",
-            crate::text::terminal_safe(mechanism)
+            crate::text::terminal_safe_bounded(mechanism)
         ),
         format!(
             "{:<LABEL_WIDTH$}{}",
@@ -61,7 +61,7 @@ pub(super) fn render_snapshot_human(snapshot: &Snapshot) -> Vec<String> {
         format!(
             "{:<LABEL_WIDTH$}{}",
             "started_at:",
-            crate::text::terminal_safe(started_at)
+            crate::text::terminal_safe_bounded(started_at)
         ),
         format!(
             "{:<LABEL_WIDTH$}{}",
@@ -100,16 +100,80 @@ pub(super) fn render_snapshot_human(snapshot: &Snapshot) -> Vec<String> {
                 member
                     .name
                     .as_deref()
-                    .map(crate::text::terminal_safe)
+                    .map(crate::text::terminal_safe_bounded)
                     .unwrap_or_else(|| "-".to_string()),
                 member
                     .start_time
                     .as_deref()
-                    .map(crate::text::terminal_safe)
+                    .map(crate::text::terminal_safe_bounded)
                     .unwrap_or_else(|| "-".to_string()),
             ]
         })
         .collect();
     lines.extend(crate::text::aligned_table(HEADERS, &cells, "  ", "  "));
+    lines
+}
+
+/// Choose `inspect --all`'s output form. JSON is the original single-array wire
+/// representation; the default human form gives every target one summary row and
+/// expands inspected snapshots through the existing single-run renderer.
+pub(super) fn inspect_all_output_lines(
+    outcomes: &[InspectAllOutcome],
+    json: bool,
+) -> Result<Vec<String>, RunnerError> {
+    if json {
+        let line = serde_json::to_string(outcomes).map_err(|err| {
+            RunnerError::new(
+                exit::SETUP,
+                format!("could not render the inspect --all report: {err}"),
+            )
+        })?;
+        return Ok(vec![line]);
+    }
+    Ok(render_inspect_all_human(outcomes))
+}
+
+fn render_inspect_all_human(outcomes: &[InspectAllOutcome]) -> Vec<String> {
+    if outcomes.is_empty() {
+        return vec!["no live runs to inspect".to_string()];
+    }
+
+    const HEADERS: [&str; 3] = ["RUN_ID", "STATUS", "ERROR"];
+    let cells: Vec<[String; 3]> = outcomes
+        .iter()
+        .map(|outcome| {
+            [
+                crate::text::terminal_safe_bounded(&outcome.run_id),
+                match outcome.status {
+                    InspectAllStatus::Inspected => "inspected",
+                    InspectAllStatus::AlreadyGone => "already_gone",
+                    InspectAllStatus::Failed => "failed",
+                }
+                .to_string(),
+                outcome
+                    .error
+                    .as_deref()
+                    .map(crate::text::terminal_safe_bounded)
+                    .unwrap_or_else(|| "-".to_string()),
+            ]
+        })
+        .collect();
+    let mut lines = crate::text::aligned_table(HEADERS, &cells, "", "  ");
+
+    for outcome in outcomes {
+        let Some(snapshot) = &outcome.snapshot else {
+            continue;
+        };
+        lines.push(String::new());
+        lines.push(format!(
+            "snapshot for {}:",
+            crate::text::terminal_safe_bounded(&outcome.run_id)
+        ));
+        lines.extend(
+            render_snapshot_human(snapshot)
+                .into_iter()
+                .map(|line| format!("  {line}")),
+        );
+    }
     lines
 }

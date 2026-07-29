@@ -4,13 +4,13 @@
 //! stderr are written to `<dir>/stdout.log` and `<dir>/stderr.log`, independent of
 //! whether the runner's own echo is live or suppressed (`AGENTS.md`, "Streams are
 //! strictly separated"; the task's "don't break live echo"). Capture rides
-//! ProcessKit's existing per-stream tee — a [`CaptureTee`] wraps whatever sink
-//! `run`'s sink-selection block already tees to (`tokio::io::stdout()`/`stderr()`
-//! by default, or `tokio::io::sink()` under `--no-echo` — see `src/run/launch.rs` and
-//! K-050) and mirrors every byte the pump observes into a bounded capture file —
-//! so no second output-reading path is invented and the child's back-pressure is
-//! exactly the echo sink's (the tee is awaited on ProcessKit's line pump).
-//! `--no-echo` changes only which sink is wrapped, never what capture records.
+//! ProcessKit's existing decoded per-stream tee — a [`CaptureTee`] mirrors every
+//! byte that line sink observes into a bounded capture file. Live echo is a
+//! separate raw tee in `src/run/launch.rs`, so it can forward pipe chunks without
+//! paying a write and mutex round-trip per decoded line while this established
+//! capture path keeps its byte accounting, hashes, and truncation semantics.
+//! `--no-echo` changes only whether the raw sink is installed, never what capture
+//! records.
 //! The pump's own memory bound is ProcessKit's
 //! [`OutputBufferPolicy`](processkit::OutputBufferPolicy): `run` hands the kernel a
 //! byte-capped policy so a single never-terminated line cannot grow the pump's
@@ -300,7 +300,7 @@ type Shared = Arc<Mutex<StreamCapture>>;
 
 /// A run's capture: the two per-stream files and their shared metadata. The runner
 /// builds one when `--capture-dir` is set, hands each stream's [`CaptureTee`] to
-/// the matching `stdout_tee`/`stderr_tee`, keeps this handle, and reads
+/// the matching decoded `stdout_tee`/`stderr_tee`, keeps this handle, and reads
 /// [`finalize`](Self::finalize) once the run has ended.
 pub struct Capture {
     stdout: Shared,
@@ -336,8 +336,10 @@ impl Capture {
         })
     }
 
-    /// The tee sink for stdout: `echo` (the live-echo target) fanned out to the
-    /// stdout capture file.
+    /// The decoded tee sink for stdout. `echo` is normally a sink because live
+    /// passthrough uses ProcessKit's independent raw tee; keeping it generic makes
+    /// the capture primitive useful in isolation and preserves its tested broken-
+    /// echo behavior.
     pub fn stdout_tee<W: AsyncWrite + Unpin>(&self, echo: W) -> CaptureTee<W> {
         CaptureTee::new(echo, self.stdout.clone())
     }
@@ -371,10 +373,10 @@ fn info_of(shared: &Shared) -> CaptureInfo {
     }
 }
 
-/// A per-stream tee that writes each byte to the live echo *and* mirrors it into a
-/// bounded capture file. Handed to `Command::stdout_tee`/`stderr_tee`; ProcessKit's
-/// line pump drives it, awaiting each write (so back-pressure and stream framing are
-/// exactly the plain-echo tee's).
+/// A per-stream decoded tee that writes each byte to its downstream sink and mirrors
+/// it into a bounded capture file. Handed to `Command::stdout_tee`/`stderr_tee`;
+/// ProcessKit's line pump drives it, awaiting each write. The production downstream
+/// is a sink; live passthrough is independently handled by the raw tee.
 ///
 /// The capture mirrors precisely the bytes the echo accepted, so the file can never
 /// double-count or lose the tail of a partial write. If the echo sink ever errors

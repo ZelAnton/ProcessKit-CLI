@@ -37,14 +37,19 @@ jobs:
         run: yamllint .
 
   installer-lint:
-    name: installer scripts
+    name: installers and package manifests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.x'
       - name: Check POSIX installer
         run: shellcheck install.sh scripts/tests/test-install.sh
       - name: Smoke-test POSIX installer
         run: scripts/tests/test-install.sh
+      - name: Test package-manifest generator
+        run: python -m unittest scripts/tests/test_generate_package_manifests.py
       - name: Parse PowerShell installer
         shell: pwsh
         run: |
@@ -127,7 +132,7 @@ jobs:
       # this job actually execute the test suite on the same
       # aarch64-unknown-linux-gnu / aarch64-pc-windows-msvc triplets the
       # release matrix ships (see release.yml), rather than only
-      # cross-compile-checking them (target-check below). macos-latest is
+      # relying on the targeted musl test lane below. macos-latest is
       # already aarch64 (Apple Silicon), so with these two additions every
       # aarch64 release target has real, executed test coverage. These two
       # entries are required checks from the start, same as the three
@@ -304,7 +309,7 @@ jobs:
       fail-fast: false
       # Same arm64 additions and rationale as the `test` job above: real
       # execution on the aarch64-unknown-linux-gnu / aarch64-pc-windows-msvc
-      # triplets instead of only target-check's cross-compile check. The e2e
+      # triplets instead of relying on a cross-compile check. The e2e
       # tier's real process trees make it heavier than `test`, but GitHub's
       # arm64 runners are free for public repos like the x86_64 ones, so the
       # added cost here is wall-clock time, not billing — acceptable given
@@ -341,13 +346,14 @@ jobs:
   # release.yml's build-artifacts matrix ships six target triplets. With the
   # `test`/`e2e` jobs above now running natively on ubuntu-24.04-arm and
   # windows-11-arm (in addition to macos-latest, already Apple Silicon),
-  # five of those six triplets get real, executed test coverage — not just a
-  # compile check. This job now cross-checks only the one release target
-  # that still has no native runner to execute on:
-  # x86_64-unknown-linux-musl (GitHub does not host a musl-libc runner).
-  # `cargo check --all-targets` (no test run, just a compile check) surfaces
-  # a build regression here instead of on release day; musl uses the same
-  # apt cross toolchain as release.yml's build-artifacts job. The two
+  # five of those six triplets run on their native libc and architecture.
+  # The remaining x86_64-unknown-linux-musl test binaries are statically
+  # linked, so they can execute on ubuntu-latest even though GitHub does not
+  # host a musl userspace runner. This required job runs both the default and
+  # e2e tiers against that shipped target, using the same apt toolchain as
+  # release.yml's build-artifacts job. Stress remains in its dedicated
+  # scheduled/manual workflow: it is a load campaign, not a release-target
+  # compatibility gate. The two
   # aarch64 entries this job used to cross-compile-check
   # (aarch64-pc-windows-msvc, aarch64-unknown-linux-gnu) were dropped: they
   # would now duplicate the compilation half of the `test` job's native
@@ -356,6 +362,7 @@ jobs:
   target-check:
     name: target-check (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -379,8 +386,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.apt }}
-      - name: cargo check --all-targets
-        run: cargo check --all-targets --target ${{ matrix.target }}
+      - name: Run unit and integration tests
+        run: cargo test --target ${{ matrix.target }}
+      - name: Run end-to-end containment tests
+        run: cargo test --target ${{ matrix.target }} --features e2e --test e2e -- --nocapture
 
   audit:
     name: cargo-deny
@@ -471,7 +480,7 @@ jobs:
         with:
           toolchain: "1.88"
       # rust-toolchain.toml tracks stable and would otherwise win here; remove it
-      # so cargo uses the 1.85 toolchain installed above and truly tests the floor.
+      # so cargo uses the 1.88 toolchain installed above and truly tests the floor.
       - run: rm -f rust-toolchain.toml
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo check --all-targets

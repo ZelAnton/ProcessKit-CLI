@@ -124,6 +124,37 @@ re-declared at the job level here (a job-level `permissions:` block *replaces*,
 rather than merges with, the top-level `contents: write`), the `release` job
 above is unaffected and keeps only the top-level permission it already had.
 
+## What the `package-manifests` job does
+
+This final job waits for the release and every archive-matrix leg to settle. It
+still runs when a leg failed only in its final provenance-attestation step,
+because the archive and checksum were already uploaded; a missing required
+checksum instead fails generation honestly. The job never publishes to an
+external package repository. It:
+
+1. Checks out the exact release tag and downloads the Release's archive
+   `.sha256` sidecars.
+2. Runs `scripts/generate_package_manifests.py`, which accepts only a SemVer
+   release and verifies that every sidecar names the exact archive whose URL is
+   being embedded.
+3. Produces the three-file `ZelAnton.ProcessKitCLI` winget manifest, an
+   architecture-aware Scoop `processkit-cli.json`, and a Homebrew
+   `processkit-cli.rb` formula for macOS Arm64 plus Linux x86_64. The Linux
+   formula deliberately uses the static musl archive rather than inheriting
+   the release runner's glibc floor; Linux Arm64 waits for a compatible static
+   archive.
+4. Syntax-checks the JSON and Ruby output, packages the complete directory as
+   `processkit-cli-v<version>-package-manifests.tar.gz`, and checksums that
+   bundle.
+5. Attaches the individual manifests, bundle, and bundle checksum to the
+   existing GitHub Release with `--clobber` idempotence.
+
+Winget retains its external `microsoft/winget-pkgs` review. Scoop and Homebrew
+receive ready-to-copy files for an account-owned bucket/tap, but those separate
+repositories are not mutated and need no credentials in this project. This
+keeps all external channel availability out of the crate/tag/Release critical
+path.
+
 ## Required repository configuration
 
 - **`CRATES_IO_TOKEN`** (secret) — required. Publishing to crates.io fails the
@@ -134,9 +165,10 @@ above is unaffected and keeps only the top-level permission it already had.
   `RELEASE_APP_ID` is set, the "Mint GitHub App token" step is skipped and the
   push falls back to the default `GITHUB_TOKEN` — fine while `main` is
   unprotected.
-- The `GITHUB_TOKEN` used to create/edit the GitHub Release and to upload
-  build artifacts is the default one GitHub Actions provides; no setup needed
-  beyond the job-level `permissions:` blocks already in the workflow.
+- The `GITHUB_TOKEN` used to create/edit the GitHub Release and to upload build
+  artifacts and package manifests is the default one GitHub Actions provides;
+  no setup needed beyond the job-level `permissions:` blocks already in the
+  workflow.
 
 ## Recovering from a failure partway through a release
 
@@ -175,6 +207,11 @@ already-complete release:
   completions/man/`schema/` trees + checksum it the same way the job does —
   see "What the `build-artifacts` job does" above for the exact contents —
   then `gh release upload <tag> <archive> <archive>.sha256 --clobber`).
+- **Failure in `package-manifests`**: the crate, tag, Release, and prebuilt
+  archives are already published. Repair or upload any missing checksum
+  sidecar, then re-run this job; generation is deterministic from the tagged
+  script plus those sidecars, and every upload uses `--clobber`. Do not trigger
+  a new release merely to repair these distributor inputs.
 
 ## GitHub App bypass for a protected `main`
 

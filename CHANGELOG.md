@@ -12,6 +12,11 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- Checksum-derived winget, Scoop, and Homebrew distributor manifests attached
+  to every release after the platform archives finish uploading.
+- An adoption-oriented positioning guide comparing ProcessKit CLI with common
+  deadline, process-group, service-manager, container, init, and PowerShell
+  alternatives without overstating the platform-specific cleanup guarantees.
 - A ProcessKit-family mdBook documentation site, including the shared cover and
   theme, rendered-link validation, and GitHub Pages deployment from `main`.
 - A user-focused Pages guide set covering installation, cookbook workflows,
@@ -50,8 +55,18 @@ to a dated version section.
   the project's settled stream, redaction, control, cleanup, shell, and wait choices.
 - Cross-platform runnable examples for compatibility preflight, foreground event
   parsing, detached supervision, and label-scoped fleet cancellation, smoke-tested in CI.
+- `wait --report-outcome` for a single observed run, returning terminal
+  `runner_exit` fields as one JSON object without changing the waiter's exit code.
+- A default human-readable `inspect --all` report with per-target status rows and
+  expanded snapshots, while preserving the original `--json` array.
+- Conjunctive `prune --label KEY=VALUE` filtering for scoped real and dry-run
+  cleanup, conservatively excluding ownerless orphan locks when filtered.
 
 ### Changed
+
+- Extended the fuzz tier to the raw environment-file and operator-label parsers, including invalid-UTF-8 rejection and secret-safe diagnostic coverage.
+- CI now executes the default and E2E test tiers for the shipped static musl
+  target instead of only cross-compiling it.
 - Update the contained-run backend to ProcessKit 3.1.0 while retaining the
   existing public CLI, lifecycle schema, and MSRV contracts.
 - Split the registry into a stable facade, platform-specific implementation files,
@@ -64,8 +79,12 @@ to a dated version section.
   adapter to production builds.
 - Registry stale/unprobeable test fixtures now share one typed `Record` serializer
   and scratch-path factory across unit and through-binary tests.
+- Default live output now uses ProcessKit's chunk-based raw tee, preserving exact
+  child bytes while substantially reducing per-line echo overhead.
 
 ### Fixed
+- The detached-supervision examples now hold their child behind an explicit
+  release marker, eliminating the inspect-versus-fast-exit race in CI smoke runs.
 - Headless Windows integration fixtures no longer leave Windows Terminal error
   panes open after their contained console processes are torn down.
 - Environment entries now reject whitespace and control characters in keys, and
