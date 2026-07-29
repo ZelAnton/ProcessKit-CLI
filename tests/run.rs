@@ -247,7 +247,7 @@ fn missing_stdin_file_is_a_pre_run_setup_failure() {
 fn malformed_env_file_is_a_pre_run_setup_failure() {
     let dir = scratch("env-file-malformed");
     let env_file = dir.join("bad.env");
-    std::fs::write(&env_file, "GOOD=value\nmissing-separator\n").expect("write fixture");
+    std::fs::write(&env_file, "GOOD=value\nBAD KEY=value\n").expect("write fixture");
     let env_file = path_arg(&env_file);
 
     let out = run_with_flags(

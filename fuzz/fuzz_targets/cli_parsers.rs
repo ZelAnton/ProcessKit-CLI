@@ -3,13 +3,14 @@
 //! anything outside its own strict grammar rather than panic or silently
 //! reinterpret it (see each function's own doc comment for its grammar:
 //! `--timeout`/`--idle-timeout`/`--grace` duration, `--require-exit-code-band`, `--env`,
-//! `--max-memory` size, `--max-processes` count, `--cpu-quota` core fraction).
+//! `--run-id`, `--max-memory` size, `--max-processes` count, `--cpu-quota` core
+//! fraction).
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
 use processkit_cli::cli::{
     parse_cpu_quota, parse_duration, parse_env_kv, parse_exit_code_band, parse_max_processes,
-    parse_positive_duration, parse_size,
+    parse_positive_duration, parse_run_id, parse_size,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -18,6 +19,7 @@ fuzz_target!(|data: &[u8]| {
         let _ = parse_positive_duration(text);
         let _ = parse_exit_code_band(text);
         let _ = parse_env_kv(text);
+        let _ = parse_run_id(text);
         let _ = parse_size(text);
         let _ = parse_max_processes(text);
         let _ = parse_cpu_quota(text);

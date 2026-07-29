@@ -74,8 +74,10 @@ pub enum Command {
 // `inherit_stdio`/`inherit_stdin`/`stdin_file`.
 #[derive(Debug, Args)]
 pub struct RunArgs {
-    /// Identifier for this run; a value is generated when omitted.
-    #[arg(long, value_name = "id")]
+    /// Identifier for this run; a value is generated when omitted. Explicit ids
+    /// are 1-256 characters and cannot contain terminal control or formatting
+    /// characters.
+    #[arg(long, value_name = "id", value_parser = parse_run_id)]
     pub run_id: Option<String>,
 
     /// Attach operator metadata as `KEY=VALUE` (repeatable). Later values replace
@@ -295,7 +297,7 @@ pub struct RunArgs {
 #[derive(Debug, Args)]
 pub struct InspectArgs {
     /// The run to inspect.
-    #[arg(long, value_name = "id")]
+    #[arg(long, value_name = "id", value_parser = parse_run_id)]
     pub run_id: String,
 
     /// Emit the snapshot as JSON instead of a human-readable rendering. Optional,
@@ -324,6 +326,7 @@ pub struct TargetArgs {
     #[arg(
         long,
         value_name = "id",
+        value_parser = parse_run_id,
         conflicts_with = "all",
         required_unless_present = "all"
     )]
@@ -369,6 +372,7 @@ pub struct WaitArgs {
     #[arg(
         long,
         value_name = "id",
+        value_parser = parse_run_id,
         conflicts_with = "all",
         required_unless_present = "all"
     )]
@@ -750,21 +754,52 @@ pub fn parse_exit_code_band(raw: &str) -> Result<(u8, u8), String> {
 
 /// Parse a `--env` value: `KEY=VALUE`, split on the **first** `=` (so a value
 /// containing `=` is preserved verbatim rather than truncated). A missing `=` or
-/// an empty `KEY` is rejected at parse time — mapped to the `USAGE` exit — rather
-/// than silently accepted as a malformed environment variable name.
+/// an empty `KEY`, or one containing whitespace/control characters, is rejected
+/// at parse time — mapped to the `USAGE` exit — rather than silently accepted as
+/// a malformed environment variable name.
 ///
 /// `pub`/`#[doc(hidden)]` — see [`parse_duration`]'s note on why (fuzz target).
 #[doc(hidden)]
 pub fn parse_env_kv(raw: &str) -> Result<(String, String), String> {
     let (key, value) = raw.split_once('=').ok_or_else(|| {
-        format!(
-            "`--env` value `{raw}` must be `KEY=VALUE` (a literal `=` separating name and value)"
-        )
+        "`--env` value must be `KEY=VALUE` (a literal `=` separating name and value)".to_string()
     })?;
     if key.is_empty() {
-        return Err(format!("`--env` value `{raw}` has an empty KEY before `=`"));
+        return Err("`--env` value has an empty KEY before `=`".to_string());
+    }
+    if key
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(format!(
+            "`--env` KEY `{}` contains whitespace or a control character",
+            key.escape_debug()
+        ));
     }
     Ok((key.to_string(), value.to_string()))
+}
+
+/// Parse an explicit `--run-id`. Run ids become registry keys and appear in human
+/// diagnostics, so keep them non-empty, bounded, and free of characters that can
+/// split or invisibly reshape terminal output. Ordinary Unicode remains valid.
+#[doc(hidden)]
+pub fn parse_run_id(raw: &str) -> Result<String, String> {
+    const MAX_CHARS: usize = 256;
+
+    if raw.is_empty() {
+        return Err("`--run-id` cannot be empty".to_string());
+    }
+    if raw.chars().count() > MAX_CHARS {
+        return Err(format!(
+            "`--run-id` cannot exceed {MAX_CHARS} Unicode characters"
+        ));
+    }
+    if crate::text::contains_terminal_unsafe(raw) {
+        return Err(
+            "`--run-id` cannot contain terminal control or formatting characters".to_string(),
+        );
+    }
+    Ok(raw.to_string())
 }
 
 #[cfg(test)]
@@ -1796,12 +1831,94 @@ mod tests {
     }
 
     #[test]
-    fn parse_env_kv_rejects_a_missing_separator_or_empty_key() {
-        for bad in ["FOO", "", "=novalue"] {
+    fn parse_env_kv_rejects_a_missing_separator_or_invalid_key() {
+        for bad in [
+            "FOO",
+            "",
+            "=novalue",
+            " SPACE=value",
+            "TAB\t=value",
+            "LINE\n=value",
+            "NO BREAK\u{00a0}=value",
+        ] {
             assert!(
                 parse_env_kv(bad).is_err(),
                 "expected `{bad}` to be rejected as a KEY=VALUE pair"
             );
+        }
+    }
+
+    #[test]
+    fn parse_env_kv_errors_never_repeat_the_value() {
+        let secret = "do-not-print-this-secret";
+        for bad in [
+            format!("BAD KEY={secret}"),
+            format!("={secret}"),
+            secret.to_string(),
+        ] {
+            let error = parse_env_kv(&bad).expect_err("the malformed entry must fail");
+            assert!(
+                !error.contains(secret),
+                "environment parse errors must not disclose values: {error:?}"
+            );
+            assert!(
+                !error.chars().any(char::is_control),
+                "environment parse errors stay on one terminal line: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_rejects_an_environment_key_with_whitespace() {
+        assert!(
+            Cli::try_parse_from([
+                "processkit-cli",
+                "run",
+                "--jsonl",
+                "events.jsonl",
+                "--env",
+                "BAD KEY=value",
+                "--",
+                "true",
+            ])
+            .is_err(),
+            "invalid environment keys must fail at the CLI boundary"
+        );
+    }
+
+    #[test]
+    fn run_id_parser_accepts_ordinary_unicode_at_the_boundary() {
+        let boundary = "é".repeat(256);
+        assert_eq!(parse_run_id("build-α").unwrap(), "build-α");
+        assert_eq!(parse_run_id(&boundary).unwrap(), boundary);
+    }
+
+    #[test]
+    fn every_by_id_command_rejects_unsafe_run_ids_at_parse_time() {
+        let too_long = "x".repeat(257);
+        for bad in ["", "line\nbreak", "bidi\u{202e}override", &too_long] {
+            let commands = [
+                vec![
+                    "processkit-cli",
+                    "run",
+                    "--run-id",
+                    bad,
+                    "--jsonl",
+                    "events.jsonl",
+                    "--",
+                    "true",
+                ],
+                vec!["processkit-cli", "inspect", "--run-id", bad],
+                vec!["processkit-cli", "cancel", "--run-id", bad],
+                vec!["processkit-cli", "kill", "--run-id", bad],
+                vec!["processkit-cli", "wait", "--run-id", bad],
+            ];
+            for command in commands {
+                assert!(
+                    Cli::try_parse_from(command).is_err(),
+                    "every by-id command must reject {bad:?}"
+                );
+            }
         }
     }
 

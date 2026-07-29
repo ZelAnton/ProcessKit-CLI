@@ -302,13 +302,14 @@ fn info_of(shared: &Shared) -> CaptureInfo {
 ///
 /// The capture mirrors precisely the bytes the echo accepted, so the file can never
 /// double-count or lose the tail of a partial write. If the echo sink ever errors
-/// (e.g. the runner's own stdout was closed), the error is swallowed and capture
-/// continues to the file alone — a broken live echo must not cost the transcript,
-/// and, critically, an error returned from a tee would disable it for the rest of
-/// the run.
+/// or reports zero progress for a non-empty write (e.g. the runner's own stdout was
+/// closed), capture continues to the file alone — a broken live echo must not cost
+/// the transcript, and, critically, an error returned from a tee would disable it
+/// for the rest of the run.
 pub struct CaptureTee<W> {
     echo: W,
-    /// Latched once the echo sink errors: thereafter bytes go only to the file.
+    /// Latched once the echo sink errors or stops progressing: thereafter bytes go
+    /// only to the file.
     echo_broken: bool,
     shared: Shared,
 }
@@ -352,6 +353,15 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CaptureTee<W> {
             return Poll::Ready(Ok(buf.len()));
         }
         match Pin::new(&mut this.echo).poll_write(cx, buf) {
+            // AsyncWrite reserves `Ok(0)` on a non-empty buffer for a sink that can
+            // no longer accept bytes. Treat it like a broken echo so `write_all`
+            // cannot turn a harmless display failure into `WriteZero` and disable
+            // capture for the remainder of the child stream.
+            Poll::Ready(Ok(0)) if !buf.is_empty() => {
+                this.echo_broken = true;
+                this.absorb(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
             // Mirror *exactly* the bytes the echo took; the pump re-offers the tail
             // on the next poll, which we mirror then — no loss, no duplication.
             Poll::Ready(Ok(n)) => {
@@ -525,6 +535,34 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for IdleActivityTee<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    struct ZeroThenPanicEcho {
+        polled: bool,
+    }
+
+    impl AsyncWrite for ZeroThenPanicEcho {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            assert!(
+                !self.polled,
+                "a zero-progress echo must be latched as broken"
+            );
+            self.polled = true;
+            Poll::Ready(Ok(0))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     /// Drive a stream's capture directly (bypassing the async tee) to exercise the
     /// counting / ceiling / hashing logic without a live process, at the default
@@ -551,6 +589,29 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir.join(format!("{name}.log"))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn zero_progress_echo_is_latched_while_capture_continues() {
+        let path = temp_path("zero-progress-echo");
+        let shared = Arc::new(Mutex::new(
+            StreamCapture::new(path.clone(), CAPTURE_MAX_BYTES).expect("create capture file"),
+        ));
+        let mut tee = CaptureTee::new(ZeroThenPanicEcho { polled: false }, shared.clone());
+
+        tee.write_all(b"first").await.expect("capture first chunk");
+        tee.write_all(b"second")
+            .await
+            .expect("capture after echo is latched broken");
+        tee.flush().await.expect("flush capture");
+        drop(tee);
+
+        let mut guard = shared.lock().expect("capture lock");
+        let info = guard.info();
+        assert_eq!(info.bytes(), 11);
+        assert!(!info.truncated());
+        assert!(!info.write_error());
+        assert_eq!(std::fs::read(path).unwrap(), b"firstsecond");
     }
 
     #[test]

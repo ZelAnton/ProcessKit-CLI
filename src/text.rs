@@ -7,13 +7,24 @@
 pub(crate) fn terminal_safe(text: &str) -> String {
     text.chars()
         .map(|character| {
-            if character.is_control() || is_terminal_format(character) {
+            if is_terminal_unsafe(character) {
                 ' '
             } else {
                 character
             }
         })
         .collect()
+}
+
+/// Report whether a string contains a character that can control or invisibly
+/// reshape terminal output. CLI identifiers reject these characters at ingress;
+/// human renderers replace them defensively at the output boundary.
+pub(crate) fn contains_terminal_unsafe(text: &str) -> bool {
+    text.chars().any(is_terminal_unsafe)
+}
+
+fn is_terminal_unsafe(character: char) -> bool {
+    character.is_control() || is_terminal_format(character)
 }
 
 /// Unicode's formatting characters are not covered by [`char::is_control`], but

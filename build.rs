@@ -41,12 +41,16 @@ mod cli;
 #[path = "src/labels.rs"]
 #[allow(dead_code)]
 mod labels;
+#[path = "src/text.rs"]
+#[allow(dead_code)]
+mod text;
 
 fn main() {
     // Re-run only when the CLI surface (or this script) actually changes —
     // otherwise Cargo would already skip re-running an unchanged build script.
     println!("cargo:rerun-if-changed=src/cli.rs");
     println!("cargo:rerun-if-changed=src/labels.rs");
+    println!("cargo:rerun-if-changed=src/text.rs");
     println!("cargo:rerun-if-changed=build.rs");
 
     let manifest_dir = PathBuf::from(

@@ -661,6 +661,11 @@ onto `processkit::Command`'s own environment builder (`env`/`env_remove`/
 - `--env <KEY=VALUE>` (repeatable) sets one variable for the child, splitting on
   the *first* `=` (so a value that itself contains `=` is preserved verbatim).
 
+For both entry sources, `KEY` must be non-empty and contain no whitespace or
+control characters. Invalid command-line entries are usage errors; invalid file
+entries fail setup before the child starts. Parser diagnostics never repeat the
+value, so a malformed secret-bearing entry does not disclose its secret.
+
 **Applied order: clear, then remove, then env-file, then explicit set** — regardless of the order the
 flags are given on the command line. Concretely: `--env-clear` first empties the
 slate (or is skipped if absent), `--env-remove` then strips any of the remaining

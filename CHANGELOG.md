@@ -40,6 +40,12 @@ to a dated version section.
 ### Fixed
 - Headless Windows integration fixtures no longer leave Windows Terminal error
   panes open after their contained console processes are torn down.
+- Environment entries now reject whitespace and control characters in keys, and
+  malformed-entry diagnostics no longer repeat potentially secret values.
+- Bounded capture continues after a live echo sink reports zero write progress,
+  treating it like a broken echo instead of disabling the transcript pump.
+- Explicit run ids are validated consistently across every by-id command: they
+  must contain 1-256 characters and no terminal control or formatting characters.
 
 ## [0.3.1] - 2026-07-26
 

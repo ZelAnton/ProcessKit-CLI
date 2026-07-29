@@ -67,6 +67,9 @@ Application order is fixed, regardless of flag order: **clear, remove, env-file,
 explicit set**. Repeated files are applied in argument order, and an explicit
 `--env` therefore wins over every file or removal for the same key. A file read,
 UTF-8, or syntax failure is `SETUP` (111) before the child starts.
+For either `--env` or a file entry, the key must be non-empty and contain no
+whitespace or control characters. Diagnostics for malformed entries do not
+repeat their values.
 
 ```sh
 processkit-cli run \
@@ -95,6 +98,9 @@ processkit-cli run \
 When omitted, the runner generates an id and writes it in `run_started`. A
 caller that needs to address the live run immediately should provide an id or
 read the first event before calling `inspect`, `cancel`, `kill`, or `wait`.
+Explicit ids must contain 1-256 Unicode characters and cannot contain terminal
+control or invisible formatting characters. The same validation applies to
+every by-id command, so an unsafe id is rejected before registry access.
 
 Run ids are not operating-system PIDs and are not required to be globally
 unique. Two live runs with the same explicit id make by-id control ambiguous;
