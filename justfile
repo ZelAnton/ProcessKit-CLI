@@ -111,7 +111,7 @@ mutants *args='':
 # Spelling + internal-link/anchor checks — mirrors ci.yml's gating `typos` and `docs-links` jobs.
 docs-checks:
     typos .
-    lychee --offline --config .lychee.toml README.md CONTRIBUTING.md SECURITY.md CHANGELOG.md 'docs/**/*.md'
+    lychee --offline --config .lychee.toml README.md CONTRIBUTING.md SECURITY.md CHANGELOG.md 'docs/**/*.md' 'skills/**/*.md'
 
 # Build the public mdBook site and verify every rendered local link and anchor.
 docs:

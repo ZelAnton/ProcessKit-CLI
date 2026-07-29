@@ -40,6 +40,12 @@ to a dated version section.
   snapshot-addressed result per live run, including honest per-run errors.
 - Opt-in `run --capture-overflow cancel` protection for runaway output, with an
   additive `output_overflow` JSONL event, graceful teardown, and reserved code 113.
+- Per-commit Criterion history artifacts and automatic same-OS comparison against
+  the latest successful `main`, with non-gating warnings above a 20% median increase.
+- Checksum-verifying `install.sh` and `install.ps1` one-command installers with
+  platform detection, version pinning, custom destinations, and safe overwrite refusal.
+- An installable `using-processkit-cli` agent skill with Codex metadata, a Claude
+  Code marketplace entry, contained-run recipes, and live contract drift tests.
 
 ### Changed
 - Split the registry into a stable facade, platform-specific implementation files,

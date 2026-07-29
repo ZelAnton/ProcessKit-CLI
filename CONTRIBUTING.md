@@ -114,7 +114,7 @@ covered by `.gitignore`, so this pipeline's own gitignored `.work/` scratch
 tree is never in scope). A link check ([`lychee`]) gates internal relative
 paths and section anchors, but only over the tracked documentation set
 (`README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `CHANGELOG.md`,
-`docs/**/*.md`). A separate, non-gating job additionally checks external
+`docs/**/*.md` and `skills/**/*.md`). A separate, non-gating job additionally checks external
 `http(s)` URLs over that same documentation set — a real network request in
 CI can flake for reasons unrelated to this repo, so it never blocks a merge.
 
@@ -122,7 +122,7 @@ Run the same checks locally before opening a pull request:
 
 ```sh
 typos .
-lychee --offline --config .lychee.toml README.md CONTRIBUTING.md SECURITY.md CHANGELOG.md 'docs/**/*.md'
+lychee --offline --config .lychee.toml README.md CONTRIBUTING.md SECURITY.md CHANGELOG.md 'docs/**/*.md' 'skills/**/*.md'
 ```
 
 or, as one target (`just docs-checks`, running both commands above in
@@ -363,7 +363,10 @@ edit the `coverage` target) for a plain terminal summary instead.
 CI publishes a [criterion]-based regression lane to the non-gating `perf`
 job's step summary on every push/PR — see [README.md, "Benchmarks"] for what
 it covers (internal primitives plus through-the-binary scenarios) and how to
-read the results. Run the same command locally:
+read the results. Each OS also uploads a 90-day `perf-history-<os>` artifact
+with median estimates and compares it with the latest successful `main` run.
+Changes above 20% produce an Actions warning and a comparison table, but never
+gate the build because shared runners are noisy. Run the same benchmark locally:
 
 ```sh
 cargo bench --features bench
@@ -373,6 +376,15 @@ or:
 
 ```sh
 just bench
+```
+
+To reproduce the history transformation or compare two saved summaries:
+
+```sh
+python scripts/criterion_history.py summarize target/criterion current.json
+python scripts/criterion_history.py compare baseline.json current.json \
+  --threshold-percent 20 --markdown comparison.md
+python -m unittest scripts/tests/test_criterion_history.py
 ```
 
 [criterion]: https://github.com/bheisler/criterion.rs

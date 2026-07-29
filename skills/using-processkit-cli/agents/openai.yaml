@@ -1,0 +1,4 @@
+interface:
+  display_name: "Use ProcessKit CLI"
+  short_description: "Run external commands without orphan processes"
+  default_prompt: "Use $using-processkit-cli to run this external command with bounded, observable cleanup."

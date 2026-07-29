@@ -8,6 +8,43 @@ of your environment.
 
 ## Prebuilt archives
 
+### One-command verified install
+
+The repository installers select the host archive, download its published
+`.sha256` sidecar, fail closed on any mismatch, and install only after successful
+verification. They refuse to replace an existing destination unless running that
+file with `--version` identifies it as `processkit-cli`.
+
+Linux or macOS:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ZelAnton/ProcessKit-CLI/main/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/ZelAnton/ProcessKit-CLI/main/install.ps1 | iex
+```
+
+The defaults install the latest release under `~/.local/bin`. For a pinned
+version, custom destination, or explicit target, download the script and pass its
+options directly:
+
+```sh
+sh install.sh --version X.Y.Z --install-dir /opt/processkit/bin
+```
+
+```powershell
+.\install.ps1 -Version X.Y.Z -InstallDir C:\Tools\ProcessKit
+```
+
+The scripts print the installed binary's `--version` result and tell you when the
+destination is not yet on `PATH`. The POSIX installer supports the published Linux
+x86_64/Arm64 and macOS Arm64 builds; use `--target
+x86_64-unknown-linux-musl` when the static musl archive is required. The PowerShell
+installer selects x86_64 or Arm64 from `PROCESSOR_ARCHITECTURE`.
+
 Every [GitHub Release](https://github.com/ZelAnton/ProcessKit-CLI/releases)
 contains one archive per supported target:
 

@@ -1,0 +1,14 @@
+{
+  "name": "processkit-cli-skills",
+  "owner": {
+    "name": "Zhelezniakou Anton",
+    "url": "https://github.com/ZelAnton/ProcessKit-CLI"
+  },
+  "plugins": [
+    {
+      "name": "using-processkit-cli",
+      "source": "./skills/using-processkit-cli",
+      "description": "Run external commands with contained descendants, deadlines, and JSONL evidence."
+    }
+  ]
+}

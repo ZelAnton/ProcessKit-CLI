@@ -40,6 +40,22 @@ point of the project.
 
 ### Prebuilt binaries (recommended)
 
+Install the latest matching archive in one command. Both installers verify the
+published SHA-256 sidecar before extracting and refuse to overwrite a destination
+that does not identify itself as `processkit-cli`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ZelAnton/ProcessKit-CLI/main/install.sh | sh
+```
+
+```powershell
+irm https://raw.githubusercontent.com/ZelAnton/ProcessKit-CLI/main/install.ps1 | iex
+```
+
+They default to `~/.local/bin`; download the script to pass a pinned `--version` /
+`-Version`, a custom install directory, or an explicit target. See the
+[installation guide](docs/installation.md#one-command-verified-install).
+
 Every release attaches a prebuilt archive per platform to its
 [GitHub Release](https://github.com/ZelAnton/ProcessKit-CLI/releases), each with
 a `<archive>.sha256` checksum next to it. Download the archive for your platform,
@@ -190,6 +206,15 @@ close/logoff/system shutdown, all of which the runner catches — still run
 the owned container's ordinary teardown path on every supported platform; this
 tri-state applies only where the runner never gets to run it at all (a crash, a
 `SIGKILL`, an outer Job Object terminate).
+
+## Installable agent skill
+
+Agents that routinely launch external tools can install the compact
+[`using-processkit-cli` skill](skills/using-processkit-cli/SKILL.md). It teaches
+when to wrap a command, fail-closed `probe` preflight, bounded foreground and
+detached recipes, and authoritative `runner_exit` handling. Codex and Claude Code
+installation instructions are in the [`skills` catalog](skills/README.md); CI pins
+the skill's flags and exit-code claims to the built binary.
 
 ## Command interface
 
@@ -913,11 +938,14 @@ Run the whole lane locally with:
 cargo bench --features bench
 ```
 
-CI publishes results to the `perf` job's step summary on every push/PR — a
-data source, not a gate: the job never fails the pipeline and is not a
-required check (same non-gating pattern as the `coverage` job; see
-`CONTRIBUTING.md`, "Code coverage"). Absolute numbers are noisy on shared CI
-hardware; treat the summary as a trend over time, not a single-run verdict.
+CI publishes results to the `perf` job's step summary on every push/PR and
+uploads one machine-readable `perf-history-<os>` artifact per commit for 90
+days. Each run compares its Criterion medians with the latest successful
+`main` artifact on the same OS; increases above 20% create an Actions warning
+and a table in the summary. This remains a data source, not a gate: the job is
+non-required and `continue-on-error`, because absolute numbers on shared CI
+hardware are noisy. Treat repeated same-OS alerts as a trend worth
+investigating, not a single-run verdict.
 
 The table below is one informal, single-run snapshot from a Windows
 development host (not tuned, not a target) — a sanity baseline for a reader

@@ -36,6 +36,27 @@ jobs:
       - name: Lint YAML
         run: yamllint .
 
+  installer-lint:
+    name: installer scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check POSIX installer
+        run: shellcheck install.sh scripts/tests/test-install.sh
+      - name: Smoke-test POSIX installer
+        run: scripts/tests/test-install.sh
+      - name: Parse PowerShell installer
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path 'install.ps1'), [ref]$tokens, [ref]$errors)
+          if ($errors.Count) {
+            $errors | ForEach-Object { Write-Error $_ }
+            exit 1
+          }
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
@@ -166,6 +187,9 @@ jobs:
     # matrix, covering both the `cfg(unix)` and `cfg(windows)` halves of the
     # through-the-binary scenarios (echo overhead, startup latency).
     continue-on-error: true
+    permissions:
+      actions: read
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -182,12 +206,60 @@ jobs:
       - name: Run benchmarks
         shell: bash
         run: |
+          set -o pipefail
+          cargo bench --features bench 2>&1 | tee benchmark-output.txt
           {
             echo "### Benchmark results (${{ matrix.os }})"
             echo '```text'
-            cargo bench --features bench
+            cat benchmark-output.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Write machine-readable benchmark summary
+        shell: bash
+        run: >-
+          python scripts/criterion_history.py summarize target/criterion
+          criterion-summary.json --commit "$GITHUB_SHA" --runner "${{ matrix.os }}"
+      - name: Find the latest successful main baseline
+        id: baseline
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_ID=$(gh run list --workflow ci.yml --branch main --status success --limit 20 \
+            --json databaseId,headSha \
+            --jq 'map(select(.headSha != "${{ github.sha }}"))[0].databaseId // empty')
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          if [ -z "$RUN_ID" ]; then
+            echo "No prior successful main run is available; this run seeds the baseline history."
+          fi
+      - name: Download the prior baseline
+        if: ${{ steps.baseline.outputs.run_id != '' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ steps.baseline.outputs.run_id }}
+        run: >-
+          gh run download "$RUN_ID" --name "perf-history-${{ matrix.os }}"
+          --dir perf-baseline
+      - name: Compare against the prior main baseline
+        if: ${{ hashFiles('perf-baseline/criterion-summary.json') != '' }}
+        shell: bash
+        run: |
+          python scripts/criterion_history.py compare \
+            perf-baseline/criterion-summary.json criterion-summary.json \
+            --threshold-percent 20 --markdown perf-comparison.md
+          cat perf-comparison.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload benchmark history point
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: perf-history-${{ matrix.os }}
+          path: |
+            criterion-summary.json
+            perf-comparison.md
+          if-no-files-found: ignore
+          retention-days: 90
 
   e2e:
     name: e2e (${{ matrix.os }})
@@ -320,7 +392,7 @@ jobs:
         with:
           args: >-
             --offline --no-progress --verbose --config .lychee.toml
-            README.md CONTRIBUTING.md SECURITY.md CHANGELOG.md 'docs/**/*.md'
+            README.md CONTRIBUTING.md SECURITY.md CHANGELOG.md 'docs/**/*.md' 'skills/**/*.md'
           format: markdown
           fail: true
 
@@ -349,7 +421,7 @@ jobs:
         with:
           args: >-
             --no-progress --verbose --cache --max-cache-age 1d --config .lychee.toml
-            README.md CONTRIBUTING.md SECURITY.md CHANGELOG.md 'docs/**/*.md'
+            README.md CONTRIBUTING.md SECURITY.md CHANGELOG.md 'docs/**/*.md' 'skills/**/*.md'
           format: markdown
           fail: false
 
