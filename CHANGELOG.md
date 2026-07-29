@@ -36,6 +36,10 @@ to a dated version section.
   composable across human and JSON discovery output.
 - Absolute JSONL and optional capture-directory locators in the owner-only registry,
   `list`, and inspect snapshot, completing detached-run artifact discovery.
+- Fleet-wide `inspect --all --json` with conjunctive label filters and one
+  snapshot-addressed result per live run, including honest per-run errors.
+- Opt-in `run --capture-overflow cancel` protection for runaway output, with an
+  additive `output_overflow` JSONL event, graceful teardown, and reserved code 113.
 
 ### Changed
 - Split the registry into a stable facade, platform-specific implementation files,

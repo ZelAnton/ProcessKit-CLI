@@ -31,10 +31,12 @@
 //!   `cancel`/`kill` command reached the live runner — the child did not choose to
 //!   stop, so its code is not forwarded: the run reports a reserved-band code
 //!   ([`crate::exit::TIMEOUT`] / [`crate::exit::CANCELLED`] /
-//!   [`crate::exit::CONTROL_CANCELLED`] / [`crate::exit::CONTROL_KILLED`]) and an
+//!   [`crate::exit::CONTROL_CANCELLED`] / [`crate::exit::CONTROL_KILLED`] /
+//!   [`crate::exit::OUTPUT_OVERFLOW`]) and an
 //!   explanatory stderr line, kept distinct from
 //!   each other and from any child result. Their machine-readable JSONL form is the
-//!   `timeout` / `cancelled` / `killed` (plus terminal `runner_exit`) event written
+//!   `timeout` / `output_overflow` / `cancelled` / `killed` (plus terminal
+//!   `runner_exit`) event written
 //!   to `--jsonl` (see [`crate::events`] and `docs/schema.md`). The control-plane
 //!   endings reuse the *same* teardown as the local ones — `cancel` runs the shared
 //!   soft-stop → grace → hard-kill path, `kill` hard-kills the tree at once — so a
@@ -67,6 +69,7 @@ use std::time::Duration;
 
 use processkit::Outcome;
 
+use crate::capture::CaptureOverflow;
 use crate::cli::RunArgs;
 use crate::control;
 use crate::exit::RunnerError;
@@ -262,6 +265,9 @@ enum Ending {
     /// `--timeout` ([`TimeoutTrigger::Overall`]) or the `--idle-timeout`
     /// ([`TimeoutTrigger::Idle`]). Both take the same teardown and terminal code.
     TimedOut(TimeoutTrigger),
+    /// A capture stream exceeded its byte ceiling while the opt-in `cancel`
+    /// overflow policy was active.
+    OutputOverflow(CaptureOverflow),
     /// A local stop signal reached the runner — `Ctrl-C`, (Unix) `SIGTERM` /
     /// `SIGHUP`, or (Windows) `Ctrl-Break`/console close/logoff/system shutdown.
     /// All take the same teardown and terminal code; the carried
@@ -284,6 +290,8 @@ enum Termination {
         limit: Duration,
         trigger: TimeoutTrigger,
     },
+    /// A bounded capture stream exceeded its configured ceiling.
+    OutputOverflow(CaptureOverflow),
     /// The run was cancelled by a local stop signal: `Ctrl-C`, (Unix) `SIGTERM` /
     /// `SIGHUP`, or (Windows) `Ctrl-Break`/console close/logoff/system shutdown.
     /// The carried [`CancelSignal`] names which, so the message stays honest.

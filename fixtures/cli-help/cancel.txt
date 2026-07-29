@@ -1,0 +1,9 @@
+Ask a live run to cancel (graceful where supported, then a hard kill), by `--run-id` or, in aggregate, `--all`
+
+Usage: processkit-cli cancel [OPTIONS]
+
+Options:
+      --run-id <id>        The single run to act on. Mutually exclusive with `--all`; exactly one of the two is required
+      --all                Act on every run confirmed live in a snapshot taken the moment this invocation starts, instead of one named run — the aggregate counterpart to `--run-id`, for the typical orchestrator teardown sequence (cancel everything, wait for it all to be gone, then prune). A run that registers *after* the snapshot is out of scope for this invocation and is never acted on. Mutually exclusive with `--run-id`; exactly one of the two is required. See [`crate::control::cancel_all`] / [`crate::control::kill_all`] and `docs/control-plane.md` for the snapshot and per-run report semantics
+      --label <KEY=VALUE>  With `--all`, restrict the snapshot to runs carrying this exact operator label (repeatable; multiple filters combine with logical AND)
+  -h, --help               Print help

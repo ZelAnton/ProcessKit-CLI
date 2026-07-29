@@ -608,6 +608,75 @@ fn custom_capture_max_bytes_clips_the_stream_at_the_configured_ceiling() {
     );
 }
 
+/// The opt-in overflow policy turns a noisy, non-idle child into a distinct
+/// runner-owned ending. It must use the shared graceful teardown, preserve the
+/// bounded capture metadata, and never alias a child exit or a time deadline.
+#[test]
+fn capture_overflow_cancel_ends_a_run_with_a_distinct_outcome() {
+    let dir = scratch("capture-overflow-cancel");
+    let capture_dir = dir.join("capture");
+    let program_and_args = shell_inline(if cfg!(windows) {
+        "for /L %i in (1,1,1000000) do @echo 0123456789abcdef"
+    } else {
+        "while :; do printf '0123456789abcdef\\n'; done"
+    });
+    let capture_flag = path_arg(&capture_dir);
+    let out = run_with_flags(
+        &dir,
+        &[],
+        &[
+            "--capture-dir",
+            &capture_flag,
+            "--capture-max-bytes",
+            "64",
+            "--capture-overflow",
+            "cancel",
+            "--no-echo",
+            "--grace",
+            "10ms",
+        ],
+        program_and_args,
+    );
+
+    assert_eq!(
+        out.status.code(),
+        Some(113),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let events = read_run_events(&dir);
+    let kinds: Vec<_> = events
+        .iter()
+        .filter_map(|event| event["event"].as_str())
+        .collect();
+    let overflow = events
+        .iter()
+        .find(|event| event["event"] == "output_overflow")
+        .expect("an output_overflow event");
+    assert_eq!(overflow["stream"], "stdout");
+    assert_eq!(overflow["max_bytes"], 64);
+    assert_eq!(overflow["grace_ms"], 10);
+    assert!(
+        kinds
+            .windows(3)
+            .any(|window| window == ["output_overflow", "cleanup_started", "cleanup_finished"]),
+        "overflow must enter the shared graceful teardown: {kinds:?}"
+    );
+    let captured = events
+        .iter()
+        .find(|event| event["event"] == "output_captured")
+        .expect("forced endings still report capture metadata");
+    assert_eq!(captured["stdout"]["truncated"], true);
+    assert_eq!(file_len(&capture_dir.join("stdout.log")), 64);
+    let terminal = events.last().expect("terminal runner_exit");
+    assert_eq!(terminal["event"], "runner_exit");
+    assert_eq!(terminal["source"], "output_overflow");
+    assert_eq!(terminal["code"], 113);
+    assert!(terminal["child_code"].is_null());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `--no-echo` (T-196) suppresses only the runner's live retransmission of the
 /// child's stdout/stderr on the runner's own stdout/stderr — the pipe, the pump,
 /// `--capture-dir`, and the JSONL event stream are all otherwise unaffected.

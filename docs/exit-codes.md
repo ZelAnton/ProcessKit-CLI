@@ -45,14 +45,16 @@ failure is not mistaken for a child result.
 | 110  | `PROBE_INCOMPATIBLE` | The **preflight probe** (`processkit-cli probe`) found this binary's compatibility surface does not satisfy a `--require-*` expectation. A *pre-launch* verdict, not a run outcome — no child is ever spawned by a probe. See "Preflight probe" below. |
 | 111  | `SETUP`           | A fail-closed **setup / support failure**: a prerequisite the runner needs to run — or to report a result — could not be established or produced for an ordinary reason (its async runtime would not build, a required `--jsonl`/`--capture-dir` output or `--stdin-file` input could not be opened, or a `probe`/`inspect`/control reply would not serialize). An environment/resource condition the caller can usually act on (a bad path, missing permissions, exhausted resources), **not** a runner bug — that stays `INTERNAL` (104). See "Setup failures vs internal faults" below. |
 | 112  | `WAIT_TIMEOUT`    | The **`wait` subcommand's own** deadline (`wait --run-id <id> --timeout <duration>`) elapsed while the run it was waiting for was still live. *The waiter* gave up; the run was never touched — `wait` is read-only and reaches no runner — and is still going. Deliberately **not** `TIMEOUT` (106), which means the opposite (the *runner* enforced a deadline and tore the child's tree down), and not `CONTROL` (103), since the run was resolved unambiguously and found perfectly healthy. See "A waiter's deadline is not a run's deadline" below. |
+| 113  | `OUTPUT_OVERFLOW` | A capture stream exceeded `--capture-max-bytes` while `--capture-overflow cancel` was active. The runner ended the tree through its graceful-stop and escalation path. Distinct from a time deadline; `output_overflow` identifies the stream and limit. |
 
-Codes `113`–`119` are **reserved** for future runner-own conditions. `--help`
+Codes `114`–`119` are **reserved** for future runner-own conditions. `--help`
 and `--version` are not failures: they print to stdout and exit `0`.
 
 ## Timeout, cancel, and kill: runner-imposed outcomes
 
-`TIMEOUT` (106), `CANCELLED` (107), `CONTROL_CANCELLED` (108), and `CONTROL_KILLED`
-(109) are not *failures* of the runner and not the child's own exit — they are
+`TIMEOUT` (106), `CANCELLED` (107), `CONTROL_CANCELLED` (108), `CONTROL_KILLED`
+(109), and `OUTPUT_OVERFLOW` (113) are not *failures* of the runner and not the
+child's own exit — they are
 outcomes the runner **imposes** when it ends a run that did not stop on its own. The
 child did not choose to exit, so forwarding "its" code would be a lie; instead each
 takes a distinct reserved-band code so a caller can tell them apart:
@@ -67,7 +69,8 @@ takes a distinct reserved-band code so a caller can tell them apart:
   the `cancelled` event's `source` rather than by a distinct code),
 - a control-plane `cancel` command ended it — the same graceful teardown as a Ctrl-C,
   but triggered over the network (`108`), and
-- a control-plane `kill` command force-killed it immediately, no grace (`109`).
+- a control-plane `kill` command force-killed it immediately, no grace (`109`), and
+- the opt-in capture-volume guard ended it through graceful teardown (`113`).
 
 The two control-plane codes are what make a *remote* end-of-run distinguishable from a
 *local* one, and a graceful `cancel` from an immediate `kill` — by code alone, before
@@ -80,7 +83,7 @@ console child no soft stop is delivered at all, the grace window elapses, and th
 Object is then killed atomically (see `README.md`, "Timeouts, cancel, and
 grace"). As with every runner-own code, the numeric value is a best-effort signal;
 the authoritative, machine-readable form of these outcomes is the `timeout` /
-`cancelled` / `killed` event (and the terminal `runner_exit`) in the versioned JSONL
+`output_overflow` / `cancelled` / `killed` event (and the terminal `runner_exit`) in the versioned JSONL
 stream — see `docs/schema.md`.
 
 ## A waiter's deadline is not a run's deadline
@@ -199,7 +202,7 @@ run can fail before it begins — a program that is not there (`SPAWN` 101), a c
 that cannot be created or a limit that cannot be applied (`BACKEND` 102), an unwritable
 `--jsonl`/`--capture-dir` (`SETUP` 111) — and the detached copy exits with precisely
 that code, which the caller then relays unchanged. A caller therefore reads `run
---detach`'s failures with the same table as `run`'s, and the reserved range `113`–`119`
+--detach`'s failures with the same table as `run`'s, and the reserved range `114`–`119`
 stays free. Two failures belong to the detach wrapper itself rather than to the run, and
 both take `SETUP` (111): the detached copy could not be spawned at all (a support step
 failed; blaming `SPAWN` would point at the caller's program, which was never reached),
@@ -254,4 +257,4 @@ are additionally recorded out of band.
   rather than overloading an existing one. `WAIT_TIMEOUT` (112) is the most recent,
   taking the next free slot after `SETUP` (111) rather than overloading `TIMEOUT`
   (106), whose meaning is the opposite one (see "A waiter's deadline is not a run's
-  deadline" above); codes `113`–`119` remain reserved.
+  deadline" above); codes `114`–`119` remain reserved.

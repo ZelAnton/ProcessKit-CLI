@@ -347,6 +347,7 @@ mod tests {
             // The `--capture-max-bytes` flag (T-181) appears in the surface
             // automatically too — same derivation as the resource-limit flags below.
             "run:--capture-max-bytes",
+            "run:--capture-overflow",
             "run:--inherit-stdio",
             "run:--windows-graceful-ctrl-break",
             "run:--inherit-stdin",
@@ -364,6 +365,8 @@ mod tests {
             "run:--max-processes",
             "run:--cpu-quota",
             "inspect:--json",
+            "inspect:--all",
+            "inspect:--label",
             "cancel:--run-id",
             "cancel:--label",
             "kill:--label",

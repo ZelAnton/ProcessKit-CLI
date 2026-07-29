@@ -1,0 +1,10 @@
+Query a live run over local IPC
+
+Usage: processkit-cli inspect [OPTIONS]
+
+Options:
+      --run-id <id>        The single run to inspect. Mutually exclusive with `--all`; exactly one target form is required
+      --all                Inspect every run confirmed live in one registry snapshot. Aggregate output is a single JSON array, so this form requires `--json`
+      --label <KEY=VALUE>  With `--all`, restrict the snapshot to runs carrying this exact operator label (repeatable; multiple filters combine with logical AND)
+      --json               Emit the snapshot as JSON instead of a human-readable rendering. Optional, mirroring `list`/`prune` — `inspect` has a human-readable form of its own (see `src/control/render.rs::render_snapshot_human`)
+  -h, --help               Print help

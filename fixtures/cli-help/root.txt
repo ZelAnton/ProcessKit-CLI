@@ -1,0 +1,18 @@
+Run one shell-free command inside ProcessKit's containment boundary.
+
+Usage: processkit-cli <COMMAND>
+
+Commands:
+  run      Run a program inside a ProcessKit container and report its lifecycle
+  inspect  Query a live run over local IPC
+  cancel   Ask a live run to cancel (graceful where supported, then a hard kill), by `--run-id` or, in aggregate, `--all`
+  kill     Hard-kill a live run's container immediately, by `--run-id` or, in aggregate, `--all`
+  wait     Block until a run recorded in the per-user registry has finished
+  list     List every run recorded in the per-user registry, whatever its health (live/stale/unprobed)
+  prune    Reap the registry's confirmed-stale entries — the leftover records of runners that died abruptly — while never touching a live run's entry
+  probe    Report this binary's compatibility surface for a consumer's fail-closed compatibility preflight — no run, no child, no side effects
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version

@@ -179,6 +179,15 @@ pub enum Event {
         /// Which deadline fired: `overall` (`--timeout`) or `idle` (`--idle-timeout`).
         reason: &'static str,
     },
+    /// A capture stream exceeded its configured per-stream byte ceiling while
+    /// `--capture-overflow cancel` was active. This is emitted before the shared
+    /// graceful cleanup tail; the terminal runner code is `OUTPUT_OVERFLOW` (113).
+    OutputOverflow {
+        /// `stdout` or `stderr`: whichever stream crossed its ceiling first.
+        stream: &'static str,
+        max_bytes: u64,
+        grace_ms: Option<u64>,
+    },
     /// The run was cancelled and torn down through the shared soft-stop → grace →
     /// hard-kill path. `source` names the trigger: `ctrl_c` for a local `Ctrl-C`,
     /// `sigterm` / `sighup` for the Unix stop signals the runner catches (`kill`,
@@ -218,7 +227,7 @@ pub enum Event {
     /// The terminal event of every run: the exact code the runner process returns.
     /// Always emitted — including on the runner's own failure — so a child's code
     /// is never lost or aliased (`AGENTS.md`, "Exit-code fidelity"). `source`
-    /// names why the runner exited (`child_exit` | `timeout` | `cancelled` |
+    /// names why the runner exited (`child_exit` | `timeout` | `output_overflow` | `cancelled` |
     /// `control_cancel` | `control_kill` | `spawn_error` | `container_error` |
     /// `internal` | `setup`); `child_code` carries the child's own code when it
     /// exited on its own, and is `null` for a runner-imposed ending or a child
@@ -882,6 +891,16 @@ mod tests {
             Event::RunnerExit {
                 code: 109,
                 source: "control_kill",
+                child_code: None,
+            },
+            Event::OutputOverflow {
+                stream: "stdout",
+                max_bytes: 65_536,
+                grace_ms: Some(2_000),
+            },
+            Event::RunnerExit {
+                code: 113,
+                source: "output_overflow",
                 child_code: None,
             },
         ]

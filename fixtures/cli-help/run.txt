@@ -1,0 +1,94 @@
+Run a program inside a ProcessKit container and report its lifecycle
+
+Usage: processkit-cli run [OPTIONS] --jsonl <events.jsonl> -- <program>...
+
+Arguments:
+  <program>...
+          The program to run followed by its arguments. Everything after `--` is taken verbatim — there is no shell mode, so nothing here is expanded or re-interpreted. Kept as `OsString`s to preserve bytes exactly
+
+Options:
+      --run-id <id>
+          Identifier for this run; a value is generated when omitted. Explicit ids are 1-256 characters and cannot contain terminal control or formatting characters
+
+      --label <KEY=VALUE>
+          Attach operator metadata as `KEY=VALUE` (repeatable). Later values replace earlier values for the same key in the registry and lifecycle event
+
+      --cwd <dir>
+          Working directory for the child process
+
+      --jsonl <events.jsonl>
+          File to receive the versioned JSONL lifecycle events (never stdout)
+
+      --create-no-window
+          Windows: create the child with CREATE_NO_WINDOW
+
+      --windows-graceful-ctrl-break
+          Windows: launch the child as a console process-group leader so ProcessKit's graceful stop can send it `CTRL_BREAK` before the hard Job Object kill. This is opt-in because it changes Windows console-signal routing. It is a no-op on other platforms and conflicts with modes that deliberately provide no shared console (`--create-no-window` and `--detach`)
+
+      --timeout <duration>
+          Hard deadline for the whole run; the tree is torn down when it elapses. A value of `0` is rejected at parse time (see [`parse_positive_duration`]) — it would arm a deadline that is already elapsed on the first poll, almost certainly an operator typo rather than an intentional immediate teardown
+
+      --idle-timeout <duration>
+          Deadline on child **silence**: the tree is torn down when the child produces no observed output for this long. Unlike `--timeout` (a ceiling on the whole run), this deadline is *re-armed* on every chunk of the child's output, so a child that keeps talking is never reaped no matter how long it runs — only one that goes quiet past the window is (the classic "stuck build worker"). An idle expiry reuses the same reserved `TIMEOUT` (106) exit and the same soft-stop → grace → hard-kill teardown as `--timeout`, told apart only by the `timeout` event's `reason` field (`idle` vs `overall`; see `docs/schema.md`). Same grammar and parse-time validation as `--timeout` — including the rejection of `0`, which would otherwise guarantee an immediate teardown (`remaining` saturates to zero) — see [`parse_positive_duration`]. Cannot be combined with `--inherit-stdio`: under direct inheritance the runner runs no output pump, so there is no point at which to observe the child and re-arm the deadline — the flags conflict at parse time, like `--capture-dir`
+
+      --grace <duration>
+          Grace period between a cancel/timeout and the hard kill. Same duration grammar as `--timeout`/`--idle-timeout`, but — unlike them — `0` stays legal here: it means "no pause", a real and useful setting, not a degenerate one, so this flag keeps using the more permissive [`parse_duration`] rather than [`parse_positive_duration`]
+
+      --max-memory <size>
+          Cap the run's **whole process tree** total memory. Accepts a byte count with an optional binary unit — `1048576`, `512k`, `256m`, `2g` (see [`parse_size`] for the grammar). Enforcement needs a real whole-tree container (Windows Job Object or Linux cgroup v2); where none exists the run fails fast with a `limit_hit` rather than silently running unbounded (see `README.md`, "Resource limits"). Omit to leave memory unbounded
+
+      --max-processes <n>
+          Cap the number of live processes in the run's **whole tree**. A positive integer (`0` is rejected at parse time). Same whole-tree-container requirement and fail-fast `limit_hit` as `--max-memory`; note the Linux asymmetry documented in `README.md` ("Resource limits"): there it bounds a contained child's *descendants*, not the number of top-level launches into the group. Omit to leave the count unbounded
+
+      --cpu-quota <cores>
+          Cap the run's **whole-tree** CPU as a fraction of a single core: `0.5` is half a core, `2` is two cores' worth. A finite value greater than `0` (`0`, negatives, `NaN`, and infinities are rejected at parse time — see [`parse_cpu_quota`]). Same whole-tree-container requirement and fail-fast `limit_hit` as `--max-memory`. Omit to leave CPU unbounded
+
+      --capture-dir <dir>
+          Directory for bounded stdout/stderr capture files (`stdout.log`, `stderr.log`). When set, the child's output is teed into these files alongside the live echo; each stream's byte count, content hash, and truncation flag are reported in the `output_captured` JSONL event
+
+      --capture-max-bytes <size>
+          Per-**stream** ceiling on bytes written to a `--capture-dir` file — the same value that otherwise defaults to `crate::capture::CAPTURE_MAX_BYTES` (8 MiB). Same grammar as `--max-memory` (see [`parse_size`]): a byte count with an optional binary unit — `1048576`, `512k`, `256m`, `2g`. Only takes effect together with `--capture-dir`; omitting it leaves the default ceiling in place, so a bare `run` (with or without `--capture-dir`) stays byte-for-byte unchanged. Does not change the `output_captured` event's shape or the meaning of its `truncated` flag, which still just means "the stream outran whatever per-stream ceiling was in effect" (see `src/capture.rs` and `README.md`, "Bounded output capture")
+
+      --capture-overflow <policy>
+          What to do when either capture stream exceeds `--capture-max-bytes`. `truncate` (the default when omitted) keeps the run alive and clips only the transcript; `cancel` ends the whole run through the same graceful teardown as a timeout. Requires `--capture-dir` because the capture byte ceiling is the source of this signal
+
+          Possible values:
+          - truncate: Preserve the historical behavior: clip the transcript and keep running
+          - cancel:   Gracefully stop the run, then hard-kill survivors after `--grace`
+
+      --inherit-stdio
+          Give the child the runner's stdin, stdout, and stderr handles directly. This preserves terminal status and cannot be combined with mediated I/O or Windows' no-console mode
+
+      --no-echo
+          Suppress the child's live stdout/stderr echo on the runner's own stdout/ stderr. The pipe + pump stay wired up exactly as without the flag — only the runner-side echo write is skipped — so `--capture-dir` still receives the child's bytes in full and `--idle-timeout` still re-arms on every observed chunk; only the live retransmission to the runner's own stdout/ stderr is dropped. Meant for an embedding orchestrator that reads results from `--jsonl`/`--capture-dir` and finds the child's output, interleaved with its own, pure noise. Cannot be combined with `--inherit-stdio`, which runs no pump to suppress in the first place
+
+      --detach
+          Start the run **detached** from this invocation and return as soon as it has provably started, instead of staying the runner's parent for the whole run. The command re-spawns this binary — in a new session on Unix, with `DETACHED_PROCESS` on Windows — to do the actual run, waits until that copy has registered the run and written its `run_started` event to `--jsonl`, and then exits. From that point the run is supervised out of band, exactly like any other run: `--jsonl` for its events, `inspect`/`cancel`/`kill` for its control plane, `list` for discovery, and `wait` for its end.
+          
+          **The exit code changes meaning under this flag**, and only under it: it reports whether the run *started*, never how the child finished. A successful start is `0` even for a child that later fails, and a start that failed keeps the same reserved-band code the run itself would have reported. The child's real code stays fully available where a detached caller can actually observe it — the terminal `runner_exit` event in `--jsonl` (see `docs/exit-codes.md`, "Detached runs").
+          
+          Cannot be combined with the interactive stdio modes (`--inherit-stdio`, `--inherit-stdin`): a detached run has no terminal to hand over and nobody left to type at it. There is no live echo either — the detached runner runs with `--no-echo`'s discarding sinks — while `--jsonl` (still required), `--capture-dir`, and `--idle-timeout` all keep observing the child's output exactly as they do in the foreground.
+
+      --inherit-stdin
+          Give the child the runner's own stdin (terminal, file, or pipe). This does not create a PTY and cannot be combined with `--stdin-file`
+
+      --stdin-file <file>
+          Stream this file to the child's stdin, then close it at EOF. The file's bytes stay out of argv and cannot be combined with `--inherit-stdin`
+
+      --argv-raw
+          Record the raw argv in diagnostics instead of the redacted hash + hint
+
+      --env-clear
+          Clear the child's entire inherited environment before any `--env-remove`/`--env` is applied (repeatable flag has no effect beyond the first). Maps onto `processkit::Command::env_clear()`. See `README.md`, "Environment", for the full applied order
+
+      --env-remove <KEY>
+          Remove an inherited environment variable by name (repeatable). Applied after `--env-clear` and before `--env-file`/`--env`, so either later source can restore the same key. Maps onto `processkit::Command::env_remove()`
+
+      --env-file <file>
+          Read child environment entries from a UTF-8 `KEY=VALUE` file (repeatable). Empty lines and lines whose first non-whitespace character is `#` are ignored. Files are applied in argument order after removals and before explicit `--env`, keeping their contents out of the runner's argv
+
+      --env <KEY=VALUE>
+          Set an environment variable for the child as `KEY=VALUE` (repeatable). Applied last — after `--env-clear` and `--env-remove` — so it always wins on a duplicated key. Maps onto `processkit::Command::env()`
+
+  -h, --help
+          Print help (see a summary with '-h')

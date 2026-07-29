@@ -17,8 +17,10 @@ use processkit::{
     ProcessGroupOptions, RunningProcess, Stdin, StdioMode,
 };
 
-use crate::capture::{CAPTURE_INFLIGHT_MAX_BYTES, CAPTURE_MAX_BYTES, Capture, IdleClock};
-use crate::cli::{RunArgs, parse_env_kv};
+use crate::capture::{
+    CAPTURE_INFLIGHT_MAX_BYTES, CAPTURE_MAX_BYTES, Capture, CaptureOverflow, IdleClock,
+};
+use crate::cli::{CaptureOverflowPolicy, RunArgs, parse_env_kv};
 use crate::control::{self, SnapshotSource};
 use crate::events::{self, Emitter, Event, Member};
 use crate::exit::{self, RunnerError};
@@ -498,6 +500,7 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     // neither delays the child's exit nor blocks teardown, and is dropped (tearing the
     // transport down) when another branch wins.
     let capturing = capture.is_some();
+    let cancel_on_capture_overflow = args.capture_overflow == Some(CaptureOverflowPolicy::Cancel);
     let ending = tokio::select! {
         biased;
         signal = wait_for_cancel_signal() => Ending::Cancelled(signal),
@@ -512,6 +515,7 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
         },
         () = deadline(timeout) => Ending::TimedOut(TimeoutTrigger::Overall),
         () = idle_deadline(idle_timeout, &idle_clock) => Ending::TimedOut(TimeoutTrigger::Idle),
+        overflow = capture_overflow(&capture, cancel_on_capture_overflow) => Ending::OutputOverflow(overflow),
         never = control::serve(control_server, &snapshot_source, &command_tx) => match never {},
     };
 
@@ -602,6 +606,20 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
                 termination_error(Termination::Timeout { limit, trigger }, &teardown, grace);
             Err(finish(&mut emitter, "timeout", None, error))
         }
+        Ending::OutputOverflow(overflow) => {
+            emitter.emit(&Event::OutputOverflow {
+                stream: overflow.stream,
+                max_bytes: overflow.max_bytes,
+                grace_ms: grace.map(duration_ms),
+            });
+            emit_cleanup_started(&mut emitter, &group);
+            let teardown = graceful_teardown(&group, grace).await;
+            emit_cleanup_finished(&mut emitter, &group, Some(&teardown));
+            emit_output_captured(&mut emitter, &capture);
+            clear_registration(&registration);
+            let error = termination_error(Termination::OutputOverflow(overflow), &teardown, grace);
+            Err(finish(&mut emitter, "output_overflow", None, error))
+        }
         Ending::Cancelled(signal) => {
             // Every local stop signal — `Ctrl-C`, on Unix `SIGTERM`/`SIGHUP`, and on
             // Windows `Ctrl-Break`/console-close/logoff/shutdown — resolves here and
@@ -659,6 +677,14 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             let error = control_kill_error();
             Err(finish(&mut emitter, "control_kill", None, error))
         }
+    }
+}
+
+/// Park forever unless capture overflow is configured as an ending trigger.
+async fn capture_overflow(capture: &Option<Capture>, cancel: bool) -> CaptureOverflow {
+    match (capture.as_ref(), cancel) {
+        (Some(capture), true) => capture.overflowed().await,
+        _ => std::future::pending().await,
     }
 }
 
@@ -896,7 +922,7 @@ fn set_terminal_foreground(fd: libc::c_int, pgrp: libc::pid_t) -> std::io::Resul
 /// `limit_hit` event emitted immediately before the shared tail — the authoritative,
 /// machine-readable channel (`docs/exit-codes.md`, "Why a band is not enough on its
 /// own"; the numeric exit code is only a best-effort hint). No reserved-band slot was
-/// spent on it (`113`–`119` stay reserved today).
+/// spent on it (no additional runner-owned code is minted here).
 fn create_group(args: &RunArgs) -> processkit::Result<ProcessGroup> {
     match build_limit_options(args) {
         Some(options) => ProcessGroup::with_options(options),

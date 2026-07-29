@@ -11,6 +11,7 @@
     { "$ref": "#/$defs/cleanupFinished" },
     { "$ref": "#/$defs/limitHit" },
     { "$ref": "#/$defs/timeout" },
+    { "$ref": "#/$defs/outputOverflow" },
     { "$ref": "#/$defs/cancelled" },
     { "$ref": "#/$defs/killed" },
     { "$ref": "#/$defs/spawnFailed" },
@@ -262,6 +263,20 @@
       "required": ["schema_version", "time", "event", "timeout_ms", "grace_ms", "reason"],
       "additionalProperties": false
     },
+    "outputOverflow": {
+      "type": "object",
+      "description": "A capture stream exceeded its per-stream byte ceiling while --capture-overflow cancel was active. The run then enters the shared graceful teardown and exits with OUTPUT_OVERFLOW (113).",
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "time": { "$ref": "#/$defs/time" },
+        "event": { "const": "output_overflow" },
+        "stream": { "type": "string", "enum": ["stdout", "stderr"], "description": "The first stream to cross the ceiling." },
+        "max_bytes": { "$ref": "#/$defs/u64", "description": "The configured per-stream capture ceiling." },
+        "grace_ms": { "$ref": "#/$defs/u64OrNull", "description": "The --grace window, ms; null if unset." }
+      },
+      "required": ["schema_version", "time", "event", "stream", "max_bytes", "grace_ms"],
+      "additionalProperties": false
+    },
     "cancelled": {
       "type": "object",
       "description": "The run was cancelled and torn down through the shared soft-stop -> grace -> hard-kill path.",
@@ -335,6 +350,7 @@
           "enum": [
             "child_exit",
             "timeout",
+            "output_overflow",
             "cancelled",
             "control_cancel",
             "control_kill",

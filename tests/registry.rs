@@ -369,6 +369,71 @@ fn inspect_reports_a_live_run_in_human_form() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn inspect_all_snapshots_live_runs_with_conjunctive_labels() {
+    let dir = scratch("inspect-all");
+    let registry = registry_dir(&dir);
+    let ci_dir = dir.join("ci");
+    let local_dir = dir.join("local");
+    fs::create_dir_all(&ci_dir).expect("create CI run directory");
+    fs::create_dir_all(&local_dir).expect("create local run directory");
+    let mut ci = command_with_flags(
+        &ci_dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &[
+            "--run-id",
+            "inspect-ci",
+            "--label",
+            "pipeline=ci",
+            "--label",
+            "lane=test",
+        ],
+        inspectable_child(),
+    )
+    .spawn()
+    .expect("spawn CI run");
+    let mut local = command_with_flags(
+        &local_dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "inspect-local", "--label", "pipeline=local"],
+        inspectable_child(),
+    )
+    .spawn()
+    .expect("spawn local run");
+    wait_until(|| record_count(&registry) == 2, Duration::from_secs(10));
+
+    let out = Command::new(bin())
+        .args([
+            "inspect",
+            "--all",
+            "--json",
+            "--label",
+            "pipeline=ci",
+            "--label",
+            "lane=test",
+        ])
+        .env("PROCESSKIT_CLI_REGISTRY_DIR", &registry)
+        .output()
+        .expect("run aggregate inspect");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "aggregate inspect succeeds: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("aggregate inspect prints one JSON array");
+    let outcomes = report.as_array().expect("report is an array");
+    assert_eq!(outcomes.len(), 1, "only the conjunctive match is inspected");
+    assert_eq!(outcomes[0]["run_id"], "inspect-ci");
+    assert_eq!(outcomes[0]["snapshot"]["run_id"], "inspect-ci");
+    assert!(outcomes[0]["error"].is_null());
+
+    let _ = ci.wait();
+    let _ = local.wait();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A run id that is not registered is a distinguishable failure: the reserved
 /// `CONTROL` code (103), a message naming the run on stderr, and no snapshot — never a
 /// hang or a generic error.

@@ -1,0 +1,17 @@
+Report this binary's compatibility surface for a consumer's fail-closed compatibility preflight — no run, no child, no side effects
+
+Usage: processkit-cli probe [OPTIONS] --json
+
+Options:
+      --json
+          Emit the report as JSON. Required because `probe` is a machine-readable preflight contract with a single fixed output shape — unlike `inspect`, whose `--json` is optional (T-214) since it also has a human-readable form. clap enforces this flag's presence and `probe` always prints JSON
+      --require-schema-version <N>
+          Require the binary's JSONL event `schema_version` to equal `<N>` exactly (adapters pin an exact version). A mismatch is a fail-closed incompatibility
+      --require-exit-code-band <start-end>
+          Require the reserved runner exit-code band to be exactly `<start>-<end>` (e.g. `100-119`). A mismatch is a fail-closed incompatibility. A malformed value is a usage error (100), like any other bad flag
+      --require-surface <token>
+          Require a CLI **surface token** to be present (repeatable). A token is either a subcommand name (`run`, `probe`) or a subcommand long flag (`run:--capture-dir`, `inspect:--json`). An absent token is a fail-closed incompatibility, so a consumer can assert the exact flags it will use exist
+      --print-schema
+          Print this binary's embedded JSONL event-schema document (`fixtures/schema/v1/schema.json`, embedded at build time via `include_str!`, see [`crate::probe::SCHEMA_JSON`]) to stdout, byte-for-byte identical to that fixture file, and exit successfully — **instead of** evaluating or printing the usual probe report. **Cannot be combined with any `--require-*` flag**: clap rejects that combination as an ordinary usage error (exit `100`), the same code any other malformed `probe` invocation gets, rather than silently skipping the requested checks and exiting `0` — a probe that were asked to verify expectations must never report a false "ok" (see the module-level fail-closed contract in `src/probe.rs`). This lets a consumer holding only an installed binary or an unpacked release archive (no git checkout, no tag to match) fetch the exact machine-readable schema its own version emits, entirely offline (see `docs/schema.md` and README's "JSONL event schema")
+  -h, --help
+          Print help

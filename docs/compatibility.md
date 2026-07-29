@@ -6,6 +6,13 @@ ProcessKit CLI has three public compatibility surfaces:
 2. the reserved runner exit-code band;
 3. JSONL `schema_version`.
 
+The human CLI surface is guarded by through-binary golden snapshots for the root
+help and every public subcommand in `fixtures/cli-help/`. An intentional flag,
+value-name, default, or help change must be regenerated with
+`UPDATE_CLI_HELP_GOLDEN=1 cargo test --test cli_help` and the fixture diff reviewed.
+The test normalizes only the Windows `.exe` suffix and line endings; all contract
+text and ordering remain exact.
+
 Breaking any of them requires a major release. An adapter should verify the
 exact pieces it uses before launching a payload rather than discovering an
 incompatible binary after work has started.

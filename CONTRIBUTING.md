@@ -93,6 +93,19 @@ just fmt-check
 just deny
 ```
 
+The root and every public subcommand also have exact through-binary `--help`
+snapshots under `fixtures/cli-help/`. If a CLI contract change is intentional,
+regenerate them and review the resulting fixture diff:
+
+```sh
+UPDATE_CLI_HELP_GOLDEN=1 cargo test --test cli_help
+```
+
+In PowerShell, set `$env:UPDATE_CLI_HELP_GOLDEN = "1"` for the test and remove
+the variable afterward. The ordinary `cargo test` path compares the built
+binary against the committed snapshots and prints this same update instruction
+on drift.
+
 ## Documentation quality
 
 CI gates two checks, over two different scopes. A spelling check ([`typos`])

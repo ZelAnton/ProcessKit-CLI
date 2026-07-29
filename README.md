@@ -202,12 +202,13 @@ processkit-cli run     [--run-id <id>] [--label <KEY=VALUE>]... [--cwd <dir>]
                        [--grace <duration>] [--max-memory <size>]
                        [--max-processes <n>] [--cpu-quota <cores>]
                        [--capture-dir <dir>] [--capture-max-bytes <size>]
+                       [--capture-overflow <truncate|cancel>]
                        [--no-echo] [--detach] [--argv-raw]
                        [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
                        [--env-clear] [--env-remove <KEY>]... [--env-file <file>]...
                        [--env <KEY=VALUE>]...
                        -- <program> <args...>
-processkit-cli inspect --run-id <id> [--json]
+processkit-cli inspect (--run-id <id> [--json] | --all --json [--label <KEY=VALUE>]...)
 processkit-cli cancel  (--run-id <id> | --all [--label <KEY=VALUE>]...)
 processkit-cli kill    (--run-id <id> | --all [--label <KEY=VALUE>]...)
 processkit-cli wait    (--run-id <id> | --all [--label <KEY=VALUE>]...) [--timeout <duration>]
@@ -310,6 +311,12 @@ cancel/kill against it is a bounded `CONTROL` (103) failure — never a hang. Cl
 after an abrupt runner
 death follows the platform-specific `abrupt_cleanup` guarantee above; only Windows
 currently guarantees the whole tree.
+
+`inspect --all --json` snapshots the confirmed-live registry entries once, then
+inspects those exact record paths and endpoints. Repeated `--label KEY=VALUE`
+filters are conjunctive. Its single JSON array preserves one result per snapshot
+target: either `snapshot` or an explicit per-run `error`, so a disappearing runner
+cannot silently vanish from a fleet observation.
 
 `cancel --all` / `kill --all` (mutually exclusive with `--run-id`, exactly one
 of the two required, the same clap shape `wait --all` established) are the mutating
@@ -743,6 +750,15 @@ concern sized once for the whole binary, while `--capture-max-bytes` bounds
 the on-disk per-stream transcript size, an operator's disk-budget choice per
 invocation — the two are deliberately kept separate rather than one deriving
 from the other.
+
+By default, overflow keeps this historical truncate-and-continue behavior. The
+opt-in `--capture-overflow cancel` policy instead ends the run when either stream
+first exceeds the ceiling. It emits `output_overflow` with the first stream and
+limit, follows the same soft-stop → `--grace` → hard-kill path as a timeout, and
+returns runner-owned `OUTPUT_OVERFLOW` (113); terminal `runner_exit.source` is
+`output_overflow` and `child_code` is `null`. The policy works with `--no-echo` and
+detached runs because both retain the same capture tee. `--capture-overflow
+truncate` is an explicit spelling of the default.
 
 ## Resource limits
 

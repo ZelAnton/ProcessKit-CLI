@@ -55,7 +55,8 @@ pub enum Command {
 /// [--windows-graceful-ctrl-break]
 /// [--timeout <duration>] [--idle-timeout <duration>] [--grace <duration>]
 /// [--max-memory <size>] [--max-processes <n>] [--cpu-quota <cores>]
-/// [--capture-dir <dir>] [--capture-max-bytes <size>] [--no-echo] [--detach]
+/// [--capture-dir <dir>] [--capture-max-bytes <size>]
+/// [--capture-overflow <truncate|cancel>] [--no-echo] [--detach]
 /// [--argv-raw] [--label <KEY=VALUE>] [--env-clear] [--env-remove <KEY>]
 /// [--env-file <file>] [--env <KEY=VALUE>]
 /// [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
@@ -192,6 +193,14 @@ pub struct RunArgs {
     #[arg(long, value_name = "size", value_parser = parse_size)]
     pub capture_max_bytes: Option<u64>,
 
+    /// What to do when either capture stream exceeds `--capture-max-bytes`.
+    /// `truncate` (the default when omitted) keeps the run alive and clips only
+    /// the transcript; `cancel` ends the whole run through the same graceful
+    /// teardown as a timeout. Requires `--capture-dir` because the capture byte
+    /// ceiling is the source of this signal.
+    #[arg(long, value_name = "policy", value_enum, requires = "capture_dir")]
+    pub capture_overflow: Option<CaptureOverflowPolicy>,
+
     /// Give the child the runner's stdin, stdout, and stderr handles directly.
     /// This preserves terminal status and cannot be combined with mediated I/O
     /// or Windows' no-console mode.
@@ -293,12 +302,37 @@ pub struct RunArgs {
     pub command: Vec<OsString>,
 }
 
+/// Policy applied when a bounded output transcript reaches its ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CaptureOverflowPolicy {
+    /// Preserve the historical behavior: clip the transcript and keep running.
+    Truncate,
+    /// Gracefully stop the run, then hard-kill survivors after `--grace`.
+    Cancel,
+}
+
 /// `inspect --run-id <id> [--json]`
 #[derive(Debug, Args)]
 pub struct InspectArgs {
-    /// The run to inspect.
-    #[arg(long, value_name = "id", value_parser = parse_run_id)]
-    pub run_id: String,
+    /// The single run to inspect. Mutually exclusive with `--all`; exactly one
+    /// target form is required.
+    #[arg(long, value_name = "id", value_parser = parse_run_id, conflicts_with = "all", required_unless_present = "all")]
+    pub run_id: Option<String>,
+
+    /// Inspect every run confirmed live in one registry snapshot. Aggregate output
+    /// is a single JSON array, so this form requires `--json`.
+    #[arg(
+        long,
+        conflicts_with = "run_id",
+        required_unless_present = "run_id",
+        requires = "json"
+    )]
+    pub all: bool,
+
+    /// With `--all`, restrict the snapshot to runs carrying this exact operator
+    /// label (repeatable; multiple filters combine with logical AND).
+    #[arg(long = "label", value_name = "KEY=VALUE", value_parser = crate::labels::parse, requires = "all", conflicts_with = "run_id")]
+    pub labels: Vec<OperatorLabel>,
 
     /// Emit the snapshot as JSON instead of a human-readable rendering. Optional,
     /// mirroring `list`/`prune` — `inspect` has a human-readable form of its own
@@ -886,7 +920,9 @@ mod tests {
         let Command::Inspect(args) = cli.command else {
             panic!("expected the inspect subcommand");
         };
-        assert_eq!(args.run_id, "r1");
+        assert_eq!(args.run_id.as_deref(), Some("r1"));
+        assert!(!args.all);
+        assert!(args.labels.is_empty());
         assert!(
             !args.json,
             "--json is optional and defaults to off for inspect"
@@ -894,7 +930,25 @@ mod tests {
 
         assert!(
             Cli::try_parse_from(["processkit-cli", "inspect", "--json"]).is_err(),
-            "--run-id is required"
+            "--run-id or --all is required"
+        );
+        let cli = Cli::try_parse_from([
+            "processkit-cli",
+            "inspect",
+            "--all",
+            "--json",
+            "--label",
+            "pipeline=ci",
+        ])
+        .expect("aggregate inspect parses");
+        let Command::Inspect(args) = cli.command else {
+            panic!("expected inspect");
+        };
+        assert!(args.all && args.json && args.run_id.is_none());
+        assert_eq!(args.labels.len(), 1);
+        assert!(
+            Cli::try_parse_from(["processkit-cli", "inspect", "--all"]).is_err(),
+            "aggregate inspect requires machine-readable output"
         );
     }
 
@@ -2164,6 +2218,60 @@ mod tests {
                 "a malformed `--capture-max-bytes {bad}` must fail at parse time"
             );
         }
+    }
+
+    #[test]
+    fn run_parses_capture_overflow_policy_and_requires_capture() {
+        let cli = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--capture-dir",
+            "cap",
+            "--capture-overflow",
+            "cancel",
+            "--",
+            "true",
+        ])
+        .expect("cancel overflow policy with capture is valid");
+        let Command::Run(args) = cli.command else {
+            panic!("expected the run subcommand");
+        };
+        assert_eq!(args.capture_overflow, Some(CaptureOverflowPolicy::Cancel));
+
+        assert!(
+            Cli::try_parse_from([
+                "processkit-cli",
+                "run",
+                "--jsonl",
+                "events.jsonl",
+                "--capture-overflow",
+                "cancel",
+                "--",
+                "true",
+            ])
+            .is_err(),
+            "an overflow policy without a capture source must fail at parse time"
+        );
+
+        let Command::Run(defaults) = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--",
+            "true",
+        ])
+        .expect("a valid default run")
+        .command
+        else {
+            panic!("expected the run subcommand");
+        };
+        assert!(
+            defaults.capture_overflow.is_none(),
+            "omission preserves the historical truncate-and-continue behavior"
+        );
     }
 
     #[test]

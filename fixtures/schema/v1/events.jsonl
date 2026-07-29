@@ -16,3 +16,5 @@
 {"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"killed","source":"control_kill"}
 {"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"runner_exit","code":108,"source":"control_cancel","child_code":null}
 {"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"runner_exit","code":109,"source":"control_kill","child_code":null}
+{"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"output_overflow","stream":"stdout","max_bytes":65536,"grace_ms":2000}
+{"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"runner_exit","code":113,"source":"output_overflow","child_code":null}

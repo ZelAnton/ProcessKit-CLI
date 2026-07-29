@@ -35,7 +35,16 @@ fn main() -> ExitCode {
     // and each reports through the shared runner-error path below.
     match cli.command {
         Command::Run(args) => run::execute(*args),
-        Command::Inspect(args) => report(control::inspect(&args.run_id, args.json)),
+        Command::Inspect(args) => report(if args.all {
+            control::inspect_all(&args.labels)
+        } else {
+            control::inspect(
+                args.run_id
+                    .as_deref()
+                    .expect("clap requires --run-id when --all is absent"),
+                args.json,
+            )
+        }),
         Command::Cancel(args) => report(if args.all {
             control::cancel_all(&args.labels)
         } else {

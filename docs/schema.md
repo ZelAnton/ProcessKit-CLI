@@ -272,6 +272,24 @@ runner's output pump, so it conflicts with `--inherit-stdio` at parse time (like
 `--capture-dir`); it does compose with `--capture-dir`, whose tee re-arms the same
 one timer.
 
+### `output_overflow`
+
+A capture stream exceeded its configured per-stream ceiling while
+`--capture-overflow cancel` was active. The event is emitted before the same
+soft-stop → grace → hard-kill teardown used by a timeout.
+
+| Field       | Type              | Notes |
+|-------------|-------------------|-------|
+| `stream`    | string            | `stdout` or `stderr`, whichever crossed the ceiling first. |
+| `max_bytes` | integer           | The active per-stream `--capture-max-bytes` ceiling (or its 8 MiB default). |
+| `grace_ms`  | integer, nullable | The `--grace` window, ms; `null` if unset. |
+
+The terminal `runner_exit` has `source: "output_overflow"`, code
+`OUTPUT_OVERFLOW` (113), and `child_code: null`. `output_captured` still follows
+cleanup and reports the transcript's final counters and truncation flags. Without
+the opt-in `cancel` policy, crossing the same ceiling emits no `output_overflow` and
+continues the run, preserving the default truncate-only behavior.
+
 ### `cancelled`
 
 The run was cancelled and torn down through the shared soft-stop → grace → hard-kill
@@ -381,7 +399,7 @@ is never lost or aliased even when the process returns a runner-band code
 | Field        | Type              | Notes                                                                       |
 |--------------|-------------------|-----------------------------------------------------------------------------|
 | `code`       | integer           | The exit code the runner process returns (child's code, or a runner-band code). |
-| `source`     | string            | Why the runner exited: `child_exit`, `timeout`, `cancelled`, `control_cancel`, `control_kill`, `spawn_error`, `container_error`, `internal`, or `setup`. |
+| `source`     | string            | Why the runner exited: `child_exit`, `timeout`, `output_overflow`, `cancelled`, `control_cancel`, `control_kill`, `spawn_error`, `container_error`, `internal`, or `setup`. |
 | `child_code` | integer, nullable | The child's own exit code when it exited on its own; `null` for a runner-imposed ending or a child that never produced one. |
 
 When `source` is `child_exit`, `code` equals `child_code`. For a runner-imposed

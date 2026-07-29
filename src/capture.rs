@@ -34,11 +34,13 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWrite;
+use tokio::sync::Notify;
 
 use crate::events::CaptureInfo;
 use crate::hash::Sha256;
@@ -97,6 +99,57 @@ pub const CAPTURE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// (see the module docs above), counted here, never read back off the kernel.
 pub const CAPTURE_INFLIGHT_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+/// The first capture stream that exceeded its configured per-stream ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaptureOverflow {
+    pub stream: &'static str,
+    pub max_bytes: u64,
+}
+
+/// A lock-free, one-shot bridge from the synchronous pump sink to the runner's
+/// asynchronous ending race. The atomic value is authoritative; `Notify` only
+/// wakes the single waiter, so notifications cannot be lost if overflow happens
+/// just before the future starts polling.
+struct OverflowSignal {
+    stream: AtomicU8,
+    max_bytes: u64,
+    notify: Notify,
+}
+
+impl OverflowSignal {
+    fn new(max_bytes: u64) -> Self {
+        Self {
+            stream: AtomicU8::new(0),
+            max_bytes,
+            notify: Notify::new(),
+        }
+    }
+
+    fn trip(&self, stream: u8) {
+        if self
+            .stream
+            .compare_exchange(0, stream, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.notify.notify_one();
+        }
+    }
+
+    async fn wait(&self) -> CaptureOverflow {
+        loop {
+            let notified = self.notify.notified();
+            let stream = self.stream.load(Ordering::Acquire);
+            if stream != 0 {
+                return CaptureOverflow {
+                    stream: if stream == 1 { "stdout" } else { "stderr" },
+                    max_bytes: self.max_bytes,
+                };
+            }
+            notified.await;
+        }
+    }
+}
+
 /// One stream's capture file plus its running metadata. Behind an `Arc<Mutex<…>>`
 /// so the [`CaptureTee`] on ProcessKit's pump task and the runner reading the final
 /// metadata share one state; the lock is only ever held for a synchronous file
@@ -130,6 +183,9 @@ pub struct StreamCapture {
     /// [`CaptureInfo`] as its own explicit flag, so a consumer learns the on-disk
     /// transcript is short of the byte counter without comparing sizes.
     write_error: bool,
+    /// Present only for a run-owned capture; direct benchmark/unit-test instances
+    /// keep their original standalone behavior.
+    overflow_signal: Option<(Arc<OverflowSignal>, u8)>,
 }
 
 impl StreamCapture {
@@ -146,7 +202,13 @@ impl StreamCapture {
             hasher: Sha256::new(),
             truncated: false,
             write_error: false,
+            overflow_signal: None,
         })
+    }
+
+    fn with_overflow_signal(mut self, signal: Arc<OverflowSignal>, stream: u8) -> Self {
+        self.overflow_signal = Some((signal, stream));
+        self
     }
 
     /// Fold `bytes` (already echoed live) into the capture: count them, write the
@@ -181,8 +243,11 @@ impl StreamCapture {
                 self.write_error = true;
             }
         }
-        if self.seen > self.max_bytes {
+        if self.seen > self.max_bytes && !self.truncated {
             self.truncated = true;
+            if let Some((signal, stream)) = &self.overflow_signal {
+                signal.trip(*stream);
+            }
         }
     }
 
@@ -240,6 +305,7 @@ type Shared = Arc<Mutex<StreamCapture>>;
 pub struct Capture {
     stdout: Shared,
     stderr: Shared,
+    overflow: Arc<OverflowSignal>,
 }
 
 impl Capture {
@@ -254,15 +320,20 @@ impl Capture {
     /// `--capture-max-bytes`) is byte-for-byte the same ceiling as before T-181.
     pub fn create(dir: &Path, max_bytes: u64) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
-        let stdout = Arc::new(Mutex::new(StreamCapture::new(
-            dir.join("stdout.log"),
-            max_bytes,
-        )?));
-        let stderr = Arc::new(Mutex::new(StreamCapture::new(
-            dir.join("stderr.log"),
-            max_bytes,
-        )?));
-        Ok(Self { stdout, stderr })
+        let overflow = Arc::new(OverflowSignal::new(max_bytes));
+        let stdout = Arc::new(Mutex::new(
+            StreamCapture::new(dir.join("stdout.log"), max_bytes)?
+                .with_overflow_signal(overflow.clone(), 1),
+        ));
+        let stderr = Arc::new(Mutex::new(
+            StreamCapture::new(dir.join("stderr.log"), max_bytes)?
+                .with_overflow_signal(overflow.clone(), 2),
+        ));
+        Ok(Self {
+            stdout,
+            stderr,
+            overflow,
+        })
     }
 
     /// The tee sink for stdout: `echo` (the live-echo target) fanned out to the
@@ -282,6 +353,11 @@ impl Capture {
     /// metadata honestly reflects the partial transcript captured before teardown.
     pub fn finalize(&self) -> (CaptureInfo, CaptureInfo) {
         (info_of(&self.stdout), info_of(&self.stderr))
+    }
+
+    /// Wait until either stream first exceeds the configured ceiling.
+    pub async fn overflowed(&self) -> CaptureOverflow {
+        self.overflow.wait().await
     }
 }
 
@@ -612,6 +688,35 @@ mod tests {
         assert!(!info.truncated());
         assert!(!info.write_error());
         assert_eq!(std::fs::read(path).unwrap(), b"firstsecond");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn overflow_signal_is_one_shot_and_not_lost_before_waiting() {
+        let root = temp_path("overflow-signal");
+        let dir = root
+            .parent()
+            .expect("scratch parent")
+            .join("overflow-signal-dir");
+        let capture = Capture::create(&dir, 4).expect("create capture");
+
+        capture.stderr.lock().expect("stderr lock").absorb(b"12345");
+        capture
+            .stdout
+            .lock()
+            .expect("stdout lock")
+            .absorb(b"abcdef");
+
+        let overflow = tokio::time::timeout(Duration::from_millis(100), capture.overflowed())
+            .await
+            .expect("a pre-existing overflow must wake a later waiter");
+        assert_eq!(
+            overflow,
+            CaptureOverflow {
+                stream: "stderr",
+                max_bytes: 4,
+            },
+            "the first stream to cross the ceiling wins permanently"
+        );
     }
 
     #[test]

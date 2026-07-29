@@ -676,6 +676,105 @@ async fn inspect_async(run_id: &str, json: bool) -> Result<(), RunnerError> {
     Ok(())
 }
 
+/// Inspect every run confirmed live in one registry snapshot, optionally restricted
+/// by conjunctive labels. The report is always one JSON array: each target carries
+/// either its snapshot or an honest per-run reachability error, and any error makes
+/// the aggregate command return [`exit::CONTROL`] after printing the full report.
+pub fn inspect_all(labels: &[crate::labels::OperatorLabel]) -> Result<(), RunnerError> {
+    let runtime = current_thread_runtime()?;
+    runtime.block_on(inspect_all_async(labels))
+}
+
+#[derive(Debug, Serialize)]
+pub struct InspectAllOutcome {
+    pub run_id: String,
+    pub snapshot: Option<Snapshot>,
+    pub error: Option<String>,
+}
+
+async fn inspect_all_async(labels: &[crate::labels::OperatorLabel]) -> Result<(), RunnerError> {
+    let registry = registry::open_read_only_for_setup()?;
+    let targets =
+        snapshot_mutation_targets(&registry, labels).map_err(registry::setup_read_error)?;
+
+    let mut outcomes = Vec::with_capacity(targets.len());
+    for target in targets {
+        match inspect_snapshot_target(&registry, &target).await {
+            Ok(snapshot) => outcomes.push(InspectAllOutcome {
+                run_id: target.run_id,
+                snapshot: Some(snapshot),
+                error: None,
+            }),
+            Err(err) => outcomes.push(InspectAllOutcome {
+                run_id: target.run_id,
+                snapshot: None,
+                error: Some(err.to_string()),
+            }),
+        }
+    }
+
+    let line = serde_json::to_string(&outcomes).map_err(|err| {
+        RunnerError::new(
+            exit::SETUP,
+            format!("could not render the inspect --all report: {err}"),
+        )
+    })?;
+    println!("{line}");
+
+    let failed = outcomes
+        .iter()
+        .filter(|outcome| outcome.error.is_some())
+        .count();
+    if failed > 0 {
+        return Err(RunnerError::new(
+            exit::CONTROL,
+            format!(
+                "inspect --all: {failed} of {} target run(s) could not be inspected; see the report above for the per-run reason",
+                outcomes.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+async fn inspect_snapshot_target(
+    registry: &registry::Registry,
+    target: &MutationTarget,
+) -> Result<Snapshot, RunnerError> {
+    if snapshot_target_state(registry, target, "inspect")? == SnapshotTargetState::AlreadyGone {
+        return Err(unreachable_run(
+            "inspect",
+            &target.run_id,
+            "the snapshotted run finished before it could be inspected".to_string(),
+        ));
+    }
+    let endpoint = target.endpoint.as_deref().ok_or_else(|| {
+        unreachable_run(
+            "inspect",
+            &target.run_id,
+            "the run is live but exposes no control endpoint".to_string(),
+        )
+    })?;
+    let stream = connect_live(endpoint, "inspect", &target.run_id).await?;
+    if snapshot_target_state(registry, target, "inspect")? == SnapshotTargetState::AlreadyGone {
+        return Err(unreachable_run(
+            "inspect",
+            &target.run_id,
+            "the snapshotted run finished before it could answer".to_string(),
+        ));
+    }
+    let snapshot: Snapshot =
+        converse_under_deadline(stream, INSPECT_REQUEST, "inspect", &target.run_id).await?;
+    if snapshot.run_id != target.run_id {
+        return Err(unreachable_run(
+            "inspect",
+            &target.run_id,
+            "the runner returned a snapshot for a different run".to_string(),
+        ));
+    }
+    Ok(snapshot)
+}
+
 /// Client entry for `cancel --run-id <id>`: reach the live runner through the
 /// registry and ask it to end the run through its shared soft-stop → grace →
 /// hard-kill teardown. On success the runner acks and its run exits with

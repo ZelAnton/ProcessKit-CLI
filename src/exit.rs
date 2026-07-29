@@ -119,7 +119,7 @@ pub const PROBE_INCOMPATIBLE: u8 = 110;
 /// stays [`INTERNAL`]. Splitting them out keeps `INTERNAL` (104) honestly meaning
 /// "a runner bug", so a consumer is never misled into reading a setup error as one.
 /// Takes the next free code after [`PROBE_INCOMPATIBLE`] so no existing assignment
-/// shifts; `113`–`119` remain reserved.
+/// shifts; `113` is assigned below and `114`–`119` remain reserved.
 pub const SETUP: u8 = 111;
 /// The **`wait` subcommand's own** deadline elapsed while its target(s) were still
 /// live: `wait --timeout <duration>`, either the single-run form (`--run-id <id>`) or
@@ -136,9 +136,15 @@ pub const SETUP: u8 = 111;
 /// found perfectly healthy — nothing was unreachable — so folding the two together
 /// would tell a caller "I could not find your run" when the truth is "I found it, it
 /// is still running". Takes the next free code after [`SETUP`] so no existing
-/// assignment shifts; `113`–`119` remain reserved. See [`crate::wait`] and
+/// assignment shifts. See [`crate::wait`] and
 /// `docs/registry.md`, "Waiting — `wait`".
 pub const WAIT_TIMEOUT: u8 = 112;
+/// A capture stream exceeded `--capture-max-bytes` while the opt-in
+/// `--capture-overflow cancel` policy was active. The runner ended the tree via
+/// its normal graceful-stop and escalation path, so this is a runner-imposed
+/// outcome rather than a child exit. `113` is distinct from [`TIMEOUT`] because
+/// elapsed time and output volume are different operational failures.
+pub const OUTPUT_OVERFLOW: u8 = 113;
 
 /// A runner-own failure carrying the exit code it should surface and a
 /// human-readable message. Distinct from a child's exit — a child's code is
@@ -192,6 +198,7 @@ mod tests {
             PROBE_INCOMPATIBLE,
             SETUP,
             WAIT_TIMEOUT,
+            OUTPUT_OVERFLOW,
         ] {
             assert!(
                 (RUNNER_RANGE_START..=RUNNER_RANGE_END).contains(&code),
@@ -218,6 +225,7 @@ mod tests {
             PROBE_INCOMPATIBLE,
             SETUP,
             WAIT_TIMEOUT,
+            OUTPUT_OVERFLOW,
         ];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {
@@ -227,12 +235,18 @@ mod tests {
     }
 
     #[test]
-    fn the_four_runner_imposed_endings_are_all_distinct() {
+    fn runner_imposed_endings_are_all_distinct() {
         // A caller must be able to tell every runner-imposed ending apart by code:
         // a --timeout, a local stop signal (Ctrl-C, on Unix SIGTERM / SIGHUP, on
         // Windows Ctrl-Break / console close / logoff / shutdown — all of which
         // share CANCELLED), a control-plane cancel, and a control-plane kill.
-        let endings = [TIMEOUT, CANCELLED, CONTROL_CANCELLED, CONTROL_KILLED];
+        let endings = [
+            TIMEOUT,
+            CANCELLED,
+            CONTROL_CANCELLED,
+            CONTROL_KILLED,
+            OUTPUT_OVERFLOW,
+        ];
         for (i, a) in endings.iter().enumerate() {
             for b in &endings[i + 1..] {
                 assert_ne!(a, b, "two runner-imposed endings collided on {a}");

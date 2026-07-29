@@ -346,7 +346,8 @@ pub(super) async fn graceful_teardown(
 }
 
 /// Turn a runner-imposed ending into the reserved-band error it surfaces:
-/// [`exit::TIMEOUT`] / [`exit::CANCELLED`] plus a message that names the ending
+/// [`exit::TIMEOUT`] / [`exit::OUTPUT_OVERFLOW`] / [`exit::CANCELLED`] plus a
+/// message that names the ending
 /// and describes, truthfully, how the tree was torn down.
 pub(super) trait TeardownDescription {
     fn soft(&self) -> SoftTerminate;
@@ -404,6 +405,13 @@ pub(super) fn termination_error<T: TeardownDescription>(
             format!(
                 "run idle-timed out after {} with no output",
                 format_duration(limit)
+            ),
+        ),
+        Termination::OutputOverflow(overflow) => (
+            exit::OUTPUT_OVERFLOW,
+            format!(
+                "run output exceeded the {}-byte capture ceiling on {}",
+                overflow.max_bytes, overflow.stream
             ),
         ),
         // Every local-signal cancel surfaces the same reserved code; only the headline

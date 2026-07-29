@@ -1,0 +1,9 @@
+List every run recorded in the per-user registry, whatever its health (live/stale/unprobed)
+
+Usage: processkit-cli list [OPTIONS]
+
+Options:
+      --json               Emit one JSON object per entry (one per line) instead of a human-readable table. Unlike `inspect`/`probe`, this flag is optional — `list` has a human-readable form of its own
+      --label <KEY=VALUE>  Keep only entries carrying this exact operator label. Repeat for logical AND
+      --health <health>    Keep only entries with this registry-health verdict [possible values: live, stale, unprobed]
+  -h, --help               Print help
