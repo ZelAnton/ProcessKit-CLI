@@ -1543,10 +1543,13 @@ fn inherited_stdio_preserves_a_usable_posix_terminal() {
              JSONL={event_state}; processes={process_state:?}"
             )
         });
+    use std::os::unix::process::ExitStatusExt as _;
+
     assert_eq!(
         status.code(),
         Some(0),
-        "the pty-hosted inherited-stdio run must complete cleanly; child report={:?}; JSONL={:?}",
+        "the pty-hosted inherited-stdio run must complete cleanly; signal={:?}; child report={:?}; JSONL={:?}",
+        status.signal(),
         std::fs::read_to_string(&report),
         std::fs::read_to_string(&jsonl),
     );

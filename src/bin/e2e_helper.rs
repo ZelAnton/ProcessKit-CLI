@@ -284,20 +284,23 @@ fn pty_parent(args: &[String]) -> ExitCode {
 
         // Restoring the runner's foreground group happens while this host is a
         // background member of that same group. Linux directs the resulting
-        // SIGTTOU to the group, not only to the tcsetpgrp caller, so model an
-        // interactive shell and ignore it in the host. Reset the disposition in
-        // the runner's pre-exec hook: the test-only ignore must not leak into the
-        // runner or the payload it subsequently spawns.
-        let mut ignored: libc::sigaction = unsafe { std::mem::zeroed() };
-        ignored.sa_sigaction = libc::SIG_IGN;
-        if unsafe { libc::sigemptyset(&mut ignored.sa_mask) } != 0
-            || unsafe { libc::sigaction(libc::SIGTTOU, &ignored, std::ptr::null_mut()) } != 0
-        {
-            eprintln!(
-                "e2e-helper pty-parent: could not ignore SIGTTOU: {}",
-                std::io::Error::last_os_error()
-            );
-            return ExitCode::from(3);
+        // SIGTTOU to the group, not only to the tcsetpgrp caller. The kernel can
+        // also send SIGHUP to that foreground group when the controlling-session
+        // leader exits. Model an interactive shell and ignore both in the host.
+        // Reset the dispositions in the runner's pre-exec hook: the test-only
+        // ignores must not leak into the runner or its payload.
+        for signal in [libc::SIGTTOU, libc::SIGHUP] {
+            let mut ignored: libc::sigaction = unsafe { std::mem::zeroed() };
+            ignored.sa_sigaction = libc::SIG_IGN;
+            if unsafe { libc::sigemptyset(&mut ignored.sa_mask) } != 0
+                || unsafe { libc::sigaction(signal, &ignored, std::ptr::null_mut()) } != 0
+            {
+                eprintln!(
+                    "e2e-helper pty-parent: could not ignore signal {signal}: {}",
+                    std::io::Error::last_os_error()
+                );
+                return ExitCode::from(3);
+            }
         }
 
         let helper = std::env::current_exe().expect("resolve current e2e helper");
@@ -322,12 +325,14 @@ fn pty_parent(args: &[String]) -> ExitCode {
         // functions. Resetting here happens before the runner can spawn payloads.
         unsafe {
             command.pre_exec(|| {
-                let mut default_action: libc::sigaction = std::mem::zeroed();
-                default_action.sa_sigaction = libc::SIG_DFL;
-                if libc::sigemptyset(&mut default_action.sa_mask) != 0
-                    || libc::sigaction(libc::SIGTTOU, &default_action, std::ptr::null_mut()) != 0
-                {
-                    return Err(std::io::Error::last_os_error());
+                for signal in [libc::SIGTTOU, libc::SIGHUP] {
+                    let mut default_action: libc::sigaction = std::mem::zeroed();
+                    default_action.sa_sigaction = libc::SIG_DFL;
+                    if libc::sigemptyset(&mut default_action.sa_mask) != 0
+                        || libc::sigaction(signal, &default_action, std::ptr::null_mut()) != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
                 Ok(())
             });
