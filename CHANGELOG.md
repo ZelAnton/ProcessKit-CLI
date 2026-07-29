@@ -28,6 +28,10 @@ to a dated version section.
   conjunctive `--label` filters for `cancel --all`, `kill --all`, and `wait --all`.
 - A POSIX PTY e2e assertion that verifies foreground process-group restoration
   after an inherited-stdio run returns.
+- `cargo-binstall` metadata for one-command installation from the existing
+  prebuilt GitHub Release archives on every published target.
+- A scheduled, manually dispatchable, non-gating canary that builds and tests
+  against ProcessKit's current git `main` on Linux and Windows.
 
 ### Changed
 - Split the registry into a stable facade, platform-specific implementation files,

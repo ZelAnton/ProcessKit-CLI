@@ -1,0 +1,73 @@
+name: ProcessKit upstream canary
+
+# NON-GATING: schedule/manual only, with no push or pull_request trigger, so this
+# workflow is never a required change check. A red run is intentionally visible:
+# it means ProcessKit's current main no longer builds or passes this runner's
+# default binary-contract tests and should be investigated before the next
+# crates.io dependency update.
+
+on:
+  schedule:
+    # Weekly, offset from fuzz (Monday), mutants (Wednesday), and stress (Friday).
+    - cron: '23 3 * * 2'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  upstream-main:
+    name: upstream main (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@stable # rolling toolchain selector — intentionally unpinned
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # The checkout is disposable. Appending a patch here exercises upstream
+      # without changing the committed manifest or lockfile on main.
+      - name: Patch ProcessKit to upstream main
+        shell: bash
+        run: |
+          printf '\n%s\n%s\n' \
+            '[patch.crates-io]' \
+            'processkit = { git = "https://github.com/ZelAnton/ProcessKit-rs.git" }' \
+            >> Cargo.toml
+          cargo update -p processkit
+          if ! grep -A3 '^name = "processkit"$' Cargo.lock \
+            | grep -q '^source = "git+https://github.com/ZelAnton/ProcessKit-rs.git'; then
+            echo 'ProcessKit did not resolve from the expected upstream git repository' >&2
+            exit 1
+          fi
+          cargo tree -p processkit
+
+      # Mirrors ci.yml's default test job. E2E remains in its own platform lane;
+      # this canary's purpose is early public-API and binary-contract feedback.
+      - name: Build all default targets
+        run: cargo build --all-targets
+
+      - name: Run the default test tier
+        run: cargo test
+
+      - name: Report outcome
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### ProcessKit upstream main (${{ matrix.os }}): ${{ job.status }}"
+            echo
+            echo 'The disposable checkout patched `processkit` to its git repository.'
+            if [ "${{ job.status }}" != "success" ]; then
+              echo
+              echo 'Inspect the patch, build, and test logs before the next crates.io bump.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

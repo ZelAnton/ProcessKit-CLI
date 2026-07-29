@@ -14,6 +14,22 @@ readme = "README.md"
 # `msrv` CI job verifies it — keep the two in sync.
 rust-version = "1.88"
 
+# cargo-binstall downloads the same root-layout archives produced by
+# `.github/workflows/release.yml`, avoiding a local Rust compilation.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.tar.gz"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+# The release workflow uses ZIP only for its two supported Windows targets.
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.zip"
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.zip"
+pkg-fmt = "zip"
+
 # ---------------------------------------------------------------------------
 # Library target
 #

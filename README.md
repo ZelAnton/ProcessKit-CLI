@@ -71,6 +71,24 @@ with the [GitHub CLI](https://cli.github.com):
 gh attestation verify "$archive" --repo ZelAnton/ProcessKit-CLI
 ```
 
+### With cargo-binstall
+
+Rust users who already have
+[`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall) can install the
+matching prebuilt release in one command, without compiling ProcessKit or this
+runner locally:
+
+```sh
+cargo binstall processkit-cli
+```
+
+The manifest metadata points cargo-binstall at the same root-layout GitHub
+Release archive described above (`.tar.gz` on Unix, `.zip` on Windows). The
+archive's neighboring `.sha256` file and GitHub attestation remain available for
+independent verification; cargo-binstall does not verify those two sidecar
+artifacts on the user's behalf. Download the archive manually when an
+installation also needs the bundled completions, man pages, or schema files.
+
 ### From crates.io
 
 The prebuilt binaries do not replace `cargo install` — building from source stays

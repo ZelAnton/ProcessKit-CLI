@@ -2,8 +2,9 @@
 
 `processkit-cli` is distributed as one self-contained executable. A machine
 that runs the binary does not need Python, a virtual environment, or a Rust
-toolchain. Choose a prebuilt archive for production and CI; use `cargo install`
-when building from source is already part of your environment.
+toolchain. Choose a prebuilt archive directly or through `cargo-binstall` for
+production and CI; use `cargo install` when building from source is already part
+of your environment.
 
 ## Prebuilt archives
 
@@ -68,6 +69,22 @@ gh attestation verify "$archive" --repo ZelAnton/ProcessKit-CLI
 Both checks are useful in automation: the checksum is portable and offline once
 downloaded, while attestation verification ties the bytes to the release
 workflow and repository identity.
+
+## Install with cargo-binstall
+
+If [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall) is already
+available, install the matching prebuilt binary without a local source build:
+
+```sh
+cargo binstall processkit-cli
+```
+
+The crate metadata resolves to the same GitHub Release archive documented above:
+`.tar.gz` with a root-level `processkit-cli` on Unix, and `.zip` with a root-level
+`processkit-cli.exe` on Windows. The adjacent `.sha256` and signed provenance
+attestation belong to that same release, but cargo-binstall does not verify those
+sidecars automatically. Use the manual archive path when policy requires those
+checks or when you also need `completions/`, `man/`, or `schema/`.
 
 ## Install from crates.io
 
