@@ -198,7 +198,6 @@ fn pty_parent(args: &[String]) -> ExitCode {
     #[cfg(unix)]
     {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-        use std::os::unix::process::CommandExt;
 
         let Some(runner) = flag_value(args, "--runner") else {
             eprintln!("e2e-helper pty-parent: expected --runner <path>");
@@ -253,6 +252,35 @@ fn pty_parent(args: &[String]) -> ExitCode {
         let slave_err = unsafe { OwnedFd::from_raw_fd(slave_err) };
         let slave_probe = unsafe { OwnedFd::from_raw_fd(slave_probe) };
 
+        // Keep the PTY's controlling session alive in this host process. If the
+        // runner itself owns the session, POSIX revokes the controlling terminal
+        // as soon as that session leader exits, making an after-exit tcgetpgrp()
+        // observation inherently too late (macOS reports ENOTTY). The runner
+        // inherits this foreground group, exactly like a command launched by an
+        // interactive shell, while the host remains alive to verify restoration.
+        if unsafe { libc::setsid() } < 0 {
+            eprintln!(
+                "e2e-helper pty-parent: setsid failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return ExitCode::from(3);
+        }
+        if unsafe { libc::ioctl(slave_in.as_raw_fd(), libc::TIOCSCTTY as _, 0) } < 0 {
+            eprintln!(
+                "e2e-helper pty-parent: TIOCSCTTY failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return ExitCode::from(3);
+        }
+        let original_pgrp = unsafe { libc::getpgrp() };
+        if unsafe { libc::tcsetpgrp(slave_in.as_raw_fd(), original_pgrp) } < 0 {
+            eprintln!(
+                "e2e-helper pty-parent: initial tcsetpgrp failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return ExitCode::from(3);
+        }
+
         let helper = std::env::current_exe().expect("resolve current e2e helper");
         let mut command = Command::new(runner);
         command
@@ -270,22 +298,6 @@ fn pty_parent(args: &[String]) -> ExitCode {
             .stdin(Stdio::from(slave_in))
             .stdout(Stdio::from(slave_out))
             .stderr(Stdio::from(slave_err));
-        // SAFETY: this hook runs after fork and before exec, calls only
-        // async-signal-safe libc functions, and returns an io::Error on failure.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp()) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
         let mut runner = match command.spawn() {
             Ok(child) => child,
             Err(err) => {
@@ -293,7 +305,6 @@ fn pty_parent(args: &[String]) -> ExitCode {
                 return ExitCode::from(4);
             }
         };
-        let runner_pgrp = runner.id() as libc::pid_t;
         let mut master_reader = match master.try_clone() {
             Ok(reader) => reader,
             Err(err) => {
@@ -336,15 +347,15 @@ fn pty_parent(args: &[String]) -> ExitCode {
         loop {
             match runner.try_wait() {
                 Ok(Some(status)) => {
-                    // The runner created the PTY session and was its original
-                    // foreground group. Its guard must restore that exact value
-                    // after temporarily handing control to a process-group-backed
-                    // child. Keep a duplicate slave descriptor solely to observe
-                    // the terminal state after the runner has returned.
+                    // The runner inherited the host's foreground group. Its guard
+                    // must restore that exact value after temporarily handing
+                    // control to a process-group-backed child. Keep a duplicate
+                    // slave descriptor solely to observe the terminal state after
+                    // the runner has returned.
                     let restored = unsafe { libc::tcgetpgrp(slave_probe.as_raw_fd()) };
-                    if restored != runner_pgrp {
+                    if restored != original_pgrp {
                         eprintln!(
-                            "e2e-helper pty-parent: foreground pgrp was {restored}, expected restored runner group {runner_pgrp}"
+                            "e2e-helper pty-parent: foreground pgrp was {restored}, expected restored runner group {original_pgrp}"
                         );
                         return ExitCode::from(5);
                     }
