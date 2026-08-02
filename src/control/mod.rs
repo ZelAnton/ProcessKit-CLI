@@ -715,13 +715,13 @@ async fn inspect_all_async(
     let mut outcomes = Vec::with_capacity(targets.len());
     for target in targets {
         match inspect_snapshot_target(&registry, &target).await {
-            Ok(InspectSnapshot::Inspected(snapshot)) => outcomes.push(InspectAllOutcome {
+            Ok(SnapshotDispatch::Dispatched(snapshot)) => outcomes.push(InspectAllOutcome {
                 run_id: target.run_id,
                 status: InspectAllStatus::Inspected,
                 snapshot: Some(snapshot),
                 error: None,
             }),
-            Ok(InspectSnapshot::AlreadyGone) => outcomes.push(InspectAllOutcome {
+            Ok(SnapshotDispatch::AlreadyGone) => outcomes.push(InspectAllOutcome {
                 run_id: target.run_id,
                 status: InspectAllStatus::AlreadyGone,
                 snapshot: None,
@@ -756,44 +756,18 @@ async fn inspect_all_async(
     Ok(())
 }
 
+/// Drive one aggregate inspect target through [`dispatch_snapshot_target`] — the same
+/// ladder `cancel --all` / `kill --all` run per target (see [`mutate_snapshot_target`])
+/// — adding only the read-only verb's own final step: the snapshot must name the run
+/// that was addressed.
 async fn inspect_snapshot_target(
     registry: &registry::Registry,
     target: &SnapshotTarget,
-) -> Result<InspectSnapshot, RunnerError> {
-    if snapshot_target_state(registry, target, "inspect")? == SnapshotTargetState::AlreadyGone {
-        return Ok(InspectSnapshot::AlreadyGone);
-    }
-    let endpoint = target.endpoint.as_deref().ok_or_else(|| {
-        unreachable_run(
-            "inspect",
-            &target.run_id,
-            "the run is live but exposes no control endpoint".to_string(),
-        )
-    })?;
-    let stream = match connect_live(endpoint, "inspect", &target.run_id).await {
-        Ok(stream) => stream,
-        Err(err) => {
-            return match snapshot_target_state(registry, target, "inspect")? {
-                SnapshotTargetState::AlreadyGone => Ok(InspectSnapshot::AlreadyGone),
-                SnapshotTargetState::Live => Err(err),
-            };
-        }
-    };
-    if snapshot_target_state(registry, target, "inspect")? == SnapshotTargetState::AlreadyGone {
-        return Ok(InspectSnapshot::AlreadyGone);
-    }
-    let snapshot: Snapshot =
-        match converse_under_deadline(stream, INSPECT_REQUEST, "inspect", &target.run_id).await {
-            Ok(snapshot) => snapshot,
-            Err(err) => {
-                return match snapshot_target_state(registry, target, "inspect")? {
-                    SnapshotTargetState::AlreadyGone => Ok(InspectSnapshot::AlreadyGone),
-                    SnapshotTargetState::Live => Err(err),
-                };
-            }
-        };
-    verify_snapshot_identity(&snapshot, &target.run_id)?;
-    Ok(InspectSnapshot::Inspected(snapshot))
+) -> Result<SnapshotDispatch<Snapshot>, RunnerError> {
+    dispatch_snapshot_target(registry, target, "inspect", INSPECT_REQUEST, |snapshot| {
+        verify_snapshot_identity(snapshot, &target.run_id)
+    })
+    .await
 }
 
 fn verify_snapshot_identity(snapshot: &Snapshot, expected_run_id: &str) -> Result<(), RunnerError> {
@@ -958,15 +932,22 @@ enum SnapshotTargetState {
     AlreadyGone,
 }
 
+/// What driving one aggregate snapshot target through [`dispatch_snapshot_target`]
+/// produced: the runner's own reply to the verb (`T` — a [`Snapshot`] for `inspect
+/// --all`, a [`ControlAck`] for `cancel --all` / `kill --all`), or the record-specific
+/// verdict that the target finished before the exchange completed.
+///
+/// One type for both call sites rather than a per-verb pair: `already_gone` is the
+/// same reclassification decision in both, and the aggregate reports differ only in
+/// how they render it (see [`InspectAllStatus::AlreadyGone`] and
+/// [`ControlAllStatus::AlreadyGone`]).
 #[derive(Debug)]
-enum SnapshotMutation {
-    Accepted(ControlAck),
-    AlreadyGone,
-}
-
-#[derive(Debug)]
-enum InspectSnapshot {
-    Inspected(Snapshot),
+enum SnapshotDispatch<T> {
+    /// The runner answered and the caller's final verification accepted the reply.
+    Dispatched(T),
+    /// The snapshotted record is confirmed absent or stale — the desired terminal
+    /// state for mass teardown, and honest "nothing left to inspect" for the
+    /// read-only verb.
     AlreadyGone,
 }
 
@@ -1007,13 +988,13 @@ async fn mutate_all_async(
     let mut outcomes = Vec::with_capacity(targets.len());
     for target in targets {
         match mutate_snapshot_target(&registry, &target, command).await {
-            Ok(SnapshotMutation::Accepted(ack)) => outcomes.push(ControlAllOutcome {
+            Ok(SnapshotDispatch::Dispatched(ack)) => outcomes.push(ControlAllOutcome {
                 run_id: ack.run_id,
                 accepted: ack.accepted,
                 status: ControlAllStatus::Accepted,
                 error: None,
             }),
-            Ok(SnapshotMutation::AlreadyGone) => outcomes.push(ControlAllOutcome {
+            Ok(SnapshotDispatch::AlreadyGone) => outcomes.push(ControlAllOutcome {
                 run_id: target.run_id,
                 accepted: false,
                 status: ControlAllStatus::AlreadyGone,
@@ -1072,20 +1053,47 @@ fn snapshot_live_targets(
         .collect())
 }
 
-/// Dispatch one aggregate target without resolving its non-unique `run_id` again.
+/// Dispatch one aggregate snapshot target without resolving its non-unique `run_id`
+/// again — the single ladder every `--all` verb runs per target, generic over the
+/// reply type exactly as [`converse_under_deadline`] already is.
 ///
-/// A failed connect or conversation is reclassified only when the record-specific
-/// liveness check confirms the target is now absent or stale. That is the desired
-/// terminal state for mass teardown, so it is reported as `already_gone`; an
-/// unprobeable or identity-changed record remains a hard failure.
-async fn mutate_snapshot_target(
+/// The sequence is the whole contract, and it is deliberately one implementation
+/// rather than one per verb: the reclassification policy below is load-bearing for the
+/// aggregate exit-code contract, so a second copy could silently drift into a
+/// different policy for one command (the failure mode the hard-teardown tail had
+/// before [`crate::run::teardown`]'s `emit_hard_teardown` unified it).
+///
+/// 1. Re-confirm the snapshotted record ([`snapshot_target_state`]) *before* touching
+///    the transport: a target that finished since the snapshot is `already_gone`, not
+///    a failure.
+/// 2. Refuse a live target that advertises no endpoint — it cannot be reached, and
+///    "still live" is not "already gone".
+/// 3. [`connect_live`], then [`converse_under_deadline`] with `verb`, each with a
+///    record-specific re-probe on error: a failure is reclassified as `already_gone`
+///    **only** when the re-probe confirms the record is now absent or stale. An
+///    unprobeable or identity-changed record stays a hard failure — unknown liveness
+///    is not evidence the target ended (see [`snapshot_target_state`]).
+/// 4. Hand the parsed reply to the caller's `verify` step (identity for a snapshot,
+///    ack matching for a mutation), which alone decides whether the reply belongs to
+///    the target that was addressed.
+///
+/// `action` names the verb in every operator-facing message, while `verb` is the text
+/// actually written to the wire; they read the same today for both call sites, but the
+/// module keeps the diagnostic label and the protocol token separate everywhere else
+/// ([`converse_under_deadline`] takes both too), so this driver does not fuse them.
+async fn dispatch_snapshot_target<T, V>(
     registry: &registry::Registry,
     target: &SnapshotTarget,
-    command: ControlCommand,
-) -> Result<SnapshotMutation, RunnerError> {
-    let action = command.verb();
+    action: &str,
+    verb: &str,
+    verify: V,
+) -> Result<SnapshotDispatch<T>, RunnerError>
+where
+    T: serde::de::DeserializeOwned,
+    V: FnOnce(&T) -> Result<(), RunnerError>,
+{
     if snapshot_target_state(registry, target, action)? == SnapshotTargetState::AlreadyGone {
-        return Ok(SnapshotMutation::AlreadyGone);
+        return Ok(SnapshotDispatch::AlreadyGone);
     }
     let Some(endpoint) = target.endpoint.as_deref() else {
         return Err(unreachable_run(
@@ -1097,37 +1105,60 @@ async fn mutate_snapshot_target(
 
     let stream = match connect_live(endpoint, action, &target.run_id).await {
         Ok(stream) => stream,
-        Err(err) => {
-            return match snapshot_target_state(registry, target, action)? {
-                SnapshotTargetState::AlreadyGone => Ok(SnapshotMutation::AlreadyGone),
-                SnapshotTargetState::Live => Err(err),
-            };
-        }
+        Err(err) => return reclassify_target_failure(registry, target, action, err),
     };
 
     if snapshot_target_state(registry, target, action)? == SnapshotTargetState::AlreadyGone {
-        return Ok(SnapshotMutation::AlreadyGone);
+        return Ok(SnapshotDispatch::AlreadyGone);
     }
 
-    let ack: ControlAck =
-        match converse_under_deadline(stream, command.verb(), action, &target.run_id).await {
-            Ok(ack) => ack,
-            Err(err) => {
-                return match snapshot_target_state(registry, target, action)? {
-                    SnapshotTargetState::AlreadyGone => Ok(SnapshotMutation::AlreadyGone),
-                    SnapshotTargetState::Live => Err(err),
-                };
-            }
-        };
+    let reply: T = match converse_under_deadline(stream, verb, action, &target.run_id).await {
+        Ok(reply) => reply,
+        Err(err) => return reclassify_target_failure(registry, target, action, err),
+    };
 
-    if !ack_matches(&ack, action, &target.run_id) {
-        return Err(unreachable_run(
+    verify(&reply)?;
+    Ok(SnapshotDispatch::Dispatched(reply))
+}
+
+/// Decide what a transport-level failure against one snapshot target *means*: it is
+/// `already_gone` only when the record-specific re-probe confirms the target is now
+/// absent or stale, and otherwise the original failure stands. A re-probe that cannot
+/// answer at all replaces `err` with its own [`exit::CONTROL`] refusal — unknown
+/// liveness must not be laundered into either verdict.
+fn reclassify_target_failure<T>(
+    registry: &registry::Registry,
+    target: &SnapshotTarget,
+    action: &str,
+    err: RunnerError,
+) -> Result<SnapshotDispatch<T>, RunnerError> {
+    match snapshot_target_state(registry, target, action)? {
+        SnapshotTargetState::AlreadyGone => Ok(SnapshotDispatch::AlreadyGone),
+        SnapshotTargetState::Live => Err(err),
+    }
+}
+
+/// Drive one aggregate mutation target through [`dispatch_snapshot_target`], adding
+/// only the mutating verbs' own final step: a well-behaved runner acks the exact
+/// action and run it was asked about, and anything else is a failure rather than a
+/// false success (the same [`ack_matches`] contract the by-id form applies).
+async fn mutate_snapshot_target(
+    registry: &registry::Registry,
+    target: &SnapshotTarget,
+    command: ControlCommand,
+) -> Result<SnapshotDispatch<ControlAck>, RunnerError> {
+    let action = command.verb();
+    dispatch_snapshot_target(registry, target, action, command.verb(), |ack| {
+        if ack_matches(ack, action, &target.run_id) {
+            return Ok(());
+        }
+        Err(unreachable_run(
             action,
             &target.run_id,
             "the runner did not acknowledge the command for the snapshotted target".to_string(),
-        ));
-    }
-    Ok(SnapshotMutation::Accepted(ack))
+        ))
+    })
+    .await
 }
 
 /// Reconfirm the exact registry record captured by [`snapshot_live_targets`].
