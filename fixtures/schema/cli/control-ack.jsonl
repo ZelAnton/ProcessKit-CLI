@@ -1,0 +1,3 @@
+{"accepted":true,"action":"cancel","run_id":"build-42"}
+{"accepted":true,"action":"kill","run_id":"build-42"}
+[{"accepted":true,"error":null,"run_id":"build-42","status":"accepted"}]

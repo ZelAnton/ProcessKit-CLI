@@ -1,0 +1,2 @@
+{"live":1,"orphaned_locks":1,"pruned":1,"unprobed":1}
+{"candidates":[{"kind":"entry","run_id":"build-43","socket_dir":null,"started_at":"2026-07-20T21:00:00.000Z"},{"kind":"orphaned_lock","lock_file_name":"build-45.lock"}],"live":1,"orphaned_locks":1,"pruned":1,"unprobed":1}

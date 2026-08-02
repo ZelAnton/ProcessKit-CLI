@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/ZelAnton/ProcessKit-CLI/main/fixtures/schema/cli/control-ack.schema.json",
+  "title": "processkit-cli `cancel`/`kill` acknowledgement and `--all` report",
+  "description": "The machine-readable stdout of the mutating control-plane commands, in both forms: the single-target acknowledgement (`cancel --run-id <id>` / `kill --run-id <id>`, one JSON object — the runner's own reply line, printed verbatim once the client has verified it) and the aggregate report (`cancel --all` / `kill --all`, one JSON array with one entry per snapshot target). Validate against `#/$defs/ack` or `#/$defs/controlAllReport` directly when the invocation is known. The normative prose is docs/control-plane.md, \"The ack\" and \"`cancel --all` / `kill --all`\"; the in-code source of truth is src/control/mod.rs. Validated against fixtures/schema/cli/control-ack.jsonl, and against the real binary's output, by tests/machine_output.rs.",
+  "oneOf": [
+    { "$ref": "#/$defs/ack" },
+    { "$ref": "#/$defs/controlAllReport" }
+  ],
+  "$defs": {
+    "ack": {
+      "type": "object",
+      "description": "The single-target acknowledgement: the runner accepted the command and began tearing the run down. This is the one shape published here that also crosses a process boundary (runner to client) and it still carries no version field — see fixtures/schema/cli/README.md, \"Versioning\".",
+      "properties": {
+        "accepted": {
+          "const": true,
+          "description": "Always true in printed output: the client verifies `accepted`/`action`/`run_id` against the command it sent and fails closed with CONTROL (103) on any mismatch, so a rejected or garbled reply is never printed as a false success."
+        },
+        "action": {
+          "type": "string",
+          "enum": ["cancel", "kill"],
+          "description": "The action taken, echoed so the client can confirm the runner answered the verb it sent."
+        },
+        "run_id": {
+          "type": "string",
+          "description": "The run the command targeted — the id the client matched in the registry."
+        }
+      },
+      "required": ["accepted", "action", "run_id"],
+      "additionalProperties": false
+    },
+    "controlAllReport": {
+      "type": "array",
+      "description": "`cancel --all` / `kill --all`'s report: exactly one entry per target in the registry snapshot taken when the invocation started — no entry is ever skipped silently. An empty confirmed-live snapshot prints `[]` and exits 0; any `failed` entry makes the whole command exit CONTROL (103) *after* printing the complete report, never a silent 0 on partial failure.",
+      "items": { "$ref": "#/$defs/controlAllOutcome" }
+    },
+    "controlAllOutcome": {
+      "type": "object",
+      "description": "One aggregate target's outcome.",
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "description": "The target record's run id. Descriptive only: aggregate dispatch is keyed by the unique registry-record path, so two live records sharing an id are still addressed independently."
+        },
+        "accepted": {
+          "type": "boolean",
+          "description": "Whether a live runner acknowledged this invocation's mutation."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["accepted", "already_gone", "failed"],
+          "description": "`accepted` — the runner acknowledged the verb; `already_gone` — the target finished before its turn, so the desired terminal state is already reached without an ack (successful, not an error); `failed` — the still-potentially-live target could not be safely reached or did not acknowledge."
+        },
+        "error": {
+          "type": ["string", "null"],
+          "description": "Why a `failed` target was not accepted; null for both successful statuses."
+        }
+      },
+      "required": ["run_id", "accepted", "status", "error"],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "const": "accepted" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "accepted": { "const": true },
+              "error": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "status": { "const": "already_gone" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "accepted": { "const": false },
+              "error": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "status": { "const": "failed" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "accepted": { "const": false },
+              "error": { "type": "string" }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,3 @@
+{"argv_sha256":"1111111111111111111111111111111111111111111111111111111111111111","capture_dir":"/samples/build-42/capture","endpoint":"/samples/pkc-0123456789abcdef/c.sock","health":"live","hint":null,"jsonl":"/samples/build-42.jsonl","labels":{"lane":"build","pipeline":"ci"},"run_id":"build-42","started_at":"2026-07-20T21:00:00.000Z"}
+{"argv_sha256":null,"capture_dir":null,"endpoint":null,"health":"stale","hint":null,"jsonl":null,"labels":{},"run_id":"build-43","started_at":"2026-07-20T21:00:00.000Z"}
+{"argv_sha256":null,"capture_dir":null,"endpoint":null,"health":"unprobed","hint":null,"jsonl":null,"labels":{},"run_id":"build-44","started_at":"2026-07-20T21:00:00.000Z"}

@@ -1,0 +1,2 @@
+{"binary":"processkit-cli","compatible":true,"exit_code_band":{"end":119,"start":100},"mismatches":[],"probe_version":1,"schema_version":1,"surface":["run","run:--jsonl"],"version":"0.0.0"}
+{"binary":"processkit-cli","compatible":false,"exit_code_band":{"end":119,"start":100},"mismatches":["requires CLI surface token `run:--not-a-real-flag`, which this binary does not expose"],"probe_version":1,"schema_version":1,"surface":["run","run:--jsonl"],"version":"0.0.0"}

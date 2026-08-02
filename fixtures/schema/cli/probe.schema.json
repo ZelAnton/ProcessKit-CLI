@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/ZelAnton/ProcessKit-CLI/main/fixtures/schema/cli/probe.schema.json",
+  "title": "processkit-cli `probe --json` compatibility report",
+  "description": "The single JSON line `processkit-cli probe --json` prints to stdout — the fail-closed launcher preflight a consumer runs on a candidate binary before launching anything through it. Printed in both the compatible and the incompatible case (an unmet `--require-*` expectation exits PROBE_INCOMPATIBLE (110) with `compatible: false`), so the consumer always has a parseable result. The normative prose is docs/compatibility.md and docs/integration.md, \"Fail-closed preflight: `probe`\"; the in-code source of truth is src/probe.rs. Validated against fixtures/schema/cli/probe.jsonl, and against the real binary's output, by tests/machine_output.rs.",
+  "$ref": "#/$defs/probeReport",
+  "$defs": {
+    "u8": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 255
+    },
+    "probeReport": {
+      "type": "object",
+      "description": "One `probe --json` report line.",
+      "properties": {
+        "probe_version": {
+          "const": 1,
+          "description": "The report's own format version (src/probe.rs, PROBE_VERSION) — the launcher contract's own axis, independent of the JSONL `schema_version`, the control-plane `snapshot_version`, and the `registry_version`. Pinned here: a bump is a breaking change to this shape and updates this document with it."
+        },
+        "binary": {
+          "const": "processkit-cli",
+          "description": "The binary's package name, so a consumer can confirm the candidate really is this runner and not some other program that happens to accept a `probe` argument."
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.+-]+)?$",
+          "description": "The binary's semantic version (CARGO_PKG_VERSION). Together with `surface`, this is what a consumer pins for the outputs that carry no version field of their own (fixtures/schema/cli/README.md, \"Versioning\")."
+        },
+        "schema_version": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The JSONL event `schema_version` this binary emits — the value adapters pin (docs/schema.md, \"Versioning\"). Currently 1."
+        },
+        "exit_code_band": {
+          "type": "object",
+          "description": "The reserved runner exit-code band this binary uses (docs/exit-codes.md). A consumer pins it so a child exit that happens to fall in the band is never confused with a runner failure. Currently 100-119.",
+          "properties": {
+            "start": { "$ref": "#/$defs/u8", "description": "Inclusive lower bound." },
+            "end": { "$ref": "#/$defs/u8", "description": "Inclusive upper bound." }
+          },
+          "required": ["start", "end"],
+          "additionalProperties": false
+        },
+        "surface": {
+          "type": "array",
+          "description": "The CLI surface tokens this binary exposes: every subcommand name plus `<subcommand>:--<long-flag>` for each of its long flags, sorted and deduplicated. Derived from the live clap definition, so it cannot drift from the real parser; clap's own `--help`/`--version` are excluded.",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*(?::--[a-z0-9][a-z0-9-]*)?$"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "compatible": {
+          "type": "boolean",
+          "description": "Whether every `--require-*` expectation the consumer asked for is satisfied. `true` when none was requested (a healthy self-report)."
+        },
+        "mismatches": {
+          "type": "array",
+          "description": "One human-readable reason per unmet expectation — the parseable \"why\" behind `compatible: false`. Always present; empty exactly when `compatible` is true.",
+          "items": { "type": "string" }
+        }
+      },
+      "required": [
+        "probe_version",
+        "binary",
+        "version",
+        "schema_version",
+        "exit_code_band",
+        "surface",
+        "compatible",
+        "mismatches"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": { "compatible": { "const": true } },
+            "required": ["compatible"]
+          },
+          "then": {
+            "properties": { "mismatches": { "maxItems": 0 } },
+            "description": "A compatible report never carries a mismatch: `compatible` is exactly `mismatches.is_empty()` (src/probe.rs, `run`)."
+          },
+          "else": {
+            "properties": { "mismatches": { "minItems": 1 } },
+            "description": "An incompatible report always names at least one concrete reason — never a generic failure."
+          }
+        }
+      ]
+    }
+  }
+}

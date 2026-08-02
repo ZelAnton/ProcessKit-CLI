@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/ZelAnton/ProcessKit-CLI/main/fixtures/schema/cli/list.schema.json",
+  "title": "processkit-cli `list --json` registry entry",
+  "description": "One line of `processkit-cli list --json`: the command prints one JSON object per registry entry, one per line (JSON Lines), ordered deterministically by `run_id` then `started_at`. An empty registry prints no lines at all and exits 0. This is the client's own display shape, deliberately decoupled from the on-disk registry record (docs/registry.md, \"Record format\") — it never carries the record's lock file name or `registry_version`. The normative prose is docs/registry.md, \"Discovery — `list`\"; the in-code source of truth is src/list.rs. Validated against fixtures/schema/cli/list.jsonl, and against the real binary's output, by tests/machine_output.rs.",
+  "$ref": "#/$defs/listEntry",
+  "$defs": {
+    "rfc3339Millis": {
+      "type": "string",
+      "description": "RFC 3339 UTC with millisecond precision (`…Z`) — the same formatter every other timestamp in this binary uses.",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+    },
+    "listEntry": {
+      "type": "object",
+      "description": "One registered run as `list --json` prints it.",
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "description": "The run's identifier — the value a caller passes as `--run-id` to `inspect`/`cancel`/`kill`/`wait`. Not unique: the registry does not enforce uniqueness (docs/registry.md, \"Run id resolution\")."
+        },
+        "health": {
+          "type": "string",
+          "enum": ["live", "stale", "unprobed"],
+          "description": "`live` — a runner still holds the entry's liveness lock; `stale` — a **confirmed** leftover from a runner that died without cleaning up; `unprobed` — the liveness lock could not even be opened (permission denied, a rejected symlink/reparse point, a non-regular file in its place), so liveness is genuinely unknown and is never reported as the confirmed-dead `stale`. All three are listed, never hidden."
+        },
+        "started_at": { "$ref": "#/$defs/rfc3339Millis", "description": "Run start time." },
+        "hint": {
+          "type": ["string", "null"],
+          "description": "The run's worker-shape category (`msbuild_node_reuse`, …) from the same classifier catalog the JSONL `run_started` event uses (docs/schema.md, \"Hint classifier\"), or null for the common case of a command matching no known shape — and for a record written before the field existed. A fixed category label, never command-line content; the catalog grows additively and docs/schema.md is its single source of truth."
+        },
+        "argv_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "The run's one-way argv fingerprint — lowercase-hex SHA-256, in full (the human-readable table abbreviates it instead), so a caller can join this entry to the `argv_sha256` of the same run's `run_started` event byte for byte. Null for a record written before the field existed, or one whose value did not survive the registry's read-side shape guard."
+        },
+        "labels": {
+          "type": "object",
+          "description": "Operator labels in full, empty when the run carried none. Keys and values are re-validated when the record is read back (src/labels.rs); a value that fails validation is dropped from the map rather than failing the whole record.",
+          "propertyNames": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9._-]{0,63}$" },
+          "additionalProperties": { "type": "string", "maxLength": 256 }
+        },
+        "jsonl": {
+          "type": ["string", "null"],
+          "description": "Absolute path to the run's JSONL lifecycle stream, or null when the record publishes none."
+        },
+        "capture_dir": {
+          "type": ["string", "null"],
+          "description": "Absolute output-capture directory, or null when the run was started without `--capture-dir`."
+        },
+        "endpoint": {
+          "type": ["string", "null"],
+          "description": "The run's local control-transport address (a unix socket path or a Windows named pipe name), or null when the transport was never stood up — best-effort degradation, and never populated again for a stale entry's original runner, though the last-published value stays whatever the record said."
+        }
+      },
+      "required": [
+        "run_id",
+        "health",
+        "started_at",
+        "hint",
+        "argv_sha256",
+        "labels",
+        "jsonl",
+        "capture_dir",
+        "endpoint"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

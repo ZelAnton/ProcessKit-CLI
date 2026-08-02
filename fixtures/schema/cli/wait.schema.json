@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/ZelAnton/ProcessKit-CLI/main/fixtures/schema/cli/wait.schema.json",
+  "title": "processkit-cli `wait --report-outcome` report",
+  "description": "The single JSON object `processkit-cli wait --run-id <id> --report-outcome` prints to stdout once the run it waited for is no longer live. Opt-in and single-run only (clap rejects `wait --all --report-outcome`); a plain `wait` prints nothing at all. The report never changes `wait`'s exit code — a reported non-zero `code` is still exit 0 for the waiter, and the run's own outcome codes are never forwarded as the waiting process's status. The normative prose is docs/registry.md, \"Waiting — `wait`\"; the in-code source of truth is src/wait.rs. Validated against fixtures/schema/cli/wait.jsonl, and against the real binary's output, by tests/machine_output.rs.",
+  "$ref": "#/$defs/waitOutcome",
+  "$defs": {
+    "waitOutcome": {
+      "type": "object",
+      "description": "How the awaited run ended, as far as the waiter could honestly establish. Null fields are always present rather than omitted, so a consumer never has to distinguish absent from unknown.",
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "description": "The run the waiter was asked about — echoed even when nothing could be established about it."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["reported", "unknown"],
+          "description": "`reported` — the waiter observed the run live, then read its terminal `runner_exit` event from the JSONL locator the record published. `unknown` — it could not: it never observed the run live (an unknown or already-finished run id), the record published no locator, the runner died without a terminal event, or the stream could not be read. `unknown` is honest data, not an error: the exit code is unchanged."
+        },
+        "code": {
+          "type": ["integer", "null"],
+          "description": "The terminal `runner_exit` event's `code` — the exit code the run's own runner process returned (the child's code, or a reserved runner-band code). Null when `status` is `unknown`."
+        },
+        "source": {
+          "type": ["string", "null"],
+          "description": "The terminal `runner_exit` event's `source` — why the runner exited (`child_exit`, `timeout`, `control_cancel`, …). Null when `status` is `unknown`. The vocabulary is deliberately not duplicated here: fixtures/schema/v1/schema.json's `runnerExit.source` is its single source of truth, and it grows additively (docs/schema.md, \"Versioning\")."
+        },
+        "child_code": {
+          "type": ["integer", "null"],
+          "description": "The child's own exit code when it exited on its own; null for a runner-imposed ending, for a child that never produced one, and whenever `status` is `unknown`."
+        }
+      },
+      "required": ["run_id", "status", "code", "source", "child_code"],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "const": "reported" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "code": { "type": "integer" },
+              "source": { "type": "string" }
+            },
+            "description": "A reported outcome always names both the code and the source it read from the terminal event; only `child_code` may still be null there."
+          },
+          "else": {
+            "properties": {
+              "code": { "type": "null" },
+              "source": { "type": "null" },
+              "child_code": { "type": "null" }
+            },
+            "description": "An unknown outcome fabricates nothing: all three outcome fields are null."
+          }
+        }
+      ]
+    }
+  }
+}

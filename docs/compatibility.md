@@ -69,6 +69,59 @@ Within one schema version, readers must tolerate additive optional fields and
 unknown event fields. Removing or changing the meaning/type of an existing
 field requires a new schema version.
 
+## Machine-output schemas
+
+The JSONL stream is not the only machine-readable output. The discovery and
+control commands print machine-readable JSON to stdout too, and each of those
+shapes has a published JSON Schema (draft 2020-12, self-contained) plus a golden
+fixture under
+[`fixtures/schema/cli/`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/fixtures/schema/cli/README.md):
+
+| Output | Schema document | Golden fixture |
+| --- | --- | --- |
+| `probe --json` | `fixtures/schema/cli/probe.schema.json` | `probe.jsonl` |
+| `list --json` | `fixtures/schema/cli/list.schema.json` | `list.jsonl` |
+| `inspect --json`, `inspect --all --json` | `fixtures/schema/cli/inspect.schema.json` | `inspect.jsonl` |
+| `cancel`/`kill` ack, `cancel --all`/`kill --all` report | `fixtures/schema/cli/control-ack.schema.json` | `control-ack.jsonl` |
+| `prune --json`, `prune --dry-run --json` | `fixtures/schema/cli/prune.schema.json` | `prune.jsonl` |
+| `wait --report-outcome` | `fixtures/schema/cli/wait.schema.json` | `wait.jsonl` |
+
+`tests/machine_output.rs` validates the real binary's output for each of these
+against its document on every test run, so an accidental shape change fails CI
+instead of reaching an adapter. A document whose family has more than one output
+form has a root `oneOf` over named `$defs`, so a consumer can validate against the
+exact form it invoked — for example `inspect.schema.json#/$defs/snapshot`.
+
+**These outputs carry no version field, deliberately.** Only four contracts in
+this project version themselves, and each of them can be read by a party that did
+not invoke the binary: the durable JSONL stream (`schema_version`) and registry
+record (`registry_version`), the cross-process control-plane snapshot
+(`snapshot_version`), and the probe report (`probe_version`), whose whole job is to
+be read before the binary's version is known. Everything else in the table above is
+a synchronous stdout rendering read by the caller that just invoked this exact
+binary: that caller already knows the version and can pin the shape through the
+`probe` preflight above — the reported `version`, plus one `--require-surface`
+token per subcommand and flag it will actually use. A per-output version field
+would be a second, redundant pinning axis, so none was added.
+
+Consequently these shapes ride on the *first* compatibility surface (command names
+and flags), not on a version integer of their own:
+
+- a breaking change to any of them — removing a field, renaming it, changing its
+  type or the meaning of a value — is a **major** release, announced in the
+  changelog, and the documents under `fixtures/schema/cli/` are updated in place;
+  there is no `vN/` directory there because there is no version for a consumer to
+  pin;
+- additive changes (a new field, or a new value in an open-ended string field)
+  remain minor/patch, exactly as they are for the JSONL stream, and a reader that
+  consumes the fields it knows is unaffected.
+
+The published documents set `additionalProperties: false` so that this repository's
+own tests fail when a field is added without publishing it. An adapter that copies a
+document into its own pipeline and wants to tolerate a future additive field should
+relax that keyword on its copy rather than pin a field set the project treats as
+additive.
+
 ## Exit-code compatibility
 
 Normal foreground runs forward the child code. Runner-owned outcomes occupy

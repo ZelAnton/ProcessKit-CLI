@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/ZelAnton/ProcessKit-CLI/main/fixtures/schema/cli/inspect.schema.json",
+  "title": "processkit-cli `inspect --json` output",
+  "description": "The machine-readable output of `processkit-cli inspect --json`, in both its forms: the single-target snapshot (`--run-id <id> --json`, one JSON object) and the aggregate report (`--all --json`, one JSON array with one entry per snapshot target). Validate against `#/$defs/snapshot` or `#/$defs/inspectAllReport` directly when the invocation is known. Without `--json` both forms print a human-readable rendering instead, which is not a machine contract and is not described here. The normative prose is docs/control-plane.md, \"`inspect`\" and \"The inspect snapshot\"; the in-code source of truth is src/control/mod.rs. Validated against fixtures/schema/cli/inspect.jsonl, and against the real binary's output, by tests/machine_output.rs.",
+  "oneOf": [
+    { "$ref": "#/$defs/snapshot" },
+    { "$ref": "#/$defs/inspectAllReport" }
+  ],
+  "$defs": {
+    "u32": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "u32OrNull": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "rfc3339Millis": {
+      "type": "string",
+      "description": "RFC 3339 UTC with millisecond precision (`…Z`) — the same formatter the JSONL events and the registry record use.",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+    },
+    "member": {
+      "type": "object",
+      "description": "One member of the run's container, enriched with `ppid`/`name`/`start_time` wherever ProcessKit's members_info() can report them — the same shape, read through the same call, as the JSONL `members_snapshot` (docs/schema.md, \"Enriched member fields\"). Each enriched field stays independently null where the platform cannot report it.",
+      "properties": {
+        "pid": { "$ref": "#/$defs/u32", "description": "The process id." },
+        "ppid": { "$ref": "#/$defs/u32OrNull", "description": "Parent pid; null where the platform can't report it." },
+        "name": { "type": ["string", "null"], "description": "Executable name; null where the platform can't report it." },
+        "start_time": { "type": ["string", "null"], "description": "Opaque, platform-specific start-time token as a decimal string (not a timestamp); null where the platform can't report it." }
+      },
+      "required": ["pid", "ppid", "name", "start_time"],
+      "additionalProperties": false
+    },
+    "snapshot": {
+      "type": "object",
+      "description": "One live run's state, as `inspect --run-id <id> --json` prints it and as the runner replies to the control-plane `inspect` verb. Queried at request time, so it reflects the container's composition *when inspected*, not at start.",
+      "properties": {
+        "snapshot_version": {
+          "const": 2,
+          "description": "Snapshot format version (src/control/mod.rs, SNAPSHOT_VERSION) — the control plane's own client/runner axis, independent of the JSONL `schema_version` and the `registry_version`. Pinned here: a bump is a breaking change to this shape and updates this document with it."
+        },
+        "run_id": {
+          "type": "string",
+          "description": "The run's identifier — the key the client matched in the registry. Never a PID."
+        },
+        "mechanism": {
+          "type": "string",
+          "enum": ["job_object", "cgroup_v2", "process_group"],
+          "description": "Containment mechanism, in the same vocabulary as the JSONL `run_started`."
+        },
+        "root_pid": { "$ref": "#/$defs/u32OrNull", "description": "The root child's PID; null if the backend exposed none." },
+        "started_at": { "$ref": "#/$defs/rfc3339Millis", "description": "Run start time." },
+        "jsonl": {
+          "type": ["string", "null"],
+          "description": "Absolute path to the run's JSONL lifecycle stream; null only when reading a legacy snapshot that published none."
+        },
+        "capture_dir": {
+          "type": ["string", "null"],
+          "description": "Absolute output-capture directory, or null when capture is disabled."
+        },
+        "members": {
+          "type": "array",
+          "description": "A point-in-time snapshot of the container's members.",
+          "items": { "$ref": "#/$defs/member" }
+        }
+      },
+      "required": [
+        "snapshot_version",
+        "run_id",
+        "mechanism",
+        "root_pid",
+        "started_at",
+        "jsonl",
+        "capture_dir",
+        "members"
+      ],
+      "additionalProperties": false
+    },
+    "inspectAllReport": {
+      "type": "array",
+      "description": "`inspect --all --json`'s report: exactly one entry per target in the registry snapshot taken when the invocation started — no entry is ever skipped silently. An empty confirmed-live snapshot prints `[]` and exits 0; any `failed` entry makes the whole command exit CONTROL (103) *after* printing the complete report.",
+      "items": { "$ref": "#/$defs/inspectAllOutcome" }
+    },
+    "inspectAllOutcome": {
+      "type": "object",
+      "description": "One aggregate target's outcome.",
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "description": "The target record's run id. Descriptive only: aggregate dispatch is keyed by the unique registry-record path, so two live records sharing an id are still addressed independently."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["inspected", "already_gone", "failed"],
+          "description": "`inspected` — a snapshot was taken; `already_gone` — the target finished before its turn (not an error); `failed` — the still-potentially-live target could not be reached or answered unusably."
+        },
+        "snapshot": {
+          "description": "The target's snapshot for `inspected`, null otherwise.",
+          "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/snapshot" }]
+        },
+        "error": {
+          "type": ["string", "null"],
+          "description": "Why a `failed` target could not be inspected; null for both successful statuses."
+        }
+      },
+      "required": ["run_id", "status", "snapshot", "error"],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "const": "inspected" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "snapshot": { "$ref": "#/$defs/snapshot" },
+              "error": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "status": { "const": "already_gone" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "snapshot": { "type": "null" },
+              "error": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "status": { "const": "failed" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "snapshot": { "type": "null" },
+              "error": { "type": "string" }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

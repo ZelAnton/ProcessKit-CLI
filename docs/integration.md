@@ -65,6 +65,16 @@ uncontained-launch hazard this project exists to prevent. See
 [`src/probe.rs`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/src/probe.rs) and the normative exit-code table in
 [`docs/exit-codes.md`](exit-codes.md).
 
+The report's shape is published as a JSON Schema with a golden fixture —
+`fixtures/schema/cli/probe.schema.json` and `probe.jsonl` — so an adapter can
+validate what it parsed instead of re-deriving the shape by hand. Every
+machine-readable output in this guide has such a pair; see
+[`fixtures/schema/cli/README.md`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/fixtures/schema/cli/README.md)
+for the full table, and `docs/compatibility.md`, "Machine-output schemas", for
+why these outputs carry no version field of their own (the `probe` report's
+`probe_version` and the `inspect` snapshot's `snapshot_version` are the two that
+do).
+
 `probe --print-schema` is a separate, simpler mode on the same subcommand: it
 prints this binary's embedded JSONL event-schema document instead of the
 report above and exits `0`, so an adapter that only needs the schema for its
@@ -260,7 +270,17 @@ contact the runner at all and is described in [`docs/registry.md`](registry.md),
   restarted, or that supervises runs another process launched — and so has no
   child process to wait on. It prints nothing (the exit code is the answer),
   never touches the run, and needs no control endpoint, so it also works for a
-  run whose transport never came up.
+  run whose transport never came up. Adding **`--report-outcome`** (single-run
+  only) makes it print one JSON object naming how the run ended — `status`
+  `reported` with the terminal event's `code`/`source`/`child_code`, or `status`
+  `unknown` with all three `null` when the outcome could not be established —
+  without changing any of the exit codes below. See
+  [`docs/registry.md`](registry.md), "Waiting — `wait`".
+
+Each of these outputs has a published JSON Schema and golden fixture under
+`fixtures/schema/cli/`: `inspect.schema.json` (the single snapshot and the
+`--all` array), `control-ack.schema.json` (the `cancel`/`kill` ack and the
+`--all` report array), and `wait.schema.json` (`--report-outcome`).
 
 Both mutating verbs' outcomes are also written to the *target run's own*
 `--jsonl` stream (a `cancelled`/`killed` event with `source`
@@ -361,6 +381,11 @@ processkit-cli prune --json   # reap only the confirmed-stale entries
 Both are read-only with respect to any *live* run's control transport; neither
 carries the "could not reach the target run" failure modes of §4.
 
+Their machine-readable shapes are published too: `fixtures/schema/cli/list.schema.json`
+(one entry object per line) and `fixtures/schema/cli/prune.schema.json` (the plain
+tally and, as `#/$defs/dryRunReport`, the `--dry-run` form with its `candidates`
+list), each with a golden `*.jsonl` fixture beside it.
+
 ## 6. Typical errors
 
 - **Stale registry entry.** The runner behind a `run_id` died abruptly
@@ -427,6 +452,12 @@ carries the "could not reach the target run" failure modes of §4.
   strategy for automation agents that launch external tools through the runner.
 - [`docs/schema.md`](schema.md) — the normative JSONL event schema (every
   field, every event, versioning rules).
+- [`fixtures/schema/cli/README.md`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/fixtures/schema/cli/README.md)
+  — the JSON Schema documents and golden fixtures for every machine-readable
+  output in this guide (`probe`, `list`, `inspect`, the `cancel`/`kill` acks,
+  `prune`, `wait --report-outcome`), and why they are unversioned.
+- [`docs/compatibility.md`](compatibility.md) — the compatibility surfaces, the
+  pinning procedure, and the upgrade/downgrade checklists.
 - [`docs/exit-codes.md`](exit-codes.md) — the normative reserved exit-code
   band and the child-fidelity rule.
 - [`docs/control-plane.md`](control-plane.md) — the normative local transport,

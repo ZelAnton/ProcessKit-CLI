@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/ZelAnton/ProcessKit-CLI/main/fixtures/schema/cli/prune.schema.json",
+  "title": "processkit-cli `prune --json` report",
+  "description": "The single JSON object `processkit-cli prune --json` prints to stdout, in both its forms: the tally of a real reaping pass, and — under `--dry-run` — the same tally plus the `candidates` a real pass over that exact state would reap. Validate against `#/$defs/tally` or `#/$defs/dryRunReport` directly when the invocation is known. Prune deletes only entries it can *confirm* are stale: a live entry is never touched, and one whose liveness could not be probed at all is left in place rather than guessed at. A missing or empty registry is not an error — it reports an all-zero tally and exits 0. The normative prose is docs/registry.md, \"Reaping — `prune`\" and \"Previewing a reap — `prune --dry-run`\"; the in-code source of truth is src/prune.rs. Validated against fixtures/schema/cli/prune.jsonl, and against the real binary's output, by tests/machine_output.rs.",
+  "oneOf": [
+    { "$ref": "#/$defs/tally" },
+    { "$ref": "#/$defs/dryRunReport" }
+  ],
+  "$defs": {
+    "count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "rfc3339Millis": {
+      "type": "string",
+      "description": "RFC 3339 UTC with millisecond precision (`…Z`).",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+    },
+    "tally": {
+      "type": "object",
+      "description": "`prune --json`'s tally of one completed reaping pass.",
+      "properties": {
+        "pruned": {
+          "$ref": "#/$defs/count",
+          "description": "Confirmed-stale entries (`.json`/`.lock` pairs) whose files were reaped. On unix a reaped entry also takes its published private control-socket directory with it; that is counted here, not separately."
+        },
+        "live": {
+          "$ref": "#/$defs/count",
+          "description": "Entries left untouched because a live runner still holds their lock — paired records and lone orphaned lock files alike."
+        },
+        "unprobed": {
+          "$ref": "#/$defs/count",
+          "description": "Entries whose liveness could not be probed at all and were therefore left in place — liveness unknown is never read as confirmed-stale."
+        },
+        "orphaned_locks": {
+          "$ref": "#/$defs/count",
+          "description": "Confirmed-stale lone `.lock` files (no paired `.json`) that were reaped. Kept separate from `pruned` because reaping one deletes a single file rather than a `.json`/`.lock` pair."
+        }
+      },
+      "required": ["pruned", "live", "unprobed", "orphaned_locks"],
+      "additionalProperties": false
+    },
+    "dryRunReport": {
+      "type": "object",
+      "description": "`prune --dry-run --json`'s preview: the same four tally fields — so a consumer already parsing the tally needs no new field names — plus the machine-readable list of what a real pass would reap. Nothing is deleted.",
+      "properties": {
+        "pruned": { "$ref": "#/$defs/count", "description": "Confirmed-stale entries a real prune would reap." },
+        "live": { "$ref": "#/$defs/count", "description": "Entries a real prune would leave untouched as live." },
+        "unprobed": { "$ref": "#/$defs/count", "description": "Entries a real prune would leave in place as unprobeable." },
+        "orphaned_locks": { "$ref": "#/$defs/count", "description": "Confirmed-stale orphaned `.lock` files a real prune would reap." },
+        "candidates": {
+          "type": "array",
+          "description": "Every confirmed-stale candidate the counts above tally — exactly what a real prune pass over this same state would reap. Paired-record candidates come first, then orphaned lock files.",
+          "items": { "$ref": "#/$defs/candidate" }
+        }
+      },
+      "required": ["pruned", "live", "unprobed", "orphaned_locks", "candidates"],
+      "additionalProperties": false
+    },
+    "candidate": {
+      "description": "One thing a real prune would reap. Internally tagged on `kind`, so a consumer branches on one field rather than guessing which of two disjoint field sets is populated.",
+      "oneOf": [
+        { "$ref": "#/$defs/entryCandidate" },
+        { "$ref": "#/$defs/orphanedLockCandidate" }
+      ]
+    },
+    "entryCandidate": {
+      "type": "object",
+      "description": "A paired `.json`/`.lock` record a real prune would reap.",
+      "properties": {
+        "kind": { "const": "entry" },
+        "run_id": { "type": "string", "description": "The record's run id." },
+        "started_at": { "$ref": "#/$defs/rfc3339Millis", "description": "The record's start time." },
+        "socket_dir": {
+          "type": ["string", "null"],
+          "description": "The private control-socket directory a real prune would reap along with this entry's two files, or null when it would reap none — the record published no endpoint, published one that is not the shape a control server creates (so the reap refuses it rather than deleting it), or is a Windows record, whose named-pipe endpoint leaves nothing on disk. Always present, so a consumer reads one field rather than inferring from its absence."
+        }
+      },
+      "required": ["kind", "run_id", "started_at", "socket_dir"],
+      "additionalProperties": false
+    },
+    "orphanedLockCandidate": {
+      "type": "object",
+      "description": "A lone `.lock` file with no `.json` sibling a real prune would reap.",
+      "properties": {
+        "kind": { "const": "orphaned_lock" },
+        "lock_file_name": {
+          "type": "string",
+          "description": "The lock file's name, with no directory component."
+        }
+      },
+      "required": ["kind", "lock_file_name"],
+      "additionalProperties": false
+    }
+  }
+}
