@@ -92,29 +92,50 @@ instead of reaching an adapter. A document whose family has more than one output
 form has a root `oneOf` over named `$defs`, so a consumer can validate against the
 exact form it invoked — for example `inspect.schema.json#/$defs/snapshot`.
 
-**These outputs carry no version field, deliberately.** Only four contracts in
-this project version themselves, and each of them can be read by a party that did
-not invoke the binary: the durable JSONL stream (`schema_version`) and registry
-record (`registry_version`), the cross-process control-plane snapshot
-(`snapshot_version`), and the probe report (`probe_version`), whose whole job is to
-be read before the binary's version is known. Everything else in the table above is
-a synchronous stdout rendering read by the caller that just invoked this exact
-binary: that caller already knows the version and can pin the shape through the
-`probe` preflight above — the reported `version`, plus one `--require-surface`
-token per subcommand and flag it will actually use. A per-output version field
-would be a second, redundant pinning axis, so none was added.
+**Two rows of that table carry a version field; the other four deliberately do
+not.** `probe --json` carries `probe_version` and `inspect --json` carries
+`snapshot_version` — the same field the runner puts on the control-plane wire —
+and each document pins the current value with `const`, so a bump is a breaking
+change you can detect in the payload itself. **Pin those two on their own version
+field**, not on the CLI version alone: ignoring a `snapshot_version` bump across
+an upgrade is exactly the class of mistake this section exists to prevent. Both
+are versioned for the reason the project's other two versioned contracts (the
+durable JSONL stream's `schema_version` and the registry record's
+`registry_version`) are: each can be read by a party that did not invoke the
+binary — the snapshot crosses a process boundary to a runner that may be a
+different build, and the probe report's whole job is to be read *before* the
+binary's version is known.
 
-Consequently these shapes ride on the *first* compatibility surface (command names
-and flags), not on a version integer of their own:
+**The remaining four — `list --json`, the `cancel`/`kill` ack and `--all` report,
+`prune --json`, and `wait --report-outcome` — carry no version field,
+deliberately.** Each is a synchronous stdout rendering read by the caller that
+just invoked this exact binary. That includes the printed ack, whose content does
+arrive over the wire but is re-serialized by the client from the three fields it
+parsed and verified, so its field set is the client's own (see
+[`fixtures/schema/cli/README.md`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/fixtures/schema/cli/README.md),
+"Versioning"). Such a caller already knows the version and can pin the shape
+through the `probe` preflight above — the reported `version`, plus one
+`--require-surface` token per subcommand and flag it will actually use. A
+per-output version field would be a second, redundant pinning axis, so none was
+added.
 
-- a breaking change to any of them — removing a field, renaming it, changing its
-  type or the meaning of a value — is a **major** release, announced in the
-  changelog, and the documents under `fixtures/schema/cli/` are updated in place;
-  there is no `vN/` directory there because there is no version for a consumer to
-  pin;
-- additive changes (a new field, or a new value in an open-ended string field)
-  remain minor/patch, exactly as they are for the JSONL stream, and a reader that
-  consumes the fields it knows is unaffected.
+Consequently:
+
+- **The unversioned four ride on the *first* compatibility surface** (command
+  names and flags), not on a version integer of their own. A breaking change to
+  any of them — removing a field, renaming it, changing its type or the meaning
+  of a value — is a **major** release, announced in the changelog.
+- **`probe --json` and `inspect --json` additionally bump their own field.** A
+  breaking change to either shape bumps `probe_version` / `snapshot_version`
+  respectively, and that field — which the schema document pins with `const` — is
+  what a consumer should check.
+- **Every document under `fixtures/schema/cli/` is updated in place.** There is no
+  `vN/` directory there (unlike `fixtures/schema/v1/`, whose `v1` *is* the JSONL
+  `schema_version`), because a version here, where there is one, lives in the
+  payload rather than in a path. If a future release gives one of the unversioned
+  four a version field of its own, that is the point to revisit the layout.
+- **Additive changes remain minor/patch**, exactly as they are for the JSONL
+  stream, and a reader that consumes the fields it knows is unaffected.
 
 The published documents set `additionalProperties: false` so that this repository's
 own tests fail when a field is added without publishing it. An adapter that copies a

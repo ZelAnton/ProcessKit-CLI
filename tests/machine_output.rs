@@ -28,8 +28,9 @@
 //!    the document rejects.
 //!
 //! See `fixtures/schema/cli/README.md` for the layout, the versioning decision
-//! these outputs embody (they deliberately carry no version field of their own),
-//! and what the normalization does and does not touch.
+//! these outputs embody (`probe` and `inspect` carry their own `probe_version` /
+//! `snapshot_version`; the other four deliberately carry no version field), and
+//! what the normalization does and does not touch.
 
 mod common;
 

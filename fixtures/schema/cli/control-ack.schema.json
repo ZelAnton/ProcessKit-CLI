@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/ZelAnton/ProcessKit-CLI/main/fixtures/schema/cli/control-ack.schema.json",
   "title": "processkit-cli `cancel`/`kill` acknowledgement and `--all` report",
-  "description": "The machine-readable stdout of the mutating control-plane commands, in both forms: the single-target acknowledgement (`cancel --run-id <id>` / `kill --run-id <id>`, one JSON object — the runner's own reply line, printed verbatim once the client has verified it) and the aggregate report (`cancel --all` / `kill --all`, one JSON array with one entry per snapshot target). Validate against `#/$defs/ack` or `#/$defs/controlAllReport` directly when the invocation is known. The normative prose is docs/control-plane.md, \"The ack\" and \"`cancel --all` / `kill --all`\"; the in-code source of truth is src/control/mod.rs. Validated against fixtures/schema/cli/control-ack.jsonl, and against the real binary's output, by tests/machine_output.rs.",
+  "description": "The machine-readable stdout of the mutating control-plane commands, in both forms: the single-target acknowledgement (`cancel --run-id <id>` / `kill --run-id <id>`, one JSON object — the client's own re-serialization of the runner's reply, printed once the client has verified that reply against the command it sent) and the aggregate report (`cancel --all` / `kill --all`, one JSON array with one entry per snapshot target). Validate against `#/$defs/ack` or `#/$defs/controlAllReport` directly when the invocation is known. The normative prose is docs/control-plane.md, \"The ack\" and \"`cancel --all` / `kill --all`\"; the in-code source of truth is src/control/mod.rs. Validated against fixtures/schema/cli/control-ack.jsonl, and against the real binary's output, by tests/machine_output.rs.",
   "oneOf": [
     { "$ref": "#/$defs/ack" },
     { "$ref": "#/$defs/controlAllReport" }
@@ -10,7 +10,7 @@
   "$defs": {
     "ack": {
       "type": "object",
-      "description": "The single-target acknowledgement: the runner accepted the command and began tearing the run down. This is the one shape published here that also crosses a process boundary (runner to client) and it still carries no version field — see fixtures/schema/cli/README.md, \"Versioning\".",
+      "description": "The single-target acknowledgement: the runner accepted the command and began tearing the run down. An ack does cross a process boundary on the control-plane wire, but this document describes **stdout**, and stdout is not that wire message: src/control/mod.rs (`mutate_async`) deserializes the reply into a three-field `ControlAck`, verifies `accepted`/`action`/`run_id` against the command it sent, and prints a fresh serialization of what it parsed. A field an unknown newer runner added is therefore dropped at deserialization and never reaches stdout — which is why `additionalProperties: false` is exact here rather than merely strict. Because the printed shape is set by the client's version, this output is one of the four published here that deliberately carry no version field of their own (unlike `probe --json`'s `probe_version` and `inspect --json`'s `snapshot_version`) — see fixtures/schema/cli/README.md, \"Versioning\".",
       "properties": {
         "accepted": {
           "const": true,

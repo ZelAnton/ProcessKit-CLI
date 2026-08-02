@@ -29,10 +29,14 @@ validates both the golden fixture *and* the real binary's live output against
 every document. On a disagreement between a schema and the prose, trust the prose
 and treat the schema as needing a fix.
 
-## Versioning: these outputs are deliberately unversioned
+## Versioning: two of these six are versioned, four deliberately are not
 
-This was an explicit decision, not an oversight (see `docs/compatibility.md`,
-"Machine-output schemas", for the consumer-facing statement of it).
+`probe --json` carries `probe_version` and `inspect --json` carries
+`snapshot_version`; both documents pin the current value with `const`, so a bump
+is visible in the payload itself. The other four families here carry no version
+field, and that was an explicit decision, not an oversight (see
+`docs/compatibility.md`, "Machine-output schemas", for the consumer-facing
+statement of it).
 
 This project already versions four contracts on four independent axes: the JSONL
 `schema_version`, the registry record's `registry_version`, the control-plane
@@ -55,8 +59,28 @@ already knows which version produced them, and can pin that version's shape with
 the `probe` preflight (`version` plus the `surface` tokens for the exact
 subcommand and flags it is about to use). A per-output version field would add a
 second, redundant pinning axis without adding information the caller does not
-already have, so none was added, and none of these outputs gained a version field
-in the task that published these schemas.
+already have, so none was added, and none of these four gained a version field in
+the task that published these schemas.
+
+The `cancel`/`kill` ack is the one entry in that list that looks like it belongs
+with the versioned contracts instead, since an ack really does travel across a
+process boundary. What is **printed** is not that wire message, though. The
+client parses the runner's reply into a three-field `ControlAck`, verifies
+`accepted`/`action`/`run_id` against the command it sent — failing closed with
+`CONTROL` (103) on any mismatch rather than reporting a false success — and
+then prints a **fresh serialization of what it
+parsed** (`src/control/mod.rs`, `mutate_async`; `inspect` renders its snapshot
+the same way). Nothing is passed through byte-for-byte, so a field some newer
+runner added is dropped at deserialization and never reaches stdout: do not
+expect a mixed deployment's newer runner to surface unknown fields through an
+older client, and note that this is precisely why `control-ack.schema.json` can
+set `additionalProperties: false` and be *exact* about stdout rather than merely
+strict. The printed ack's field set is therefore fixed by the version of the
+client — the binary the caller just invoked — which is the same synchronous
+rendering the paragraph above describes, needing no version of its own for the
+same reason. Should the *wire* ack ever grow a variable shape, that is a
+control-plane concern and belongs on the control plane's own existing axis
+(`snapshot_version`) rather than on a new one for this printed form.
 
 Two consequences follow, and they are the whole compatibility story for this
 directory:
@@ -65,10 +89,15 @@ directory:
   like a breaking change to a flag (`docs/compatibility.md`, "Compatibility and
   upgrades"). It is announced in `CHANGELOG.md` and the documents in this
   directory are updated **in place** — there is no `vN/` directory here (unlike
-  `fixtures/schema/v1/`, whose `v1` *is* the JSONL `schema_version`), because
-  there is no version field for a consumer to pin. If a future task ever decides
-  one of these outputs does need its own version field, that is the point at which
-  a versioned directory should appear alongside it.
+  `fixtures/schema/v1/`, whose `v1` *is* the JSONL `schema_version`), because a
+  version here, where there is one, lives in the payload rather than in a path.
+  For the four unversioned families there is simply no version field for a
+  consumer to pin; if a future task ever decides one of them does need its own,
+  that is the point at which a versioned directory should appear alongside it.
+  For `probe --json` and `inspect --json` the pin already exists *inside* the
+  document — a breaking change to those shapes bumps `probe_version` /
+  `snapshot_version`, and that field, not a directory name, is what a consumer
+  checks.
 - **Additive changes stay additive.** A new field on one of these objects, or a
   new value in an open-ended string field, is a minor/patch change; a reader that
   consumes the fields it knows is unaffected. Note that these documents set
@@ -76,14 +105,6 @@ directory:
   drift-detection tests* (an added field must be published here in the same
   commit); an adapter that copies a document into its own pipeline and wants to
   tolerate a future additive field can relax that keyword on its copy.
-
-The one shape here that *does* cross a process boundary is the `cancel`/`kill`
-**ack**: it is the runner's reply as well as the client's stdout. It stays
-unversioned too, deliberately — it is a three-field, self-identifying reply
-(`accepted`/`action`/`run_id`) that the client verifies field by field before
-printing, failing closed with `CONTROL` (103) on any mismatch rather than
-reporting a false success. If it ever grows a variable shape, it belongs on the
-control plane's existing `snapshot_version` axis rather than on a new one.
 
 ## The fixtures
 

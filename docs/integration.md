@@ -455,7 +455,9 @@ list), each with a golden `*.jsonl` fixture beside it.
 - [`fixtures/schema/cli/README.md`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/fixtures/schema/cli/README.md)
   — the JSON Schema documents and golden fixtures for every machine-readable
   output in this guide (`probe`, `list`, `inspect`, the `cancel`/`kill` acks,
-  `prune`, `wait --report-outcome`), and why they are unversioned.
+  `prune`, `wait --report-outcome`), and the versioning decision behind them
+  (`probe` and `inspect` carry their own version field; the other four
+  deliberately carry none).
 - [`docs/compatibility.md`](compatibility.md) — the compatibility surfaces, the
   pinning procedure, and the upgrade/downgrade checklists.
 - [`docs/exit-codes.md`](exit-codes.md) — the normative reserved exit-code
