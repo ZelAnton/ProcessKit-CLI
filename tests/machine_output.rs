@@ -314,15 +314,26 @@ fn long_child() -> Vec<String> {
     }
 }
 
-/// A child that exits cleanly after a few seconds — long enough for a `wait` to
-/// observe the run live first, with the same ~5s margin `tests/registry.rs`'s
-/// `inspectable_child` uses for the same reason (a shorter window is a flake on a
-/// loaded CI host, where spawning the waiter can itself cost seconds).
+/// A child that exits cleanly after ~15s — brief only next to [`long_child`], and
+/// deliberately the same width as `tests/registry.rs`'s `inspectable_child`, for the
+/// same measured reason.
+///
+/// The window has to cover *two* processes in sequence before the run ends: the
+/// runner publishing its record, and a separate `wait --report-outcome` client being
+/// spawned and reaching its first probe while the run is still live. Only a waiter
+/// that observed the run live reports the terminal outcome; one that arrives late is
+/// honestly `unknown` (`src/wait.rs`), and this file's scenario hard-asserts the
+/// `reported` line *and* pins it in `fixtures/schema/cli/wait.jsonl`, so missing the
+/// window fails both the assertion and the byte-for-byte fixture comparison. ~5s is
+/// the width `inspectable_child` started at: enough on an idle machine, but it flaked
+/// reproducibly under host contention (see its own comment), and the race here is the
+/// same one with an extra client spawn inside the window. Widening costs wall-clock
+/// time and nothing else: the scenario waits for the run to end either way.
 fn brief_child() -> Vec<String> {
     if cfg!(windows) {
-        shell_inline("ping -n 6 127.0.0.1 >nul")
+        shell_inline("ping -n 16 127.0.0.1 >nul")
     } else {
-        shell_inline("sleep 5")
+        shell_inline("sleep 15")
     }
 }
 

@@ -752,9 +752,13 @@ runner's argv (and are never copied into lifecycle events or registry records).
 Operator labels are separate, non-secret metadata: repeat `run --label KEY=VALUE`
 to group runs for discovery and aggregate operations. Keys are 1-64 ASCII bytes,
 start with a letter or `_`, and otherwise use letters, digits, `.`, `-`, or `_`;
-values are at most 256 characters with no control characters. A later run label
-replaces an earlier value for the same key. `list` and `run_started.labels` expose
-the resulting map; aggregate label filters combine with logical AND.
+values are at most 256 characters and, like an explicit `--run-id`, cannot contain
+terminal control or invisible formatting characters (bidi overrides and isolates,
+zero-width marks, tag characters). A later run label replaces an earlier value for
+the same key; a label already on an older registry record that fails either check
+is dropped from that record's map while the record itself is kept. `list` and
+`run_started.labels` expose the resulting map; aggregate label filters combine with
+logical AND.
 
 ## Bounded output capture
 

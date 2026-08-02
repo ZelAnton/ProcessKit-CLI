@@ -61,6 +61,17 @@ fn read_only_record(dir: &Path) -> String {
     fs::read_to_string(records.pop().unwrap()).expect("read the registry record")
 }
 
+/// How long a fixture waits for the registry to reach an expected state (a record
+/// appearing, a second run registering, an endpoint being published) before giving up.
+///
+/// Deliberately generous: every condition here is reached by *another process* —
+/// spawning the runner binary, standing up its control transport and publishing its
+/// record — and on a heavily loaded host that whole chain can cost seconds rather than
+/// the few hundred milliseconds it takes on an idle one. The budget costs nothing when
+/// the condition holds (the poll returns immediately), so the only thing a tight value
+/// buys is intermittent failures.
+const RECORD_WAIT: Duration = Duration::from_secs(20);
+
 /// Poll `cond` until it holds or `timeout` elapses (then panic).
 fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) {
     let start = Instant::now();
@@ -105,12 +116,16 @@ fn backdate(path: &Path, age: Duration) {
         .expect("backdate the fixture's mtime");
 }
 
-/// A child that stays alive for ~2s — long enough to observe the live entry.
+/// A child that stays alive for ~6s — long enough to observe the live entry by
+/// scanning the registry directory directly, with room for the runner itself to take
+/// seconds to start and register on a loaded host (the same margin reasoning as
+/// [`inspectable_child`], which additionally has to survive whole client
+/// invocations).
 fn slow_child() -> Vec<String> {
     if cfg!(windows) {
-        shell_inline("ping -n 3 127.0.0.1 >nul")
+        shell_inline("ping -n 7 127.0.0.1 >nul")
     } else {
-        shell_inline("sleep 2")
+        shell_inline("sleep 6")
     }
 }
 
@@ -139,7 +154,7 @@ fn run_creates_then_removes_the_registry_entry() {
     .expect("spawn the runner");
 
     // While the run is live, exactly one record exists and it is well-formed.
-    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+    wait_until(|| record_count(&registry) == 1, RECORD_WAIT);
     let record = read_only_record(&registry);
     assert!(
         record.contains("\"run_id\""),
@@ -187,14 +202,18 @@ fn timeout_teardown_removes_the_registry_entry() {
     let child = command_with_flags(
         &dir,
         &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
-        &["--timeout", "3s"],
+        &["--timeout", "8s"],
         long_child(),
     )
     .spawn()
     .expect("spawn the runner");
 
-    // The entry appears while the run is live...
-    wait_until(|| record_count(&registry) == 1, Duration::from_secs(3));
+    // The entry appears while the run is live — the one observation window here that
+    // [`RECORD_WAIT`] cannot cover, since the run's own deadline above ends it (and
+    // deletes the record) at 8s. The two are sized together: enough room for the
+    // runner to start and register on a loaded host, with slack left before the
+    // teardown this test is actually about.
+    wait_until(|| record_count(&registry) == 1, Duration::from_secs(6));
 
     // ...the deadline ends the run with the reserved TIMEOUT code...
     let out = child.wait_with_output().expect("the runner exits");
@@ -214,13 +233,50 @@ fn timeout_teardown_removes_the_registry_entry() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A child that stays alive ~5s — long enough to inspect the live run, short enough
-/// that the run exits cleanly (removing its entry) without a kill.
+/// A child that stays alive ~15s — long enough to observe the live run through one or
+/// more *client invocations* (`inspect`/`list`/`wait`, each its own process spawn),
+/// short enough that the run still exits cleanly (removing its entry) without a kill.
+///
+/// The window is the fixture's whole point, so it is sized for a loaded host rather
+/// than an idle one: every observation here costs at least one binary spawn plus a
+/// registry scan, and a second run registering (or a waiter taking its snapshot) can
+/// add several more seconds under full `cargo test` parallelism. A ~5s window was
+/// enough on an idle machine but flaked reproducibly under host contention — the run
+/// simply ended mid-test, surfacing as "no run with that id is registered" or as a
+/// `wait_until` that could never reach its count. Keep this comfortably above
+/// [`RECORD_WAIT`]-scale delays; it costs wall-clock time in the fixtures that let the
+/// run finish on its own, and nothing else.
 fn inspectable_child() -> Vec<String> {
     if cfg!(windows) {
-        shell_inline("ping -n 6 127.0.0.1 >nul")
+        shell_inline("ping -n 16 127.0.0.1 >nul")
     } else {
-        shell_inline("sleep 5")
+        shell_inline("sleep 15")
+    }
+}
+
+/// A child that stays alive ~30s — for the scenarios whose live window has to span
+/// *two* whole client invocations rather than one.
+///
+/// [`inspectable_child`] is sized for one observation: spawn a client, let it resolve
+/// the run and report. Three tests here need the run to still be live at a *second*
+/// client spawn — `inspect_all_snapshots_live_runs_with_conjunctive_labels` (JSON then
+/// human aggregate `inspect`, each taking a full process-tree snapshot of the match),
+/// `list_reports_a_live_run` (JSON then human `list`), and
+/// `list_filters_by_labels_and_health_with_shared_semantics` (two filtered `list`s
+/// around a stale-fixture write) — and every cost inside that window is paid twice.
+///
+/// Measured, not guessed: at the ~15s window these were exactly the fixtures that still
+/// failed when the registry suite was run two, three, and four ways in parallel on an
+/// already loaded host, always on the *second* invocation and always with the run
+/// already gone ("no live runs to inspect", "no runs registered"). Doubling the window
+/// costs wall-clock time only in these three tests — they wait for their runs to exit
+/// anyway, and they run alongside the rest of the suite — so the fixtures that merely
+/// let one run finish keep the shorter window.
+fn twice_inspectable_child() -> Vec<String> {
+    if cfg!(windows) {
+        shell_inline("ping -n 31 127.0.0.1 >nul")
+    } else {
+        shell_inline("sleep 30")
     }
 }
 
@@ -253,7 +309,7 @@ fn inspect_reports_a_live_run() {
     .expect("spawn the runner");
 
     // The run is inspectable once its record (and thus its endpoint) is published.
-    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+    wait_until(|| record_count(&registry) == 1, RECORD_WAIT);
 
     let out = inspect(&registry, "inspect-me");
     assert_eq!(
@@ -337,7 +393,7 @@ fn inspect_reports_a_live_run_in_human_form() {
     .spawn()
     .expect("spawn the runner");
 
-    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+    wait_until(|| record_count(&registry) == 1, RECORD_WAIT);
 
     let out = Command::new(bin())
         .args(["inspect", "--run-id", "inspect-me-human"])
@@ -391,7 +447,9 @@ fn inspect_all_snapshots_live_runs_with_conjunctive_labels() {
             "--label",
             "lane=test",
         ],
-        inspectable_child(),
+        // Both runs must still be live at the *second* aggregate `inspect` below, which
+        // is two full snapshot round trips into this test — hence the wider window.
+        twice_inspectable_child(),
     )
     .spawn()
     .expect("spawn CI run");
@@ -399,11 +457,11 @@ fn inspect_all_snapshots_live_runs_with_conjunctive_labels() {
         &local_dir,
         &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
         &["--run-id", "inspect-local", "--label", "pipeline=local"],
-        inspectable_child(),
+        twice_inspectable_child(),
     )
     .spawn()
     .expect("spawn local run");
-    wait_until(|| record_count(&registry) == 2, Duration::from_secs(10));
+    wait_until(|| record_count(&registry) == 2, RECORD_WAIT);
 
     let out = Command::new(bin())
         .args([
@@ -528,7 +586,7 @@ fn inspect_reports_ambiguous_run_id_for_duplicate_run_ids() {
     .spawn()
     .expect("spawn the second runner");
 
-    wait_until(|| record_count(&registry) == 2, Duration::from_secs(10));
+    wait_until(|| record_count(&registry) == 2, RECORD_WAIT);
 
     let out = inspect(&registry, run_id);
     assert_eq!(
@@ -584,7 +642,7 @@ fn cancel_ends_a_live_run_with_the_control_cancel_code() {
     .expect("spawn the runner");
 
     // The run is reachable once its record (and thus its endpoint) is published.
-    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+    wait_until(|| record_count(&registry) == 1, RECORD_WAIT);
 
     let out = control_client(&registry, "cancel", "cancel-me");
     assert_eq!(
@@ -625,7 +683,7 @@ fn kill_ends_a_live_run_with_the_control_kill_code() {
     .spawn()
     .expect("spawn the runner");
 
-    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+    wait_until(|| record_count(&registry) == 1, RECORD_WAIT);
 
     let out = control_client(&registry, "kill", "kill-me");
     assert_eq!(
@@ -681,7 +739,7 @@ fn cancel_and_kill_report_ambiguous_run_id_for_duplicate_run_ids() {
 
     // Both runs are live and reachable at once — the ambiguity `cancel`/`kill` must
     // detect.
-    wait_until(|| record_count(&registry) == 2, Duration::from_secs(10));
+    wait_until(|| record_count(&registry) == 2, RECORD_WAIT);
 
     for verb in ["cancel", "kill"] {
         let out = control_client(&registry, verb, run_id);
@@ -834,7 +892,7 @@ fn cancel_all_reaches_every_duplicate_run_id_entry() {
     .expect("spawn the second duplicate runner");
 
     // All three entries are live and reachable before the aggregate verb runs.
-    wait_until(|| record_count(&registry) == 3, Duration::from_secs(10));
+    wait_until(|| record_count(&registry) == 3, RECORD_WAIT);
 
     let out = control_all_client(&registry, "cancel");
     assert_eq!(
@@ -964,7 +1022,7 @@ fn cancel_all_partially_failing_reports_every_target_and_the_control_code() {
     )
     .spawn()
     .expect("spawn the runner whose endpoint will be broken");
-    wait_until(|| record_count(&registry) == 2, Duration::from_secs(10));
+    wait_until(|| record_count(&registry) == 2, RECORD_WAIT);
 
     // Break exactly one target's published endpoint. The runner itself writes its
     // record once, at registration, so this edit stands for the rest of the run: the
@@ -1135,7 +1193,10 @@ fn list_filters_by_labels_and_health_with_shared_semantics() {
             "--label",
             "lane=test",
         ],
-        slow_child(),
+        // Both runs must stay live across two whole `list` client invocations (plus
+        // the stale fixture written between them), so they use the two-invocation
+        // window, not the single-observation one.
+        twice_inspectable_child(),
     )
     .spawn()
     .expect("spawn labeled CI run");
@@ -1143,11 +1204,11 @@ fn list_filters_by_labels_and_health_with_shared_semantics() {
         &local_dir,
         &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
         &["--run-id", "list-local", "--label", "pipeline=local"],
-        slow_child(),
+        twice_inspectable_child(),
     )
     .spawn()
     .expect("spawn labeled local run");
-    wait_until(|| record_count(&registry) == 2, Duration::from_secs(10));
+    wait_until(|| record_count(&registry) == 2, RECORD_WAIT);
     write_stale_entry(&registry, "list-stale", "list-stale");
 
     let out = list_with_flags(
@@ -1224,13 +1285,15 @@ fn list_reports_a_live_run() {
         &dir,
         &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
         &["--run-id", "list-me"],
-        inspectable_child(),
+        // The run has to still be live for the human-readable `list` further down, a
+        // second whole client invocation after the `--json` one.
+        twice_inspectable_child(),
     )
     .spawn()
     .expect("spawn the runner");
 
     // The run is listable once its record (and thus its endpoint) is published.
-    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+    wait_until(|| record_count(&registry) == 1, RECORD_WAIT);
 
     let out = list(&registry, true);
     assert_eq!(
@@ -1530,7 +1593,7 @@ fn wait_blocks_until_a_live_run_finishes() {
     .expect("spawn the runner");
 
     // The run is waitable once its record is published.
-    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+    wait_until(|| record_count(&registry) == 1, RECORD_WAIT);
 
     let mut waiter = spawn_wait(&registry, "wait-me", None);
 
@@ -1584,7 +1647,7 @@ fn wait_report_outcome_reads_the_observed_runs_terminal_event() {
     .spawn()
     .expect("spawn the runner");
 
-    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+    wait_until(|| record_count(&registry) == 1, RECORD_WAIT);
     let waiter = std::thread::spawn({
         let registry = registry.clone();
         move || wait_for_run_outcome(&registry, "wait-outcome")
@@ -1683,7 +1746,7 @@ fn wait_times_out_on_a_live_run_with_its_own_reserved_code() {
     .spawn()
     .expect("spawn the runner");
 
-    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+    wait_until(|| record_count(&registry) == 1, RECORD_WAIT);
 
     let out = wait_for_run(&registry, "long-runner", Some("1s"));
     assert_eq!(
@@ -1750,7 +1813,7 @@ fn wait_reports_ambiguous_run_id_for_duplicate_run_ids() {
     .spawn()
     .expect("spawn the second runner");
 
-    wait_until(|| record_count(&registry) == 2, Duration::from_secs(10));
+    wait_until(|| record_count(&registry) == 2, RECORD_WAIT);
 
     // A generous `--timeout` that must never be reached: the ambiguity is a hard
     // failure detected on the very first probe, so a 112 here would mean `wait` sat on
@@ -1893,7 +1956,7 @@ fn wait_all_blocks_until_the_one_live_run_finishes() {
     .expect("spawn the runner");
 
     // The run is waitable once its record is published.
-    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+    wait_until(|| record_count(&registry) == 1, RECORD_WAIT);
 
     let mut waiter = spawn_wait_all(&registry, None);
 
@@ -1954,7 +2017,7 @@ fn wait_all_times_out_with_a_run_still_live() {
     .spawn()
     .expect("spawn the runner");
 
-    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+    wait_until(|| record_count(&registry) == 1, RECORD_WAIT);
 
     let out = wait_all_for(&registry, Some("1s"));
     assert_eq!(
@@ -2016,7 +2079,7 @@ fn wait_all_snapshot_excludes_a_run_that_registers_after_it_starts() {
     )
     .spawn()
     .expect("spawn the first runner");
-    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+    wait_until(|| record_count(&registry) == 1, RECORD_WAIT);
 
     let waiter = spawn_wait_all(&registry, None);
     // Give the waiter comfortable room to take its one snapshot scan before the
@@ -2031,7 +2094,7 @@ fn wait_all_snapshot_excludes_a_run_that_registers_after_it_starts() {
     )
     .spawn()
     .expect("spawn the second runner");
-    wait_until(|| record_count(&registry) == 2, Duration::from_secs(10));
+    wait_until(|| record_count(&registry) == 2, RECORD_WAIT);
 
     // `run1` finishing on its own clears everything the snapshot actually contained.
     let status = run1.wait().expect("the first runner exits");
@@ -2111,7 +2174,7 @@ fn wait_all_timeout_ignores_an_unprobed_entry_never_in_the_snapshot() {
     .spawn()
     .expect("spawn the runner");
 
-    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
+    wait_until(|| record_count(&registry) == 1, RECORD_WAIT);
     write_unprobeable_entry(
         &registry,
         "run-unprobed-sibling-0000",
@@ -2174,7 +2237,7 @@ fn prune_reaps_a_stale_entry_and_keeps_a_live_one() {
     .expect("spawn the runner");
 
     // Both records are present once the live runner has published its own.
-    wait_until(|| record_count(&registry) == 2, Duration::from_secs(10));
+    wait_until(|| record_count(&registry) == 2, RECORD_WAIT);
 
     let out = prune(&registry, true);
     assert_eq!(
@@ -2271,7 +2334,7 @@ fn prune_reaps_an_orphaned_lock_file_alongside_a_stale_pair_and_a_live_run() {
     .spawn()
     .expect("spawn the runner");
 
-    wait_until(|| record_count(&registry) == 2, Duration::from_secs(10));
+    wait_until(|| record_count(&registry) == 2, RECORD_WAIT);
 
     let out = prune(&registry, true);
     assert_eq!(
@@ -2395,7 +2458,7 @@ fn prune_dry_run_previews_without_deleting_and_matches_a_real_prune() {
     .spawn()
     .expect("spawn the runner");
 
-    wait_until(|| record_count(&registry) == 2, Duration::from_secs(10));
+    wait_until(|| record_count(&registry) == 2, RECORD_WAIT);
 
     let dry_out = prune_dry_run(&registry, true);
     assert_eq!(
@@ -2535,11 +2598,8 @@ fn prune_reaps_the_control_socket_of_an_abruptly_killed_runner() {
     .expect("spawn the runner");
 
     // Wait for the record *and* the endpoint it publishes once its transport is up.
-    wait_until(|| record_count(&registry) == 1, Duration::from_secs(10));
-    wait_until(
-        || record_endpoint(&registry).is_some(),
-        Duration::from_secs(10),
-    );
+    wait_until(|| record_count(&registry) == 1, RECORD_WAIT);
+    wait_until(|| record_endpoint(&registry).is_some(), RECORD_WAIT);
     let endpoint = record_endpoint(&registry).expect("the live run published an endpoint");
     let socket = PathBuf::from(&endpoint);
     let socket_dir = socket

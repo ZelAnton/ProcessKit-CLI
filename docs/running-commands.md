@@ -111,8 +111,11 @@ Repeat `--label KEY=VALUE` on `run` to attach non-secret operator metadata. The
 resulting map appears in `run_started.labels` and `list`; later values replace
 earlier values for a duplicate key. Keys are 1-64 ASCII bytes, begin with a letter
 or `_`, and otherwise contain letters, digits, `.`, `-`, or `_`. Values are at most
-256 characters and contain no control characters. Repeated label filters on
-`cancel --all`, `kill --all`, and `wait --all` combine with logical AND.
+256 characters and, like an explicit run id above, cannot contain terminal control
+or invisible formatting characters; the same check runs on read, so a label an
+older record already carries is dropped from that record's map when it fails, while
+the record itself is kept. Repeated label filters on `cancel --all`, `kill --all`,
+and `wait --all` combine with logical AND.
 
 ## Foreground lifecycle
 
