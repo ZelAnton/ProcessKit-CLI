@@ -315,7 +315,7 @@ pub enum CaptureOverflowPolicy {
     Cancel,
 }
 
-/// `inspect --run-id <id> [--json]`
+/// `inspect (--run-id <id> | --all [--label <KEY=VALUE>]...) [--json]`
 #[derive(Debug, Args)]
 pub struct InspectArgs {
     /// The single run to inspect. Mutually exclusive with `--all`; exactly one
@@ -341,7 +341,8 @@ pub struct InspectArgs {
     pub json: bool,
 }
 
-/// `cancel (--run-id <id> | --all)`, `kill (--run-id <id> | --all)`
+/// `cancel (--run-id <id> | --all [--label <KEY=VALUE>]...)`, `kill (--run-id <id> |
+/// --all [--label <KEY=VALUE>]...)`
 ///
 /// Shared argument for the mutating control commands (`cancel`, `kill`): act on the
 /// single named run (`--run-id`), exactly as before T-217, or, in aggregate
@@ -383,7 +384,8 @@ pub struct TargetArgs {
     pub labels: Vec<OperatorLabel>,
 }
 
-/// `wait (--run-id <id> | --all) [--timeout <duration>]`
+/// `wait (--run-id <id> [--report-outcome] | --all [--label <KEY=VALUE>]...)
+/// [--timeout <duration>]`
 ///
 /// Blocks while the named run (`--run-id`) — or, in aggregate (`--all`), every run
 /// confirmed live in a snapshot taken the moment the wait starts — is still live in

@@ -903,6 +903,146 @@ fn cancel_all_reaches_every_duplicate_run_id_entry() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The record file of the sole registered run named `run_id`, for fixtures that need
+/// to edit one specific record of several while its runner stays live.
+fn record_path_for(dir: &Path, run_id: &str) -> PathBuf {
+    let mut matches: Vec<PathBuf> = fs::read_dir(dir)
+        .expect("the registry directory exists once the runs have started")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .filter(|path| {
+            let text = fs::read_to_string(path).unwrap_or_default();
+            let record: serde_json::Value = match serde_json::from_str(&text) {
+                Ok(record) => record,
+                Err(_) => return false,
+            };
+            record["run_id"] == run_id
+        })
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected exactly one registry record for `{run_id}`"
+    );
+    matches.pop().expect("checked for exactly one match")
+}
+
+/// (T-291, [K-090]) The aggregate **partial-failure** contract, end to end through the
+/// binary and in the default `cargo test` tier: when part of the fan-out cannot be
+/// reached, `cancel --all` still dispatches to every other target, still prints the
+/// full per-run report, and *then* fails with the reserved `CONTROL` (103) code — never
+/// a silent `0`, and never abandoning the reachable targets.
+///
+/// The unreachable target is forced deterministically rather than raced: its record's
+/// advertised `endpoint` is rewritten to text that is not a well-formed control
+/// endpoint on either platform, while its runner stays live and registered. That is
+/// the case the shared per-target ladder (`dispatch_snapshot_target`,
+/// `src/control/mod.rs`) must classify as `failed` rather than `already_gone` — the
+/// record-specific re-probe still finds the entry live, so nothing confirms the run
+/// ended. Its unit-level counterparts live in `src/control/tests.rs`
+/// (`live_but_unreachable_target_is_a_hard_failure_for_every_aggregate_verb`); this
+/// test pins what the *operator* sees: exit code, report, and stderr verdict.
+#[test]
+fn cancel_all_partially_failing_reports_every_target_and_the_control_code() {
+    let dir = scratch("control-all-partial-failure-code");
+    let registry = registry_dir(&dir);
+
+    let mut reachable = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "reachable-run"],
+        long_child(),
+    )
+    .spawn()
+    .expect("spawn the reachable runner");
+    let mut unreachable = command_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "unreachable-run"],
+        long_child(),
+    )
+    .spawn()
+    .expect("spawn the runner whose endpoint will be broken");
+    wait_until(|| record_count(&registry) == 2, Duration::from_secs(10));
+
+    // Break exactly one target's published endpoint. The runner itself writes its
+    // record once, at registration, so this edit stands for the rest of the run: the
+    // entry stays `live` (its liveness lock is untouched) while its advertised
+    // endpoint can no longer be connected to.
+    let broken = record_path_for(&registry, "unreachable-run");
+    let mut record: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&broken).expect("read the target record"))
+            .expect("the record is JSON");
+    record["endpoint"] = serde_json::Value::String("not-a-control-endpoint".to_string());
+    fs::write(
+        &broken,
+        serde_json::to_vec(&record).expect("serialize the edited record"),
+    )
+    .expect("publish the unreachable endpoint");
+
+    let out = control_all_client(&registry, "cancel");
+    assert_eq!(
+        out.status.code(),
+        Some(103),
+        "a partially failing fan-out ends with the reserved CONTROL code; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("cancel --all prints its report even on failure");
+    let outcomes = report.as_array().expect("the report is a JSON array");
+    assert_eq!(
+        outcomes.len(),
+        2,
+        "the report names every snapshot target, failed ones included: {report}"
+    );
+
+    let reached = outcomes
+        .iter()
+        .find(|entry| entry["run_id"] == "reachable-run")
+        .unwrap_or_else(|| panic!("the report names `reachable-run`: {report}"));
+    assert_eq!(
+        reached["status"], "accepted",
+        "one target failing must not abandon the others: {report}"
+    );
+    assert_eq!(reached["accepted"], true, "{report}");
+
+    let refused = outcomes
+        .iter()
+        .find(|entry| entry["run_id"] == "unreachable-run")
+        .unwrap_or_else(|| panic!("the report names `unreachable-run`: {report}"));
+    assert_eq!(
+        refused["status"], "failed",
+        "a still-live target that cannot be reached is `failed`, not `already_gone`: {report}"
+    );
+    assert_eq!(refused["accepted"], false, "{report}");
+    assert_eq!(
+        refused["error"],
+        "cannot cancel run `unreachable-run`: the registry entry contains an invalid control \
+         endpoint",
+        "the per-run reason names the run and why it could not be reached: {report}"
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cancel --all: 1 of 2 target run(s)"),
+        "the aggregate verdict counts the failures: {stderr}"
+    );
+
+    let status = reachable.wait().expect("the reachable target exits");
+    assert_eq!(
+        status.code(),
+        Some(108),
+        "the reachable target still received the real control-plane cancel"
+    );
+    // The unreachable target never got the verb — by design — so this test owns its
+    // teardown.
+    let _ = unreachable.kill();
+    let _ = unreachable.wait();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// `cancel --all` / `kill --all` against a registry with no confirmed-live entries —
 /// an absent directory, or one holding only a confirmed-stale leftover — is not an
 /// error: an empty snapshot means nothing to act on, mirroring `prune` exactly as the
