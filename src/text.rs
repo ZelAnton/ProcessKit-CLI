@@ -31,8 +31,9 @@ pub(crate) fn terminal_safe_bounded(text: &str) -> String {
 }
 
 /// Report whether a string contains a character that can control or invisibly
-/// reshape terminal output. CLI identifiers reject these characters at ingress;
-/// human renderers replace them defensively at the output boundary.
+/// reshape terminal output. CLI identifiers reject these characters at ingress
+/// (`cli::parse_run_id`, `labels::valid_value`); human renderers replace them
+/// defensively at the output boundary.
 pub(crate) fn contains_terminal_unsafe(text: &str) -> bool {
     text.chars().any(is_terminal_unsafe)
 }

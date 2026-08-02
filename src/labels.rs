@@ -29,7 +29,7 @@ pub fn parse(raw: &str) -> Result<OperatorLabel, String> {
     }
     if !valid_value(value) {
         return Err(format!(
-            "label value for `{key}` must be at most {MAX_VALUE_CHARS} characters and contain no control characters"
+            "label value for `{key}` must be at most {MAX_VALUE_CHARS} characters and contain no terminal control or formatting characters"
         ));
     }
     Ok(OperatorLabel {
@@ -69,9 +69,16 @@ pub fn valid_key(key: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
 }
 
-/// Validate a value read from an untrusted registry record.
+/// Validate a value read from an untrusted registry record. Mirrors
+/// `cli::parse_run_id`'s terminal-safety bar: labels are display/discovery
+/// strings persisted into registry records and echoed verbatim in the
+/// `run_started` JSONL event, so they reject the same terminal control and
+/// invisible Unicode formatting characters at ingress (see
+/// `text::contains_terminal_unsafe`'s doc comment for that shared ingress
+/// contract) rather than relying solely on the output-boundary sanitization
+/// human renderers already apply.
 pub fn valid_value(value: &str) -> bool {
-    value.chars().count() <= MAX_VALUE_CHARS && !value.chars().any(char::is_control)
+    value.chars().count() <= MAX_VALUE_CHARS && !crate::text::contains_terminal_unsafe(value)
 }
 
 #[cfg(test)]
@@ -94,6 +101,7 @@ mod tests {
             "9bad=value",
             "bad key=value",
             "key=a\nb",
+            "key=bidi\u{202e}value",
         ] {
             assert!(parse(bad).is_err(), "expected `{bad}` to be rejected");
         }
