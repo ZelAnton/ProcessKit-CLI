@@ -1313,7 +1313,7 @@ async fn aggregate_target_that_finishes_before_dispatch_is_already_gone() {
     let outcome = mutate_snapshot_target(&registry, &target, ControlCommand::Kill)
         .await
         .expect("an already-finished target is a successful aggregate outcome");
-    assert!(matches!(outcome, SnapshotMutation::AlreadyGone));
+    assert!(matches!(outcome, SnapshotDispatch::AlreadyGone));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1333,8 +1333,114 @@ async fn endpointless_target_that_finishes_before_dispatch_is_already_gone() {
     let outcome = mutate_snapshot_target(&registry, &target, ControlCommand::Kill)
         .await
         .expect("an already-finished endpointless target is successful");
-    assert!(matches!(outcome, SnapshotMutation::AlreadyGone));
+    assert!(matches!(outcome, SnapshotDispatch::AlreadyGone));
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// (T-291) `inspect --all`'s per-target step is the same ladder the mutating `--all`
+/// verbs run ([`dispatch_snapshot_target`]), so a target that finishes between the
+/// snapshot and its turn is the read-only verb's `already_gone` too — not a failure
+/// that would push the aggregate command onto [`exit::CONTROL`]. The mutating
+/// counterpart is `aggregate_target_that_finishes_before_dispatch_is_already_gone`
+/// above; both call sites are pinned so the shared driver cannot start reclassifying
+/// for one verb only.
+#[tokio::test]
+async fn aggregate_inspect_target_that_finishes_before_dispatch_is_already_gone() {
+    let dir = scratch_registry_dir("aggregate-inspect-target-gone");
+    let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
+    let registration = registry
+        .register_plain("short-run", Some("endpoint-now-gone"), SystemTime::now())
+        .expect("register the live target");
+    let mut targets = snapshot_live_targets(&registry, &[]).expect("snapshot live targets");
+    let target = targets.pop().expect("the target is in the snapshot");
+
+    drop(registration);
+
+    let outcome = inspect_snapshot_target(&registry, &target)
+        .await
+        .expect("an already-finished target is a successful aggregate inspect outcome");
+    assert!(matches!(outcome, SnapshotDispatch::AlreadyGone));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// (T-291, [K-090]) The genuine **partial-failure** shape of every aggregate verb,
+/// forced deterministically in the default `cargo test` tier rather than left to the
+/// opt-in `e2e` one: a target that is still registered *live* but cannot be reached
+/// must stay a hard failure. The endpoint recorded here is not a well-formed control
+/// endpoint on either platform, so [`connect_live`] refuses before any I/O, and the
+/// record-specific re-probe that follows still finds the entry live — which is exactly
+/// the condition under which [`dispatch_snapshot_target`] must **not** launder the
+/// failure into `already_gone` ("the desired terminal state was reached" would be a
+/// false claim: the run is still going). Driven through both call sites so the shared
+/// driver cannot drift into reclassifying for one verb only.
+#[tokio::test]
+async fn live_but_unreachable_target_is_a_hard_failure_for_every_aggregate_verb() {
+    let dir = scratch_registry_dir("aggregate-live-unreachable");
+    let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
+    let registration = registry
+        .register_plain("stuck-run", Some("endpoint-now-gone"), SystemTime::now())
+        .expect("register the live target");
+    let mut targets = snapshot_live_targets(&registry, &[]).expect("snapshot live targets");
+    let target = targets.pop().expect("the target is in the snapshot");
+
+    let err = mutate_snapshot_target(&registry, &target, ControlCommand::Kill)
+        .await
+        .expect_err("a still-live unreachable target is a failure, not `already_gone`");
+    assert_eq!(err.code(), exit::CONTROL);
+    assert_eq!(
+        err.to_string(),
+        "cannot kill run `stuck-run`: the registry entry contains an invalid control endpoint"
+    );
+
+    let err = inspect_snapshot_target(&registry, &target)
+        .await
+        .expect_err("the read-only verb reaches the same verdict through the same ladder");
+    assert_eq!(err.code(), exit::CONTROL);
+    assert_eq!(
+        err.to_string(),
+        "cannot inspect run `stuck-run`: the registry entry contains an invalid control endpoint"
+    );
+
+    drop(registration);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// (T-291) The endpoint-less refusal in the middle of the shared ladder, on a target
+/// that is still live: "live but unreachable" is a failure for every aggregate verb,
+/// and the refusal text is one shared sentence worded by each verb's own action — the
+/// counterpart to `endpointless_target_that_finishes_before_dispatch_is_already_gone`,
+/// where the same record *had* ended and is therefore successful.
+#[tokio::test]
+async fn live_endpointless_target_is_refused_by_every_aggregate_verb() {
+    let dir = scratch_registry_dir("aggregate-live-endpointless");
+    let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
+    let registration = registry
+        .register_plain("no-endpoint-run", None, SystemTime::now())
+        .expect("register the live endpointless target");
+    let mut targets = snapshot_live_targets(&registry, &[]).expect("snapshot live targets");
+    let target = targets.pop().expect("the target is in the snapshot");
+
+    let err = mutate_snapshot_target(&registry, &target, ControlCommand::Cancel)
+        .await
+        .expect_err("a live target with no endpoint cannot be cancelled");
+    assert_eq!(err.code(), exit::CONTROL);
+    assert_eq!(
+        err.to_string(),
+        "cannot cancel run `no-endpoint-run`: the run is live but exposes no control endpoint"
+    );
+
+    let err = inspect_snapshot_target(&registry, &target)
+        .await
+        .expect_err("a live target with no endpoint cannot be inspected either");
+    assert_eq!(err.code(), exit::CONTROL);
+    assert_eq!(
+        err.to_string(),
+        "cannot inspect run `no-endpoint-run`: the run is live but exposes no control endpoint"
+    );
+
+    drop(registration);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
