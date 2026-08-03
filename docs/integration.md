@@ -193,6 +193,46 @@ with open(jsonl_path, encoding="utf-8") as f:
 Pin `schema_version` here too (or rely on the `probe` preflight in §1 to have
 already ruled out a mismatch) — never assume a fixed shape without checking it.
 
+**Or let the binary read it back for you.** `events` is the first-party reader of
+the same stream, so an adapter that only needs to *show* a run's story — or to
+check one — does not have to write the loop above at all:
+
+```sh
+processkit-cli events --run-id build-42               # rendered for a human
+processkit-cli events --run-id build-42 --follow      # ... as it happens
+processkit-cli events --file "$jsonl" --json          # the runner's own bytes
+processkit-cli events --file "$jsonl" --validate      # conformance check
+```
+
+It resolves the stream through the registry (`--run-id`, the same `jsonl` locator
+`list --json` publishes in §5) or reads a path directly (`--file`, for a stream
+whose registry record is already gone — a clean exit deletes its own record — or
+one this registry never knew about). Exactly one of the two is required and they
+are mutually exclusive; there is no precedence rule, so passing both is a `USAGE`
+(100) error. Like `list`/`wait` it is read-only: registry opened read-only, no
+control-plane round trip, nothing mutated.
+
+Three properties matter for an adapter:
+
+- **`--json` is a pass-through, not a re-serialization.** Each line is emitted
+  byte for byte as the runner wrote it, so a field a *newer* runner added survives
+  the trip — the pipeline `processkit-cli events --file … --json | your-parser` is
+  exactly as lossless as reading the file yourself. A line that is not JSON is
+  reported on stderr instead of emitted, so stdout stays parseable JSONL.
+- **`--follow` is bounded by the run, never by an invented deadline.** It returns
+  at the terminal `runner_exit`, or once the registry reports the run over and the
+  stream has stopped growing — the abrupt-death case, explained on stderr rather
+  than passed off as a complete stream. It hands out only *complete* lines, so a
+  half-written event is never parsed as an event.
+- **`--validate` is a conformance gate.** It checks every line against the schema
+  document this binary embeds — the same one `probe --print-schema` prints in §1 —
+  reports each violation by line number and by what it violated, and exits
+  `EVENTS_INVALID` (114) if any line fails, `0` if none does. An unreadable stream
+  is still `SETUP` (111) and a `--run-id` naming no single stream is still
+  `CONTROL` (103), so a fixture-checking CI job can tell "invalid" from "could not
+  be checked". This is the recommended way for an adapter to keep its own recorded
+  fixtures honest against the runner version it targets.
+
 **Ordering** (normative: [`docs/schema.md`](schema.md#ordering)). A normal run
 emits, in order:
 
@@ -241,8 +281,9 @@ an adapter can query, steer, and wait for it while it is still live. Every
 command resolves the target purely by `run_id` through the per-user registry —
 never by PID. This is also the whole supervision story for a run launched with
 `--detach` (§2): a detached run is an ordinary run in the registry, and these
-four commands are how an adapter that is no longer its parent watches and steers
-it:
+four commands are how an adapter that is no longer its parent steers it —
+alongside `events` (§3), which reads that run's stream back without contacting it
+at all:
 
 ```sh
 processkit-cli inspect --run-id build-42 --json

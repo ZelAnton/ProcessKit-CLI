@@ -107,7 +107,7 @@ file** (`<opaque-stem>.lock`). The record is a single JSON object:
 | `argv_sha256`      | The run's one-way argv fingerprint — lowercase-hex SHA-256 of the canonical argv encoding, byte-identical to the `run_started` event's `command.argv_sha256` for the same run (`docs/schema.md`, "Fingerprint"). `null` on a record written before this field existed, or whose value failed the read-side shape check below. Never argv itself (see "Which run is which" below). |
 | `hint`             | The run's worker-shape category from the same classifier catalog the event stream uses (`docs/schema.md`, "Hint classifier") — e.g. `msbuild_node_reuse` — or `null` when the command matches no known shape (the common case) and on a record predating the field. A fixed category label, never argv content. |
 | `labels`           | Operator metadata from repeated `run --label KEY=VALUE`; an empty object on an unlabeled or older record. Used for discovery and exact-match aggregate filtering, not as a secret store. |
-| `jsonl`            | Absolute path to the run's JSONL lifecycle stream, or `null` on an older record. |
+| `jsonl`            | Absolute path to the run's JSONL lifecycle stream, or `null` on an older record. This is the locator `events --run-id` resolves — which is why it keeps working for a finished-but-not-yet-reaped record, and why `events --file` exists for after the record is gone. |
 | `capture_dir`      | Absolute output-capture directory, or `null` when capture is disabled or the record predates this field. |
 | `liveness`         | How to decide whether the record is live or stale (see below). |
 

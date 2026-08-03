@@ -281,14 +281,42 @@ JSONL never goes to stdout. Runner diagnostics use stderr, and child stderr is
 also forwarded there. Use `--no-echo --capture-dir` when stdout must not be
 forwarded at all.
 
-## Tail lifecycle events safely
+## Read a run's lifecycle events
 
-Treat JSONL as an append-only sequence of complete lines. A reader should:
+```sh
+processkit-cli events --run-id build-42            # what happened, rendered
+processkit-cli events --run-id build-42 --follow   # ... as it happens
+processkit-cli events --file build-42.jsonl        # once the record is gone
+processkit-cli events --file build-42.jsonl --json # raw lines, for a parser
+```
+
+`events` is read-only: it resolves the stream through the registry (`--run-id`)
+or reads a path directly (`--file`), never contacts the run, and mutates nothing.
+It hands out only complete lines, and `--follow` stops at the terminal
+`runner_exit` — or, for a runner killed before it could write one, once the run
+is gone and the stream has stopped growing.
+
+## Check a stream against the event schema
+
+```sh
+processkit-cli events --file fixture.jsonl --validate
+```
+
+Checks every line against the schema embedded in that exact binary and reports
+each violation by line number; exit `0` when all lines conform, `114`
+(`EVENTS_INVALID`) when any does not. Useful in CI for an adapter's own recorded
+fixtures — no separate validator, and no second copy of the schema to keep in
+sync.
+
+## Tail lifecycle events safely in your own reader
+
+When something other than `events` reads the stream, treat JSONL as an
+append-only sequence of complete lines. A reader should:
 
 1. buffer until newline;
 2. parse one object;
 3. verify `schema_version`;
-4. dispatch on `type` while tolerating unknown additive fields;
+4. dispatch on `event` while tolerating unknown additive fields;
 5. stop only after terminal `runner_exit` or an explicit external recovery
    decision.
 

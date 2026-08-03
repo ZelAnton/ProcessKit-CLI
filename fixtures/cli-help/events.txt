@@ -1,0 +1,26 @@
+Read back a run's JSONL lifecycle stream: render it, follow it, pass it through, or check it against the embedded event schema
+
+Usage: processkit-cli events [OPTIONS]
+
+Options:
+      --run-id <id>
+          Resolve the stream through the per-user registry: the JSONL locator published by the record(s) registered under this run id (`list --json`'s `jsonl` field). Works for a live run *and* for a finished-but-not-yet-reaped one, whose record still names the completed stream. Mutually exclusive with `--file`; exactly one of the two is required
+
+      --file <path>
+          Read this events file directly, skipping registry resolution entirely — the escape hatch for a stream whose registry record is already gone (a clean exit deletes its own record, and `prune` reaps the leftovers of one that did not), and the way to check an events file that was never registered here at all, such as an adapter's own fixture. Mutually exclusive with `--run-id`; exactly one of the two is required
+
+      --json
+          Pass each stream line through **verbatim** instead of rendering it — the raw JSONL bytes the runner wrote, byte for byte, never re-serialized through this binary's own event types (see [`crate::events_cmd`], "Why `--json` is a pass-through"). Mutually exclusive with `--validate`, which replaces the event output with a conformance report rather than reshaping it
+
+      --follow
+          Keep reading as the stream grows, until the terminal `runner_exit` event is observed — the detached-run counterpart to watching a foreground run's own output.
+          
+          Bounded by the run's own lifetime rather than by an invented deadline: a follow also returns, with an explanation on stderr, once the registry says the run is over and the stream has stopped growing — which is what an abruptly killed runner (one that never got to write its terminal event) leaves behind. It never blocks past the end of the run it is watching. See [`crate::events_cmd`], "Following, and when it stops".
+
+      --validate
+          Check every line against the JSON Schema this binary embeds at build time — the very document `probe --print-schema` prints — instead of printing the events: each non-conforming line is reported with its line number and what it violated, then a summary.
+          
+          Exits `0` when every line conforms and [`crate::exit::EVENTS_INVALID`] (114) when any does not, so an adapter author can gate their own fixtures on it in CI, and tell "invalid" apart from "could not be checked" (an unreadable stream is still `SETUP`, 111). Mutually exclusive with `--json`.
+
+  -h, --help
+          Print help (see a summary with '-h')

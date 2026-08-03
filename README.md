@@ -250,6 +250,8 @@ processkit-cli cancel  (--run-id <id> | --all [--label <KEY=VALUE>]...)
 processkit-cli kill    (--run-id <id> | --all [--label <KEY=VALUE>]...)
 processkit-cli wait    --run-id <id> [--timeout <duration>] [--report-outcome]
 processkit-cli wait    --all [--label <KEY=VALUE>]... [--timeout <duration>]
+processkit-cli events  (--run-id <id> | --file <events.jsonl>)
+                       [--json | --validate] [--follow]
 processkit-cli list    [--json] [--label <KEY=VALUE>]... [--health <live|stale|unprobed>]
 processkit-cli prune   [--json] [--dry-run] [--label <KEY=VALUE>]...
 processkit-cli probe   --json [--require-schema-version <N>]
@@ -429,6 +431,41 @@ dropped — the same conservative stance `--run-id` takes. See
 [`docs/registry.md`](docs/registry.md), "Waiting — `wait`", "The aggregate barrier —
 `wait --all`".
 
+`events` is the *story* counterpart: it reads back the JSONL lifecycle stream a run
+wrote with `run --jsonl`, so the detach → observe → conclude loop needs no external
+`tail`/`jq` recipe. It names the stream either through the registry
+(`--run-id <id>`, which resolves the `jsonl` locator `list --json` publishes — for a
+live run *and* for a finished-but-not-yet-reaped one) or directly
+(`--file <events.jsonl>`, the escape hatch for a stream whose record is already
+gone, and the way to check a file this registry never knew about, such as an
+adapter's own fixture). The two are mutually exclusive and exactly one is required:
+there is deliberately no precedence rule, so passing both is a `USAGE` (100) error
+rather than a silent choice between them. Like `list`/`wait` it is read-only — it
+opens the registry read-only, never connects to a run's control transport, and
+mutates nothing.
+
+By default it renders each event as one line, `<time>  <event>  key=value …`, with
+every fragment passed through the same terminal-safety barrier the other
+human-readable output uses (an events file is untrusted input). `--json` instead
+passes each line through **verbatim**, the runner's own bytes, never re-serialized
+through this binary's event types — so a stream written by a newer runner keeps
+fields this build has never heard of; a line that is not JSON is reported on stderr
+rather than emitted, so stdout stays parseable JSONL. `--follow` keeps reading a
+growing stream until the terminal `runner_exit` event, or until the registry says
+the run is over and the stream has stopped growing (what an abruptly killed runner
+leaves behind, explained on stderr); it is bounded by the run's own lifetime and
+never invents a deadline of its own.
+
+`events --validate` is the conformance checker: it checks every line against the
+JSON Schema this binary embeds — the very document `probe --print-schema` prints —
+reports each violation with its line number and what it violated, and exits `0`
+when all lines conform or the reserved `EVENTS_INVALID` (`114`) when any does not.
+A stream that cannot be read at all is still `SETUP` (`111`) and a `--run-id` that
+names no single stream is still `CONTROL` (`103`), so a CI job can tell "invalid"
+apart from "could not be checked". See
+[`docs/detached-runs.md`](docs/detached-runs.md), "Reading the stream back —
+`events`".
+
 `list` is the discovery counterpart to `inspect`/`cancel`/`kill`: it scans the same
 per-user registry and prints every entry it finds — `run_id`, health (`live`/
 `stale`/`unprobed`), `started_at`, the run's worker-shape `hint` and one-way argv
@@ -577,7 +614,9 @@ to the reserved band — `PROBE_INCOMPATIBLE` (`110`) — for an incompatible la
 candidate, and `wait` adds one more — `WAIT_TIMEOUT` (`112`) — for its own deadline
 elapsing while the run it was watching is still live. That last one describes the
 *waiting client*, not the run: nothing was stopped, so it is deliberately distinct
-from the run's own `TIMEOUT` (`106`).
+from the run's own `TIMEOUT` (`106`). `events --validate` adds `EVENTS_INVALID`
+(`114`) in the same spirit — a verdict about a *document*, not about any run: the
+stream it checked does not conform to this binary's event schema.
 
 `run --detach` is the single exception to the first sentence, and it mints no code
 of its own: with the run handed to a detached copy there is no child left for this
@@ -892,6 +931,12 @@ report them (nullable per-field on platforms/members it can't).
   [`fixtures/schema/v1/events.jsonl`](fixtures/schema/v1/events.jsonl).
 - Machine-readable JSON Schema (draft 2020-12) for the same contract:
   [`fixtures/schema/v1/schema.json`](fixtures/schema/v1/schema.json).
+- **Checking a stream against it, offline.** `processkit-cli events --file
+  <stream.jsonl> --validate` checks a stream — a run's own, or an adapter's
+  fixture — against that very schema as embedded in the binary, reporting each
+  violation by line and exiting `EVENTS_INVALID` (`114`) if any line does not
+  conform. No clone, no separate validator, and no second implementation of the
+  schema to keep in sync.
 - **Getting the schema without a git checkout.** A consumer holding only an
   installed binary or an unpacked release archive — no clone, no tag to match —
   has two offline ways to get the exact schema its own version emits: run
@@ -925,7 +970,10 @@ never had a `run_id` — and `prune` reaps the confirmed-stale leftovers it show
 blocks on that same registry until its target — one named run (`--run-id`) or every
 run confirmed live in a snapshot taken at the start (`--all`) — is no longer live, for
 a supervisor that is not the runner's parent, bounding itself with `--timeout` and its
-own reserved exit code (`112`). `probe` reports and
+own reserved exit code (`112`). `events` reads the run's own JSONL stream back —
+rendered, followed to its terminal event, passed through verbatim with `--json`, or
+schema-checked with `--validate` (`EVENTS_INVALID`, 114) — resolving it through the
+same registry and mutating nothing. `probe` reports and
 verifies the binary's compatibility surface for a consumer's fail-closed launcher
 preflight, with no side effects, exiting `PROBE_INCOMPATIBLE` (110) on an
 incompatible candidate; `probe --print-schema` instead prints the binary's

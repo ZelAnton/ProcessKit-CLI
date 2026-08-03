@@ -15,6 +15,7 @@ const CASES: &[(&str, &[&str])] = &[
     ("cancel", &["cancel"]),
     ("kill", &["kill"]),
     ("wait", &["wait"]),
+    ("events", &["events"]),
     ("list", &["list"]),
     ("prune", &["prune"]),
     ("probe", &["probe"]),

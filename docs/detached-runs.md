@@ -107,6 +107,51 @@ processkit-cli wait --run-id "$run_id" --timeout 30m
 The run id is an address while the runner is live. The JSONL file is the durable
 record after the registry entry has been removed on clean completion.
 
+## Reading the stream back — `events`
+
+`events` closes the detach loop: it reads that JSONL stream back without an
+external tailer or JSON filter, and without the caller having to look the locator
+up first.
+
+```sh
+# Watch a detached run as it happens, until its terminal `runner_exit`.
+processkit-cli events --run-id nightly-index --follow
+
+# What happened, after the fact — the registry record is gone, the file is not.
+processkit-cli events --file "$events"
+
+# The runner's own bytes, for a machine (line-for-line, nothing re-serialized).
+processkit-cli events --file "$events" --json
+
+# Conformance-check a stream against this binary's embedded event schema.
+processkit-cli events --file "$events" --validate
+```
+
+**Naming the stream.** `--run-id` resolves the locator through the registry — the
+same `jsonl` field `list --json` publishes — which works while a record exists,
+live or merely not yet reaped. `--file` reads a path directly and is the answer
+once the record is gone (a clean exit deletes its own record, and `prune` reaps
+what an abrupt death left), or for a stream this registry never knew about. The two
+are mutually exclusive and exactly one is required; passing both is a `USAGE` (100)
+error rather than a silent choice between them. When `--run-id` names no single
+readable stream — no record, several records naming different streams, or a run
+started without `--jsonl` — the refusal is the same `CONTROL` (103) verdict every
+other by-`run-id` command gives.
+
+**Where a follow stops.** `--follow` polls the file for growth (there is no
+notification to subscribe to for either a file or a runner's death) and returns at
+the first of: the terminal `runner_exit` event, or the registry reporting the run
+over with the stream no longer growing. The second case is what an abruptly killed
+runner leaves behind — it never got to write its terminal event — and it is
+explained on stderr rather than passed off as a complete stream. `--follow` never
+invents a deadline of its own: it is bounded by the run's lifetime, so a caller
+that wants a wall-clock bound imposes one itself (`wait --timeout` alongside it, or
+a bound on the whole invocation).
+
+**Read-only, like `list`/`wait`.** `events` opens the registry read-only, never
+connects to a run's control transport, and mutates nothing — so following a
+production run cannot disturb, end, or even be noticed by it.
+
 ## Shutdown sequence
 
 For one detached run:
@@ -133,7 +178,10 @@ launches.
 ## Recovery after orchestrator restart
 
 1. Run `list --json` to discover registry entries.
-2. Tail each durable JSONL file from its last complete line.
+2. Read each durable JSONL file back with `events --file <path>` (or
+   `events --run-id <id> --follow` for one still live), instead of hand-rolling a
+   tailer: it hands out only complete lines, so a run being appended to while it is
+   read never yields a half-written event.
 3. Use `inspect --json` only for entries confirmed live.
 4. Treat stale records as evidence of abrupt runner loss, not as permission to
    address the recorded PID.

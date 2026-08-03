@@ -46,8 +46,9 @@ failure is not mistaken for a child result.
 | 111  | `SETUP`           | A fail-closed **setup / support failure**: a prerequisite the runner needs to run — or to report a result — could not be established or produced for an ordinary reason (its async runtime would not build, a required `--jsonl`/`--capture-dir` output or `--stdin-file` input could not be opened, or a `probe`/`inspect`/control reply would not serialize). An environment/resource condition the caller can usually act on (a bad path, missing permissions, exhausted resources), **not** a runner bug — that stays `INTERNAL` (104). See "Setup failures vs internal faults" below. |
 | 112  | `WAIT_TIMEOUT`    | The **`wait` subcommand's own** deadline (`wait --run-id <id> --timeout <duration>`) elapsed while the run it was waiting for was still live. *The waiter* gave up; the run was never touched — `wait` is read-only and reaches no runner — and is still going. Deliberately **not** `TIMEOUT` (106), which means the opposite (the *runner* enforced a deadline and tore the child's tree down), and not `CONTROL` (103), since the run was resolved unambiguously and found perfectly healthy. See "A waiter's deadline is not a run's deadline" below. |
 | 113  | `OUTPUT_OVERFLOW` | A capture stream exceeded `--capture-max-bytes` while `--capture-overflow cancel` was active. The runner ended the tree through its graceful-stop and escalation path. Distinct from a time deadline; `output_overflow` identifies the stream and limit. |
+| 114  | `EVENTS_INVALID`  | `events --validate` found at least one line of the JSONL stream it checked that does not conform to the event schema this binary embeds (the document `probe --print-schema` prints). A verdict about a **document**, not about any run — `events` spawns no child, contacts no runner, and mutates nothing. Deliberately not `PROBE_INCOMPATIBLE` (110), whose subject is the opposite direction (*this binary* failing a consumer's `--require-*` expectations), and not `SETUP` (111): the stream was found, opened, and read perfectly well, and "it does not conform" is the answer, not a failure to produce one. A stream that could not be read at all is still `SETUP` (111) and a `--run-id` naming no single readable stream is still `CONTROL` (103), so a CI job can tell "invalid" from "could not be checked". See "Checking a stream: `events --validate`" below. |
 
-Codes `114`–`119` are **reserved** for future runner-own conditions. `--help`
+Codes `115`–`119` are **reserved** for future runner-own conditions. `--help`
 and `--version` are not failures: they print to stdout and exit `0`.
 
 ## Timeout, cancel, and kill: runner-imposed outcomes
@@ -131,6 +132,29 @@ A malformed probe argument (for example a bad `--require-exit-code-band` value) 
 `USAGE` (100) error like any other bad flag — distinct from `PROBE_INCOMPATIBLE`, which
 means "the arguments were well-formed, but this binary cannot meet them".
 
+## Checking a stream: `events --validate`
+
+`EVENTS_INVALID` (114) is the second code that is a verdict rather than an ending, and
+it points the other way from `PROBE_INCOMPATIBLE` (110). `110` says *this binary* does
+not meet what a consumer requires of it; `114` says a **document** — a JSONL stream,
+this binary's own or an adapter's fixture — does not conform to the event schema this
+binary embeds. Neither is a run outcome: `events` spawns no child, contacts no runner,
+and mutates nothing (it is read-only in the same sense `list` and `wait` are).
+
+The three ways `events --validate` can end are deliberately distinguishable by code
+alone, because a CI job gating a fixture needs "your file is wrong" told apart from "I
+could not check it":
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | Every checked line conforms. The summary line on stdout says how many were checked. |
+| `114` (`EVENTS_INVALID`) | The check ran and at least one line does not conform. Each violating line is reported on stdout by line number and by what it violated; the count is in the summary. A line that is not JSON at all counts as a violation, not as something to skip. |
+| `111` (`SETUP`) | The stream could not be read at all (no such file, unreadable). Nothing was checked, so nothing is claimed about it. |
+| `103` (`CONTROL`) | `--run-id` named no single readable stream: no registry record names that id, several records name different streams, or the run published none (it ran without `--jsonl`). The same "there is no single target" verdict every other by-`run-id` command gives. |
+
+`--validate` never reports `0` for a stream it could not check, and never reports `114`
+for one it merely could not read: that separation is the whole point of the code.
+
 ## Setup failures vs internal faults
 
 `SETUP` (111) and `INTERNAL` (104) are deliberately kept apart so the code alone tells a
@@ -202,7 +226,7 @@ run can fail before it begins — a program that is not there (`SPAWN` 101), a c
 that cannot be created or a limit that cannot be applied (`BACKEND` 102), an unwritable
 `--jsonl`/`--capture-dir` (`SETUP` 111) — and the detached copy exits with precisely
 that code, which the caller then relays unchanged. A caller therefore reads `run
---detach`'s failures with the same table as `run`'s, and the reserved range `114`–`119`
+--detach`'s failures with the same table as `run`'s, and the reserved range `115`–`119`
 stays free. Two failures belong to the detach wrapper itself rather than to the run, and
 both take `SETUP` (111): the detached copy could not be spawned at all (a support step
 failed; blaming `SPAWN` would point at the caller's program, which was never reached),
@@ -254,7 +278,10 @@ are additionally recorded out of band.
   do that yet" — but the number is not reassigned to a new meaning; it stays
   reserved and unused going forward.
 - New runner-own conditions take the **next free code** in the reserved range
-  rather than overloading an existing one. `WAIT_TIMEOUT` (112) is the most recent,
-  taking the next free slot after `SETUP` (111) rather than overloading `TIMEOUT`
-  (106), whose meaning is the opposite one (see "A waiter's deadline is not a run's
-  deadline" above); codes `114`–`119` remain reserved.
+  rather than overloading an existing one. `EVENTS_INVALID` (114) is the most recent,
+  taking the next free slot after `OUTPUT_OVERFLOW` (113) rather than overloading
+  `PROBE_INCOMPATIBLE` (110), whose subject is this binary's own compatibility rather
+  than a document's (see "Checking a stream: `events --validate`" below); `WAIT_TIMEOUT`
+  (112) did the same before it, taking the slot after `SETUP` (111) rather than
+  overloading `TIMEOUT` (106), whose meaning is the opposite one (see "A waiter's
+  deadline is not a run's deadline" above); codes `115`–`119` remain reserved.

@@ -191,7 +191,11 @@ processkit-cli run --run-id demo --capture-dir ./demo-output \
 processkit-cli inspect --run-id demo --json
 processkit-cli cancel --run-id demo
 
-# 4. Discover or clean up registry state after an orchestrator restart.
+# 4. Read its lifecycle story back — live, or long after it finished.
+processkit-cli events --run-id demo --follow
+processkit-cli events --file demo.jsonl
+
+# 5. Discover or clean up registry state after an orchestrator restart.
 processkit-cli list --json
 processkit-cli prune --dry-run --json
 ```

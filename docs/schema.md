@@ -52,6 +52,19 @@ alternatives avoid that:
   `schema.json` and the golden `events.jsonl` fixture exactly as checked out
   for that release.
 
+And to *check* a stream against it without a checkout — or a JSON Schema
+validator of your own — `processkit-cli events --file <stream.jsonl> --validate`
+validates every line against that same embedded document, reporting each
+violation by line number and exiting `EVENTS_INVALID` (`114`) when any line does
+not conform (see [`docs/exit-codes.md`](exit-codes.md), "Checking a stream:
+`events --validate`"). It is the recommended way for an adapter to keep its own
+recorded fixtures honest against the runner version it targets. The checker is
+in-binary and adds no runtime dependency: it interprets the embedded document
+over the keyword subset that document uses and **refuses to run** on anything it
+does not implement, and the test tier holds its verdict against a real JSON
+Schema engine's, line for line, over the golden fixture and a generated mutation
+corpus.
+
 ## Transport
 
 - Events are written to the file named by `run`'s `--jsonl` option, **never to

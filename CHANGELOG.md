@@ -12,6 +12,24 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- `events`, a read-only subcommand that reads a run's JSONL lifecycle stream back:
+  it resolves the stream through the per-user registry (`--run-id`, the same
+  locator `list --json` publishes) or takes an explicit `--file <events.jsonl>` for
+  a stream whose registry record is already gone, then renders each event for a
+  human (default), passes the runner's own lines through byte for byte (`--json`),
+  follows a growing stream to its terminal `runner_exit` (`--follow`), or checks
+  every line against the event schema this binary embeds (`--validate`). Like
+  `list`/`wait` it opens the registry read-only, never contacts a run's control
+  transport, and mutates nothing.
+- `EVENTS_INVALID` (`114`), the reserved exit code `events --validate` returns when
+  a checked stream does not conform to that schema — a verdict about a document,
+  distinct from `SETUP` (111) for a stream that could not be read at all and from
+  `CONTROL` (103) for a `--run-id` that names no single stream. Codes `115`–`119`
+  remain reserved. The check adds **no runtime dependency**: it interprets the
+  embedded schema document over the keyword subset that document uses, refuses to
+  run on anything it does not implement, and is held to a real JSON Schema engine's
+  verdict — line for line, over the golden fixture and a generated mutation corpus
+  — by the test tier.
 - Checksum-derived winget, Scoop, and Homebrew distributor manifests attached
   to every release after the platform archives finish uploading.
 - An adoption-oriented positioning guide comparing ProcessKit CLI with common
@@ -114,6 +132,8 @@ to a dated version section.
   child bytes while substantially reducing per-line echo overhead.
 
 ### Fixed
+- The cookbook's own JSONL reader recipe told readers to dispatch on a `type`
+  field; the event stream has always named that field `event`.
 - The detached-supervision examples now hold their child behind an explicit
   release marker, eliminating the inspect-versus-fast-exit race in CI smoke runs.
 - Headless Windows integration fixtures no longer leave Windows Terminal error

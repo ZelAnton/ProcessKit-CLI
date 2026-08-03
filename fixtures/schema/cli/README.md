@@ -13,6 +13,14 @@ same three-part contract discipline the JSONL lifecycle-event stream already has
 | `prune --json` (tally and `--dry-run`) | `prune.schema.json` | `prune.jsonl` | [`docs/registry.md`](../../../docs/registry.md), "Reaping — `prune`" |
 | `wait --report-outcome` | `wait.schema.json` | `wait.jsonl` | [`docs/registry.md`](../../../docs/registry.md), "Waiting — `wait`" |
 
+**Why `events --json` is not a seventh family.** It is not a *non-event* output:
+`events --json` passes the runner's own JSONL lines through byte for byte, so the
+document that describes it is [`fixtures/schema/v1/schema.json`](../v1/schema.json)
+itself — the very one this directory exists to complement. Publishing a second
+schema for the same bytes would create exactly the parallel contract this
+repository avoids. (`events --validate`'s report and the default rendering are
+human-readable text, not machine output, and so belong to no family here either.)
+
 Every schema document is JSON Schema **draft 2020-12**, fully self-contained
 (internal `$defs` only, no remote `$ref`) — the same convention
 [`fixtures/schema/v1/schema.json`](../v1/schema.json) follows, and the reason the

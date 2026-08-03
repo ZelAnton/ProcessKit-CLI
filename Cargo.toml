@@ -65,8 +65,8 @@ path = "src/lib.rs"
 # ---------------------------------------------------------------------------
 [dependencies]
 # Command-line parsing. The `derive` API expresses the normative CLI surface —
-# the eight subcommands (run/inspect/cancel/kill/wait/list/prune/probe), their
-# flags, and the verbatim `-- <program> <args...>` tail — that AGENTS.md
+# the nine subcommands (run/inspect/cancel/kill/wait/events/list/prune/probe),
+# their flags, and the verbatim `-- <program> <args...>` tail — that AGENTS.md
 # counts as part of the compatibility surface.
 clap = { version = "4", features = ["derive"] }
 # (De)serialize the versioned JSONL event schema — this project's public,
@@ -206,6 +206,19 @@ clap_mangen = "0.3"
 # `docs/schema.md` in lockstep (`tests/events.rs`). Default features pull in a
 # remote-`$ref` HTTP/file resolver (and `reqwest`) that this schema — fully
 # self-contained via internal `$defs` — never needs, so they are disabled.
+#
+# It is deliberately a **dev**-dependency even though `events --validate`
+# (src/events_cmd/) ships a schema checker of its own: linking this crate into
+# the shipped binary would add ~85 crates to its runtime dependency tree (ICU,
+# `wasm-bindgen`, `num-bigint`, `fancy-regex`, …) and two license families the
+# runtime allow-list in `deny.toml` does not carry, which is not a proportionate
+# price for one diagnostic flag in a containment tool. The shipped checker
+# instead interprets the embedded schema document directly over the small
+# keyword subset that document uses, refusing to run on anything it does not
+# implement — and `tests/events.rs` holds it to *this* crate's verdict, line for
+# line, over the golden fixture and a generated mutation corpus, so "the checker
+# in the binary agrees with a real JSON Schema engine" is a tested fact rather
+# than a claim.
 jsonschema = { version = "0.49.1", default-features = false }
 # Property-based test tier for the hand-rolled primitives (SHA-256 in
 # `src/hash.rs`, the `--timeout`/`--grace` duration grammar in `src/cli/parse.rs`,

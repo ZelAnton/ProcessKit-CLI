@@ -215,7 +215,10 @@ order:
 
 1. Read the `processkit-cli` exit code.
 2. Read the final complete JSONL records, especially `runner_exit` and any
-   preceding timeout, cancellation, spawn, container, or limit event.
+   preceding timeout, cancellation, spawn, container, or limit event —
+   `processkit-cli events --run-id <id>` (or `--file <events.jsonl>` once the
+   registry record is gone) renders them without an external tailer, and
+   `events --json` hands the raw lines to a parser unchanged.
 3. Read bounded stdout/stderr capture only when the program's output is needed.
 4. If the run may still be live, call `inspect --json` for the current member
    snapshot and containment mechanism.

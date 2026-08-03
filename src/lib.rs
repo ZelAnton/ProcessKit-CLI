@@ -35,7 +35,10 @@
 //! confirmed-stale leftovers of runners that died abruptly while never touching a
 //! live entry; and [`wait`] is the *lifetime* counterpart, blocking on the same
 //! registry until a run is no longer live, for a supervisor that is not the
-//! runner's parent and so cannot wait on it as a child process. The compatibility
+//! runner's parent and so cannot wait on it as a child process. [`events_cmd`]
+//! closes the loop by reading a run's JSONL stream back — rendering, following,
+//! passing through, or schema-checking the very events [`events`] wrote — resolving
+//! the stream through the same registry, and mutating nothing. The compatibility
 //! surface — CLI flags (see [`cli`]), the exit-code
 //! contract (see [`exit`] and `docs/exit-codes.md`), and the JSONL `schema_version`
 //! (see [`events`] and `docs/schema.md`) — is fixed.
@@ -50,6 +53,8 @@ pub mod control;
 pub mod duration_fmt;
 #[doc(hidden)]
 pub mod events;
+#[doc(hidden)]
+pub mod events_cmd;
 #[doc(hidden)]
 pub mod exit;
 #[doc(hidden)]

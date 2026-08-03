@@ -11,10 +11,13 @@
 //! struct lives in the file named after the module that implements that
 //! subcommand — `run.rs` ([`RunArgs`]), `control.rs` ([`InspectArgs`] and the
 //! shared [`TargetArgs`] behind `cancel`/`kill`), `wait.rs` ([`WaitArgs`]),
-//! `list.rs` ([`ListArgs`]), `prune.rs` ([`PruneArgs`]), and `probe.rs`
-//! ([`ProbeArgs`]) — and the hand-written value parsers those arguments share
-//! live in `parse.rs`. Each file carries the unit tests for the shapes it
-//! defines.
+//! `list.rs` ([`ListArgs`]), `prune.rs` ([`PruneArgs`]), `probe.rs`
+//! ([`ProbeArgs`]), and `events.rs` ([`EventsArgs`]) — and the hand-written value
+//! parsers those arguments share live in `parse.rs`. Each file carries the unit
+//! tests for the shapes it defines. The one file whose name does not match its
+//! implementing module is `events.rs`: the `events` subcommand is implemented by
+//! [`crate::events_cmd`], because the plain `events` module name already belongs to
+//! the JSONL emitter that command reads back.
 //!
 //! The submodules are private and everything they define is re-exported here, so
 //! `crate::cli::<Item>` stays the single path to every CLI type and parser —
@@ -23,6 +26,7 @@
 //! file to generate completions and man pages from the live parser.
 
 mod control;
+mod events;
 mod list;
 mod parse;
 mod probe;
@@ -33,6 +37,7 @@ mod wait;
 use clap::{Parser, Subcommand};
 
 pub use control::{InspectArgs, TargetArgs};
+pub use events::EventsArgs;
 pub use list::{ListArgs, ListHealth};
 pub use probe::ProbeArgs;
 pub use prune::PruneArgs;
@@ -77,6 +82,9 @@ pub enum Command {
     Kill(TargetArgs),
     /// Block until a run recorded in the per-user registry has finished.
     Wait(WaitArgs),
+    /// Read back a run's JSONL lifecycle stream: render it, follow it, pass it
+    /// through, or check it against the embedded event schema.
+    Events(EventsArgs),
     /// List every run recorded in the per-user registry, whatever its health
     /// (live/stale/unprobed).
     List(ListArgs),
@@ -160,6 +168,7 @@ mod tests {
                 vec!["processkit-cli", "cancel", "--run-id", bad],
                 vec!["processkit-cli", "kill", "--run-id", bad],
                 vec!["processkit-cli", "wait", "--run-id", bad],
+                vec!["processkit-cli", "events", "--run-id", bad],
             ];
             for command in commands {
                 assert!(

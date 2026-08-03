@@ -21,6 +21,7 @@ use std::sync::OnceLock;
 
 use common::{command_with_flags, events_path, run, run_with_flags, scratch, shell_inline};
 use jsonschema::Validator;
+use processkit_cli::events_cmd::schema::SchemaChecker;
 use serde_json::Value;
 
 /// The compiled schema validator for `fixtures/schema/v1/schema.json`, built once
@@ -58,6 +59,133 @@ fn assert_events_match_schema(events: &[Value]) {
         failures.is_empty(),
         "event(s) did not validate against fixtures/schema/v1/schema.json:\n{}",
         failures.join("\n")
+    );
+}
+
+/// Every line of the golden fixture, parsed.
+fn golden_fixture_events() -> Vec<Value> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/schema/v1/events.jsonl");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("read golden fixture {}: {err}", path.display()));
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("each fixture line is valid JSON"))
+        .collect()
+}
+
+/// Systematic single-point mutations of `event`: for every property (and every
+/// property of every nested object), drop it, and replace it with each of a
+/// string, a number, and `null`; plus one extra unknown property, and one unknown
+/// `event` tag. Every one of these *should* be rejected by the schema — but this
+/// module deliberately does not assume that: what the differential test below
+/// asserts is that the shipped checker and the reference engine agree on each,
+/// whatever the verdict is.
+fn mutations(event: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    let Some(object) = event.as_object() else {
+        return out;
+    };
+
+    let replacements = [
+        Value::String("mutated".to_string()),
+        Value::Number(12345.into()),
+        Value::Null,
+    ];
+    for key in object.keys() {
+        let mut dropped = object.clone();
+        dropped.remove(key);
+        out.push(Value::Object(dropped));
+
+        for replacement in &replacements {
+            let mut changed = object.clone();
+            changed.insert(key.clone(), replacement.clone());
+            out.push(Value::Object(changed));
+        }
+
+        // One level of nesting, which is as deep as this schema goes
+        // (`command`, `stdout`/`stderr`, `shutdown`, and the `members` items).
+        if let Some(nested) = object[key].as_object() {
+            for nested_key in nested.keys() {
+                for replacement in &replacements {
+                    let mut inner = nested.clone();
+                    inner.insert(nested_key.clone(), replacement.clone());
+                    let mut changed = object.clone();
+                    changed.insert(key.clone(), Value::Object(inner));
+                    out.push(Value::Object(changed));
+                }
+                let mut inner = nested.clone();
+                inner.remove(nested_key);
+                let mut changed = object.clone();
+                changed.insert(key.clone(), Value::Object(inner));
+                out.push(Value::Object(changed));
+            }
+        }
+    }
+
+    let mut extra = object.clone();
+    extra.insert("invented_field".to_string(), Value::Bool(true));
+    out.push(Value::Object(extra));
+
+    let mut retagged = object.clone();
+    retagged.insert("event".to_string(), Value::String("teleported".to_string()));
+    out.push(Value::Object(retagged));
+
+    out
+}
+
+/// **The shipped `events --validate` checker agrees with a real JSON Schema
+/// engine.**
+///
+/// `src/events_cmd/schema.rs` interprets the embedded schema document itself
+/// rather than linking a JSON Schema crate into the binary (see that module's
+/// "Why not a JSON Schema engine"). What makes that safe is not the argument in
+/// its doc comment — it is this test: for the golden fixture and for a generated
+/// corpus of single-point mutations of it, the two implementations must return the
+/// *same verdict* on every document. A subset validator that quietly ignored a
+/// keyword would answer "valid" where this one answers "invalid", and fail here.
+#[test]
+fn the_shipped_checker_agrees_with_the_reference_engine() {
+    let reference = schema_validator();
+    let shipped = SchemaChecker::compile().expect("the embedded schema compiles");
+
+    let mut checked = 0usize;
+    let mut disagreements = Vec::new();
+    let mut rejected = 0usize;
+    for event in golden_fixture_events() {
+        for candidate in std::iter::once(event.clone()).chain(mutations(&event)) {
+            checked += 1;
+            let theirs = reference.is_valid(&candidate);
+            let ours = shipped.conforms(&candidate);
+            if !theirs {
+                rejected += 1;
+            }
+            if theirs != ours {
+                disagreements.push(format!("reference={theirs} shipped={ours} for {candidate}"));
+            }
+        }
+    }
+
+    assert!(
+        disagreements.is_empty(),
+        "{} of {checked} documents got different verdicts:
+{}",
+        disagreements.len(),
+        disagreements
+            .iter()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(
+                "
+"
+            )
+    );
+    // Guard against a vacuous pass: the corpus must actually contain documents the
+    // schema rejects, or "the two agree" would only mean "both said yes to
+    // everything".
+    assert!(
+        checked > 500 && rejected > 100,
+        "the corpus must exercise both verdicts: {checked} checked, {rejected} rejected"
     );
 }
 

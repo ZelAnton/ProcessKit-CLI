@@ -40,9 +40,13 @@
 //! non-UTF-8 garbage anywhere is exactly what the real read-back already treats
 //! as "no reportable outcome" (`None`), not an error.
 //!
-//! If a future `events` subcommand's line reader routes through the same
-//! primitive (see [`processkit_cli::wait::head_matches_run_id`]'s doc
-//! comment), it is covered by this same target for free.
+//! Scope note: the `events` subcommand, which this target's original doc comment
+//! anticipated as a possible second consumer, landed reading streams a different
+//! way and deliberately does **not** route through these primitives — it walks the
+//! whole stream incrementally, handing out complete lines as a file grows, rather
+//! than scanning a bounded head/tail window for one terminal event (see
+//! `src/events_cmd/mod.rs`). So this target covers `wait --report-outcome`'s
+//! read-back only, and its coverage does not extend to `events`.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;

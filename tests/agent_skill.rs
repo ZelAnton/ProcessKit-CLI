@@ -42,6 +42,8 @@ fn skill_facts_match_the_built_compatibility_surface() {
         ("inspect:--all", "inspect --all --json"),
         ("cancel:--all", "cancel --all"),
         ("kill:--all", "kill --all"),
+        ("events:--follow", "events --run-id build-42 --follow"),
+        ("events:--validate", "--validate"),
     ] {
         assert!(
             surface.iter().any(|value| value == token),
@@ -57,6 +59,7 @@ fn skill_facts_match_the_built_compatibility_surface() {
         ("CONTROL_KILLED", exit::CONTROL_KILLED),
         ("WAIT_TIMEOUT", exit::WAIT_TIMEOUT),
         ("OUTPUT_OVERFLOW", exit::OUTPUT_OVERFLOW),
+        ("EVENTS_INVALID", exit::EVENTS_INVALID),
     ] {
         assert!(
             SKILL.contains(&format!("{name} ({code})")),

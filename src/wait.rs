@@ -385,7 +385,14 @@ fn read_terminal_outcome(
 /// (`fuzz/fuzz_targets/runner_exit_tail.rs`, T-301), by the same
 /// `#[doc(hidden)] pub` exposure pattern `registry_record`/`control_wire`/
 /// `cli_parsers` already use (K-041/K-060) — and any future consumer of the same
-/// tail-read-back primitive, e.g. a prospective `events` subcommand's line reader.
+/// tail-read-back primitive.
+///
+/// That fuzz target is, as of the `events` subcommand landing, still the only
+/// other consumer: `events` reads a stream a different way on purpose — walking it
+/// incrementally and handing out complete lines as the file grows, rather than
+/// scanning a bounded head/tail window for one terminal event — so it does *not*
+/// route through this function (see [`crate::events_cmd`]). This doc comment used
+/// to name it as a prospective caller; it is not one.
 #[doc(hidden)]
 pub fn head_matches_run_id(head: &[u8], expected_run_id: &str) -> bool {
     head.split(|byte| *byte == b'\n').any(|line| {

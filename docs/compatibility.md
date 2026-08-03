@@ -86,6 +86,11 @@ fixture under
 | `prune --json`, `prune --dry-run --json` | `fixtures/schema/cli/prune.schema.json` | `prune.jsonl` |
 | `wait --report-outcome` | `fixtures/schema/cli/wait.schema.json` | `wait.jsonl` |
 
+`events --json` is deliberately absent from that table: it passes the runner's own
+JSONL lines through byte for byte, so the document that describes it is the event
+schema above (`fixtures/schema/v1/schema.json`), not a second one of its own. That
+is also what `events --validate` checks a stream against.
+
 `tests/machine_output.rs` validates the real binary's output for each of these
 against its document on every test run, so an accidental shape change fails CI
 instead of reaching an adapter. A document whose family has more than one output

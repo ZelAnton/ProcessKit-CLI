@@ -127,7 +127,7 @@ pub const PROBE_INCOMPATIBLE: u8 = 110;
 /// stays [`INTERNAL`]. Splitting them out keeps `INTERNAL` (104) honestly meaning
 /// "a runner bug", so a consumer is never misled into reading a setup error as one.
 /// Takes the next free code after [`PROBE_INCOMPATIBLE`] so no existing assignment
-/// shifts; `113` is assigned below and `114`–`119` remain reserved.
+/// shifts; `113`/`114` are assigned below and `115`–`119` remain reserved.
 pub const SETUP: u8 = 111;
 /// The **`wait` subcommand's own** deadline elapsed while its target(s) were still
 /// live: `wait --timeout <duration>`, either the single-run form (`--run-id <id>`) or
@@ -153,6 +153,27 @@ pub const WAIT_TIMEOUT: u8 = 112;
 /// outcome rather than a child exit. `113` is distinct from [`TIMEOUT`] because
 /// elapsed time and output volume are different operational failures.
 pub const OUTPUT_OVERFLOW: u8 = 113;
+/// `events --validate` found at least one line of the JSONL stream it checked that
+/// does not conform to the event schema this binary embeds — the **checker's
+/// verdict about a document**, not anything about a run.
+///
+/// It is emphatically not a run outcome: `events` never spawns a child, never
+/// contacts a runner, and never mutates anything (see [`crate::events_cmd`]), so no
+/// run-ending code ([`TIMEOUT`], [`CANCELLED`], [`OUTPUT_OVERFLOW`], …) could carry
+/// this meaning without lying about what happened. Nor is it
+/// [`PROBE_INCOMPATIBLE`] (110), whose whole subject is the opposite direction —
+/// *this binary* failing a consumer's `--require-*` expectations, not a consumer's
+/// document failing this binary's schema — and folding the two together would make
+/// `110` ambiguous for the fail-closed preflight that depends on it. Nor is it
+/// [`SETUP`] (111): the stream was found, opened, and read perfectly well; what the
+/// caller asked to know is the answer, and the answer is "it does not conform".
+///
+/// A stream that could not be read at all is still [`SETUP`], and a `--run-id` that
+/// names no single readable stream is still [`CONTROL`] — this code means the check
+/// ran and failed, so a CI job can gate a fixture on it and tell "invalid" apart from
+/// "could not check". Takes the next free code after [`OUTPUT_OVERFLOW`] so no
+/// existing assignment shifts; `115`–`119` remain reserved.
+pub const EVENTS_INVALID: u8 = 114;
 
 /// A runner-own failure carrying the exit code it should surface and a
 /// human-readable message. Distinct from a child's exit — a child's code is
@@ -207,6 +228,7 @@ mod tests {
             SETUP,
             WAIT_TIMEOUT,
             OUTPUT_OVERFLOW,
+            EVENTS_INVALID,
         ] {
             assert!(
                 (RUNNER_RANGE_START..=RUNNER_RANGE_END).contains(&code),
@@ -234,6 +256,7 @@ mod tests {
             SETUP,
             WAIT_TIMEOUT,
             OUTPUT_OVERFLOW,
+            EVENTS_INVALID,
         ];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {

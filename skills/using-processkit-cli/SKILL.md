@@ -71,7 +71,20 @@ processkit-cli inspect --run-id build-42 --json
 ```
 
 The detach command's `0` means the run started, not that the child succeeded. Read
-the detached run's terminal `runner_exit` for its outcome.
+the detached run's terminal `runner_exit` for its outcome — with the built-in
+reader rather than an ad-hoc `tail`/`jq`:
+
+```sh
+processkit-cli events --run-id build-42 --follow        # watch it happen
+processkit-cli events --file /absolute/run/events.jsonl  # after the fact
+```
+
+`events` is read-only and resolves the stream through the registry (`--run-id`) or
+directly (`--file`, once the registry record is gone). `--follow` returns at the
+terminal `runner_exit`, or when the run is over and the stream stopped growing.
+`--json` passes the runner's own lines through byte for byte; `--validate` checks a
+stream against the embedded event schema and exits `EVENTS_INVALID (114)` if any
+line does not conform.
 
 Use `cancel --run-id build-42` for graceful teardown and `kill --run-id build-42`
 only for an immediate hard kill. Never clean up by process name or PID. For fleets,

@@ -8,6 +8,7 @@ Commands:
   cancel   Ask a live run to cancel (graceful where supported, then a hard kill), by `--run-id` or, in aggregate, `--all`
   kill     Hard-kill a live run's container immediately, by `--run-id` or, in aggregate, `--all`
   wait     Block until a run recorded in the per-user registry has finished
+  events   Read back a run's JSONL lifecycle stream: render it, follow it, pass it through, or check it against the embedded event schema
   list     List every run recorded in the per-user registry, whatever its health (live/stale/unprobed)
   prune    Reap the registry's confirmed-stale entries — the leftover records of runners that died abruptly — while never touching a live run's entry
   probe    Report this binary's compatibility surface for a consumer's fail-closed compatibility preflight — no run, no child, no side effects
