@@ -9,7 +9,8 @@ use crate::labels::OperatorLabel;
 
 use super::parse::{parse_positive_duration, parse_run_id};
 
-/// `wait (--run-id <id> [--report-outcome] | --all [--label <KEY=VALUE>]...)
+/// `wait (--run-id <id> [--report-outcome] | --all [--label <KEY=VALUE>]...
+/// [--report-outcome])
 /// [--timeout <duration>]`
 ///
 /// Blocks while the named run (`--run-id`) — or, in aggregate (`--all`), every run
@@ -56,14 +57,12 @@ pub struct WaitArgs {
     #[arg(long = "label", value_name = "KEY=VALUE", value_parser = crate::labels::parse, requires = "all", conflicts_with = "run_id")]
     pub labels: Vec<OperatorLabel>,
 
-    /// After a single observed-live run finishes, print one JSON outcome object
-    /// containing the terminal `runner_exit` source, runner code, and child code.
-    /// The wait command's own exit status remains unchanged. If the run was already
-    /// gone when waiting began, its registry record and JSONL locator are no longer
-    /// knowable, so the object reports `status: "unknown"` with null outcome fields.
-    /// Restricted to `--run-id`; aggregate outcome reporting can be added later with
-    /// an explicit per-target contract.
-    #[arg(long, requires = "run_id", conflicts_with = "all")]
+    /// After the target finishes, print its terminal `runner_exit` outcome. With
+    /// `--run-id`, this is one JSON object; with `--all`, it is one JSON array in
+    /// stable snapshot order with one entry per target. The wait command's own exit
+    /// status remains unchanged. A target whose outcome cannot be read is reported
+    /// as `status: "unknown"` with null outcome fields.
+    #[arg(long)]
     pub report_outcome: bool,
 
     /// Give up after this long instead of waiting indefinitely. This is a deadline
@@ -152,7 +151,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_report_outcome_is_single_run_only() {
+    fn wait_report_outcome_is_allowed_for_single_and_aggregate_modes() {
         let cli = Cli::try_parse_from([
             "processkit-cli",
             "wait",
@@ -165,10 +164,13 @@ mod tests {
             panic!("expected the wait subcommand");
         };
         assert!(args.report_outcome);
-        assert!(
-            Cli::try_parse_from(["processkit-cli", "wait", "--all", "--report-outcome"]).is_err(),
-            "aggregate reporting has no per-target wire contract yet"
-        );
+        let cli = Cli::try_parse_from(["processkit-cli", "wait", "--all", "--report-outcome"])
+            .expect("aggregate wait may request per-target outcomes");
+        let Command::Wait(args) = cli.command else {
+            panic!("expected the wait subcommand");
+        };
+        assert!(args.all);
+        assert!(args.report_outcome);
     }
 
     #[test]

@@ -1876,13 +1876,24 @@ fn wait_does_not_create_the_registry_directory() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Spawn `wait --all [--timeout <duration>]` against `registry` **without** waiting
+/// Spawn `wait --all [--timeout <duration>] [--report-outcome]` against `registry` **without** waiting
 /// for it, mirroring `spawn_wait` for the aggregate barrier: the only way to prove
 /// blocking (or the deliberate absence of it, T-216) rather than infer it from
 /// elapsed time.
 fn spawn_wait_all(registry: &Path, timeout: Option<&str>) -> Child {
+    spawn_wait_all_with_report(registry, timeout, false)
+}
+
+fn spawn_wait_all_with_report(
+    registry: &Path,
+    timeout: Option<&str>,
+    report_outcome: bool,
+) -> Child {
     let mut cmd = Command::new(bin());
     cmd.args(["wait", "--all"]);
+    if report_outcome {
+        cmd.arg("--report-outcome");
+    }
     if let Some(timeout) = timeout {
         cmd.args(["--timeout", timeout]);
     }
@@ -1898,6 +1909,12 @@ fn wait_all_for(registry: &Path, timeout: Option<&str>) -> Output {
     spawn_wait_all(registry, timeout)
         .wait_with_output()
         .expect("the wait --all client exits")
+}
+
+fn wait_all_with_report_for(registry: &Path, timeout: Option<&str>) -> Output {
+    spawn_wait_all_with_report(registry, timeout, true)
+        .wait_with_output()
+        .expect("the reporting wait --all client exits")
 }
 
 /// `wait --all` against a registry with no live runs at all — an absent directory, or
@@ -1926,6 +1943,15 @@ fn wait_all_returns_at_once_with_no_live_runs() {
         String::from_utf8_lossy(&out.stdout)
     );
 
+    let reported = wait_all_with_report_for(&registry, Some("10s"));
+    assert_eq!(reported.status.code(), Some(0));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&reported.stdout)
+            .expect("empty aggregate report is JSON"),
+        serde_json::json!([]),
+        "an empty snapshot reports one empty JSON array"
+    );
+
     // A registry with only confirmed-stale leftovers is likewise nothing to wait for.
     write_stale_entry(&registry, "run-stale-0000", "run-stale-0000");
     let out = wait_all_for(&registry, Some("10s"));
@@ -1934,6 +1960,209 @@ fn wait_all_returns_at_once_with_no_live_runs() {
         Some(0),
         "a registry with only stale entries has nothing live to wait for; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Aggregate reporting remembers every snapshot target's locator and prints one
+/// stable entry per target only after the barrier clears. The ids intentionally start
+/// in reverse order so this also proves the report is not based on filesystem order.
+#[test]
+fn wait_all_reports_multiple_target_outcomes_in_stable_order() {
+    let dir = scratch("wait-all-report-multi");
+    let registry = registry_dir(&dir);
+    let zulu_dir = dir.join("zulu");
+    let alpha_dir = dir.join("alpha");
+    fs::create_dir_all(&zulu_dir).expect("create the zulu run directory");
+    fs::create_dir_all(&alpha_dir).expect("create the alpha run directory");
+    let mut zulu = command_with_flags(
+        &zulu_dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "zulu-run"],
+        slow_child(),
+    )
+    .spawn()
+    .expect("spawn the zulu runner");
+    let mut alpha = command_with_flags(
+        &alpha_dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "alpha-run"],
+        slow_child(),
+    )
+    .spawn()
+    .expect("spawn the alpha runner");
+    wait_until(|| record_count(&registry) == 2, RECORD_WAIT);
+
+    let waiter = spawn_wait_all_with_report(&registry, None, true);
+    assert!(zulu.wait().expect("the zulu runner exits").success());
+    assert!(alpha.wait().expect("the alpha runner exits").success());
+    let out = waiter
+        .wait_with_output()
+        .expect("the aggregate reporting wait exits");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        out.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("aggregate report is one JSON value");
+    assert_eq!(
+        report,
+        serde_json::json!([
+            {"run_id":"alpha-run","status":"reported","code":0,"source":"child_exit","child_code":0},
+            {"run_id":"zulu-run","status":"reported","code":0,"source":"child_exit","child_code":0}
+        ]),
+        "entries use snapshot locators and stable run-id ordering"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A malformed and an unavailable snapshotted JSONL locator are honest unknown
+/// entries, while a normal locator still reports its terminal event. The barrier's
+/// success code remains `0` because report data never changes wait semantics.
+#[test]
+fn wait_all_reports_mixed_reported_and_unknown_outcomes() {
+    let dir = scratch("wait-all-report-unknown");
+    let registry = registry_dir(&dir);
+    let reported_dir = dir.join("reported");
+    let malformed_dir = dir.join("malformed");
+    let unavailable_dir = dir.join("unavailable");
+    for run_dir in [&reported_dir, &malformed_dir, &unavailable_dir] {
+        fs::create_dir_all(run_dir).expect("create the run directory");
+    }
+    let mut reported = command_with_flags(
+        &reported_dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "reported-run"],
+        slow_child(),
+    )
+    .spawn()
+    .expect("spawn the reported runner");
+    let mut malformed = command_with_flags(
+        &malformed_dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "malformed-run"],
+        slow_child(),
+    )
+    .spawn()
+    .expect("spawn the malformed runner");
+    let mut unavailable = command_with_flags(
+        &unavailable_dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "unavailable-run"],
+        slow_child(),
+    )
+    .spawn()
+    .expect("spawn the unavailable runner");
+    wait_until(|| record_count(&registry) == 3, RECORD_WAIT);
+
+    let malformed_path = dir.join("malformed-events.jsonl");
+    fs::write(&malformed_path, b"not-json\n").expect("write malformed JSONL");
+    let unavailable_path = dir.join("unavailable-events.jsonl");
+    for (run_id, jsonl) in [
+        ("malformed-run", malformed_path),
+        ("unavailable-run", unavailable_path),
+    ] {
+        let path = record_path_for(&registry, run_id);
+        let mut record: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read the run record"))
+                .expect("the run record is JSON");
+        record["jsonl"] = serde_json::Value::String(jsonl.to_string_lossy().into_owned());
+        fs::write(
+            &path,
+            serde_json::to_vec(&record).expect("serialize the edited run record"),
+        )
+        .expect("publish the edited JSONL locator");
+    }
+
+    let waiter = spawn_wait_all_with_report(&registry, None, true);
+    assert!(
+        reported
+            .wait()
+            .expect("the reported runner exits")
+            .success()
+    );
+    assert!(
+        malformed
+            .wait()
+            .expect("the malformed runner exits")
+            .success()
+    );
+    assert!(
+        unavailable
+            .wait()
+            .expect("the unavailable runner exits")
+            .success()
+    );
+    let out = waiter
+        .wait_with_output()
+        .expect("the mixed aggregate reporting wait exits");
+    assert_eq!(out.status.code(), Some(0));
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("mixed report is one JSON array");
+    assert_eq!(report.as_array().map(Vec::len), Some(3));
+    assert_eq!(report[0]["run_id"], "malformed-run");
+    assert_eq!(report[0]["status"], "unknown");
+    assert_eq!(report[1]["run_id"], "reported-run");
+    assert_eq!(report[1]["status"], "reported");
+    assert_eq!(report[1]["child_code"], 0);
+    assert_eq!(report[2]["run_id"], "unavailable-run");
+    assert_eq!(report[2]["status"], "unknown");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Aggregate reporting preserves a control-plane terminal outcome, including its
+/// reserved runner code and source, after the barrier observes the cancelled run.
+#[test]
+fn wait_all_reports_a_control_cancel_outcome() {
+    let dir = scratch("wait-all-report-cancel");
+    let registry = registry_dir(&dir);
+    let runner_dir = dir.join("runner");
+    fs::create_dir_all(&runner_dir).expect("create the runner directory");
+    let mut runner = command_with_flags(
+        &runner_dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &["--run-id", "cancelled-run"],
+        long_child(),
+    )
+    .spawn()
+    .expect("spawn the cancellable runner");
+
+    wait_until(|| record_count(&registry) == 1, RECORD_WAIT);
+    let waiter = spawn_wait_all_with_report(&registry, None, true);
+
+    let cancel = control_all_client(&registry, "cancel");
+    assert_eq!(
+        cancel.status.code(),
+        Some(0),
+        "cancel --all acknowledges the snapshot target; stderr: {}",
+        String::from_utf8_lossy(&cancel.stderr)
+    );
+    assert_eq!(
+        runner.wait().expect("the cancelled runner exits").code(),
+        Some(108),
+        "the control-plane cancel keeps its reserved run exit code"
+    );
+
+    let out = waiter
+        .wait_with_output()
+        .expect("the aggregate wait exits after cancellation");
+    assert_eq!(out.status.code(), Some(0));
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("cancelled aggregate report is JSON");
+    assert_eq!(
+        report,
+        serde_json::json!([{
+            "run_id": "cancelled-run",
+            "status": "reported",
+            "code": 108,
+            "source": "control_cancel",
+            "child_code": null
+        }])
     );
 
     let _ = fs::remove_dir_all(&dir);
@@ -1958,7 +2187,7 @@ fn wait_all_blocks_until_the_one_live_run_finishes() {
     // The run is waitable once its record is published.
     wait_until(|| record_count(&registry) == 1, RECORD_WAIT);
 
-    let mut waiter = spawn_wait_all(&registry, None);
+    let mut waiter = spawn_wait_all_with_report(&registry, None, true);
 
     // While the run is live the waiter must still be blocked, cross-checked against
     // the registry actually still holding the live record on every probe.
@@ -1980,7 +2209,7 @@ fn wait_all_blocks_until_the_one_live_run_finishes() {
     let status = runner.wait().expect("the runner exits");
     assert!(status.success(), "the fixture run exits cleanly");
 
-    // ...and the waiter must then return promptly, with success and no output.
+    // ...and the waiter must then return promptly with one reported outcome.
     let out = waiter
         .wait_with_output()
         .expect("the wait --all client exits once its snapshot is clear");
@@ -1990,10 +2219,18 @@ fn wait_all_blocks_until_the_one_live_run_finishes() {
         "waiting for every snapshot run to finish exits 0; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(
-        out.stdout.is_empty(),
-        "`wait --all` prints nothing on success: {:?}",
-        String::from_utf8_lossy(&out.stdout)
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("single-target aggregate report is JSON");
+    assert_eq!(
+        report,
+        serde_json::json!([{
+            "run_id": "wait-all-me",
+            "status": "reported",
+            "code": 0,
+            "source": "child_exit",
+            "child_code": 0
+        }]),
+        "a single snapshot target produces one outcome entry"
     );
 
     let _ = fs::remove_dir_all(&dir);
@@ -2019,7 +2256,12 @@ fn wait_all_times_out_with_a_run_still_live() {
 
     wait_until(|| record_count(&registry) == 1, RECORD_WAIT);
 
-    let out = wait_all_for(&registry, Some("1s"));
+    let out = {
+        let waiter = spawn_wait_all_with_report(&registry, Some("1s"), true);
+        waiter
+            .wait_with_output()
+            .expect("the timed-out aggregate reporting wait exits")
+    };
     assert_eq!(
         out.status.code(),
         Some(112),

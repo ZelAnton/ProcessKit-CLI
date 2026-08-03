@@ -11,7 +11,7 @@
 //! ```text
 //! processkit-cli wait --run-id build-42 [--timeout 10m]
 //! processkit-cli wait --run-id build-42 --report-outcome
-//! processkit-cli wait --all             [--timeout 10m]
+//! processkit-cli wait --all             [--timeout 10m] [--report-outcome]
 //! ```
 //!
 //! It is the *lifetime* counterpart to [`crate::list`]'s discovery and
@@ -45,8 +45,8 @@
 //!
 //! # The three outcomes of `--run-id`
 //!
-//! Scoped to the single-`run_id` mode only — see "The aggregate barrier: `wait --all`"
-//! below for why `--all` has just two outcomes, with no `CONTROL` among them.
+//! Scoped to the target's lifetime only — see "The aggregate barrier: `wait --all`"
+//! below for the snapshot and report-array rules in aggregate mode.
 //!
 //! | Exit | Meaning |
 //! | --- | --- |
@@ -55,10 +55,11 @@
 //! | [`exit::CONTROL`] (103) | More than one live run is registered under that `run_id`, so there is no single run to wait for. |
 //!
 //! Nothing is printed on ordinary success: the exit code *is* the answer. The
-//! single-run-only `--report-outcome` opt-in prints one JSON object after success,
-//! without changing that exit code. It remembers the live record's JSONL locator
-//! before clean teardown deletes the record, then reads the terminal `runner_exit`.
-//! A failure explains itself on stderr, like every other subcommand.
+//! `--report-outcome` opt-in prints one JSON object for `--run-id`, or one JSON array
+//! for `--all`, after success, without changing that exit code. It remembers each
+//! live record's JSONL locator before clean teardown deletes the record, then reads
+//! the terminal `runner_exit`. A failure explains itself on stderr, like every other
+//! subcommand.
 //!
 //! # An unknown `run_id` reads as "finished"
 //!
@@ -119,7 +120,7 @@
 //!   `Ambiguous` outcome — `--all` never resolves an id at all, so the duplicate-id
 //!   question [`RunStatus::Ambiguous`] answers for `--run-id` does not arise.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -165,8 +166,9 @@ enum WaitOutcomeStatus {
     Unknown,
 }
 
-/// The one-line machine result emitted by `wait --report-outcome`. Null fields are
-/// always present so a consumer never has to distinguish absent from unknown.
+/// One machine-readable entry emitted by `wait --report-outcome`. Null fields are
+/// always present so a consumer never has to distinguish absent from unknown. The
+/// single-run form emits this object directly; aggregate mode emits an array of them.
 #[derive(Debug, PartialEq, Eq, Serialize)]
 struct WaitOutcome<'a> {
     run_id: &'a str,
@@ -300,11 +302,9 @@ pub fn run(
     }
 }
 
-fn print_outcome(run_id: &str, jsonl: Option<PathBuf>) -> Result<(), RunnerError> {
-    let terminal = jsonl
-        .as_deref()
-        .and_then(|path| await_terminal_outcome(path, run_id));
-    let report = match terminal {
+fn outcome_for<'a>(run_id: &'a str, jsonl: Option<&std::path::Path>) -> WaitOutcome<'a> {
+    let terminal = jsonl.and_then(|path| await_terminal_outcome(path, run_id));
+    match terminal {
         Some(terminal) => WaitOutcome {
             run_id,
             status: WaitOutcomeStatus::Reported,
@@ -319,7 +319,11 @@ fn print_outcome(run_id: &str, jsonl: Option<PathBuf>) -> Result<(), RunnerError
             source: None,
             child_code: None,
         },
-    };
+    }
+}
+
+fn print_outcome(run_id: &str, jsonl: Option<PathBuf>) -> Result<(), RunnerError> {
+    let report = outcome_for(run_id, jsonl.as_deref());
     let line = serde_json::to_string(&report).map_err(|err| {
         RunnerError::new(
             exit::SETUP,
@@ -534,6 +538,7 @@ fn wait_timed_out(run_id: &str, limit: Duration, last: RunStatus) -> RunnerError
 pub fn run_all(
     timeout: Option<Duration>,
     labels: &[crate::labels::OperatorLabel],
+    report_outcome: bool,
 ) -> Result<(), RunnerError> {
     let registry = registry::open_read_only_for_setup()?;
     let deadline = timeout.map(WaitDeadline::new);
@@ -541,8 +546,9 @@ pub fn run_all(
     // The snapshot: one scan, fixed before the first poll, to exactly the entries
     // confirmed live right now. Every later pass only ever *removes* from this set —
     // nothing is ever added to it (see the module doc for why).
-    let mut targets =
+    let snapshot_targets =
         snapshot_target_paths(&registry, labels).map_err(registry::setup_read_error)?;
+    let mut targets = snapshot_targets.clone();
     // Whether the most recent pass over `targets` found an entry that could not be
     // re-probed — reported honestly on a timeout instead of a confident "still live"
     // the last pass never actually established for every remaining entry.
@@ -550,6 +556,9 @@ pub fn run_all(
 
     loop {
         if targets.is_empty() {
+            if report_outcome {
+                print_all_outcomes(&snapshot_targets)?;
+            }
             return Ok(());
         }
 
@@ -582,13 +591,23 @@ pub fn run_all(
 fn snapshot_target_paths(
     registry: &registry::Registry,
     labels: &[crate::labels::OperatorLabel],
-) -> std::io::Result<HashSet<PathBuf>> {
-    Ok(registry
+) -> std::io::Result<Vec<WaitTarget>> {
+    let mut targets: Vec<WaitTarget> = registry
         .snapshot_live_entries()?
         .into_iter()
         .filter(|entry| crate::labels::matches(&entry.record.labels, labels))
-        .map(|entry| entry.path)
-        .collect())
+        .map(|entry| WaitTarget {
+            run_id: entry.record.run_id,
+            record_path: entry.path,
+            jsonl: entry.record.jsonl.map(PathBuf::from),
+        })
+        .collect();
+    targets.sort_by(|left, right| {
+        left.run_id
+            .cmp(&right.run_id)
+            .then_with(|| left.record_path.cmp(&right.record_path))
+    });
+    Ok(targets)
 }
 
 /// Re-probe every entry still in `targets` against a fresh scan, dropping any that is
@@ -601,24 +620,24 @@ fn snapshot_target_paths(
 /// [`Health::Unprobed`], for [`wait_all_timed_out`] to report honestly.
 fn reprobe_targets(
     registry: &registry::Registry,
-    targets: &HashSet<PathBuf>,
-) -> std::io::Result<(HashSet<PathBuf>, bool)> {
+    targets: &[WaitTarget],
+) -> std::io::Result<(Vec<WaitTarget>, bool)> {
     let mut current: HashMap<PathBuf, Health> = registry
         .entries()?
         .into_iter()
         .map(|entry| (entry.path, entry.health))
         .collect();
 
-    let mut still_outstanding = HashSet::with_capacity(targets.len());
+    let mut still_outstanding = Vec::with_capacity(targets.len());
     let mut any_unprobed = false;
-    for path in targets {
-        match current.remove(path) {
+    for target in targets {
+        match current.remove(&target.record_path) {
             Some(Health::Live) => {
-                still_outstanding.insert(path.clone());
+                still_outstanding.push(target.clone());
             }
             Some(Health::Unprobed) => {
                 any_unprobed = true;
-                still_outstanding.insert(path.clone());
+                still_outstanding.push(target.clone());
             }
             // Confirmed stale, or no longer present in the scan at all: over either
             // way.
@@ -626,6 +645,33 @@ fn reprobe_targets(
         }
     }
     Ok((still_outstanding, any_unprobed))
+}
+
+#[derive(Debug, Clone)]
+struct WaitTarget {
+    run_id: String,
+    record_path: PathBuf,
+    jsonl: Option<PathBuf>,
+}
+
+/// Print one outcome entry for every target in the original snapshot, in the same
+/// deterministic order used by the barrier. The report deliberately uses the
+/// snapshot's locators rather than looking up records after the barrier: a clean
+/// runner removes its registry record before the terminal event is flushed, and a
+/// replacement record must never retarget a report for the old run.
+fn print_all_outcomes(targets: &[WaitTarget]) -> Result<(), RunnerError> {
+    let report: Vec<WaitOutcome<'_>> = targets
+        .iter()
+        .map(|target| outcome_for(&target.run_id, target.jsonl.as_deref()))
+        .collect();
+    let line = serde_json::to_string(&report).map_err(|err| {
+        RunnerError::new(
+            exit::SETUP,
+            format!("could not render the wait --all outcome report: {err}"),
+        )
+    })?;
+    println!("{line}");
+    Ok(())
 }
 
 /// The give-up error for [`run_all`]: `--timeout` elapsed with `outstanding` snapshot
@@ -930,15 +976,21 @@ mod tests {
         let snapshot = snapshot_target_paths(&registry, &[]).expect("scan the fixture registry");
 
         assert!(
-            snapshot.contains(&live_path),
+            snapshot
+                .iter()
+                .any(|target| target.record_path == live_path),
             "a confirmed-live entry is in the snapshot's target set"
         );
         assert!(
-            !snapshot.contains(&stale_path),
+            !snapshot
+                .iter()
+                .any(|target| target.record_path == stale_path),
             "a confirmed-stale entry is excluded from the snapshot"
         );
         assert!(
-            !snapshot.contains(&unprobed_path),
+            !snapshot
+                .iter()
+                .any(|target| target.record_path == unprobed_path),
             "an entry only unprobed at snapshot time is excluded outright, never \
              entering the target set at all"
         );
@@ -975,29 +1027,54 @@ mod tests {
         // a clean exit produces (its own record removed).
         let missing_path = dir.join("never-existed.json");
 
-        let mut targets: HashSet<PathBuf> = HashSet::new();
-        targets.insert(live_path.clone());
-        targets.insert(stale_path.clone());
-        targets.insert(unprobed_path.clone());
-        targets.insert(missing_path.clone());
+        let targets = vec![
+            WaitTarget {
+                run_id: "live-run".to_string(),
+                record_path: live_path.clone(),
+                jsonl: None,
+            },
+            WaitTarget {
+                run_id: "stale-run".to_string(),
+                record_path: stale_path.clone(),
+                jsonl: None,
+            },
+            WaitTarget {
+                run_id: "unprobed-run".to_string(),
+                record_path: unprobed_path.clone(),
+                jsonl: None,
+            },
+            WaitTarget {
+                run_id: "missing-run".to_string(),
+                record_path: missing_path.clone(),
+                jsonl: None,
+            },
+        ];
 
         let (surviving, any_unprobed) =
             reprobe_targets(&registry, &targets).expect("reprobe against the fixture registry");
 
         assert!(
-            surviving.contains(&live_path),
+            surviving
+                .iter()
+                .any(|target| target.record_path == live_path),
             "a Live entry stays outstanding"
         );
         assert!(
-            surviving.contains(&unprobed_path),
+            surviving
+                .iter()
+                .any(|target| target.record_path == unprobed_path),
             "an Unprobed entry stays outstanding, never silently dropped"
         );
         assert!(
-            !surviving.contains(&stale_path),
+            !surviving
+                .iter()
+                .any(|target| target.record_path == stale_path),
             "a Stale entry is dropped as confirmed over"
         );
         assert!(
-            !surviving.contains(&missing_path),
+            !surviving
+                .iter()
+                .any(|target| target.record_path == missing_path),
             "an entry gone from the scan entirely is dropped as confirmed over"
         );
         assert_eq!(
@@ -1028,13 +1105,20 @@ mod tests {
             .expect("register a live run");
         let live_path = live.record_path().to_path_buf();
 
-        let mut targets: HashSet<PathBuf> = HashSet::new();
-        targets.insert(live_path.clone());
+        let targets = vec![WaitTarget {
+            run_id: "live-run".to_string(),
+            record_path: live_path.clone(),
+            jsonl: None,
+        }];
 
         let (surviving, any_unprobed) =
             reprobe_targets(&registry, &targets).expect("reprobe against the fixture registry");
 
-        assert!(surviving.contains(&live_path));
+        assert!(
+            surviving
+                .iter()
+                .any(|target| target.record_path == live_path)
+        );
         assert!(
             !any_unprobed,
             "no survivor is unprobed, so the flag must not overclaim one is"

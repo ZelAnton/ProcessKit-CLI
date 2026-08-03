@@ -68,7 +68,7 @@ fn main() -> ExitCode {
             )
         }),
         Command::Wait(args) => report(if args.all {
-            wait::run_all(args.timeout, &args.labels)
+            wait::run_all(args.timeout, &args.labels, args.report_outcome)
         } else {
             // clap's `required_unless_present`/`conflicts_with` pair on `WaitArgs`
             // guarantees exactly one of `run_id`/`all` is set, so this is never
