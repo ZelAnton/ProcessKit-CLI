@@ -23,7 +23,8 @@ name: Release
 # Prebuilt binaries: once the `release` job has published + tagged + created the
 # GitHub Release, a downstream `build-artifacts` matrix fans out across the
 # supported platforms (Windows/Linux x x86_64/aarch64, macOS aarch64 (Apple
-# Silicon), plus a static musl Linux build), builds each `--release` binary
+# Silicon), plus static musl Linux builds for x86_64 and aarch64), builds each
+# `--release` binary
 # from the freshly-tagged commit, and attaches it to that SAME Release. Each
 # archive ships with a `<archive>.sha256` checksum next to it and a signed
 # build-provenance attestation (`actions/attest-build-provenance`) so a
@@ -507,6 +508,18 @@ jobs:
           # the glibc build above, not instead of it.
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+            apt: musl-tools
+          # Static Linux, Arm64: same musl approach as the x86_64 leg above, but
+          # built NATIVELY on the ubuntu-24.04-arm hosted runner (the same
+          # GitHub-hosted aarch64 runner the `test`/`e2e` jobs in ci.yml already
+          # use) instead of cross-compiling from an x86_64 host. `musl-tools`
+          # only wraps the HOST's own gcc with musl's headers/libs — there is no
+          # apt-packaged aarch64-linux-musl cross-gcc — so producing an aarch64
+          # musl binary needs an aarch64 host, exactly like the x86_64 leg needs
+          # an x86_64 host. No `CARGO_TARGET_*_LINKER` override is needed either,
+          # for the same already-native reason.
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
             apt: musl-tools
           # macOS: Apple Silicon on the default (arm64) runner image, native,
           # no cross toolchain needed.

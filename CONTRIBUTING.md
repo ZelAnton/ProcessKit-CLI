@@ -26,8 +26,9 @@ with the `processkit` crate.
   `yaml-lint` (`yamllint .`), `msrv` (`cargo check --all-targets` on the
   toolchain the `msrv` job pins, with `rust-toolchain.toml` removed first —
   see the job for why), and `target-check` (the default and E2E test tiers via
-  `cargo test --target x86_64-unknown-linux-musl`, needing `musl-tools` on a
-  Linux host; the two aarch64 triplets it used to
+  `cargo test --target x86_64-unknown-linux-musl` and `cargo test --target
+  aarch64-unknown-linux-musl`, needing `musl-tools` on a matching-architecture
+  Linux host for each leg; the two aarch64-glibc/Windows triplets it used to
   cross-compile-check are now covered by real, executed runs of the `test`
   job below instead — see that job's comment) — so a clean run of every `just`
   target does not by itself guarantee a green CI run; run those three
@@ -66,15 +67,23 @@ arm64 runners `ubuntu-24.04-arm` and `windows-11-arm`, so every aarch64
 release target (see README.md's [platform
 matrix](README.md#platform-matrix)) gets real, executed test coverage. The
 required `target-check` job additionally runs both the default and E2E suites
-as statically linked `x86_64-unknown-linux-musl` binaries on `ubuntu-latest`;
-musl does not need to be the host libc for those binaries to execute. The two
-arm64
+as statically linked `x86_64-unknown-linux-musl` binaries on `ubuntu-latest`
+and `aarch64-unknown-linux-musl` binaries on `ubuntu-24.04-arm`; musl does not
+need to be the host libc for those binaries to execute, only a matching CPU
+architecture (there is no apt-packaged aarch64-linux-musl cross-compiler, so
+that leg builds natively on the arm64 runner rather than cross-compiling from
+an x86_64 host — see release.yml's build-artifacts matrix for the same
+reasoning). The two arm64 `test`
 entries are **required** checks from the start, same as the three
 pre-existing entries in this matrix — there is no non-gating grace period
 for them (unlike the informational `coverage`/`perf` jobs, which use
 `continue-on-error` deliberately); if you administer branch protection,
 add `test (ubuntu-24.04-arm)` and `test (windows-11-arm)` to the required
-status checks list alongside the existing `test (*)` entries.
+status checks list alongside the existing `test (*)` entries (and, since
+`target-check` gained a second matrix leg, `target-check
+(aarch64-unknown-linux-musl)` alongside the pre-existing `target-check
+(x86_64-unknown-linux-musl)`, if your protection rule lists exact per-leg
+contexts rather than the job name alone).
 
 On a Linux development host with `musl-tools` installed, reproduce the musl
 job with:
@@ -85,8 +94,11 @@ cargo test --target x86_64-unknown-linux-musl
 cargo test --target x86_64-unknown-linux-musl --features e2e --test e2e -- --nocapture
 ```
 
-There is intentionally no cross-platform `just` recipe for this host-specific
-toolchain lane. The stress tier remains in its separate scheduled/manual
+On an aarch64 Linux development host, substitute `aarch64-unknown-linux-musl`
+for the triple above — no separate cross toolchain to install; `musl-tools` on
+an aarch64 host already targets aarch64 musl. There is intentionally no
+cross-platform `just` recipe for this host-specific toolchain lane. The stress
+tier remains in its separate scheduled/manual
 workflow rather than extending this required compatibility gate.
 
 Before opening a pull request or publishing directly to `main`, make sure the
@@ -481,6 +493,61 @@ build/test output. CI publishes the same summary to the job's step summary
 and uploads each shard's directory as its own `mutants-out-shard-N` artifact.
 
 [`cargo-mutants`]: https://mutants.rs
+
+## Cross-version interop
+
+Every tier above drives one binary against itself. The mixed-version window a
+real user passes through mid-upgrade — an old runner still live in memory while
+a new client talks to it, a leftover record written by the previous version, a
+JSONL file that outlives the binary that wrote it — is covered by a scheduled,
+**non-gating** [`interop.yml`](.github/workflows/interop.yml) workflow instead.
+It downloads the latest published release archive with `gh release download`,
+builds the current checkout, and runs both against one shared scratch registry,
+executing the procedures in [`docs/compatibility.md`](docs/compatibility.md)
+rather than restating them: `list`/`inspect`/`prune`/`cancel`/`wait` in both
+client-to-runner directions, an abandoned record reaped from both sides,
+`probe --require-surface`/`--require-schema-version`/`--require-exit-code-band`
+pinning in both directions, and each binary's JSONL stream read under the
+other's schema.
+
+The driver is [`scripts/cross_version_interop.py`](scripts/cross_version_interop.py)
+and takes two binaries, so it also runs by hand against any release you want to
+compare with:
+
+```sh
+pip install jsonschema
+gh release download v0.3.0 --pattern 'processkit-cli-v0.3.0-<target>.tar.gz'
+tar -xzf processkit-cli-v0.3.0-<target>.tar.gz -C /tmp/released
+cargo build --release --bin processkit-cli
+python scripts/cross_version_interop.py \
+    --old-binary /tmp/released/processkit-cli \
+    --new-binary target/release/processkit-cli \
+    --schema-dir fixtures/schema
+```
+
+Three verdicts, and the distinction is the point:
+
+- **failure** — a compatibility break no version field declares (a withdrawn
+  CLI surface token, a JSONL field that vanished, a record or control-plane
+  reply the other version can no longer read). The workflow turns red.
+- **declared break** — a bump of `schema_version`, `snapshot_version`, or
+  `probe_version`. Bumping is the sanctioned way to break those contracts, so it
+  is reported prominently but is not a failure; it does mean mixed-version
+  operation stops working, so the change has to ship as a breaking release.
+- **skip** — a scenario that cannot run because the released binary predates a
+  flag it drives. Each skip names the missing surface token, so nothing is
+  quietly dropped.
+
+The whole lane skips gracefully, with an explicit reason in the job summary,
+when no release has been published yet or the runner's platform has no archive
+in the latest release. Its verdict logic — which differences are additive and
+which are breaking — is unit-tested offline against this repository's own
+published schema documents by `scripts/tests/test_cross_version_interop.py`,
+which the workflow runs first and unconditionally:
+
+```sh
+python -m unittest scripts/tests/test_cross_version_interop.py
+```
 
 ## Conventions
 

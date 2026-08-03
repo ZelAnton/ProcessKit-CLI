@@ -18,7 +18,7 @@ shell's quoting and security boundary.
 
 See [Running commands](../running-commands.md) for platform examples.
 The boundary is declared by the
-[CLI parser](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/src/cli.rs) and passed
+[CLI parser](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/src/cli/run.rs) and passed
 to the child without a shell by the
 [launch path](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/src/run/launch.rs).
 

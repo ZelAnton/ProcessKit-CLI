@@ -14,6 +14,7 @@ dies before it can execute teardown.
 | Linux x86_64 glibc | `x86_64-unknown-linux-gnu` | Prebuilt release archive |
 | Linux Arm64 glibc | `aarch64-unknown-linux-gnu` | Prebuilt release archive |
 | Linux x86_64 musl | `x86_64-unknown-linux-musl` | Static prebuilt archive |
+| Linux Arm64 musl | `aarch64-unknown-linux-musl` | Static prebuilt archive |
 | macOS Apple Silicon | `aarch64-apple-darwin` | Prebuilt release archive |
 
 Other Rust-supported targets may build from source, but are not part of the

@@ -160,6 +160,22 @@ with that one — in short, do not hand-delete it). See
 reached: a distinguishable result, never a hang", and the `CONTROL` (103) row
 of the reserved-band table in [`docs/exit-codes.md`](exit-codes.md).
 
+**`inspect` has a fourth reason of its own, and it is not a lost runner.** If
+the message says the runner answered with a **control-plane snapshot version**
+outside the range this client reads, the runner is reachable and healthy: the
+exchange completed, and it is the *answer* that was rejected, because it declares
+a snapshot contract this binary does not read — in practice a runner newer than
+the client you are running. `cancel`/`kill` cannot hit this, and neither can
+`list`/`wait`/`prune`, so the run itself is still fully controllable. Retrying
+will not help: inspect that run with a build that speaks its version — for a
+newer runner, one at least as new as the binary that started the run. The message
+quotes the version that arrived and the range this build reads; `processkit-cli
+probe --json` reports the `version` of **whichever binary you run**, which is how
+you tell two installed builds apart (no preflight can report a *runner's*
+snapshot version — that number only arrives in its reply). See
+[`docs/control-plane.md`](control-plane.md), "Snapshot version: a newer runner's
+reply is refused, an older one is read".
+
 **`wait` does not share this code.** The registry-only `wait --run-id <id>`
 never connects to a run's control transport, so "died mid-conversation" is
 not something it can hit, and a stale registry entry does not give it `103`
