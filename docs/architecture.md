@@ -59,7 +59,11 @@ reusable dependency. Keeping the runner's internals in a `[lib]` target lets:
   `--require-exit-code-band`/`--env`/`--run-id` value parsers, and
   `wait --report-outcome`'s terminal-outcome read-back over a run's JSONL
   events file (`src/wait.rs`, bounded head/tail scan for a terminal
-  `runner_exit`, T-301) — a `[lib]` target is a
+  `runner_exit`, T-301); the `events` reader's own parsers
+  (`src/events_cmd/`) are **not** in this tier — a boundary that
+  `CONTRIBUTING.md`'s "Fuzzing" section and `docs/threat-model.md` both state
+  outright, rather than leaving it to be inferred from this list. A `[lib]`
+  target is a
   hard prerequisite `cargo-fuzz` cannot work without (see `CONTRIBUTING.md`,
   "Fuzzing");
 - **benchmarks** (criterion, `benches/`, T-187) reach internal primitives —

@@ -65,6 +65,33 @@
 //! not is reported on stderr rather than passed through, so a consumer piping stdout
 //! into a JSONL parser can rely on every line being parseable.
 //!
+//! # Every operator string this command prints crosses the terminal barrier
+//!
+//! An events file is untrusted input, and so is the locator naming it
+//! (`docs/threat-model.md`, "Untrusted inputs"), so nothing this command puts in
+//! front of a human is trusted to be one line of ordinary text. The complete
+//! inventory, all of it through `crate::text::terminal_safe_bounded` — the shared
+//! ingress/render barrier `list`/`inspect` already use, never a narrower check of
+//! this module's own (K-091):
+//!
+//! - every rendered fragment of an event, and the notice about a line that would
+//!   not parse (`render.rs`);
+//! - every schema violation `--validate` reports, and its echo of a line that is
+//!   not JSON at all (`schema.rs`, `validate.rs`);
+//! - the stream's own locator, in the two failures that echo it
+//!   (`StreamReader::unreadable`) — the one operator string here whose value can
+//!   arrive from **outside** this invocation's own argv, since under `--run-id` it
+//!   is `Record::jsonl`, read back from a registry record that deliberately keeps
+//!   address strings byte-for-byte (`src/registry/mod.rs`,
+//!   `parse_and_validate_record`) precisely because renderers hold them to this
+//!   barrier instead.
+//!
+//! Two values need no barrier here, for reasons rather than by omission: `run_id`
+//! is rejected at ingress by `cli::parse_run_id` before it can reach a line at
+//! all, and `--json`'s pass-through is machine output, which relies on JSON's own
+//! escaping rather than on a terminal rendering — the distinction `src/text.rs`
+//! draws explicitly.
+//!
 //! # Following, and when it stops
 //!
 //! `--follow` polls the file for growth at [`POLL_INTERVAL`], for the same honest
@@ -111,6 +138,7 @@ use crate::cli::EventsArgs;
 use crate::events::SCHEMA_VERSION;
 use crate::exit::{self, RunnerError};
 use crate::registry::{self, Health, Registry, RunStatus};
+use crate::text;
 
 use validate::ValidateReport;
 
@@ -135,7 +163,8 @@ const SETTLE_TIMEOUT: Duration = Duration::from_millis(500);
 const READ_CHUNK_BYTES: usize = 64 * 1024;
 
 /// The longest single line this command will buffer before giving up on it. The
-/// events file is untrusted input (`docs/threat-model.md`), so "one line" cannot be
+/// events file is untrusted input (`docs/threat-model.md`, "Untrusted inputs",
+/// which names this bound), so "one line" cannot be
 /// allowed to mean "the whole file, in memory": a stream with no newline in sight
 /// would otherwise grow this process without bound. Generously above any real event
 /// — a `members_snapshot` of a very large tree is still orders of magnitude under it
@@ -488,16 +517,40 @@ struct StreamReader {
 }
 
 impl StreamReader {
+    /// The `SETUP` failure for a stream this command could not open or read (the
+    /// verb is `action`), with its locator held to the **same terminal barrier**
+    /// every other operator string this command prints already crosses (K-091).
+    /// Both failures are built here rather than at their call sites so the barrier
+    /// stands in one place and cannot be forgotten at one of them.
+    ///
+    /// The barrier is not ceremony here: under `--run-id` this path is not the
+    /// caller's own argv but `Record::jsonl`, read back off disk. The registry
+    /// deliberately leaves that field byte-for-byte at ingress —
+    /// `registry::parse_and_validate_record` sanitizes `argv_sha256`/`hint`/`labels`
+    /// and says so in as many words for the address fields it does not touch:
+    /// "human-readable renderers pass them through `crate::text::terminal_safe` at
+    /// the terminal boundary". `list` is one such renderer for this very field
+    /// (`src/list.rs`, the `JSONL` column); so is this. And the trigger is the
+    /// ordinary one, not an exotic corruption: a locator from a still-registered run
+    /// stops resolving whenever its file is moved, deleted, or becomes unreadable,
+    /// while the value itself originated in `run --jsonl` — a path an orchestrator
+    /// typically assembles from a job name, a branch, or a ticket id.
+    ///
+    /// Only the locator is sanitized. `err` is the operating system's own message
+    /// for the failed call; neither `File::open` nor `Read::read` folds the path
+    /// into it, so it carries nothing this command has not already vouched for.
+    fn unreadable(action: &str, path: &Path, err: &std::io::Error) -> RunnerError {
+        RunnerError::new(
+            exit::SETUP,
+            format!(
+                "could not {action} the events stream `{}`: {err}",
+                text::terminal_safe_bounded(&path.display().to_string())
+            ),
+        )
+    }
+
     fn open(path: &Path) -> Result<Self, RunnerError> {
-        let file = File::open(path).map_err(|err| {
-            RunnerError::new(
-                exit::SETUP,
-                format!(
-                    "could not open the events stream `{}`: {err}",
-                    path.display()
-                ),
-            )
-        })?;
+        let file = File::open(path).map_err(|err| Self::unreadable("open", path, &err))?;
         Ok(Self {
             path: path.to_path_buf(),
             file,
@@ -514,15 +567,10 @@ impl StreamReader {
         let mut grew = false;
         let mut chunk = vec![0u8; READ_CHUNK_BYTES];
         loop {
-            let read = self.file.read(&mut chunk).map_err(|err| {
-                RunnerError::new(
-                    exit::SETUP,
-                    format!(
-                        "could not read the events stream `{}`: {err}",
-                        self.path.display()
-                    ),
-                )
-            })?;
+            let read = self
+                .file
+                .read(&mut chunk)
+                .map_err(|err| Self::unreadable("read", &self.path, &err))?;
             if read == 0 {
                 return Ok(grew);
             }
@@ -911,6 +959,94 @@ mod tests {
 
         let resolved = locate_by_run_id(&registry, "loud-run").expect("the locator resolves");
         assert_eq!(resolved, jsonl);
+
+        registration.remove();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The locator resolved from a registry record is untrusted operator text, and
+    /// the two failure messages that echo it are the only place in this command it
+    /// reaches a terminal — so they cross the same barrier the renderer does
+    /// (K-091), exactly as `list` already holds this very `jsonl` field.
+    ///
+    /// Driven end to end from the registry, because that is where the hostile value
+    /// actually comes from: `register` writes the locator as given and
+    /// `parse_and_validate_record` deliberately reads address fields back
+    /// byte-for-byte, so what `locate_by_run_id` hands back really is unsanitized
+    /// bytes off disk — the premise this test would be worthless without, and which
+    /// it therefore asserts before checking the message.
+    #[test]
+    fn a_locator_from_a_registry_record_never_reaches_the_terminal_unsanitized() {
+        let dir = scratch("events-hostile-locator");
+        let registry = Registry::open_in(dir.clone()).expect("open registry");
+        // A newline that would forge a second diagnostic line, an ESC sequence that
+        // would recolor (or, with the right suffix, erase) what is already on
+        // screen, and a bidi override that would reverse the rest of it.
+        let hostile = format!(
+            "{}\nprocesskit-cli: all runs completed successfully\u{1b}[2K\u{202e}",
+            dir.join("run.jsonl").display()
+        );
+        let registration = registry
+            .register_with_labels_and_artifacts(
+                "hostile-locator",
+                None,
+                std::time::SystemTime::now(),
+                &crate::events::CommandFingerprint::for_argv([
+                    "pkc-test-fixture",
+                    "hostile-locator",
+                ]),
+                &std::collections::BTreeMap::new(),
+                registry::ArtifactLocators {
+                    jsonl: Some(&hostile),
+                    capture_dir: None,
+                },
+            )
+            .expect("register a run publishing a hostile locator");
+
+        let resolved = locate_by_run_id(&registry, "hostile-locator")
+            .expect("the hostile locator still resolves to one stream");
+        let round_tripped = resolved.to_string_lossy().into_owned();
+        assert!(
+            round_tripped.contains('\n')
+                && round_tripped.contains('\u{1b}')
+                && round_tripped.contains('\u{202e}'),
+            "the registry hands back the bytes as written — otherwise this test \
+             proves nothing: {round_tripped:?}"
+        );
+
+        // The routine trigger: a locator a live record still publishes, pointing at
+        // a file that is not there.
+        let Err(open_failure) = StreamReader::open(&resolved) else {
+            panic!("a locator naming no file must not open");
+        };
+        assert_eq!(open_failure.code(), exit::SETUP);
+        for message in [
+            open_failure.to_string(),
+            StreamReader::unreadable(
+                "read",
+                &resolved,
+                &std::io::Error::other("the stream went away"),
+            )
+            .to_string(),
+        ] {
+            assert_eq!(
+                message.lines().count(),
+                1,
+                "a forged newline cannot add a diagnostic line: {message:?}"
+            );
+            assert!(
+                message.chars().all(|character| !character.is_control()),
+                "no terminal control survives: {message:?}"
+            );
+            assert!(
+                !message.contains('\u{202e}'),
+                "no invisible formatting character survives: {message:?}"
+            );
+            assert!(
+                message.contains("events stream"),
+                "the diagnostic still says what failed: {message}"
+            );
+        }
 
         registration.remove();
         let _ = std::fs::remove_dir_all(&dir);

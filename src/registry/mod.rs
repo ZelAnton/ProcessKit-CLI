@@ -14,7 +14,7 @@
 //!   record uses) guarantees the restriction on every call, so a pre-existing
 //!   directory whose permissions were widened out of band is repaired before a
 //!   record is written into it; [`Registry::open_read_only`] (the path every
-//!   read-only client takes — `list`/`prune`/`wait` and the control clients)
+//!   read-only client takes — `list`/`prune`/`wait`/`events` and the control clients)
 //!   deliberately does neither — a read-only scan must not create the directory or
 //!   touch its permissions. How the mutating open reaches that state is the
 //!   platform's business and the two differ: unix simply re-applies the mode
@@ -68,7 +68,7 @@ pub(crate) fn open_read_only_for_setup() -> Result<Registry, RunnerError> {
 }
 
 /// Map a whole-registry scan failure onto the shared `SETUP` diagnostic used by
-/// `list`, `prune`, `wait`, and aggregate control operations.
+/// `list`, `prune`, `wait`, `events`, and aggregate control operations.
 pub(crate) fn setup_read_error(err: io::Error) -> RunnerError {
     RunnerError::new(
         exit::SETUP,
@@ -456,7 +456,8 @@ impl Registry {
     /// it must create the directory (and lock down a pre-existing one whose
     /// permissions do not already match) because a run is about to write a record
     /// into it. A caller that only wants to *read* the registry —
-    /// `list`/`prune`/`wait`, and the control clients `inspect`/`cancel`/`kill` —
+    /// `list`/`prune`/`wait`/`events`, and the control clients
+    /// `inspect`/`cancel`/`kill` —
     /// must use [`Registry::open_read_only`] instead, so a read-only scan cannot
     /// itself create registry state or touch its permissions.
     pub fn open() -> io::Result<Self> {
@@ -473,7 +474,8 @@ impl Registry {
 
     /// Open the per-user registry **without** creating its directory or touching its
     /// permissions — the read-only counterpart of [`Registry::open`], for callers
-    /// (`list`/`prune`/`wait`, and the control clients `inspect`/`cancel`/`kill`)
+    /// (`list`/`prune`/`wait`/`events`, and the control clients
+    /// `inspect`/`cancel`/`kill`)
     /// that must never mutate registry state just to look at it. The
     /// location is resolved exactly as [`Registry::open`] resolves it
     /// ([`REGISTRY_DIR_ENV`] if set, else the platform default); a directory that

@@ -377,6 +377,16 @@ mod tests {
             "wait:--run-id",
             "wait:--label",
             "wait:--timeout",
+            // `events` (T-296) is the second whole-subcommand confirmation of the
+            // same derivation: adding it required no edit to this module's
+            // *production* code at all — only this test list, which is what locks
+            // the claim down instead of leaving it asserted.
+            "events",
+            "events:--run-id",
+            "events:--file",
+            "events:--json",
+            "events:--follow",
+            "events:--validate",
             "probe:--json",
             "probe:--require-schema-version",
             "probe:--require-exit-code-band",

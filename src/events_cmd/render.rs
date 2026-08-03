@@ -23,13 +23,15 @@
 //!
 //! # Everything here crosses the terminal barrier
 //!
-//! The events file is *untrusted input* (`docs/threat-model.md`: any local process
-//! can write one, and `--file` will read whatever it is pointed at), so every
-//! fragment that reaches a terminal — key, value, timestamp, event name, and the
-//! raw text of a line that failed to parse — goes through
-//! [`text::terminal_safe_bounded`], the shared ingress/render barrier
-//! `list`/`inspect` already use (K-091), rather than any narrower check of this
-//! module's own.
+//! The events file is *untrusted input* (`docs/threat-model.md`, "Untrusted
+//! inputs": any local process can write one, and `events --file` reads an
+//! arbitrary caller-specified path), so every fragment that reaches a terminal —
+//! key, value, timestamp, event name, and the raw text of a line that failed to
+//! parse — goes through [`text::terminal_safe_bounded`], the shared ingress/render
+//! barrier `list`/`inspect` already use (K-091), rather than any narrower check of
+//! this module's own. This module covers the *rendering* half of that inventory;
+//! [`crate::events_cmd`]'s own docs list all of it, including the one operator
+//! string outside this file — the stream's locator.
 
 use serde_json::{Map, Value};
 

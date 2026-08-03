@@ -1,8 +1,11 @@
 //! Build script: generates shell completions and man pages from the *live* CLI
 //! definition (`src/cli/`), so operators get tab-completion and `man`
-//! documentation for `run`/`inspect`/`cancel`/`kill`/`list`/`prune`/`probe`
-//! without this project hand-maintaining a second, driftable copy of the
-//! surface.
+//! documentation for **every** subcommand that definition declares, without this
+//! project hand-maintaining a second, driftable copy of the surface. There is
+//! deliberately no list of them here: a hand-written enumeration in the very file
+//! whose point is that the surface is derived, not transcribed, would be the first
+//! thing to go stale — and the list that used to stand here had already done so
+//! twice, silently missing `wait` and then `events` (K-020/K-081).
 //!
 //! ## Why build-time generation, not a `generate-completions` subcommand
 //!

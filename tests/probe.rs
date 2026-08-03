@@ -123,6 +123,16 @@ fn probe_reports_a_consistent_compatible_surface() {
         "wait:--run-id",
         "wait:--label",
         "wait:--timeout",
+        // And for `events` (T-296), through the real binary this time: the
+        // subcommand and every one of its flags reach a consumer's
+        // `--require-surface` preflight with no hand-maintained token list behind
+        // them.
+        "events",
+        "events:--run-id",
+        "events:--file",
+        "events:--json",
+        "events:--follow",
+        "events:--validate",
         // Same story for the `run --detach` flag (T-198): a new flag on an existing
         // subcommand enters the advertised surface with no production-code edit.
         "run:--detach",

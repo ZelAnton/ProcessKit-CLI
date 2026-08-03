@@ -310,6 +310,19 @@ name in a registry `lock_file`, a calendar-invalid `started_at` like
 `2026-02-31`, valid/commented/malformed environment and label inputs, and a
 truncated/interleaved/oversized/non-UTF-8 events-file tail).
 
+**What this tier does not cover yet.** `runner_exit_tail` is the *only*
+events-file target, and `wait --report-outcome`'s bounded head/tail scan is the
+only events-file reader it drives. The `events` subcommand reads a whole stream
+at a caller-given path through a separate, hand-rolled stack — an incremental
+line reader, and under `--validate` a JSON Schema document interpreter plus the
+anchored pattern matcher it needs (`src/events_cmd/`) — and **no target above
+reaches any of it**. That stack has unit and through-the-binary coverage, and
+`tests/events.rs` holds its `--validate` verdict against the `jsonschema`
+crate's line for line, but it has no coverage-guided fuzzing; a fifth target
+over it is an open follow-up, and both this section and
+[`docs/threat-model.md`](docs/threat-model.md) deliberately say so rather than
+implying the tier is exhaustive.
+
 Requires a nightly toolchain (`rustup toolchain install nightly` — the pinned
 `stable` from [Prerequisites](#prerequisites) is not enough, since `cargo-fuzz`
 needs nightly's sanitizer support) and [`cargo-fuzz`]:

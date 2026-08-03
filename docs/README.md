@@ -128,6 +128,7 @@ agent policy and complete foreground, recovery, and escalation examples.
 | `cancel` | Request soft stop, wait through the grace window, then hard-kill survivors. |
 | `kill` | Hard-kill the run's whole container immediately. |
 | `wait` | Wait for one run, or a snapshot of all live runs, to finish. |
+| `events` | Read a run's JSONL lifecycle stream back: render, follow, pass through, or validate it. |
 | `list` | Discover live, stale, and unprobed registry entries. |
 | `prune` | Remove only entries confirmed stale. |
 | `probe` | Verify the binary's versioned compatibility surface before launch. |

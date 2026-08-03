@@ -91,6 +91,13 @@ to a dated version section.
 
 ### Changed
 
+- The threat model now enumerates the events file read back by `events` as a
+  fourth untrusted-input surface — naming `events --file`'s arbitrary
+  caller-specified path, the hand-rolled line reader, schema interpreter, and
+  pattern matcher sitting on it, and the terminal barrier every operator string
+  crosses — and states explicitly that the `cargo-fuzz` tier covers `wait
+  --report-outcome`'s read-back but **not** those parsers, so the document no
+  longer implies more coverage than exists.
 - `inspect` and `inspect --all` now check the `snapshot_version` a runner declares
   instead of rendering whatever arrives. A runner answering with a version **newer**
   than the invoked binary implements is refused with `CONTROL` (103) — for `--all`,

@@ -10,7 +10,7 @@ reading the cited code.
 
 ## Untrusted inputs
 
-Three input surfaces are treated as untrusted or semi-trusted and are handled
+Four input surfaces are treated as untrusted or semi-trusted and are handled
 accordingly (bounded parsing, validation before use, no blind trust in shape):
 
 - **Registry bytes.** Every record file under the per-user run registry
@@ -26,6 +26,39 @@ accordingly (bounded parsing, validation before use, no blind trust in shape):
   artifact (the JSONL stream) an operator or automated tooling later reads;
   the child's own stdout/stderr are unbounded, potentially adversarial or
   merely pathological, byte streams (`src/events.rs`, `src/capture.rs`).
+- **The events file read back.** The JSONL lifecycle stream is this project's
+  own output while a run writes it, and untrusted input the moment anything
+  reads it back: it sits at an operator-chosen path (`run --jsonl`), any local
+  process can write one, and a reader will read whatever it is pointed at. Two
+  commands read one. `wait --report-outcome` reads a bounded head/tail window
+  of the file a registry record names (`src/wait.rs`). `events` is the larger
+  of the two surfaces — it reads a whole stream, and `events --file <path>`
+  reads an **arbitrary caller-specified path**, including a file this registry
+  never knew about, such as an adapter's own fixture; `events --run-id <id>`
+  reads the locator a registry record publishes, itself untrusted deserialized
+  data under "Registry bytes" above. Everything on that path is hand-rolled and
+  treats the bytes as hostile:
+  - an incremental line reader that hands out only *complete* lines and refuses
+    to buffer one past `MAX_LINE_BYTES` (1 MiB), so a file with no newline in it
+    cannot decide this process's memory use; invalid UTF-8 is replaced and
+    reported, never fatal (`src/events_cmd/mod.rs`);
+  - under `--validate`, an interpreter of the embedded JSON Schema document run
+    over each parsed line (`src/events_cmd/schema.rs`) together with the small
+    anchored matcher that document's `pattern` keywords need, which runs
+    against untrusted string content (`src/events_cmd/pattern.rs`);
+  - and, at the terminal boundary, every operator-facing fragment — a rendered
+    field, the notice about a line that would not parse, a schema violation, and
+    the stream's own locator — passed through `text::terminal_safe_bounded`
+    (`src/text.rs`) before it is printed, so neither a stream's content nor a
+    registry-published path naming it can forge or overwrite what an operator
+    sees. `events --json` is the one deliberate exception and not a terminal
+    rendering: it passes the runner's own bytes through byte for byte (a line
+    that is not JSON is reported instead of emitted), relying on JSON's own
+    escaping exactly as this project's other machine-readable outputs do —
+    the line `src/text.rs` draws explicitly between the two.
+
+  See "Supply-chain compromise" below for what the fuzz tier does and does not
+  currently exercise on this surface.
 
 ## Trusted principal and boundary
 
@@ -155,12 +188,20 @@ code/docs it is implemented and described in.
   `actions/attest-build-provenance` attestation
   (`.github/workflows/release.yml`) a consumer can verify against the exact
   commit and workflow that produced them. A dedicated fuzz tier
-  (`fuzz/`) exercises the parsers that sit closest to the untrusted inputs
-  above — the registry's byte-to-record parser, the control-plane's
-  request/reply decoders, the CLI's own value parsers, and `wait
-  --report-outcome`'s read-back of a run's JSONL events file (a path any
-  local process can write, so its content is untrusted the same way) —
-  under `cargo-fuzz`.
+  (`fuzz/`) exercises **four** of the parsers that sit closest to the untrusted
+  inputs above, under `cargo-fuzz`: the registry's byte-to-record parser, the
+  control-plane's request/reply decoders, the CLI's own value parsers, and
+  `wait --report-outcome`'s bounded head/tail read-back of a run's JSONL events
+  file (a path any local process can write, so its content is untrusted the
+  same way). It does **not** reach the `events` reader described under
+  "Untrusted inputs" above — the larger of this project's two events-file
+  readers, and the only one that opens an arbitrary caller-given path: neither
+  its incremental line reader, nor the schema interpreter and anchored pattern
+  matcher behind `--validate`, is fuzzed. That stack is covered by unit and
+  through-the-binary tests, and its `--validate` verdict is held line for line
+  against a real JSON Schema engine (`tests/events.rs`), but it is **not** under
+  coverage-guided fuzzing: a fifth target over that reader is the way to close
+  the gap, and until one exists this document claims no fuzz coverage for it.
 
 ## What is not closed
 

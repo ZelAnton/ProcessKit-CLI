@@ -43,10 +43,10 @@ open (`run`'s path) guarantees that restriction before a record is written into 
 including on a pre-existing directory whose permissions were widened out of band,
 which is repaired rather than trusted. A record names a run's private control-channel
 endpoint, so a world-readable registry would hand that channel to any local process.
-The **read-only** open every other client takes — `list`, `prune`, `wait`, and the
-control clients — deliberately does neither: it does not create the directory and
-does not touch its permissions, since a read-only scan must not mutate registry
-state.
+The **read-only** open every other client takes — `list`, `prune`, `wait`, `events`,
+and the control clients — deliberately does neither: it does not create the
+directory and does not touch its permissions, since a read-only scan must not
+mutate registry state.
 
 - **Unix:** mode `0700`. Applied at creation and re-asserted with `chmod` (which,
   unlike the creating `mkdir`, is not filtered by the umask) on every mutating open.
@@ -111,10 +111,13 @@ file** (`<opaque-stem>.lock`). The record is a single JSON object:
 | `capture_dir`      | Absolute output-capture directory, or `null` when capture is disabled or the record predates this field. |
 | `liveness`         | How to decide whether the record is live or stale (see below). |
 
-Registry identity and endpoint strings remain byte-for-byte intact for matching
-and JSON output. Human-readable `list` and `inspect` output sanitizes terminal
-formatting and limits each of those untrusted fields to 256 characters plus an
-explicit `...` marker, so a corrupt record cannot create an unbounded terminal row.
+Registry identity, endpoint, and artifact-path strings remain byte-for-byte intact
+for matching and JSON output. Every human-readable renderer of one sanitizes
+terminal formatting and limits the field to 256 characters plus an explicit `...`
+marker, so a corrupt record cannot create an unbounded terminal row — `list`,
+`inspect`, and `prune` for the fields each prints, and `events` for the single
+field it echoes: the `jsonl` locator, named in the diagnostics for a stream it
+could not open or read.
 
 `list --label KEY=VALUE` applies the same exact-match, logical-AND label filters as
 the aggregate control and wait commands. `list --health live|stale|unprobed`

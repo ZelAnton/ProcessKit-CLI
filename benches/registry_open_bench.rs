@@ -1,7 +1,9 @@
 //! Phase-attribution benchmark for the *mutating* registry open — the one
-//! per-invocation cost `run` still pays that every read-only client
-//! (`list`/`prune`/`wait`, and the `inspect`/`cancel`/`kill` control clients)
-//! stopped paying when T-174 routed them through `Registry::open_read_only`.
+//! per-invocation cost `run` still pays and no read-only client
+//! (`list`/`prune`/`wait`/`events`, and the `inspect`/`cancel`/`kill` control
+//! clients) pays at all: T-174 routed the ones that existed then through
+//! `Registry::open_read_only`, and every read-only client added since has been
+//! born on that path.
 //!
 //! `startup_latency_bench.rs` measures call-to-`run_started` end to end; it
 //! cannot say *which* phase inside that window costs what. This bench isolates

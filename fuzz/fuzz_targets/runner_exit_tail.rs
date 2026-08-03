@@ -46,7 +46,12 @@
 //! whole stream incrementally, handing out complete lines as a file grows, rather
 //! than scanning a bounded head/tail window for one terminal event (see
 //! `src/events_cmd/mod.rs`). So this target covers `wait --report-outcome`'s
-//! read-back only, and its coverage does not extend to `events`.
+//! read-back only, and its coverage does not extend to `events`. That gap is
+//! recorded where a reader looks for coverage claims rather than only here:
+//! `docs/threat-model.md` names the `events` reader as an untrusted-input surface
+//! and says in as many words that this tier does not reach it, and
+//! `CONTRIBUTING.md`'s "Fuzzing" section says the same — so nothing in this
+//! repository claims a fifth target that does not exist.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
