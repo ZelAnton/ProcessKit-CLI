@@ -332,11 +332,16 @@ esac
   in an adapter, so a supervisor never inherits an unbounded wait.
 
 **`CONTROL` (103)** is the one exit code all four of these clients' by-`run_id`
-form can return, for the same underlying reason: the command could not be
-resolved to *the* single target run. See §6 for the concrete situations that
-produce it. `cancel --all` / `kill --all` reuse the same code for a different
-reason — one or more snapshot targets failed, not "no single target run" — see
-the `--all` paragraph above and `docs/control-plane.md`.
+form can return, and for all four the usual reason is the same: the command could
+not be resolved to *the* single target run. `inspect` has one further reason of its
+own, where the target *was* resolved and reached and did answer — its reply declared
+a control-plane snapshot version this client does not read, so the answer was
+refused rather than rendered (see `docs/control-plane.md`, "Snapshot version: a
+newer runner's reply is refused, an older one is read"). See §6 for the concrete
+situations that produce a `103`, that one included. `cancel --all` / `kill --all`
+reuse the same code for a different reason — one or more snapshot targets failed,
+not "no single target run" — see the `--all` paragraph above and
+`docs/control-plane.md`.
 
 ## 5. Housekeeping: `list` / `prune`
 
@@ -419,10 +424,26 @@ list), each with a golden `*.jsonl` fixture beside it.
   rather than guessing which entry the scan happened to return first. Keep
   `run_id`s unique among an adapter's own concurrently-live runs (§2) to avoid
   this entirely.
+- **An unreadable snapshot version (`inspect` only).** The runner was reached and
+  answered, but its reply declared a control-plane `snapshot_version` outside the
+  range this client reads — newer than the version it implements, or older than the
+  version it still decodes — so `inspect` refuses the answer instead of rendering it
+  under semantics its sender never promised. Also a `CONTROL` (103), with a message
+  naming the version that arrived and the range this build reads. Unlike the four
+  above it says nothing about the run's liveness: the target is registered, live,
+  reachable, and healthy, and `cancel`/`kill`/`wait`/`list` against it are
+  unaffected (an ack carries no version). Do not treat it as a lost runner or retry
+  it; inspect that run with a build that speaks its version — for a newer runner,
+  one at least as new as the binary that started the run. See
+  [`docs/control-plane.md`](control-plane.md), "Snapshot version: a newer runner's
+  reply is refused, an older one is read", and
+  [`docs/compatibility.md`](compatibility.md), "Machine-output schemas".
 - **`CONTROL`-class exit codes are not run outcomes.** A `103` from the
-  by-`run_id` form of `inspect`/`cancel`/`kill`/`wait` describes the *client's*
-  inability to resolve or reach a single target — it says nothing about how
-  the target run itself ended (or is still running). Do not conflate it with
+  by-`run_id` form of `inspect`/`cancel`/`kill`/`wait` describes a failure on the
+  *client's* side of the exchange — it could not resolve or reach a single target,
+  or (the `inspect`-only case above) could not read the answer it got — and says
+  nothing about how the target run itself ended (or is still running). Do not
+  conflate it with
   the run-outcome codes in §3's table (`106`–`109`, or the child's own code);
   those come only from the run's own process exit and its `runner_exit`
   event. The same separation applies to `WAIT_TIMEOUT` (112): it is the

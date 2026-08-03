@@ -41,6 +41,14 @@ pub const BACKEND: u8 = 102;
 /// because it is the same verdict: there is no single target run to act on (see
 /// `docs/registry.md`, "Run id resolution — ambiguity is a hard failure").
 ///
+/// [`crate::control`]'s `inspect` mints it for one further reason that is *not* an
+/// unreachable target: the runner was reached and answered, and its **answer** was
+/// refused because it declared a `snapshot_version` outside the range this build
+/// reads (see the control module's "The snapshot version a runner declares — checked,
+/// and acted on"). The run itself is live and controllable — `cancel`/`kill` against
+/// it are unaffected, their ack carrying no version — so a consumer must not read that
+/// `103` as "the runner is gone".
+///
 /// `cancel --all` / `kill --all` reuse this
 /// same code for a different fact — one or more targets in the confirmed-live
 /// snapshot could not be reached or did not acknowledge the command — never a silent
