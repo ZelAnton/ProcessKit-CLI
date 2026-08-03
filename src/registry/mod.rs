@@ -11,11 +11,18 @@
 //!   the current user (see [`platform`]). A record names a run's local transport
 //!   endpoint, so a world-readable registry would leak a control channel to any
 //!   local process. [`Registry::open`] (the mutating path a run about to write a
-//!   record uses) re-asserts the restriction on every call so a pre-existing
-//!   directory is locked down too; [`Registry::open_read_only`] (the path every
+//!   record uses) guarantees the restriction on every call, so a pre-existing
+//!   directory whose permissions were widened out of band is repaired before a
+//!   record is written into it; [`Registry::open_read_only`] (the path every
 //!   read-only client takes — `list`/`prune`/`wait` and the control clients)
 //!   deliberately does neither — a read-only scan must not create the directory or
-//!   touch its permissions.
+//!   touch its permissions. How the mutating open reaches that state is the
+//!   platform's business and the two differ: unix simply re-applies the mode
+//!   (`chmod`, constant cost), while Windows verifies the directory's DACL and
+//!   writes only on a mismatch, because there the write re-propagates an
+//!   inheritable ACE over every record in the directory (T-309 — see
+//!   `platform::create_owner_only_dir` for the measurement and the reasoning
+//!   about why verifying does not weaken the guarantee).
 //! - **No PID addressing.** A record is never indexed or identified by a bare PID
 //!   (`AGENTS.md`: "Nothing is addressed by PID, which is what makes PID reuse
 //!   irrelevant"). Entries are found by scanning records and matching their
@@ -446,19 +453,19 @@ impl Registry {
     /// default.
     ///
     /// This is the *mutating* open used by [`Registry::register`]'s caller (`run`):
-    /// it must create the directory (and re-assert its owner-only permissions on a
-    /// pre-existing one) because a run is about to write a record into it. A caller
-    /// that only wants to *read* the registry — `list`/`prune`/`wait`, and the
-    /// control clients `inspect`/`cancel`/`kill` — must use
-    /// [`Registry::open_read_only`] instead, so a read-only scan cannot itself create
-    /// registry state or touch its permissions.
+    /// it must create the directory (and lock down a pre-existing one whose
+    /// permissions do not already match) because a run is about to write a record
+    /// into it. A caller that only wants to *read* the registry —
+    /// `list`/`prune`/`wait`, and the control clients `inspect`/`cancel`/`kill` —
+    /// must use [`Registry::open_read_only`] instead, so a read-only scan cannot
+    /// itself create registry state or touch its permissions.
     pub fn open() -> io::Result<Self> {
         Self::open_in(resolve_dir()?)
     }
 
     /// Open a registry rooted at an explicit directory (the env override and the
-    /// tests use this). Creates the directory with owner-only permissions and
-    /// re-asserts them if it already exists.
+    /// tests use this). On return the directory exists and is owner-only: created
+    /// that way, or — if it already existed with different permissions — repaired.
     pub fn open_in(dir: PathBuf) -> io::Result<Self> {
         platform::create_owner_only_dir(&dir)?;
         Ok(Self { dir })

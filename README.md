@@ -965,6 +965,15 @@ covers two things:
   payload sizes; `benches/startup_latency_bench.rs` measures the latency from
   just before `run` is invoked to the `time` the runner itself stamps on its
   `run_started` JSONL event, over a short series of invocations.
+- **Phase attribution inside that startup window**:
+  `benches/registry_open_bench.rs` isolates the mutating "owner-only registry
+  open" `run` performs before it can publish a record, against a bare
+  `create_dir_all`, a no-op read-only open, and the same open forced to actually
+  write the permissions — each swept over registry sizes, since on Windows the
+  hardening ACE is inheritable and its write re-propagates over every record the
+  registry holds. It prints a plain-text attribution table before the criterion
+  groups, so the growth question is answered directly rather than inferred from
+  an end-to-end number.
 
 Run the whole lane locally with:
 
@@ -995,6 +1004,8 @@ tracked trend.
 | Echo overhead, 4MiB payload: direct vs. under `run` (no capture) | ~19 ms vs. ~224 ms |
 | Echo overhead, 4MiB payload: under `run` with `--capture-dir` | ~801 ms |
 | Startup latency, call to `run_started` | ~181 ms (median) |
+| Owner-only registry open, 0 / 64 / 256 / 1024 entries | ~0.10 ms, flat |
+| The same open when it must write the permissions | ~0.75 ms / ~20 ms / ~96 ms / ~443 ms |
 
 The live-output figures use ProcessKit's raw byte tee. Profiling the former
 decoded-line path found that its two awaited writes and mutex acquisition per
@@ -1006,9 +1017,24 @@ sink so its counters, hashes, and truncation boundary do not change.
 A release-build phase trace of short Windows runs attributed less than 1 ms to
 opening JSONL plus creating the container, about 36-41 ms to re-asserting the
 registry directory's owner-only ACL, and another 166-228 ms to
-`ProcessGroup::start`. The last phase is inside ProcessKit's public API; it has
-been reported upstream for profiling rather than worked around here. Treat all
-figures as host snapshots and the CI history as the regression signal.
+`ProcessGroup::start`.
+
+The middle phase has since been attributed properly and reduced. It was never a
+constant metadata write: the Windows ACE is inheritable and applied to a
+directory, so writing it re-propagated across every `.json` record and `.lock`
+file the registry held — which is why the figure depended on how many runs the
+measuring host happened to remember, and why an absolute number from one machine
+was never evidence. `benches/registry_open_bench.rs` measures the growth
+directly (see the two rows above: ~0.15 ms per file, ~443 ms at 1024 entries).
+`run` now verifies the directory's DACL and writes only when it does not already
+match, which makes the phase flat at ~0.1 ms whatever the registry holds; the
+security guarantee is unchanged, and a directory whose permissions were widened
+out of band is still repaired (see [`docs/registry.md`](docs/registry.md),
+"Permissions"). The remaining `ProcessGroup::start` phase is inside ProcessKit's
+public API; it has been reported upstream for profiling rather than worked
+around here, and re-measuring the whole window against a published ProcessKit
+release is a separate exercise from this one. Treat all figures as host
+snapshots and the CI history as the regression signal.
 
 [criterion]: https://github.com/bheisler/criterion.rs
 

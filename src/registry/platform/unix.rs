@@ -12,6 +12,12 @@ use crate::control::{SOCKET_FILE_NAME, socket_base_dirs, unix_control_endpoint_d
 /// Owner-only directory: mode `0700`, re-asserted with `chmod` (which, unlike the
 /// initial `mkdir`, is not filtered by the umask) so both a freshly created and a
 /// pre-existing directory end up owner-only.
+///
+/// Deliberately unconditional, unlike the Windows twin's verify-then-repair (see
+/// that module's header, T-309): the guarantee the two provide is the same, but
+/// here asserting it is a single constant-cost `chmod` on the directory itself,
+/// with no inheritance to propagate over the records inside it — so there is
+/// nothing for a verifying read to save, and the simpler code is the better one.
 pub fn create_owner_only_dir(dir: &Path) -> io::Result<()> {
     DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     fs::set_permissions(dir, Permissions::from_mode(0o700))

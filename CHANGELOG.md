@@ -61,9 +61,17 @@ to a dated version section.
   expanded snapshots, while preserving the original `--json` array.
 - Conjunctive `prune --label KEY=VALUE` filtering for scoped real and dry-run
   cleanup, conservatively excluding ownerless orphan locks when filtered.
+- A phase-attribution benchmark for the mutating owner-only registry open, swept
+  over registry sizes so the Windows DACL propagation cost is measured in-repo
+  rather than inferred from an end-to-end startup number.
 
 ### Changed
 
+- `run` no longer rewrites the Windows registry directory's owner-only DACL when
+  it already matches, removing a per-invocation cost that grew with the number of
+  remembered runs (~443 ms at 1024 entries, now flat at ~0.1 ms); the directory is
+  also created carrying the descriptor, and a pre-existing directory with widened
+  permissions is still repaired.
 - Extended the fuzz tier to the raw environment-file and operator-label parsers, including invalid-UTF-8 rejection and secret-safe diagnostic coverage.
 - CI now executes the default and E2E test tiers for the shipped static musl
   target instead of only cross-compiling it.

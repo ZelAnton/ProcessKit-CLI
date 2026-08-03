@@ -38,22 +38,44 @@ run. It is resolved in this order:
 
 ### Permissions
 
-The registry directory is created **restricted to its owner**, and the restriction
-is re-asserted on every *mutating* open (`run`'s path, so a pre-existing directory
-is locked down too before a record is written into it). A record names a run's
-private control-channel endpoint, so a world-readable registry would hand that
-channel to any local process. The **read-only** open every other client takes —
-`list`, `prune`, `wait`, and the control clients — deliberately does neither: it does
-not create the directory and does not touch its permissions, since a read-only scan
-must not mutate registry state.
+The registry directory is created **restricted to its owner**, and every *mutating*
+open (`run`'s path) guarantees that restriction before a record is written into it —
+including on a pre-existing directory whose permissions were widened out of band,
+which is repaired rather than trusted. A record names a run's private control-channel
+endpoint, so a world-readable registry would hand that channel to any local process.
+The **read-only** open every other client takes — `list`, `prune`, `wait`, and the
+control clients — deliberately does neither: it does not create the directory and
+does not touch its permissions, since a read-only scan must not mutate registry
+state.
 
 - **Unix:** mode `0700`. Applied at creation and re-asserted with `chmod` (which,
-  unlike the creating `mkdir`, is not filtered by the umask).
+  unlike the creating `mkdir`, is not filtered by the umask) on every mutating open.
 - **Windows:** a **protected** DACL that grants full control only to the current
-  user — the equivalent of `0700`. Concretely the directory's DACL is replaced with
+  user — the equivalent of `0700`. Concretely the directory's DACL is
   `D:P(A;OICI;FA;;;<current-user-SID>)`: **P**rotected (inherited ACEs from the
   parent are blocked), a single allow-**F**ull-**A**ccess ACE for the current user,
-  inherited by child objects and containers (**OICI**).
+  inherited by child objects and containers (**OICI**) so the records and lock files
+  inside are covered too. The directory is created carrying that descriptor, so it
+  never exists momentarily reachable through permissions inherited from its parent.
+
+The two platforms differ in *how* a mutating open reaches that state, because the
+cost of asserting it differs by three orders of magnitude. Unix simply re-applies
+the mode: one `chmod`, constant cost. Windows first **verifies** — one read of the
+directory's own security descriptor — and writes only when what it finds is not
+already exactly the DACL above; the write it avoids is `SetNamedSecurityInfoW`,
+which re-propagates the inheritable ACE across every record and lock file in the
+directory and therefore costs more the more runs the registry remembers (measured
+at roughly 0.15 ms per file — about 310 ms for a registry holding 1024 entries —
+by `benches/registry_open_bench.rs`).
+
+The guarantee is identical either way, and deliberately so: the write is skipped
+only when the directory's DACL is *already* the target, compared ACE for ACE
+(protected bit, allow type, inheritance flags, access mask, and binary SID). Any
+deviation, any unreadable descriptor, and any path that is not a directory all fall
+through to the unconditional write. Nothing weaker — the directory merely existing,
+a marker file, a timestamp, a cached "already done" flag — is ever accepted as
+evidence, precisely because a principal who cannot defeat the DACL could still forge
+those and suppress the repair.
 
 ## Record format
 

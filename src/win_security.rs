@@ -10,6 +10,9 @@
 //!
 //! - [`to_wide`] — the NUL-terminated UTF-16 encoding both sites need for the wide
 //!   Win32 APIs.
+//! - [`to_wide_path`] — the same for a `Path`, without the lossy UTF-8 detour, for
+//!   the by-name security calls that must address the exact object the rest of the
+//!   code will write to.
 //! - [`SecurityDescriptor`] — a RAII wrapper **parameterised on the caller's SDDL**
 //!   that owns the converted descriptor and frees it exactly once on drop.
 //!
@@ -30,6 +33,24 @@ use windows_sys::Win32::Security::Authorization::{
 pub fn to_wide(value: &str) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     std::ffi::OsStr::new(value)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+/// Encode a **path** as a NUL-terminated UTF-16 buffer, preserving whatever the
+/// OS handed us.
+///
+/// Deliberately not `to_wide(&path.to_string_lossy())`: a Windows path is natively
+/// UTF-16 and `OsStr` stores it as WTF-8, so a component the OS accepts but Rust
+/// cannot represent as UTF-8 (an unpaired surrogate) round-trips exactly through
+/// `encode_wide` while `to_string_lossy` would silently rewrite it to U+FFFD. That
+/// distinction is load-bearing for the registry: the security calls must address
+/// the *same* directory the record writes will use, so hardening a lossily
+/// rewritten neighbour of the real path is not an acceptable failure mode.
+pub fn to_wide_path(path: &std::path::Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()

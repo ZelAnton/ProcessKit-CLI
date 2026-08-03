@@ -305,3 +305,14 @@ required-features = ["bench"]
 name = "startup_latency_bench"
 harness = false
 required-features = ["bench"]
+
+# Phase attribution *inside* the startup window `startup_latency_bench` measures
+# end to end: isolates the mutating "owner-only registry open" (`Registry::open_in`)
+# against a bare `create_dir_all` and a no-op read-only open, swept over registry
+# sizes, so the permission-hardening share — and whether it grows with the number
+# of records a Windows inheritable DACL would propagate over — is measured rather
+# than assumed.
+[[bench]]
+name = "registry_open_bench"
+harness = false
+required-features = ["bench"]

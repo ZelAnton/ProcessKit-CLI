@@ -48,11 +48,20 @@ Each entry names the threat, the mechanism that closes it, and the exact
 code/docs it is implemented and described in.
 
 - **A different OS user reading or connecting to the registry/transport.**
-  The per-user registry directory's permissions are re-asserted on every
-  mutating open, not merely checked: `0o700` re-applied via `chmod` on Unix
-  (bypassing umask), a protected owner-only DACL replaced on Windows
+  The per-user registry directory's permissions are guaranteed on every
+  mutating open, not merely assumed: `0o700` re-applied via `chmod` on Unix
+  (bypassing umask); on Windows the directory is created carrying its
+  protected owner-only DACL and, on a subsequent open, that DACL is compared
+  ACE for ACE against the target and rewritten whenever it does not match
   (`src/registry/mod.rs`, `Registry::open`/`open_in`,
-  `platform::create_owner_only_dir`, `platform::restrict_to_current_user`).
+  `platform::create_owner_only_dir`). A pre-existing directory whose
+  permissions were widened out of band is repaired on both platforms. The
+  Windows comparison is deliberately exact and fail-closed — an unreadable
+  descriptor, an extra ACE, a missing protected bit, or a non-directory all
+  route to the unconditional write — so the skip can only ever elide a write
+  whose result is already in place; no weaker signal an attacker could forge
+  (the directory existing, a marker file, a cached flag) is accepted in its
+  stead. Neither platform touches ownership, then or now.
   The control-plane transport is deliberately **not** derived from that
   directory: each run atomically reserves its own short-lived `0o700`
   directory under `/tmp` (falling back to the platform temp directory) and
