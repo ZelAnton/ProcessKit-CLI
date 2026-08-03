@@ -408,7 +408,7 @@ pub fn head_matches_run_id(head: &[u8], expected_run_id: &str) -> bool {
 /// bytes — exactly what [`read_terminal_outcome`] itself reads into its own
 /// `tail`. `tail_is_file_start` is whether that window's first byte is byte 0 of
 /// the real stream: `true` means the window's first line is complete; `false`
-/// means the window was seeked into the middle of a larger stream, so its first
+/// means the window was sought into the middle of a larger stream, so its first
 /// line is necessarily partial (its own start was truncated by the seek) and
 /// must be dropped before scanning — the same distinction
 /// [`read_terminal_outcome`]'s own `start == 0` check makes. Pure — no I/O — see
@@ -419,10 +419,8 @@ pub fn scan_runner_exit_tail(tail: &[u8], tail_is_file_start: bool) -> Option<Te
     let usable = if tail_is_file_start {
         tail
     } else {
-        match tail.iter().position(|byte| *byte == b'\n') {
-            Some(index) => &tail[index + 1..],
-            None => return None,
-        }
+        let index = tail.iter().position(|byte| *byte == b'\n')?;
+        &tail[index + 1..]
     };
 
     for line in usable.split(|byte| *byte == b'\n').rev() {

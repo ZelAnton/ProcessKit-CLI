@@ -2,8 +2,12 @@
 # .github/workflows/ci.yml) and the local `typos .` command documented in
 # CONTRIBUTING.md. `typos` already respects `.gitignore` (via the `ignore`
 # crate it's built on), so generated/vendored paths (`target/`, `Cargo.lock`
-# checksums, `fuzz/corpus`/`fuzz/artifacts`, this pipeline's own gitignored
-# `.work/` scratch tree) need no explicit exclusion here.
+# checksums, `fuzz/artifacts`, this pipeline's own gitignored `.work/` scratch
+# tree) need no explicit exclusion here. `fuzz/corpus/` is committed on
+# purpose (see CONTRIBUTING.md, "Fuzzing") and is *not* gitignored, so its
+# seed files are in scope by default; most are ordinary bytes typos reads
+# fine as text, but see the `[files]` exclusion below for the one seed that
+# needs an explicit carve-out.
 #
 # No domain-term exclusion exists today: every baseline finding when this
 # file was introduced (T-203) was a genuine misspelling, fixed in the source
@@ -12,3 +16,13 @@
 # etc.) and not a real typo — see CONTRIBUTING.md's "Documentation quality"
 # section.
 [default.extend-words]
+
+[files]
+# `fuzz/corpus/runner_exit_tail/non_utf8_garbage` is a deliberately
+# malformed, invalid-UTF-8 fuzz seed (see CONTRIBUTING.md, "Fuzzing"). Its
+# leading bytes look like a UTF-16LE BOM, so typos tries to decode the whole
+# file as UTF-16LE and hard-errors on the invalid encoding instead of
+# skipping it as binary — failing the `typos` job for reasons unrelated to
+# spelling. Excluded rather than reworked, since the seed's exact bytes are
+# the point (see `fuzz/fuzz_targets/runner_exit_tail.rs`).
+extend-exclude = ["fuzz/corpus/runner_exit_tail/non_utf8_garbage"]

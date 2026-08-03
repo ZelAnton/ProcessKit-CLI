@@ -286,7 +286,7 @@ fn a_loosened_pre_existing_directory_is_repaired_on_open() {
 /// — an inherited DACL is by definition unprotected.
 #[cfg(windows)]
 #[test]
-fn records_inherit_the_directorys_owner_only_grant() {
+fn records_inherit_the_directory_owner_only_grant() {
     let dir = scratch("perms-record-inherit");
     let registry = Registry::open_in(dir.clone()).expect("open registry");
     let registration = registry
