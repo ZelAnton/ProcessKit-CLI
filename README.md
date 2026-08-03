@@ -434,6 +434,9 @@ dropped — the same conservative stance `--run-id` takes. See
 [`docs/registry.md`](docs/registry.md), "Waiting — `wait`", "The aggregate barrier —
 `wait --all`".
 
+`wait --all --report-outcome` is accepted alongside
+`wait --run-id <id> --report-outcome`; in aggregate mode it adds data only and
+does not change the barrier's exit-code contract.
 With `--report-outcome`, the barrier prints one JSON array only after every
 snapshotted target is over. Entries retain the snapshot's `run_id` and JSONL
 locator, are ordered by `run_id` then record path, and use the same fields and

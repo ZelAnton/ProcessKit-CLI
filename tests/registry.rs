@@ -1980,7 +1980,7 @@ fn wait_all_reports_multiple_target_outcomes_in_stable_order() {
         &zulu_dir,
         &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
         &["--run-id", "zulu-run"],
-        slow_child(),
+        inspectable_child(),
     )
     .spawn()
     .expect("spawn the zulu runner");
@@ -1988,7 +1988,7 @@ fn wait_all_reports_multiple_target_outcomes_in_stable_order() {
         &alpha_dir,
         &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
         &["--run-id", "alpha-run"],
-        slow_child(),
+        inspectable_child(),
     )
     .spawn()
     .expect("spawn the alpha runner");
@@ -2037,7 +2037,7 @@ fn wait_all_reports_mixed_reported_and_unknown_outcomes() {
         &reported_dir,
         &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
         &["--run-id", "reported-run"],
-        slow_child(),
+        inspectable_child(),
     )
     .spawn()
     .expect("spawn the reported runner");
@@ -2045,7 +2045,7 @@ fn wait_all_reports_mixed_reported_and_unknown_outcomes() {
         &malformed_dir,
         &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
         &["--run-id", "malformed-run"],
-        slow_child(),
+        inspectable_child(),
     )
     .spawn()
     .expect("spawn the malformed runner");
@@ -2053,7 +2053,7 @@ fn wait_all_reports_mixed_reported_and_unknown_outcomes() {
         &unavailable_dir,
         &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
         &["--run-id", "unavailable-run"],
-        slow_child(),
+        inspectable_child(),
     )
     .spawn()
     .expect("spawn the unavailable runner");
