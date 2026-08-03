@@ -50,7 +50,7 @@ use crate::hash::Sha256;
 /// user-configured) ceiling is counted (so the full byte counter stays honest)
 /// but not written, and the stream's `truncated` flag is set. Bounds the on-disk
 /// transcript so a runaway child cannot fill the disk through the capture files;
-/// the live echo is never bounded. `pub` so `src/cli.rs`'s `--capture-max-bytes`
+/// the live echo is never bounded. `pub` so `src/cli/run.rs`'s `--capture-max-bytes`
 /// docstring and `src/run/launch.rs`'s default-resolution call site can both cite this
 /// single constant instead of duplicating the value (T-181).
 pub const CAPTURE_MAX_BYTES: u64 = 8 * 1024 * 1024;

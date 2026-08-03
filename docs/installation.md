@@ -42,7 +42,8 @@ sh install.sh --version X.Y.Z --install-dir /opt/processkit/bin
 The scripts print the installed binary's `--version` result and tell you when the
 destination is not yet on `PATH`. The POSIX installer supports the published Linux
 x86_64/Arm64 and macOS Arm64 builds; use `--target
-x86_64-unknown-linux-musl` when the static musl archive is required. The PowerShell
+x86_64-unknown-linux-musl` or `--target aarch64-unknown-linux-musl` when the
+static musl archive is required for the matching architecture. The PowerShell
 installer selects x86_64 or Arm64 from `PROCESSOR_ARCHITECTURE`.
 
 Every [GitHub Release](https://github.com/ZelAnton/ProcessKit-CLI/releases)
@@ -55,6 +56,7 @@ contains one archive per supported target:
 | Linux x86_64, glibc | `x86_64-unknown-linux-gnu` | `.tar.gz` |
 | Linux Arm64, glibc | `aarch64-unknown-linux-gnu` | `.tar.gz` |
 | Linux x86_64, static musl | `x86_64-unknown-linux-musl` | `.tar.gz` |
+| Linux Arm64, static musl | `aarch64-unknown-linux-musl` | `.tar.gz` |
 | macOS Apple Silicon | `aarch64-apple-darwin` | `.tar.gz` |
 
 The naming convention is
@@ -128,7 +130,7 @@ current publication boundary is explicit:
 | --- | --- | --- |
 | winget | Three-file `ZelAnton.ProcessKitCLI` manifest for x86_64 and Arm64 | Submit all three files to `microsoft/winget-pkgs`; installation is available only after Microsoft's external review accepts the version. |
 | Scoop | `processkit-cli.json` for x86_64 and Arm64 | Ready for `bucket/processkit-cli.json` in an account-owned bucket; no canonical public bucket is advertised yet. |
-| Homebrew | `processkit-cli.rb` for macOS Arm64 and Linux x86_64 | Ready for `Formula/processkit-cli.rb` in an account-owned tap; Linux uses the static musl archive so the formula does not inherit the release runner's glibc floor. No compatible Linux Arm64 formula is generated until a static Arm64 archive exists, and no canonical public tap is advertised yet. |
+| Homebrew | `processkit-cli.rb` for macOS Arm64 and Linux x86_64/Arm64 | Ready for `Formula/processkit-cli.rb` in an account-owned tap; both Linux architectures use their static musl archive so the formula does not inherit the release runner's glibc floor. No canonical public tap is advertised yet. |
 
 Once a source is actually published, that package manager provides its normal
 install and upgrade lifecycle. Until its availability row changes, use the

@@ -393,6 +393,405 @@ fn inspect_snapshot_identity_rejects_a_foreign_run() {
     assert!(err.to_string().contains("different run"));
 }
 
+/// One snapshot exactly as a runner puts it on the wire, except for the declared
+/// `snapshot_version` — the one field whose value genuinely originates on the far
+/// side of the wire ([K-092]). Built through the real [`Snapshot`] type so a shape
+/// change cannot leave a hand-written JSON template silently stale, the same
+/// discipline `registry::test_support` applies to its record fixtures.
+fn snapshot_declaring(run_id: &str, snapshot_version: u32) -> Snapshot {
+    Snapshot {
+        snapshot_version,
+        run_id: run_id.to_string(),
+        mechanism: "job_object".to_string(),
+        root_pid: Some(4242),
+        started_at: "2026-07-20T21:00:00.000Z".to_string(),
+        jsonl: Some("/runs/build-42.jsonl".to_string()),
+        capture_dir: None,
+        members: vec![Member::from_pid(4242)],
+    }
+}
+
+/// The same snapshot serialized for the wire by the server's own serializer.
+fn snapshot_line_declaring(run_id: &str, snapshot_version: u32) -> String {
+    serialize_snapshot(&snapshot_declaring(run_id, snapshot_version))
+}
+
+/// A reply line in the **historical version-1 shape**, as the released binaries
+/// (v0.1.0 … v0.3.1) actually wrote it: `jsonl` and `capture_dir` are *absent*, not
+/// `null`, because the fields did not exist yet. It is hand-written on purpose —
+/// unlike [`snapshot_declaring`], no type in this tree still produces this shape, and
+/// re-serializing today's [`Snapshot`] with `None`s would emit `"jsonl":null` and so
+/// test something a version-1 runner never sent. The field values are the same sample
+/// values the rest of these tests use; the shape is copied from `src/control.rs` at
+/// tag `v0.3.1`.
+fn version_one_snapshot_line(run_id: &str) -> String {
+    format!(
+        "{{\"snapshot_version\":1,\"run_id\":\"{run_id}\",\"mechanism\":\"job_object\",\
+         \"root_pid\":4242,\"started_at\":\"2026-07-20T21:00:00.000Z\",\
+         \"members\":[{{\"pid\":4242,\"ppid\":null,\"name\":null,\"start_time\":null}}]}}"
+    )
+}
+
+/// (T-292) The read-side `snapshot_version` policy itself, decided where it lives —
+/// in [`SnapshotReply`]'s own decoding, before the payload's shape is parsed. The
+/// refusal is deliberately **one-sided**: a version newer than [`SNAPSHOT_VERSION`]
+/// is unknowable here and refused, while every version down to
+/// [`MIN_READABLE_SNAPSHOT_VERSION`] is read, because this build demonstrably decodes
+/// it (see the next test for the version-1 wire shape itself). Only below that floor
+/// does an older version become a refusal too. The reserved `CONTROL` (103) code and
+/// the [`unreachable_run`] wording are the same ones a snapshot naming the wrong run
+/// already gets, and the message names the arrived version, the range this build
+/// reads, and which side is newer, because the fix is a different build rather than a
+/// retry.
+#[test]
+fn a_newer_snapshot_version_is_refused_and_the_readable_range_is_accepted() {
+    let newer = serde_json::from_str::<SnapshotReply>(&snapshot_line_declaring(
+        "run-a",
+        SNAPSHOT_VERSION + 1,
+    ))
+    .expect("a newer reply still decodes — as an undecided version verdict, not a snapshot");
+    assert!(
+        matches!(newer, SnapshotReply::Unreadable(declared) if declared == u64::from(SNAPSHOT_VERSION) + 1),
+        "a newer version is classified without interpreting the payload"
+    );
+    let err = newer
+        .accept("run-a")
+        .expect_err("a snapshot from a newer contract is never interpreted under this one");
+    assert_eq!(err.code(), exit::CONTROL);
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "cannot inspect run `run-a`: the runner answered with control-plane snapshot version \
+             {}, and this client reads versions {MIN_READABLE_SNAPSHOT_VERSION} to \
+             {SNAPSHOT_VERSION} (the runner is a newer build than this client, so what its \
+             version changed is unknown here); the reply was refused rather than rendered under \
+             semantics its sender never promised — inspect this run with a processkit-cli build \
+             that implements its snapshot version (for a newer runner, one at least as new as \
+             the binary that started the run)",
+            SNAPSHOT_VERSION + 1
+        )
+    );
+
+    for readable in MIN_READABLE_SNAPSHOT_VERSION..=SNAPSHOT_VERSION {
+        let reply =
+            serde_json::from_str::<SnapshotReply>(&snapshot_line_declaring("run-a", readable))
+                .expect("a reply inside the readable range parses into a snapshot");
+        let snapshot = reply
+            .accept("run-a")
+            .expect("every version this build decodes is inspected, not refused");
+        assert_eq!(
+            snapshot.snapshot_version, readable,
+            "the runner's own declared version is what reaches the renderer, unchanged"
+        );
+    }
+
+    let below_floor = serde_json::from_str::<SnapshotReply>(&snapshot_line_declaring(
+        "run-a",
+        MIN_READABLE_SNAPSHOT_VERSION - 1,
+    ))
+    .expect("a below-floor reply decodes as a version verdict too");
+    let err = below_floor
+        .accept("run-a")
+        .expect_err("below the floor this build no longer claims to decode the shape");
+    assert_eq!(err.code(), exit::CONTROL);
+    assert!(
+        err.to_string().contains(&format!(
+            "snapshot version {}",
+            MIN_READABLE_SNAPSHOT_VERSION - 1
+        )),
+        "the refusal names the version that actually arrived: {err}"
+    );
+    assert!(
+        err.to_string().contains("older than any build"),
+        "the refusal says which side is older, since the fix is a different build: {err}"
+    );
+}
+
+/// (T-292, R-01) The floor is a **checkable** claim, not a promise: a reply in the
+/// real version-1 shape — the one every released binary writes, with `jsonl` and
+/// `capture_dir` absent rather than `null` — is read, and read *correctly*. The two
+/// later fields come back `None` ("not reported", which is exactly what a version-1
+/// runner meant), every other field is preserved, and the rendered output carries the
+/// runner's own declared version rather than this client's. This is the capability
+/// [`Snapshot::jsonl`]'s `#[serde(default)]` exists for and the reason the refusal is
+/// not symmetric; if a future bump ever breaks it, this test fails and
+/// [`MIN_READABLE_SNAPSHOT_VERSION`] is what has to move.
+#[test]
+fn the_version_one_wire_shape_is_still_decoded_correctly() {
+    let reply = serde_json::from_str::<SnapshotReply>(&version_one_snapshot_line("legacy-run"))
+        .expect("the version-1 shape parses under this build's decoder");
+    let snapshot = reply
+        .accept("legacy-run")
+        .expect("a version-1 snapshot is inspected, not refused");
+
+    assert_eq!(snapshot.snapshot_version, 1);
+    assert_eq!(snapshot.run_id, "legacy-run");
+    assert_eq!(snapshot.mechanism, "job_object");
+    assert_eq!(snapshot.root_pid, Some(4242));
+    assert_eq!(snapshot.started_at, "2026-07-20T21:00:00.000Z");
+    assert_eq!(
+        snapshot.jsonl, None,
+        "a field version 1 never declared is reported as `null`, never invented"
+    );
+    assert_eq!(snapshot.capture_dir, None);
+    assert_eq!(snapshot.members.len(), 1);
+
+    let json = snapshot_output_lines(&snapshot, true).expect("serialize the JSON snapshot");
+    assert!(
+        json[0].contains("\"snapshot_version\":1"),
+        "stdout reports the version the runner declared, not the client's: {}",
+        json[0]
+    );
+}
+
+/// (T-292, R-04) The version verdict is reached **before** the shape is parsed, so the
+/// diagnostic an operator actually needs survives the case that motivates the whole
+/// check: a newer runner whose snapshot this build cannot deserialize at all. Every
+/// field but `jsonl`/`capture_dir` is required, so a removed or renamed one would fail
+/// `serde` first and surface "the runner sent an unreadable response: missing field
+/// ..." — a parser complaint about a payload this client was never entitled to read.
+/// The reverse direction is pinned too: a **same-version** reply with a broken shape
+/// must still surface the parser's own diagnostic, because the version pre-check must
+/// not swallow the case where the version is fine and the payload genuinely is not.
+#[tokio::test]
+async fn a_newer_version_is_named_even_when_its_shape_cannot_be_parsed() {
+    let unparsable_newer = format!(
+        "{{\"snapshot_version\":{},\"run_id\":\"solo-run\"}}",
+        SNAPSHOT_VERSION + 1
+    );
+    let runner = FakeRunner::answering(unparsable_newer);
+    let err = inspect_endpoint(&runner.endpoint, "solo-run")
+        .await
+        .expect_err("a newer contract's reply is refused however unparsable it is");
+    assert_eq!(err.code(), exit::CONTROL);
+    assert!(
+        err.to_string()
+            .contains(&format!("snapshot version {}", SNAPSHOT_VERSION + 1)),
+        "the version, not the parser, explains the refusal: {err}"
+    );
+    assert!(
+        !err.to_string().contains("unreadable response"),
+        "the actionable diagnostic is not replaced by a serde field complaint: {err}"
+    );
+
+    let broken_same_version =
+        format!("{{\"snapshot_version\":{SNAPSHOT_VERSION},\"run_id\":\"solo-run\"}}");
+    let runner = FakeRunner::answering(broken_same_version);
+    let err = inspect_endpoint(&runner.endpoint, "solo-run")
+        .await
+        .expect_err("a malformed reply is refused whatever version it declares");
+    assert_eq!(err.code(), exit::CONTROL);
+    assert!(
+        err.to_string().contains("unreadable response"),
+        "a version this build does implement leaves the parser's own diagnostic intact: {err}"
+    );
+}
+
+/// A test-only runner that answers exactly one `inspect` exchange with a canned reply
+/// line over the **real** platform transport (a unix socket / a named pipe), so a
+/// client path can be driven end to end — connect, converse, verify — against a reply
+/// this crate's own server can never produce, such as a snapshot declaring a foreign
+/// `snapshot_version`. The in-memory `duplex` harness the wire-protocol tests use
+/// cannot serve this purpose: both `inspect` consumers reach the wire through
+/// [`connect_live`], which takes an *endpoint*, not a stream.
+struct FakeRunner {
+    endpoint: String,
+    #[cfg(unix)]
+    dir: std::path::PathBuf,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl FakeRunner {
+    /// Bind the transport **synchronously** — so the endpoint exists before it is
+    /// published to a registry or handed to a client — and serve one connection in
+    /// the background. The endpoint is built from the same producer constants the
+    /// real transport and the client's own [`endpoint_is_valid`] share, so
+    /// `connect_live` accepts it exactly as it accepts a real runner's.
+    #[cfg(unix)]
+    fn answering(reply: String) -> Self {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let dir = socket_base_dirs()
+            .into_iter()
+            .find(|base| base.is_dir())
+            .expect("a usable temporary directory for the fake runner's socket")
+            .join(format!("{SOCKET_DIR_PREFIX}{}", unique_token()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .expect("create the fake runner's private socket directory");
+        let path = dir.join(SOCKET_FILE_NAME);
+        let listener =
+            tokio::net::UnixListener::bind(&path).expect("bind the fake runner's control socket");
+        let endpoint = path
+            .to_str()
+            .expect("the scratch socket path is valid UTF-8")
+            .to_string();
+        let server = tokio::spawn(async move {
+            let (stream, _addr) = listener.accept().await.expect("the client connects");
+            answer_one_inspect(stream, reply).await;
+        });
+        Self {
+            endpoint,
+            dir,
+            server,
+        }
+    }
+
+    #[cfg(windows)]
+    fn answering(reply: String) -> Self {
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let endpoint = format!("{PIPE_ENDPOINT_PREFIX}{}", unique_token());
+        let pipe = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&endpoint)
+            .expect("create the fake runner's pipe instance");
+        let server = tokio::spawn(async move {
+            pipe.connect().await.expect("the client connects");
+            answer_one_inspect(pipe, reply).await;
+        });
+        Self { endpoint, server }
+    }
+}
+
+impl Drop for FakeRunner {
+    fn drop(&mut self) {
+        self.server.abort();
+        #[cfg(unix)]
+        {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+/// The fake runner's whole protocol duty: read the one request line under the same
+/// bound the real server reads it under, confirm the client asked for a snapshot, and
+/// write the canned reply through the real [`write_response`].
+async fn answer_one_inspect<S>(stream: S, reply: String)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (read_half, mut write_half) = split(stream);
+    let mut reader = BufReader::new(read_half);
+    let mut request = String::new();
+    read_bounded_line(&mut reader, &mut request)
+        .await
+        .expect("read the client's request line");
+    assert_eq!(
+        request.trim(),
+        INSPECT_REQUEST,
+        "the inspect client asks for a snapshot and nothing else"
+    );
+    write_response(&mut write_half, &reply)
+        .await
+        .expect("answer the client with the canned reply");
+}
+
+/// (T-292) The **single-run** `inspect --run-id` path runs the version policy for
+/// real, driven over the actual transport rather than by calling the check directly:
+/// a newer runner is refused with `CONTROL` (103) before anything reaches rendering,
+/// while both a same-version runner *and* one still speaking the version-1 wire shape
+/// come back intact — so the refusal can neither degenerate into "this client rejects
+/// everything" nor quietly become symmetric again. Its aggregate counterpart is the
+/// next test; both call sites are pinned so the one shared [`SnapshotReply::accept`]
+/// step cannot start applying to one path only.
+#[tokio::test]
+async fn single_run_inspect_refuses_a_newer_snapshot_version_and_reads_older_ones() {
+    let runner = FakeRunner::answering(snapshot_line_declaring("solo-run", SNAPSHOT_VERSION + 1));
+    let err = inspect_endpoint(&runner.endpoint, "solo-run")
+        .await
+        .expect_err("a newer snapshot version never reaches the rendering step");
+    assert_eq!(err.code(), exit::CONTROL);
+    assert!(
+        err.to_string()
+            .contains(&format!("snapshot version {}", SNAPSHOT_VERSION + 1)),
+        "the refusal names the version that arrived: {err}"
+    );
+
+    let runner = FakeRunner::answering(snapshot_line_declaring("solo-run", SNAPSHOT_VERSION));
+    let snapshot = inspect_endpoint(&runner.endpoint, "solo-run")
+        .await
+        .expect("a snapshot declaring this build's own version is inspected normally");
+    assert_eq!(snapshot.snapshot_version, SNAPSHOT_VERSION);
+    assert_eq!(snapshot.run_id, "solo-run");
+
+    let runner = FakeRunner::answering(version_one_snapshot_line("solo-run"));
+    let snapshot = inspect_endpoint(&runner.endpoint, "solo-run")
+        .await
+        .expect("a run started by a released binary is still inspectable after an upgrade");
+    assert_eq!(snapshot.snapshot_version, MIN_READABLE_SNAPSHOT_VERSION);
+    assert_eq!(snapshot.run_id, "solo-run");
+    assert_eq!(snapshot.jsonl, None);
+}
+
+/// (T-292, [K-090]) The **aggregate** `inspect --all` path runs the same policy
+/// through the shared [`dispatch_snapshot_target`] ladder, proved in the default
+/// `cargo test` tier rather than left to the opt-in `e2e` one: a target answering
+/// with a newer `snapshot_version` is a genuine per-target failure (the reserved
+/// `CONTROL` (103) that makes the aggregate command fail after printing its report),
+/// never laundered into the successful `already_gone` — the record is still registered
+/// live throughout, so the runner did not end, it answered something this client
+/// cannot read. A target inside the readable range — including one still on the
+/// version-1 wire shape, which is what a fleet mid-upgrade actually contains — is
+/// dispatched normally, so one legacy runner cannot fail the whole `--all` invocation.
+#[tokio::test]
+async fn aggregate_inspect_refuses_a_newer_snapshot_version_and_reads_older_ones() {
+    let dir = scratch_registry_dir("aggregate-inspect-version");
+    let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
+
+    let runner = FakeRunner::answering(snapshot_line_declaring(
+        "fleet-run-newer",
+        SNAPSHOT_VERSION + 1,
+    ));
+    let registration = registry
+        .register_plain("fleet-run-newer", Some(&runner.endpoint), SystemTime::now())
+        .expect("register the live target");
+    let mut targets = snapshot_live_targets(&registry, &[]).expect("snapshot live targets");
+    assert_eq!(targets.len(), 1, "exactly one live target at a time");
+    let target = targets.pop().expect("the target is in the snapshot");
+
+    let err = inspect_snapshot_target(&registry, &target)
+        .await
+        .expect_err("a newer snapshot version is a per-target failure, not a snapshot");
+    assert_eq!(err.code(), exit::CONTROL);
+    assert!(
+        err.to_string()
+            .contains(&format!("snapshot version {}", SNAPSHOT_VERSION + 1)),
+        "the per-target error names the version that arrived: {err}"
+    );
+    drop(registration);
+
+    for (run_id, reply) in [
+        (
+            "fleet-run-current",
+            snapshot_line_declaring("fleet-run-current", SNAPSHOT_VERSION),
+        ),
+        (
+            "fleet-run-legacy",
+            version_one_snapshot_line("fleet-run-legacy"),
+        ),
+    ] {
+        let runner = FakeRunner::answering(reply);
+        let registration = registry
+            .register_plain(run_id, Some(&runner.endpoint), SystemTime::now())
+            .expect("register the live target");
+        let mut targets = snapshot_live_targets(&registry, &[]).expect("snapshot live targets");
+        let target = targets.pop().expect("the target is in the snapshot");
+
+        let dispatch = inspect_snapshot_target(&registry, &target)
+            .await
+            .expect("a snapshot inside the readable range is dispatched normally");
+        let SnapshotDispatch::Dispatched(snapshot) = dispatch else {
+            panic!("a live, answering target is inspected, never `already_gone`");
+        };
+        assert_eq!(snapshot.run_id, run_id);
+        drop(registration);
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The source builds a snapshot from its facts and queries members live each time.
 #[test]
 fn snapshot_source_queries_members_live() {

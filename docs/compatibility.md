@@ -94,11 +94,14 @@ exact form it invoked — for example `inspect.schema.json#/$defs/snapshot`.
 
 **Two rows of that table carry a version field; the other four deliberately do
 not.** `probe --json` carries `probe_version` and `inspect --json` carries
-`snapshot_version` — the same field the runner puts on the control-plane wire —
-and each document pins the current value with `const`, so a bump is a breaking
-change you can detect in the payload itself. **Pin those two on their own version
-field**, not on the CLI version alone: ignoring a `snapshot_version` bump across
-an upgrade is exactly the class of mistake this section exists to prevent. Both
+`snapshot_version` — the same field the runner puts on the control-plane wire.
+`probe.schema.json` pins its value with `const`; `inspect.schema.json` admits the
+range of snapshot versions this build renders (see the `snapshot_version` bullet
+below), because that field reports the *runner's* contract, not the invoked
+binary's. Either way a bump is visible in the payload itself. **Pin those two on
+their own version field**, not on the CLI version alone: ignoring a
+`snapshot_version` bump across an upgrade is exactly the class of mistake this
+section exists to prevent. Both
 are versioned for the reason the project's other two versioned contracts (the
 durable JSONL stream's `schema_version` and the registry record's
 `registry_version`) are: each can be read by a party that did not invoke the
@@ -127,8 +130,18 @@ Consequently:
   of a value — is a **major** release, announced in the changelog.
 - **`probe --json` and `inspect --json` additionally bump their own field.** A
   breaking change to either shape bumps `probe_version` / `snapshot_version`
-  respectively, and that field — which the schema document pins with `const` — is
-  what a consumer should check.
+  respectively, and that field is what a consumer should check. For the snapshot,
+  this binary's own `inspect` client checks it too, and does so **asymmetrically**:
+  a runner answering with a `snapshot_version` *newer* than this build implements
+  is refused with `CONTROL` (103) rather than rendered under semantics its sender
+  never promised, while an older one is still read for as long as this build
+  genuinely decodes it (today: version 1, the version every release so far writes).
+  See [`docs/control-plane.md`](control-plane.md), "Snapshot version: a newer
+  runner's reply is refused, an older one is read", for the rule, the floor, and
+  what moves it. Two consequences for an upgrade: a bump is a hard boundary for
+  *older* clients in a mixed deployment, not merely a signal to read; and the
+  `snapshot_version` on stdout is the runner's number, so `inspect.schema.json`
+  admits the range this build renders instead of pinning a single value.
 - **Every document under `fixtures/schema/cli/` is updated in place.** There is no
   `vN/` directory there (unlike `fixtures/schema/v1/`, whose `v1` *is* the JSONL
   `schema_version`), because a version here, where there is one, lives in the
@@ -209,6 +222,14 @@ version is unchanged. Surface-token verification catches that case.
 Preserve event files across a downgrade; they are durable observations from the
 binary that produced them and must be decoded according to their own
 `schema_version`, not the currently installed executable.
+
+The rolling-upgrade and downgrade procedures above are not only described here.
+A scheduled, non-gating workflow (`.github/workflows/interop.yml`) downloads the
+latest published release and runs both directions of them against the current
+build every week — new clients over an old runner and the reverse, an abandoned
+record reaped from either side, `probe` pinning both ways, and each binary's
+JSONL stream read under the other's schema. See `CONTRIBUTING.md`,
+"Cross-version interop".
 
 ## Adapter acceptance checklist
 

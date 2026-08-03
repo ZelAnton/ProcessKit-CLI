@@ -62,6 +62,38 @@ jobs:
             exit 1
           }
 
+  # install.ps1's Windows twin of the installer-lint job above:
+  # scripts/tests/install.Tests.ps1 exercises it end to end (checksum
+  # verification, destination-identity refusal, -Version pinning, custom
+  # -InstallDir) against a local HttpListener fixture server, mirroring what
+  # scripts/tests/test-install.sh already does for install.sh in
+  # installer-lint. Runs on windows-latest since that's the only runner OS
+  # that can execute a .exe fixture the way install.ps1 expects.
+  installer-lint-windows:
+    name: installer (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # windows-latest images ship a Pester build already, but which version
+      # varies by image roll; pin explicitly rather than trust whatever is
+      # preinstalled, matching this workflow's general policy of pinned
+      # versions over floating ones. -SkipPublisherCheck sidesteps the
+      # signature-mismatch prompt against the older Pester 3.x module the
+      # image also ships (Update-Module territory, not a real trust issue —
+      # both are Microsoft-signed).
+      - name: Install pinned Pester
+        shell: pwsh
+        run: Install-Module -Name Pester -RequiredVersion 5.7.1 -Force -SkipPublisherCheck -Scope CurrentUser
+      - name: Run Windows installer Pester suite
+        shell: pwsh
+        run: |
+          Import-Module Pester -RequiredVersion 5.7.1 -ErrorAction Stop
+          $config = New-PesterConfiguration
+          $config.Run.Path = 'scripts/tests/install.Tests.ps1'
+          $config.Run.Exit = $true
+          $config.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $config
+
   examples-smoke:
     name: runnable examples (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -343,22 +375,27 @@ jobs:
       # each platform skip (e.g. the `dotnet`-absent skip).
       - run: cargo test --features e2e --test e2e -- --nocapture
 
-  # release.yml's build-artifacts matrix ships six target triplets. With the
+  # release.yml's build-artifacts matrix ships seven target triplets. With the
   # `test`/`e2e` jobs above now running natively on ubuntu-24.04-arm and
   # windows-11-arm (in addition to macos-latest, already Apple Silicon),
-  # five of those six triplets run on their native libc and architecture.
-  # The remaining x86_64-unknown-linux-musl test binaries are statically
-  # linked, so they can execute on ubuntu-latest even though GitHub does not
-  # host a musl userspace runner. This required job runs both the default and
-  # e2e tiers against that shipped target, using the same apt toolchain as
-  # release.yml's build-artifacts job. Stress remains in its dedicated
-  # scheduled/manual workflow: it is a load campaign, not a release-target
-  # compatibility gate. The two
-  # aarch64 entries this job used to cross-compile-check
-  # (aarch64-pc-windows-msvc, aarch64-unknown-linux-gnu) were dropped: they
-  # would now duplicate the compilation half of the `test` job's native
-  # aarch64 runs, and native execution is a strictly stronger check than a
-  # cross-compiled `cargo check`.
+  # five of those seven triplets run on their native libc and architecture.
+  # The remaining two — x86_64-unknown-linux-musl and
+  # aarch64-unknown-linux-musl — are statically linked, so each can execute on
+  # a plain glibc-hosted Ubuntu runner of the matching architecture even
+  # though GitHub does not host a musl userspace runner: the x86_64 leg runs
+  # on ubuntu-latest, the aarch64 leg on ubuntu-24.04-arm (the same
+  # GitHub-hosted aarch64 runner the `test`/`e2e` jobs above use), each
+  # installing `musl-tools` for its own native architecture — see
+  # release.yml's build-artifacts matrix for why that rules out cross-compiling
+  # the aarch64 leg from an x86_64 host instead. This required job runs both
+  # the default and e2e tiers against both shipped musl targets, using the
+  # same apt toolchain as release.yml's build-artifacts job. Stress remains in
+  # its dedicated scheduled/manual workflow: it is a load campaign, not a
+  # release-target compatibility gate. The two aarch64-glibc/Windows entries
+  # this job used to cross-compile-check (aarch64-pc-windows-msvc,
+  # aarch64-unknown-linux-gnu) were dropped: they would now duplicate the
+  # compilation half of the `test` job's native aarch64 runs, and native
+  # execution is a strictly stronger check than a cross-compiled `cargo check`.
   target-check:
     name: target-check (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
@@ -370,6 +407,9 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             apt: musl-tools
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            apt: musl-tools
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@stable # rolling toolchain selector — intentionally unpinned
@@ -378,9 +418,10 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: ${{ matrix.target }}
-      # musl's libc for the static build (the only remaining entry in this
-      # matrix; see the job comment above for why the aarch64 entries and
-      # their cross toolchains were dropped).
+      # musl's libc for the static build, installed for each leg's own native
+      # architecture (the two remaining entries in this matrix; see the job
+      # comment above for why the aarch64-glibc/Windows entries and their
+      # cross toolchains were dropped).
       - name: Install Linux cross toolchain
         if: ${{ matrix.apt != '' }}
         run: |

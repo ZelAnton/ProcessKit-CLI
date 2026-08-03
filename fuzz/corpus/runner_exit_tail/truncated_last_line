@@ -1,0 +1,2 @@
+{"schema_version":1,"event":"run_started","run_id":"fuzz-run"}
+{"schema_version":1,"event":"runner_exit","code":0,"source":"child_exi

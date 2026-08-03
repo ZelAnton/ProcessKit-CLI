@@ -100,17 +100,206 @@ fn backdate(path: &Path, age: Duration) {
         .expect("backdate the fixture's mtime");
 }
 
+/// Test-only: widen `dir`'s permissions out of band, simulating an operator (or a
+/// prior process) having loosened a pre-existing registry directory — the fixture
+/// the *repair* branch of [`Registry::open_in`] has to fix. Unix drops to `0755`;
+/// Windows replaces the DACL with an unprotected one that also grants Everyone
+/// read (see `platform::loosen_dacl`), the closest analogue of that mode.
+#[cfg(unix)]
+fn loosen(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).expect("loosen permissions");
+}
+
+#[cfg(windows)]
+fn loosen(dir: &Path) {
+    platform::loosen_dacl(dir).expect("loosen permissions");
+}
+
 /// The registry directory is created restricted to its owner (`0700` / an
 /// owner-only protected DACL) — a control channel address must not be world
 /// readable.
+///
+/// On Windows the resulting DACL is additionally pinned to its *exact* shape (one
+/// allow-ACE, `OICI`-inheritable, `FILE_ALL_ACCESS`, current user, on a protected
+/// descriptor) rather than only "no other principal is named": T-309 made the
+/// hardening skippable when the directory already matches, so the tests have to
+/// hold the target shape itself, not just an upper bound on who is granted.
 #[test]
 fn directory_is_created_owner_only() {
     let dir = scratch("perms");
+    assert!(!dir.exists(), "the scratch fixture starts absent");
     let _registry = Registry::open_in(dir.clone()).expect("open registry");
     assert!(
         platform::is_owner_only(&dir).expect("read permissions"),
         "the registry directory must be restricted to its owner"
     );
+    #[cfg(windows)]
+    assert!(
+        platform::has_exact_owner_only_dacl(&dir).expect("read the DACL"),
+        "a directory created carrying the descriptor must end up with exactly the target DACL"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A registry directory whose *intermediate* components do not exist yet is
+/// created whole and hardened — the `%LOCALAPPDATA%\processkit-cli\runs` shape on
+/// a machine that has never run the tool. T-309 creates only the final component
+/// with the security descriptor attached and leaves the parents to
+/// `fs::create_dir_all` exactly as before, so this pins that the two-step path
+/// still produces the same result as the old single `create_dir_all`.
+#[test]
+fn a_registry_directory_with_missing_parents_is_created_and_hardened() {
+    let root = scratch("perms-nested");
+    let dir = root.join("intermediate").join("runs");
+
+    let _registry = Registry::open_in(dir.clone()).expect("open registry with missing parents");
+    assert!(dir.is_dir(), "the whole directory chain is created");
+    assert!(
+        platform::is_owner_only(&dir).expect("read permissions"),
+        "the leaf is hardened even when its parents had to be created first"
+    );
+    #[cfg(windows)]
+    assert!(
+        platform::has_exact_owner_only_dacl(&dir).expect("read the DACL"),
+        "the retry-after-parents path must produce the same exact DACL"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A registry path that exists but is **not** a directory is still an error, as it
+/// was when the whole chain went through `fs::create_dir_all` — T-309's
+/// `CreateDirectoryW` fast path must not quietly accept a *file* and let a run
+/// discover the problem later, mid-registration.
+#[test]
+fn a_registry_path_that_is_not_a_directory_is_rejected() {
+    let path = scratch("perms-not-a-directory");
+    fs::write(&path, b"not a directory").expect("write the blocking file");
+
+    let err = match Registry::open_in(path.clone()) {
+        Ok(_) => panic!("a non-directory registry path must fail to open"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err.kind(),
+        io::ErrorKind::AlreadyExists,
+        "the same verdict `create_dir_all` gave: {err}"
+    );
+
+    let _ = fs::remove_file(&path);
+}
+
+/// The optimization itself, pinned: once the directory carries the target DACL, a
+/// second open *recognizes* it and skips the `SetNamedSecurityInfoW` whose cost
+/// grows with the number of records it would re-propagate the inheritable ACE
+/// over — and the permissions after that skipped write are still exactly right.
+///
+/// Windows-only: it is the platform whose hardening is expensive enough to be
+/// worth verifying first (`benches/registry_open_bench.rs` measured ~0.8 ms empty
+/// and ~310 ms at 1024 entries); unix re-asserts a single cheap `chmod` on every
+/// open, unchanged by T-309.
+#[cfg(windows)]
+#[test]
+fn a_repeat_open_verifies_instead_of_rewriting_the_dacl() {
+    let dir = scratch("perms-fast-path");
+    let _first = Registry::open_in(dir.clone()).expect("create the registry once");
+
+    assert!(
+        platform::takes_verified_fast_path(&dir).expect("read the DACL"),
+        "a freshly hardened directory must be recognized, or every open keeps paying the write"
+    );
+
+    let _second = Registry::open_in(dir.clone()).expect("re-open the registry");
+    assert!(
+        platform::is_owner_only(&dir).expect("read permissions"),
+        "skipping the write must leave the directory owner-only"
+    );
+    assert!(
+        platform::has_exact_owner_only_dacl(&dir).expect("read the DACL"),
+        "the verified fast path must leave exactly the target DACL"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The repair branch: a pre-existing directory whose permissions were loosened out
+/// of band is still locked back down by a mutating open, and the records already
+/// in it survive that repair. This is the half of the guarantee the T-309 fast
+/// path must never be able to swallow — hardening is skipped only when the
+/// directory is *already* exactly right, never merely because it exists.
+#[test]
+fn a_loosened_pre_existing_directory_is_repaired_on_open() {
+    let dir = scratch("perms-repair");
+    let first = Registry::open_in(dir.clone()).expect("create the registry once");
+    let registration = first
+        .register_plain("kept", None, SystemTime::now())
+        .expect("register an entry before the directory is loosened");
+
+    loosen(&dir);
+    assert!(
+        !platform::is_owner_only(&dir).expect("read permissions"),
+        "the fixture really is loosened"
+    );
+    #[cfg(windows)]
+    assert!(
+        !platform::takes_verified_fast_path(&dir).expect("read the DACL"),
+        "a loosened directory must never satisfy the verify fast path"
+    );
+
+    let repaired = Registry::open_in(dir.clone()).expect("re-open the loosened registry");
+    assert!(
+        platform::is_owner_only(&dir).expect("read permissions"),
+        "a mutating open must repair a pre-existing directory's permissions"
+    );
+    #[cfg(windows)]
+    {
+        assert!(
+            platform::has_exact_owner_only_dacl(&dir).expect("read the DACL"),
+            "the repair must produce exactly the target DACL"
+        );
+        assert!(
+            platform::takes_verified_fast_path(&dir).expect("read the DACL"),
+            "and must leave the directory in the state the next open can verify"
+        );
+    }
+    assert_eq!(
+        repaired.entries().expect("scan").len(),
+        1,
+        "repairing the directory keeps the records already in it"
+    );
+
+    drop(registration);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Records and lock files created inside the registry directory carry the
+/// owner-only grant themselves, by **inheritance** from the directory's `OICI`
+/// ACE. Pinned because T-309 explicitly considered dropping that inheritance to
+/// make the DACL write cheap and rejected it: Windows hands every account
+/// `SeChangeNotifyPrivilege` (bypass traverse checking) by default, so a record
+/// inside an owner-only directory is still reachable by full path and its *own*
+/// DACL is what refuses another principal. Without the inheritable ACE a new
+/// record would fall back to the creating token's default DACL instead.
+///
+/// A child's DACL is deliberately checked *without* requiring `SE_DACL_PROTECTED`
+/// — an inherited DACL is by definition unprotected.
+#[cfg(windows)]
+#[test]
+fn records_inherit_the_directorys_owner_only_grant() {
+    let dir = scratch("perms-record-inherit");
+    let registry = Registry::open_in(dir.clone()).expect("open registry");
+    let registration = registry
+        .register_plain("inherit", None, SystemTime::now())
+        .expect("register an entry");
+
+    assert!(
+        platform::grants_only_current_user(registration.record_path())
+            .expect("read the record's DACL"),
+        "a published record must itself be restricted to the current user"
+    );
+
+    drop(registration);
     let _ = fs::remove_dir_all(&dir);
 }
 
