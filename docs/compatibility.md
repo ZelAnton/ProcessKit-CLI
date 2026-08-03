@@ -65,9 +65,40 @@ processkit-cli probe --json --print-schema > schema.json
 document and checking compatibility are separate operations, so neither can be
 silently skipped.
 
-Within one schema version, readers must tolerate additive optional fields and
-unknown event fields. Removing or changing the meaning/type of an existing
-field requires a new schema version.
+### What a reader must tolerate within one version
+
+Within one schema version, a reader must tolerate every one of the following.
+Removing a field, renaming it, or changing the meaning or type of an existing one
+is what requires a new schema version — nothing below does.
+
+1. **New event types.** Route by the `event` discriminator and ignore a type you
+   do not know, rather than failing on it or assuming the stream is corrupt.
+2. **More occurrences of an event type you already know**, including a type that
+   previously occurred at most once. Within a version you may **not** assume any
+   event type is unique, or that its position in the stream is fixed relative to
+   other types beyond what the ordering contract states. `members_snapshot` is the
+   worked example: it appeared exactly once per run until `run --snapshot-interval`
+   made a run emit it on a cadence.
+3. **New fields on an event you already parse — including always-present ones,
+   not only optional ones.** "Additive" here means "no existing field changes",
+   not "the new field may be absent": `members_snapshot` gained an always-present
+   `reason` and an always-present `read_error`, `timeout` gained an always-present
+   `reason`, and `cleanup_started`/`cleanup_finished` gained always-present
+   `read_error` flags, all within version 1. A reader must therefore consume the
+   fields it uses rather than pin an event's exact field set — validating with
+   `additionalProperties: false` against a copy of a published document will fail
+   on the next additive release (see "Machine-output schemas" below).
+4. **New values in an open-ended descriptive string field** — a new `cancelled`
+   `source`, a new `runner_exit` `source`, a new `hint` label. Treat an unrecognized
+   value as "some other trigger" and keep routing by event type.
+5. **Unknown fields anywhere in the envelope or event body.**
+
+**The normative source is [`docs/schema.md`](schema.md)**, not this page: its
+"Ordering" section (and specifically "Multiplicity of `members_snapshot`") states
+how many of each event a stream may carry and where, and its "Versioning" section
+defines exactly which changes are additive and which are breaking. This section
+restates those obligations for an adapter author; where the two ever disagree,
+`docs/schema.md` wins and the disagreement is a bug in this page.
 
 ## Machine-output schemas
 

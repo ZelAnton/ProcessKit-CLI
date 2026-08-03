@@ -13,8 +13,8 @@ use std::time::Duration;
 
 /// Parse a human duration for `--grace` (a zero-length duration is legal there —
 /// "no pause" between soft stop and hard kill — so this parser accepts `0`; see
-/// [`parse_positive_duration`] for `--timeout`/`--idle-timeout`, where `0` is
-/// rejected as a degenerate, almost-certainly-a-typo deadline).
+/// [`parse_positive_duration`] for the deadlines and `--snapshot-interval`, where
+/// `0` is rejected as a degenerate, almost-certainly-a-typo value).
 ///
 /// Grammar: a base-10, non-negative integer with an optional unit suffix — `ms`,
 /// `s` (the default when the suffix is omitted), `m`, or `h`. Examples: `30`
@@ -67,20 +67,29 @@ pub fn parse_duration(raw: &str) -> Result<Duration, String> {
     Ok(Duration::from_millis(millis))
 }
 
-/// Parse a human duration for `--timeout` / `--idle-timeout`: same grammar as
-/// [`parse_duration`], but a total of `0` (in any unit — `0`, `0ms`, `0s`, `0m`,
-/// `0h`) is additionally rejected at parse time, mirroring the "degenerate cap"
-/// treatment `parse_size`/`parse_max_processes`/`parse_cpu_quota` give `0` for
+/// Parse a human duration for the flags where `0` is degenerate rather than
+/// meaningful — the deadlines (`--timeout`, `--idle-timeout`, `wait --timeout`) and
+/// the `run --snapshot-interval` cadence: same grammar as [`parse_duration`], but a
+/// total of `0` (in any unit — `0`, `0ms`, `0s`, `0m`, `0h`) is additionally
+/// rejected at parse time, mirroring the "degenerate cap" treatment
+/// `parse_size`/`parse_max_processes`/`parse_cpu_quota` give `0` for
 /// `--max-memory`/`--max-processes`/`--cpu-quota`.
 ///
-/// A `--timeout 0` or `--idle-timeout 0` arms a deadline that is already elapsed
-/// on the very first poll — the child is torn down immediately after spawn (for
-/// `--idle-timeout`, unconditionally, since `remaining` saturates to zero) — which
-/// is indistinguishable in practice from an operator typo (`--timeout 0` instead
-/// of, say, `--timeout 30`) and never a useful deadline in its own right. Per this
-/// module's own philosophy ("a typo fails loudly at parse time instead of arming a
-/// surprising deadline", see [`parse_duration`]), that typo is rejected here rather
-/// than silently armed.
+/// The degeneracy differs by flag, which is why the rejection message names the
+/// *shape* of the mistake rather than one flag's consequence:
+///
+/// - a `0` **deadline** (`--timeout`, `--idle-timeout`, `wait --timeout`) is already
+///   elapsed on the very first poll — the child is torn down immediately after spawn
+///   (for `--idle-timeout`, unconditionally, since `remaining` saturates to zero);
+/// - a `0` **interval** (`--snapshot-interval`) asks for no spacing at all between
+///   samples, i.e. a snapshot storm bounded only by how fast the container can be
+///   read — not a fast cadence but the absence of one.
+///
+/// Neither is a useful setting in its own right, and both are indistinguishable in
+/// practice from an operator typo (`--timeout 0` instead of, say, `--timeout 30`).
+/// Per this module's own philosophy ("a typo fails loudly at parse time instead of
+/// arming a surprising deadline", see [`parse_duration`]), that typo is rejected here
+/// rather than silently armed.
 ///
 /// `--grace 0` stays legal and keeps using [`parse_duration`] directly: there `0`
 /// is meaningful ("no pause" between the soft stop and the hard kill), not
@@ -92,9 +101,11 @@ pub fn parse_positive_duration(raw: &str) -> Result<Duration, String> {
     let duration = parse_duration(raw)?;
     if duration.is_zero() {
         return Err(format!(
-            "duration `{raw}` must be greater than 0; a zero deadline is almost \
-             certainly a typo (it expires on the first check, tearing the child \
-             down immediately after spawn) — omit the flag to leave it unbounded"
+            "duration `{raw}` must be greater than 0; zero is almost certainly a \
+             typo rather than a setting — as a deadline it expires on the first \
+             check (tearing the child down immediately after spawn), and as an \
+             interval it asks for no spacing between samples at all. Omit the flag \
+             to leave this behavior unarmed"
         ));
     }
     Ok(duration)
@@ -295,7 +306,7 @@ mod tests {
         // `0` is legal for `parse_duration` (used directly by `--grace`, where a
         // zero-length pause is a meaningful "no pause" setting, not degenerate);
         // see `parse_positive_duration_rejects_zero_in_every_unit` for the
-        // stricter parser used by `--timeout`/`--idle-timeout`.
+        // stricter parser used by the deadlines and `--snapshot-interval`.
         assert_eq!(parse_duration("0").unwrap(), Duration::ZERO);
         assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
         assert_eq!(parse_duration("5s").unwrap(), Duration::from_secs(5));
@@ -351,10 +362,11 @@ mod tests {
 
     #[test]
     fn parse_positive_duration_rejects_zero_in_every_unit() {
-        // Used by `--timeout`/`--idle-timeout`: a zero deadline arms instantly, is
-        // almost certainly a typo, and is rejected as a form error (`USAGE`, 100)
-        // rather than silently arming a surprising immediate teardown — unlike
-        // `--grace`, which keeps accepting `0` through the plain `parse_duration`.
+        // Used by `--timeout`/`--idle-timeout`/`wait --timeout` (a zero deadline
+        // arms instantly) and by `--snapshot-interval` (a zero interval is a
+        // snapshot storm, not a cadence). Both are almost certainly a typo and are
+        // rejected as a form error (`USAGE`, 100) rather than silently armed —
+        // unlike `--grace`, which keeps accepting `0` through `parse_duration`.
         for zero in ["0", "0ms", "0s", "0m", "0h"] {
             assert!(
                 parse_positive_duration(zero).is_err(),

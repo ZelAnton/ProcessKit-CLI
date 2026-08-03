@@ -19,7 +19,7 @@
 use std::time::Duration;
 
 use processkit::{
-    Error as PkError, ErrorReason as PkErrorReason, Outcome, ProcessGroup, SoftSignal,
+    Error as PkError, ErrorReason as PkErrorReason, MemberInfo, Outcome, ProcessGroup, SoftSignal,
 };
 
 use crate::capture::Capture;
@@ -138,13 +138,44 @@ pub(super) fn clear_registration(registration: &Option<registry::Registration>) 
     }
 }
 
+/// The honest-degradation policy behind [`emit_members_snapshot`]'s `members`/
+/// `read_error`: `Ok` reports the enriched snapshot the platform confirmed, `Err`
+/// falls back to an empty member list but flags it `read_error: true` instead of
+/// letting it stand as a confirmed-empty tree — the exact contract its siblings
+/// [`members_len_or_unknown`] and [`remaining_pids_or_unknown`] already apply to the
+/// teardown pair (see [`Event::MembersSnapshot`]).
+///
+/// Pulled out as a pure function over a synthetic `Result` for the same K-059 reason
+/// as those siblings: `members_info()`'s real `Err` is backend-internal plumbing, not
+/// deterministically forceable from a spawned test child, so the failure branch is
+/// exercised here directly rather than only through an always-`Ok` integration test.
+/// (`MemberInfo` has no public constructor — K-043 — so the `Ok` side is proven on
+/// the empty read, which is precisely the value the failure fallback must stay
+/// distinguishable from.)
+fn snapshot_members_or_unknown(infos: Result<Vec<MemberInfo>, PkError>) -> (Vec<Member>, bool) {
+    match infos {
+        Ok(infos) => (infos.into_iter().map(Member::from_info).collect(), false),
+        Err(_) => (Vec::new(), true),
+    }
+}
+
 /// Snapshot the container's members — enriched with `ppid`/executable
 /// `name`/`start_time` via [`ProcessGroup::members_info`] wherever the platform
 /// can report them (`events::Member::from_info`) — and emit `members_snapshot`. A
-/// read failure is a diagnostics gap, not a run failure, so it warns and skips the
-/// event; it shares the same error contract as the bare-PID `members()` this
-/// replaced (`ErrorReason::Io` only — a single vanished member is skipped, not an
-/// error).
+/// read failure is a diagnostics gap, not a run failure; it shares the same error
+/// contract as the bare-PID `members()` this replaced (`ErrorReason::Io` only — a
+/// single vanished member is skipped, not an error).
+///
+/// **A failed read is recorded, not dropped (T-298).** The event is emitted either
+/// way: on failure [`snapshot_members_or_unknown`] substitutes an empty member list
+/// and flags it `read_error: true`, and the warning still goes to the runner's
+/// stderr for a foreground operator. Emitting rather than skipping is what makes the
+/// failure observable to the *only* consumer a detached run has — its JSONL file —
+/// because a detached runner's stderr is `Stdio::null()` (`super::detach`,
+/// `spawn_detached`), so the warning alone would reach nobody. It also makes this
+/// event's multiplicity honest: the post-spawn snapshot now appears exactly once in
+/// *every* stream, as `docs/schema.md`'s "Ordering" section states, instead of
+/// vanishing on a failed read.
 ///
 /// `reason` records which trigger asked for this snapshot ([`SnapshotReason`]). The
 /// **single** enrichment path is deliberate: the post-spawn snapshot and every
@@ -152,21 +183,23 @@ pub(super) fn clear_registration(registration: &Option<registry::Registration>) 
 /// `members_info()` call, so a periodic snapshot cannot drift in shape from the
 /// first one (nor from `inspect`'s view, which reads the same call — K-043). Only
 /// the emitted `reason` differs; a failed read degrades identically for both, so a
-/// skipped sample costs the cadence one interval and nothing else.
+/// failed sample costs the cadence one interval's worth of member detail and
+/// nothing else.
 pub(super) fn emit_members_snapshot(
     emitter: &mut Emitter,
     group: &ProcessGroup,
     reason: SnapshotReason,
 ) {
-    match group.members_info() {
-        Ok(infos) => emitter.emit(&Event::MembersSnapshot {
-            reason: reason.reason(),
-            members: infos.into_iter().map(Member::from_info).collect(),
-        }),
-        Err(err) => {
-            eprintln!("processkit-cli: warning: could not snapshot container members: {err}");
-        }
+    let infos = group.members_info();
+    if let Err(err) = &infos {
+        eprintln!("processkit-cli: warning: could not snapshot container members: {err}");
     }
+    let (members, read_error) = snapshot_members_or_unknown(infos);
+    emitter.emit(&Event::MembersSnapshot {
+        reason: reason.reason(),
+        read_error,
+        members,
+    });
 }
 
 /// The shared honest-degradation policy behind [`emit_cleanup_started`]'s
@@ -1229,6 +1262,34 @@ mod tests {
             members_len_or_unknown(Err(simulated)),
             (0, true),
             "a read failure must not be indistinguishable from a confirmed-empty tree"
+        );
+    }
+
+    /// The [`emit_members_snapshot`] twin of the two tests around it, over the pure
+    /// [`snapshot_members_or_unknown`] — same K-059 rationale, and the property that
+    /// makes a failed sample observable at all in a detached run (whose stderr is
+    /// `null`): the `Err` fallback must not be indistinguishable from a confirmed
+    /// reading of an empty tree.
+    #[test]
+    fn snapshot_members_or_unknown_flags_a_read_failure_instead_of_a_confirmed_empty_tree() {
+        // `MemberInfo` has no public constructor (K-043), so the confirmed side is
+        // proven on the empty read — which is exactly the value the failure
+        // fallback below must stay distinguishable from. (`Member` deliberately
+        // carries no `PartialEq`, so the pair is asserted field-wise rather than
+        // by comparing whole tuples as the two sibling tests above do.)
+        let (members, read_error) = snapshot_members_or_unknown(Ok(Vec::new()));
+        assert!(
+            members.is_empty() && !read_error,
+            "a successful read of an empty tree is a confirmed observation, unflagged"
+        );
+        let simulated = PkError::from(PkErrorReason::Io(std::io::Error::other(
+            "simulated members_info() failure",
+        )));
+        let (members, read_error) = snapshot_members_or_unknown(Err(simulated));
+        assert!(
+            members.is_empty() && read_error,
+            "a read failure must be recorded as a flagged gap, never as a snapshot \
+             of a tree that was never observed"
         );
     }
 

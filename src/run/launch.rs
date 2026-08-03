@@ -706,8 +706,16 @@ async fn capture_overflow(capture: &Option<Capture>, cancel: bool) -> CaptureOve
 /// one interval, re-emit the snapshot through the shared
 /// [`emit_members_snapshot`]/`members_info()` path, repeat for as long as the run
 /// races. With no `--snapshot-interval` it parks forever, so a run without the flag
-/// never reads the clock, never touches the container, and emits byte-for-byte the
-/// stream it did before this arm existed.
+/// never reads the clock, never touches the container, and **adds no event**: the
+/// number, type, and position of the events such a run emits are exactly what they
+/// were before this arm existed, which is what
+/// `a_run_without_snapshot_interval_still_emits_exactly_one_members_snapshot`
+/// actually proves (an event-type sequence comparison plus a snapshot count, not a
+/// byte comparison). The *wire form* of `members_snapshot` did change for every run,
+/// flag or no flag — it gained the always-present `reason` and `read_error` fields
+/// (additive within schema v1; see [`SnapshotReason`] and `docs/schema.md`,
+/// "Versioning") — so this arm's inertness is a claim about the event stream's
+/// shape, never about its bytes.
 ///
 /// **No thread, no task: it is one more arm of the race that already exists.** The
 /// runner deliberately runs on a small current-thread runtime ([`super::run_inner`]),
@@ -731,10 +739,20 @@ async fn capture_overflow(capture: &Option<Capture>, cancel: bool) -> CaptureOve
 ///   the ProcessKit 3 migration the grace wait is the library's own
 ///   `ProcessGroup::stop` driver, and `graceful_teardown` only projects its report.)
 ///
-/// A `members_info()` read that fails warns and skips *that* sample (the honest
-/// degradation [`emit_members_snapshot`] already applies to the post-spawn snapshot);
-/// the cadence itself keeps going, so one bad read costs one interval, not the
-/// feature.
+/// A `members_info()` read that fails still emits its sample, flagged
+/// `read_error: true` with an empty `members` list — the honest degradation
+/// [`emit_members_snapshot`] applies identically to the post-spawn snapshot — and
+/// the cadence keeps going, so one bad read costs one interval's member detail, not
+/// the feature. The flag, not the accompanying stderr warning, is the contract: a
+/// detached runner's stderr is `Stdio::null()`, so in the cadence's own headline
+/// scenario the stream is the only place a failure can be reported (see
+/// [`SnapshotReason`]).
+///
+/// **The stream this arms is unbounded by design**: one line per interval per run,
+/// so a `--jsonl` file grows as `duration / interval`, with each line sized by the
+/// tree. Nothing here caps, rotates, or samples it — the operator's chosen interval
+/// is the only bound, and the sizing arithmetic for picking one is written down in
+/// `docs/running-commands.md`, "Recorded tree snapshots".
 ///
 /// Nothing here touches the output pump, the capture tee, or the echo sinks — a
 /// snapshot is a query of the container's own membership — which is exactly why the

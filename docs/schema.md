@@ -117,10 +117,11 @@ A point-in-time snapshot of the container's members. It is a snapshot, not a
 census: a listed PID may exit immediately afterward, and a process spawned during
 the read may be missing.
 
-| Field     | Type            | Notes                              |
-|-----------|-----------------|------------------------------------|
-| `reason`  | string          | What asked for this snapshot: `spawn` or `interval` (below). |
-| `members` | array of member | Each entry is a *member* (below).  |
+| Field        | Type            | Notes                              |
+|--------------|-----------------|------------------------------------|
+| `reason`     | string          | What asked for this snapshot: `spawn` or `interval` (below). |
+| `read_error` | boolean         | `true` when the member read itself failed; see "Honest degradation on a failed sample" below. |
+| `members`    | array of member | Each entry is a *member* (below).  |
 
 A **member** object:
 
@@ -140,10 +141,11 @@ the tree looked like just before a deadline fired), for the long, quiet, or
 detached runs where nobody is likely to have been watching live with `inspect` at
 the interesting moment.
 
-- `reason` is **always present**, including on the single `spawn` snapshot a run
-  without the flag emits. It is the only difference between the two: both are
-  produced by the same code through the same `members_info()` enrichment, so a
-  periodic snapshot's `members` cannot drift in shape from the first one's.
+- `reason` and `read_error` are **always present**, including on the single
+  `spawn` snapshot a run without the flag emits. `reason` is the only difference
+  between a post-spawn snapshot and a periodic one: both are produced by the same
+  code through the same `members_info()` enrichment, so a periodic snapshot's
+  `members` cannot drift in shape from the first one's.
 - The periodic snapshots stop the moment the run's ending is decided, so they
   appear **only** between `run_started` and the ending's own event
   (`root_exited`, or the `timeout`/`cancelled`/`killed` reason event) — never
@@ -153,14 +155,33 @@ the interesting moment.
   renamed, retyped, or given a new meaning, and a reader that pins a version must
   already tolerate additional events (see "Versioning"). The cadence is also
   opt-in: without `--snapshot-interval` a run emits exactly the one snapshot, at
-  exactly the point, it always did.
-- A member read that fails skips that one sample (with a warning on the runner's
-  stderr) rather than emitting a fabricated empty snapshot, exactly as for the
-  post-spawn one; the cadence continues. A missing sample is therefore a gap in
-  the cadence, not a claim that the tree was empty.
+  exactly the point, it always did. The event's *wire form*, however, changed for
+  every run including the flagless one: `reason` and `read_error` are new,
+  always-present fields, additive within v1 but not "unchanged" (see
+  [Compatibility and upgrades](compatibility.md#schema-pinning) for the reader
+  obligations that follow).
 - Snapshots are read from the container's own member list, not from the runner's
   output pump, so `--snapshot-interval` composes with every I/O mode —
   `--inherit-stdio` included, unlike `--idle-timeout`.
+
+**Honest degradation on a failed sample.** When the `members_info()` read itself
+fails, the snapshot is **still emitted**, with `read_error: true` and an empty
+`members` array — the same convention `cleanup_started`/`cleanup_finished` use for
+their own failed reads (see "Honest degradation on a teardown read failure").
+`members` is then a fallback, not an observation: a consumer must check
+`read_error` before reading an empty array as a confirmed-empty tree. The runner
+also warns on its stderr, but **that warning is not the contract**: a `--detach`ed
+runner's stdin/stdout/stderr are `null` (see
+[Detached runs](detached-runs.md#output-behavior)), so in the long, quiet, detached
+runs this cadence exists for, the flagged event in the JSONL file is the only
+report of the failure that reaches anyone. A failed sample therefore never appears
+as a gap in the cadence; a genuine gap means the run ended, the interval had not
+elapsed yet, or the stream itself stopped (see "Stream size" below).
+
+**Stream size.** The cadence is the first thing in this stream whose event count
+scales with a run's *duration*, and it is deliberately unbounded — see
+[Running commands](running-commands.md#recorded-tree-snapshots) for the recorded
+decision, the sizing arithmetic, and how to choose an interval.
 
 ### `root_exited`
 
@@ -239,7 +260,9 @@ unaffected by this), `true` when the read failed, in which case the numeric
 field(s) fall back to `0`/an empty array — not a fabricated fact, only the
 absence of one. A consumer that treats `cleanup_finished.remaining == 0` as
 "the tree is confirmed empty" must first check `read_error` is `false`; the
-runner also warns on stderr whenever this happens. This mirrors
+runner also warns on stderr whenever this happens, though — as for
+`members_snapshot`'s own flag above — that warning reaches nobody in a detached
+run, so the flag in the stream, not the warning, is the contract. This mirrors
 `output_captured`'s `write_error` flag (both are explicit failure markers, never
 inferred from the accompanying data alone).
 
@@ -514,7 +537,9 @@ The reason event names *which* ending it was: `timeout` (with `reason` `overall`
 
 **Multiplicity of `members_snapshot`.** The post-spawn `members_snapshot` above is
 the only one a run emits *by default*, and it always appears exactly once,
-directly after `run_started`. A run given `run --snapshot-interval <duration>`
+directly after `run_started` — unconditionally, because a failed member read is
+recorded as a `read_error` sample rather than omitting the event (see
+"members_snapshot"). A run given `run --snapshot-interval <duration>`
 emits **additional** `members_snapshot` events (`reason: "interval"`) on that
 cadence, all of them after the post-spawn one and all of them **before** the
 ending's own event — `root_exited` for a natural exit, or the
@@ -648,8 +673,15 @@ type, and meaning intact — is additive in the same way: a consumer that reads 
 fields it knows is unaffected and simply ignores the new one. The `output_captured`
 per-stream `write_error` flag was added this way within v1, as was the `timeout`
 event's `reason` field (when `--idle-timeout` joined `--timeout` on that event) and
-the `members_snapshot` event's own `reason` field (when `--snapshot-interval` gave
-that event a second trigger). Emitting an **existing event more times** than a
+the `members_snapshot` event's own `reason` and `read_error` fields (when
+`--snapshot-interval` gave that event a second trigger, and a failed sample a way to
+report itself). Note what that does *not* mean: those two fields appear on **every**
+`members_snapshot`, including the single one a run without the flag emits, so the
+default stream's `members_snapshot` line is not byte-identical to what an earlier
+version wrote. That is precisely the additive case above — a reader consuming the
+fields it knows is unaffected — but a reader that pinned the exact field set of an
+event, rather than the fields it uses, will notice.
+Emitting an **existing event more times** than a
 stream previously carried it is additive for the same reason a new event type is:
 no existing event's shape changes, and a consumer pinned to a version must already
 tolerate events it did not expect at that point in the stream — within a version it
@@ -657,7 +689,9 @@ may not assume an event type it knows occurs at most once. `members_snapshot` wa
 extended this way within v1 by the opt-in `run --snapshot-interval` cadence, which
 also leaves the default stream (no flag) emitting exactly the events, in exactly the
 order and the number, that it did before; the normative statement of how many such
-events a stream may carry, and where they may appear, lives in "Ordering".
+events a stream may carry, and where they may appear, lives in "Ordering", and the
+reader obligations these two additive shapes create are collected for adapter
+authors in [Compatibility and upgrades](compatibility.md#schema-pinning).
 Adding a **new value** to an open-ended
 descriptive string field — a new `cancelled` `source`, for instance, as `sigterm` and
 `sighup` were added within v1 when the runner started catching those signals — is

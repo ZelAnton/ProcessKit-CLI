@@ -156,12 +156,16 @@
           "enum": ["spawn", "interval"],
           "description": "What asked for this snapshot: 'spawn' (once, right after the child was spawned) or 'interval' (a --snapshot-interval re-sample)."
         },
+        "read_error": {
+          "type": "boolean",
+          "description": "true when the members_info() read itself failed; `members` is then an empty fallback, not a confirmed-empty tree. The sample is recorded rather than skipped so the failure is visible in the stream itself — the only channel a detached run has, its stderr being null (docs/schema.md, 'members_snapshot')."
+        },
         "members": {
           "type": "array",
           "items": { "$ref": "#/$defs/member" }
         }
       },
-      "required": ["schema_version", "time", "event", "reason", "members"],
+      "required": ["schema_version", "time", "event", "reason", "read_error", "members"],
       "additionalProperties": false
     },
     "rootExited": {

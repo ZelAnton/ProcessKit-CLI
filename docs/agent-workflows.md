@@ -32,6 +32,7 @@ events, and a run-id-based control plane.
 | A tool spawns descendants | The ProcessKit container is the cleanup scope. |
 | A command never finishes | `--timeout` bounds total runtime. |
 | A worker becomes silent | `--idle-timeout` detects missing output activity. |
+| The tool's process tree grew or lingered, and nobody was watching | `--snapshot-interval` records periodic `members_snapshot` events into the JSONL for post-hoc reading. |
 | Live output is too noisy | `--no-echo` suppresses relay while capture continues. |
 | Output is needed after failure | `--capture-dir` keeps bounded stdout/stderr files with hashes and truncation metadata. |
 | The agent loses its local process handle | `list`, `inspect`, and `wait` operate through the per-user run registry. |

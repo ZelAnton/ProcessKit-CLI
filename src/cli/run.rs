@@ -120,17 +120,32 @@ pub struct RunArgs {
     /// when the worker fleet ballooned, whether helpers lingered, what the tree
     /// looked like just before an idle deadline fired — for exactly the runs
     /// (long, detached, quiet) where nobody is likely to have been watching live
-    /// with `inspect` at the interesting moment. Omit it and the stream carries
-    /// the single post-spawn snapshot it always did, unchanged.
+    /// with `inspect` at the interesting moment. Omit it and the run emits the
+    /// single post-spawn snapshot it always did, at the same point in the stream
+    /// and with no event added — but note that the event itself now always
+    /// carries `reason` (`spawn`) and `read_error`, on the default path too:
+    /// additive fields within schema v1, not an unchanged wire form (see
+    /// `docs/schema.md`, "Versioning").
     ///
     /// Each periodic event is the ordinary `members_snapshot`, enriched through
     /// the same `ProcessGroup::members_info()` path as the post-spawn one and
     /// told apart from it only by its `reason` field (`interval` vs `spawn`; see
     /// `docs/schema.md`, "members_snapshot"). The cadence stops the moment the
     /// run's ending is decided, so a periodic snapshot never interleaves into the
-    /// teardown events; a member read that fails skips that one sample with a
-    /// warning on stderr — the same honest degradation as the post-spawn snapshot
-    /// — rather than recording a tree that was never observed.
+    /// teardown events.
+    ///
+    /// A member read that fails does not invent a tree that was never observed:
+    /// it emits that sample with `read_error: true` and an empty `members` list,
+    /// the same honest degradation `cleanup_started`/`cleanup_finished` already
+    /// apply, and the cadence continues. That flag is the contract, not the
+    /// accompanying stderr warning — a `--detach`ed runner's stderr is `null`, so
+    /// there the JSONL stream is the only channel that reports the failure at all.
+    ///
+    /// **The resulting stream is deliberately unbounded**: roughly
+    /// `duration / interval` extra lines, each sized by the tree, with no ceiling,
+    /// rotation, or sampling. On a day-long run a 1s cadence over a 100-process
+    /// tree writes several hundred megabytes; pick the interval accordingly (see
+    /// `docs/running-commands.md`, "Recorded tree snapshots", for the arithmetic).
     ///
     /// Composes with **every** I/O mode, `--inherit-stdio` included: a snapshot
     /// is a query of the container's own member list, not an observation of the
@@ -249,7 +264,17 @@ pub struct RunArgs {
     /// left to type at it. There is no live echo either — the detached runner runs
     /// with `--no-echo`'s discarding sinks — while `--jsonl` (still required),
     /// `--capture-dir`, and `--idle-timeout` all keep observing the child's output
-    /// exactly as they do in the foreground.
+    /// exactly as they do in the foreground, and `--snapshot-interval` keeps
+    /// recording the tree's shape (this is the mode it exists for — nobody is
+    /// watching a detached run live with `inspect`).
+    ///
+    /// **The detached runner's own stdin/stdout/stderr are `null`**, so every
+    /// warning the foreground runner would print reaches nobody: `--jsonl` is the
+    /// only diagnostic channel a detached run has. That is why a failed member read
+    /// is recorded as a `members_snapshot` with `read_error: true` rather than only
+    /// warned about — and why a `--jsonl` write failure (a full disk, say) is
+    /// invisible: event logging switches itself off after one unseen warning and the
+    /// stream simply ends mid-run.
     #[arg(long, conflicts_with_all = ["inherit_stdio", "inherit_stdin"])]
     pub detach: bool,
 

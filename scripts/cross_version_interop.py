@@ -34,10 +34,11 @@ Two rules shape the assertions, both taken from `docs/compatibility.md`:
   not be reported as a defect, so a published `required` list is relaxed. A field
   the old binary emits that the new schema no longer permits *is* a defect.
 * **Downgrade direction** (an artifact produced by the *new* binary, read by the
-  *old* one): "readers must tolerate additive optional fields and unknown event
-  fields", so `additionalProperties` is relaxed and an event type unknown to the
-  old schema is reported as additive. A field the old schema requires and the new
-  binary no longer emits *is* a defect.
+  *old* one): within one version a reader must tolerate new event types, new
+  fields on an event it already parses (including always-present ones, not only
+  optional ones), and unknown fields generally, so `additionalProperties` is
+  relaxed and an event type unknown to the old schema is reported as additive. A
+  field the old schema requires and the new binary no longer emits *is* a defect.
 
 Both relaxations are pure functions over the schema documents
 (`relax_for_upgrade_read` / `relax_for_downgrade_read`), as is the reading of a
@@ -180,10 +181,12 @@ def relax_for_upgrade_read(schema: Any) -> Any:
 def relax_for_downgrade_read(schema: Any) -> Any:
     """Relax `schema` for reading a NEWER producer's payload.
 
-    Drops `additionalProperties: false`: "readers must tolerate additive optional
-    fields and unknown event fields". `required` is deliberately kept — a field
-    the older schema requires and the newer producer stopped emitting is a
-    removal, which is breaking.
+    Drops `additionalProperties: false`: within one schema version a reader must
+    tolerate new fields on an event it already parses — always-present ones
+    included, not only optional ones — plus unknown fields generally
+    (`docs/compatibility.md`, "What a reader must tolerate within one version").
+    `required` is deliberately kept — a field the older schema requires and the
+    newer producer stopped emitting is a removal, which is breaking.
     """
 
     def transform(node: dict) -> dict:
