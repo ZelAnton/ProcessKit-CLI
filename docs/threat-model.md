@@ -148,8 +148,10 @@ code/docs it is implemented and described in.
   commit and workflow that produced them. A dedicated fuzz tier
   (`fuzz/`) exercises the parsers that sit closest to the untrusted inputs
   above — the registry's byte-to-record parser, the control-plane's
-  request/reply decoders, and the CLI's own value parsers — under
-  `cargo-fuzz`.
+  request/reply decoders, the CLI's own value parsers, and `wait
+  --report-outcome`'s read-back of a run's JSONL events file (a path any
+  local process can write, so its content is untrusted the same way) —
+  under `cargo-fuzz`.
 
 ## What is not closed
 

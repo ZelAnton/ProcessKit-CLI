@@ -4,9 +4,10 @@ name: Fuzz
 # of untrusted/semi-trusted input: the registry record bytes -> parse/validate
 # path (`registry_record`), the control plane's server-side request-line
 # classifier and client-side response-line JSON decode together
-# (`control_wire`), and the CLI's scalar, label, and raw environment-file
-# parsers (`cli_parsers`) — see fuzz/fuzz_targets/*.rs and
-# CONTRIBUTING.md, "Fuzzing".
+# (`control_wire`), the CLI's scalar, label, and raw environment-file
+# parsers (`cli_parsers`), and `wait --report-outcome`'s terminal-outcome
+# read-back over a run's JSONL events file (`runner_exit_tail`, T-301) — see
+# fuzz/fuzz_targets/*.rs and CONTRIBUTING.md, "Fuzzing".
 #
 # Deliberately scheduled + manual-only (no `push:`/`pull_request:` trigger) and
 # every step that can fail on a genuine finding uses `continue-on-error`, so a
@@ -40,7 +41,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [registry_record, control_wire, cli_parsers]
+        target: [registry_record, control_wire, cli_parsers, runner_exit_tail]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

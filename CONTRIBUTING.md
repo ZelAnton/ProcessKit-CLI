@@ -276,7 +276,7 @@ can never block an unrelated PR.
 
 Beyond the grammar-shaped generators the [proptest] property tier drives,
 [`fuzz/`] is a [`cargo-fuzz`] tier that explores the parsers of untrusted or
-semi-trusted input with unconstrained, coverage-guided bytes. Three targets,
+semi-trusted input with unconstrained, coverage-guided bytes. Four targets,
 each linking the crate's library target directly (never the binary):
 
 - `registry_record` — the run registry's bytes → parse/validate path
@@ -286,11 +286,17 @@ each linking the crate's library target directly (never the binary):
 - `cli_parsers` — the CLI's scalar value parsers, operator-label grammar, and
   raw `--env-file` contents (including invalid UTF-8 and the invariant that a
   rejected entry never repeats its secret value).
+- `runner_exit_tail` — `wait --report-outcome`'s terminal-outcome read-back
+  over a run's JSONL events file (`src/wait.rs`'s bounded head/tail scan for
+  the terminal `runner_exit`), a file at an operator-chosen path any local
+  process can write, so it can legitimately be truncated mid-write,
+  concurrently appended, or arbitrary bytes.
 
 Each target ships a small seed corpus under `fuzz/corpus/<target>/`, including
 historically found edge cases (a NUL/control byte or a Windows reserved device
 name in a registry `lock_file`, a calendar-invalid `started_at` like
-`2026-02-31`, and valid/commented/malformed environment and label inputs).
+`2026-02-31`, valid/commented/malformed environment and label inputs, and a
+truncated/interleaved/oversized/non-UTF-8 events-file tail).
 
 Requires a nightly toolchain (`rustup toolchain install nightly` — the pinned
 `stable` from [Prerequisites](#prerequisites) is not enough, since `cargo-fuzz`
