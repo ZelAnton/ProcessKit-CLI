@@ -160,6 +160,17 @@ with that one — in short, do not hand-delete it). See
 reached: a distinguishable result, never a hang", and the `CONTROL` (103) row
 of the reserved-band table in [`docs/exit-codes.md`](exit-codes.md).
 
+**`inspect` has a fourth reason of its own, and it is not a lost runner.** If
+the message says the runner answered with a **control-plane snapshot version**
+this client does not implement, the runner is reachable and healthy: its reply
+declares a snapshot shape this binary was not built to read, so `inspect`
+refuses it instead of rendering it under the wrong semantics. `cancel`/`kill`
+cannot hit this, and neither can `list`/`wait`/`prune`. Retrying will not help
+— check both binaries' versions (`processkit-cli probe --json` reports the
+version of whichever binary you run) and inspect that run with a build matching
+its runner. See [`docs/control-plane.md`](control-plane.md), "Snapshot version:
+a foreign version is refused, never rendered".
+
 **`wait` does not share this code.** The registry-only `wait --run-id <id>`
 never connects to a run's control transport, so "died mid-conversation" is
 not something it can hit, and a stale registry entry does not give it `103`

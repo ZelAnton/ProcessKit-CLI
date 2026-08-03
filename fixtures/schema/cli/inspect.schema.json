@@ -42,7 +42,7 @@
       "properties": {
         "snapshot_version": {
           "const": 2,
-          "description": "Snapshot format version (src/control/mod.rs, SNAPSHOT_VERSION) — the control plane's own client/runner axis, independent of the JSONL `schema_version` and the `registry_version`. Pinned here: a bump is a breaking change to this shape and updates this document with it."
+          "description": "Snapshot format version (src/control/mod.rs, SNAPSHOT_VERSION) — the control plane's own client/runner axis, independent of the JSONL `schema_version` and the `registry_version`. Pinned here: a bump is a breaking change to this shape and updates this document with it. The client acts on the value it receives over the wire: a snapshot declaring any other version is refused with CONTROL (103) rather than rendered, so this field can only ever hold the pinned value on stdout (docs/control-plane.md, 'Snapshot version: a foreign version is refused, never rendered')."
         },
         "run_id": {
           "type": "string",
@@ -57,7 +57,7 @@
         "started_at": { "$ref": "#/$defs/rfc3339Millis", "description": "Run start time." },
         "jsonl": {
           "type": ["string", "null"],
-          "description": "Absolute path to the run's JSONL lifecycle stream; null only when reading a legacy snapshot that published none."
+          "description": "Absolute path to the run's JSONL lifecycle stream. A runner of this snapshot_version always publishes it; the type stays nullable because the client's parser defaults a missing field to null instead of failing the whole reply. It is not how an older contract's snapshot is read — that one is refused before rendering."
         },
         "capture_dir": {
           "type": ["string", "null"],

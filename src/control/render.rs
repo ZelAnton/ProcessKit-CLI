@@ -1,4 +1,14 @@
 //! Human and JSON rendering for control-plane snapshots.
+//!
+//! Every [`Snapshot`] that reaches this module has already passed
+//! [`super::verify_snapshot`] — both consumers apply it before rendering — so the
+//! `snapshot_version` printed here is always this build's own
+//! [`super::SNAPSHOT_VERSION`], and the rest of the payload is a shape this build
+//! actually implements. Nothing here re-checks that (a second copy of the policy is
+//! exactly the drift the shared check exists to prevent), and nothing here may be
+//! reached by an unverified snapshot: a reply declaring a foreign version is refused
+//! with `CONTROL` (103) before it gets this far (see the parent module's "A foreign
+//! snapshot version — refused, never rendered").
 
 use crate::exit::{self, RunnerError};
 

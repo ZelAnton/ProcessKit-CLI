@@ -128,7 +128,13 @@ Consequently:
 - **`probe --json` and `inspect --json` additionally bump their own field.** A
   breaking change to either shape bumps `probe_version` / `snapshot_version`
   respectively, and that field — which the schema document pins with `const` — is
-  what a consumer should check.
+  what a consumer should check. For the snapshot, this binary's own `inspect`
+  client checks it as well: a runner answering with a different
+  `snapshot_version` is refused with `CONTROL` (103) instead of being rendered
+  under this build's semantics (see [`docs/control-plane.md`](control-plane.md),
+  "Snapshot version: a foreign version is refused, never rendered"). A bump is
+  therefore a hard boundary for a mixed deployment, not merely a signal to
+  read.
 - **Every document under `fixtures/schema/cli/` is updated in place.** There is no
   `vN/` directory there (unlike `fixtures/schema/v1/`, whose `v1` *is* the JSONL
   `schema_version`), because a version here, where there is one, lives in the

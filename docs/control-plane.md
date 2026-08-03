@@ -151,12 +151,12 @@ from the JSONL event `schema_version` and the `registry_version`.
 
 | Field              | Type              | Notes                                                                 |
 |--------------------|-------------------|-----------------------------------------------------------------------|
-| `snapshot_version` | integer           | Snapshot format version (currently `2`).                              |
+| `snapshot_version` | integer           | Snapshot format version (currently `2`). Bumped only on a **breaking** change to this shape, and acted on by the client: a snapshot declaring any other version is refused, never rendered — see "Snapshot version: a foreign version is refused, never rendered" below. |
 | `run_id`           | string            | The run's identifier — the key matched in the registry. Not a PID.    |
 | `mechanism`        | string            | Containment mechanism: `job_object`, `cgroup_v2`, or `process_group` (same vocabulary as the JSONL `run_started`). |
 | `root_pid`         | integer, nullable | The root child's PID; `null` if the backend exposed none.             |
 | `started_at`       | string            | Run start time, RFC 3339 UTC, millisecond precision.                  |
-| `jsonl`            | string, nullable  | Absolute path to the JSONL lifecycle stream; `null` only when reading a legacy snapshot. |
+| `jsonl`            | string, nullable  | Absolute path to the JSONL lifecycle stream. A runner of this `snapshot_version` always publishes it; the field stays nullable because the client's parser defaults a missing one to `null` rather than failing the whole reply. It is not how an older contract's snapshot is read — that one is refused outright (below). |
 | `capture_dir`      | string, nullable  | Absolute capture directory, or `null` when capture is disabled.       |
 | `members`          | array of member   | The container's members, enriched with `ppid`/executable `name`/`start_time` wherever ProcessKit's `members_info()` can report them — the same shape as the JSONL `members_snapshot` (`docs/schema.md`, "Enriched member fields"), and read through the same call, so the two views never drift. Fields stay `null` on platforms/members that can't report them (e.g. the "bare" BSDs). Queried **at request time**, so it reflects the container's composition *when inspected*, not at start. |
 
@@ -165,6 +165,53 @@ Example:
 ```json
 {"snapshot_version":2,"run_id":"build-42","mechanism":"job_object","root_pid":4242,"started_at":"2026-07-20T21:00:00.000Z","jsonl":"C:\\runs\\build-42.jsonl","capture_dir":null,"members":[{"pid":4242,"ppid":4200,"name":"build.exe","start_time":"133456789000000000"}]}
 ```
+
+### Snapshot version: a foreign version is refused, never rendered
+
+`snapshot_version` is not decoration — the client **checks it and acts on it**. This
+is the normative statement of that policy; the two `inspect` forms share one
+implementation of it (`src/control/mod.rs`, `verify_snapshot`).
+
+**The rule.** A snapshot whose `snapshot_version` is not the exact version the
+`inspect` client implements is **refused** with the reserved **`CONTROL` (103)** code
+and a message naming both versions and which side is newer. Nothing about that reply
+is printed: it never reaches the human rendering or `--json`, and under `--all` the
+target is reported `failed` (with that message in its `error` field), never
+`inspected` and never the successful `already_gone` — the runner did not end, it
+answered something this client cannot read. A matching version is inspected exactly as
+before; a client and a runner from the same build never see this refusal.
+
+**Why refusal, and not tolerance.** This project spends a `snapshot_version` bump
+*only* on a **breaking** change to the snapshot's shape — a removed or renamed field,
+a changed type, a changed meaning — while an additive field deliberately leaves the
+number alone (see [`docs/compatibility.md`](compatibility.md), "Machine-output
+schemas"). A different number is therefore precisely the statement "a reader built
+before this cannot correctly interpret what follows", and the `inspect` client holds
+no decoder for any shape but its own. Rendering it anyway would present a payload
+interpreted under semantics its sender never promised — the same unearned confidence
+the registry read side already refuses when it skips a record whose `registry_version`
+it does not know ([`docs/registry.md`](registry.md)). Tolerance would also be quieter
+than it looks: the client re-serializes what it parsed, so a newer runner's added
+fields are dropped at deserialization and never appear in the output — an operator
+would see a confident rendering with no marker of what was lost.
+
+**Why both directions.** A **newer** runner announces a breaking change this client
+predates — the mixed-binaries case a mid-upgrade user really has (an older `inspect`
+against a newer `run`). An **older** runner's snapshot is refused for the mirror-image
+reason: this client carries no decoder for the shape the previous contract left behind,
+so accepting it would be a softer claim than the registry makes about its own older
+records, and no better earned. In both cases the fix is the same and the message says
+so: **inspect that run with a matching `processkit-cli` build** (`probe --json` reports
+which version a given binary is; see [`docs/integration.md`](integration.md)). Retrying
+will not help — unlike an unreachable runner, this refusal is deterministic until one
+of the two binaries changes.
+
+**Consequence for a bump.** Bumping `SNAPSHOT_VERSION` is a real event for a mixed
+deployment, not just a schema edit: every client of a different version loses the
+ability to inspect this runner — loudly, with `103`, rather than silently
+misinterpreting it. `cancel`/`kill` are unaffected (their ack carries no version and is
+verified by `accepted`/`action`/`run_id` instead), as are `list`, `wait`, and `prune`,
+which never read a snapshot.
 
 ## `cancel` and `kill`
 
@@ -341,6 +388,14 @@ For the mutating verbs this matters twice over: a `cancel`/`kill` against a run 
 is already gone is the *same* bounded `CONTROL` (103) result — it never blocks waiting
 for a teardown that will not happen, and it does not mistake a dead run for a
 successful cancel.
+
+**One `inspect`-only refusal shares this code without being a lost runner.** A runner
+that answers with a snapshot declaring a `snapshot_version` this client does not
+implement is reachable and perfectly healthy — but its reply cannot be interpreted, so
+`inspect` refuses it with the same `103` instead of rendering it (see "Snapshot
+version: a foreign version is refused, never rendered"). It is the one `103` here that
+a retry never clears: it holds until one of the two binaries changes. `cancel`/`kill`
+cannot hit it — their ack carries no version.
 
 This is the exit-code half of the contract: a caller distinguishes "here is the run's
 state" / "the command was accepted" (exit `0`, JSON on stdout) from "that run is not
