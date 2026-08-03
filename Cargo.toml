@@ -186,9 +186,9 @@ windows-sys = { version = "0.61", features = [
 #
 # `build.rs` generates shell completions and man pages from the live CLI
 # definition (see that file's module doc for why this runs at build time
-# rather than as a CLI subcommand). It loads `src/cli.rs` as a module
-# (`#[path = "src/cli.rs"] mod cli;`), so it needs the same `clap` derive
-# machinery that file uses.
+# rather than as a CLI subcommand). It loads `src/cli/mod.rs` as a module
+# (`#[path = "src/cli/mod.rs"] mod cli;`), so it needs the same `clap` derive
+# machinery those files use.
 # ---------------------------------------------------------------------------
 [build-dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -208,7 +208,7 @@ clap_mangen = "0.3"
 # self-contained via internal `$defs` — never needs, so they are disabled.
 jsonschema = { version = "0.49.1", default-features = false }
 # Property-based test tier for the hand-rolled primitives (SHA-256 in
-# `src/hash.rs`, the `--timeout`/`--grace` duration grammar in `src/cli.rs`,
+# `src/hash.rs`, the `--timeout`/`--grace` duration grammar in `src/cli/parse.rs`,
 # and the `HINT_RULES` classifier in `src/events.rs`) — a regression net over
 # arbitrary/generated inputs, not just the fixed example vectors already in
 # each module's `#[cfg(test)]` block.

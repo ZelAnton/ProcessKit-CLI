@@ -1754,7 +1754,7 @@ fn dotnet_build_leaves_no_reuse_worker() {
 // `--env` / `--env-remove` / `--env-clear` (T-165): the child echoes one or more
 // named environment variables through a tiny platform shell one-liner, proving
 // each flag's effect through the built binary — the value this tier adds over a
-// unit test of the CLI parser (`src/cli.rs`) or of `src/run/launch.rs`'s builder calls.
+// unit test of the CLI parser (`src/cli/`) or of `src/run/launch.rs`'s builder calls.
 // ---------------------------------------------------------------------------
 
 /// The platform one-liner that echoes each named env var on its own line. `cmd

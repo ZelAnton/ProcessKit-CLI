@@ -1,5 +1,5 @@
 //! Build script: generates shell completions and man pages from the *live* CLI
-//! definition (`src/cli.rs`), so operators get tab-completion and `man`
+//! definition (`src/cli/`), so operators get tab-completion and `man`
 //! documentation for `run`/`inspect`/`cancel`/`kill`/`list`/`prune`/`probe`
 //! without this project hand-maintaining a second, driftable copy of the
 //! surface.
@@ -22,13 +22,17 @@
 //!
 //! ## One CLI definition, not two
 //!
-//! Loading `src/cli.rs` as a module here (`#[path = "src/cli.rs"] mod cli;` —
-//! the same file the binary itself compiles, just reached from a second
-//! compilation root) means this generator always reflects the real parser;
-//! there is no second, hand-written copy of the flags to fall out of sync. The
-//! `#[cfg(test)]` module inside `cli.rs` is compiled out here exactly as it is
-//! in a normal (non-test) build of the crate, so this build script needs none
-//! of `cli.rs`'s test-only dependencies (`proptest`).
+//! Loading `src/cli/mod.rs` as a module here (`#[path = "src/cli/mod.rs"] mod
+//! cli;` — the same files the binary itself compiles, just reached from a
+//! second compilation root) means this generator always reflects the real
+//! parser; there is no second, hand-written copy of the flags to fall out of
+//! sync. Rust treats any `#[path]`-included file as a `mod.rs`, so `cli`'s own
+//! `mod run;`/`mod parse;`/… declarations resolve against `src/cli/` here
+//! exactly as they do for the library — one `#[path]` line reaches the whole
+//! directory, and a future submodule needs no change to this script. The
+//! `#[cfg(test)]` module inside each of those files is compiled out here
+//! exactly as it is in a normal (non-test) build of the crate, so this build
+//! script needs none of their test-only dependencies (`proptest`).
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -36,7 +40,15 @@ use std::path::{Path, PathBuf};
 use clap::{CommandFactory, ValueEnum};
 use clap_complete::aot::{Shell, generate_to};
 
-#[path = "src/cli.rs"]
+#[path = "src/cli/mod.rs"]
+// `src/cli/mod.rs` re-exports every argument struct and value parser its
+// submodules define, so the library keeps one `crate::cli::<Item>` path per
+// item. This generator only ever names `Cli`, and `mod cli;` is private here, so
+// those re-exports lead nowhere in *this* compilation — which is precisely what
+// `unused_imports` reports. Allowed for the same reason the two sibling modules
+// below allow `dead_code`: the unused part belongs to the library, not to a
+// mistake in this script.
+#[allow(unused_imports)]
 mod cli;
 #[path = "src/labels.rs"]
 #[allow(dead_code)]
@@ -48,7 +60,9 @@ mod text;
 fn main() {
     // Re-run only when the CLI surface (or this script) actually changes —
     // otherwise Cargo would already skip re-running an unchanged build script.
-    println!("cargo:rerun-if-changed=src/cli.rs");
+    // A directory, watched recursively: every file under `src/cli/` is part of
+    // the parser this script reads, including any submodule added later.
+    println!("cargo:rerun-if-changed=src/cli");
     println!("cargo:rerun-if-changed=src/labels.rs");
     println!("cargo:rerun-if-changed=src/text.rs");
     println!("cargo:rerun-if-changed=build.rs");

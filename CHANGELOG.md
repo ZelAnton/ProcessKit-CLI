@@ -70,6 +70,21 @@ to a dated version section.
 
 ### Changed
 
+- `inspect` and `inspect --all` now check the `snapshot_version` a runner declares
+  instead of rendering whatever arrives. A runner answering with a version **newer**
+  than the invoked binary implements is refused with `CONTROL` (103) — for `--all`,
+  as a per-target `failed` entry — with a message naming the version that arrived and
+  the range this build reads; previously such a reply was printed under this build's
+  semantics, silently dropping whatever the newer runner added. Older runners are
+  unaffected: a `snapshot_version` 1 snapshot (every release up to 0.3.1 writes one)
+  is still read and rendered, with `jsonl`/`capture_dir` as `null`, so upgrading the
+  CLI does not cut you off from the runs your previous binary started. The
+  `snapshot_version` printed in `inspect --json` is the runner's number, so
+  `fixtures/schema/cli/inspect.schema.json` now admits the range this build renders
+  (`1` or `2`) instead of pinning `2`. Adapters that classify a `103` as "runner
+  unreachable" should note this one means the opposite — the runner is healthy and
+  its answer was rejected — and is not fixed by retrying; see `docs/control-plane.md`,
+  "Snapshot version: a newer runner's reply is refused, an older one is read".
 - Extended the fuzz tier to the raw environment-file and operator-label parsers, including invalid-UTF-8 rejection and secret-safe diagnostic coverage.
 - CI now executes the default and E2E test tiers for the shipped static musl
   target instead of only cross-compiling it.
@@ -77,6 +92,8 @@ to a dated version section.
   existing public CLI, lifecycle schema, and MSRV contracts.
 - Split the registry into a stable facade, platform-specific implementation files,
   and an isolated test module before further record/control-plane growth.
+- Split the command-line surface into one module per subcommand family plus a
+  shared value-parser module before further flag and subcommand growth.
 - Split the live control plane into a stable facade with separate platform,
   rendering, and test modules before adding further fleet operations.
 - Human-readable registry identity and endpoint fields are visibly truncated at a
