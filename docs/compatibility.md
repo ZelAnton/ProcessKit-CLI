@@ -210,6 +210,14 @@ Preserve event files across a downgrade; they are durable observations from the
 binary that produced them and must be decoded according to their own
 `schema_version`, not the currently installed executable.
 
+The rolling-upgrade and downgrade procedures above are not only described here.
+A scheduled, non-gating workflow (`.github/workflows/interop.yml`) downloads the
+latest published release and runs both directions of them against the current
+build every week — new clients over an old runner and the reverse, an abandoned
+record reaped from either side, `probe` pinning both ways, and each binary's
+JSONL stream read under the other's schema. See `CONTRIBUTING.md`,
+"Cross-version interop".
+
 ## Adapter acceptance checklist
 
 - exact supported `schema_version`;

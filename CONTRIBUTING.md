@@ -476,6 +476,61 @@ and uploads each shard's directory as its own `mutants-out-shard-N` artifact.
 
 [`cargo-mutants`]: https://mutants.rs
 
+## Cross-version interop
+
+Every tier above drives one binary against itself. The mixed-version window a
+real user passes through mid-upgrade — an old runner still live in memory while
+a new client talks to it, a leftover record written by the previous version, a
+JSONL file that outlives the binary that wrote it — is covered by a scheduled,
+**non-gating** [`interop.yml`](.github/workflows/interop.yml) workflow instead.
+It downloads the latest published release archive with `gh release download`,
+builds the current checkout, and runs both against one shared scratch registry,
+executing the procedures in [`docs/compatibility.md`](docs/compatibility.md)
+rather than restating them: `list`/`inspect`/`prune`/`cancel`/`wait` in both
+client-to-runner directions, an abandoned record reaped from both sides,
+`probe --require-surface`/`--require-schema-version`/`--require-exit-code-band`
+pinning in both directions, and each binary's JSONL stream read under the
+other's schema.
+
+The driver is [`scripts/cross_version_interop.py`](scripts/cross_version_interop.py)
+and takes two binaries, so it also runs by hand against any release you want to
+compare with:
+
+```sh
+pip install jsonschema
+gh release download v0.3.0 --pattern 'processkit-cli-v0.3.0-<target>.tar.gz'
+tar -xzf processkit-cli-v0.3.0-<target>.tar.gz -C /tmp/released
+cargo build --release --bin processkit-cli
+python scripts/cross_version_interop.py \
+    --old-binary /tmp/released/processkit-cli \
+    --new-binary target/release/processkit-cli \
+    --schema-dir fixtures/schema
+```
+
+Three verdicts, and the distinction is the point:
+
+- **failure** — a compatibility break no version field declares (a withdrawn
+  CLI surface token, a JSONL field that vanished, a record or control-plane
+  reply the other version can no longer read). The workflow turns red.
+- **declared break** — a bump of `schema_version`, `snapshot_version`, or
+  `probe_version`. Bumping is the sanctioned way to break those contracts, so it
+  is reported prominently but is not a failure; it does mean mixed-version
+  operation stops working, so the change has to ship as a breaking release.
+- **skip** — a scenario that cannot run because the released binary predates a
+  flag it drives. Each skip names the missing surface token, so nothing is
+  quietly dropped.
+
+The whole lane skips gracefully, with an explicit reason in the job summary,
+when no release has been published yet or the runner's platform has no archive
+in the latest release. Its verdict logic — which differences are additive and
+which are breaking — is unit-tested offline against this repository's own
+published schema documents by `scripts/tests/test_cross_version_interop.py`,
+which the workflow runs first and unconditionally:
+
+```sh
+python -m unittest scripts/tests/test_cross_version_interop.py
+```
+
 ## Conventions
 
 - **Formatting** is governed by `rustfmt` (run `cargo fmt`); non-Rust files
