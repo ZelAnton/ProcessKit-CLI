@@ -20,6 +20,7 @@ TARGET_ARCHIVES = {
     "windows_x64": ("x86_64-pc-windows-msvc", ".zip"),
     "windows_arm64": ("aarch64-pc-windows-msvc", ".zip"),
     "linux_x64_musl": ("x86_64-unknown-linux-musl", ".tar.gz"),
+    "linux_arm64_musl": ("aarch64-unknown-linux-musl", ".tar.gz"),
     "macos_arm64": ("aarch64-apple-darwin", ".tar.gz"),
 }
 
@@ -175,10 +176,13 @@ def homebrew_formula(data: dict[str, dict[str, str]]) -> str:
   end
 
   on_linux do
-    depends_on arch: :x86_64
     on_intel do
       url "{data['linux_x64_musl']['url']}"
       sha256 "{data['linux_x64_musl']['sha256']}"
+    end
+    on_arm do
+      url "{data['linux_arm64_musl']['url']}"
+      sha256 "{data['linux_arm64_musl']['sha256']}"
     end
   end
 

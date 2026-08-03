@@ -130,7 +130,7 @@ pub struct ProbeReport {
 /// When `args.print_schema` **is** set, this is a different, simpler contract: no
 /// report is built or printed, no `--require-*` expectation is evaluated (clap
 /// already refuses that combination as a `USAGE` (100) parse error before `run` runs
-/// at all — see `ProbeArgs::print_schema` in `src/cli.rs`), and this prints the
+/// at all — see `ProbeArgs::print_schema` in `src/cli/probe.rs`), and this prints the
 /// embedded [`SCHEMA_JSON`] document instead, always returning `Ok(())`.
 pub fn run(args: &ProbeArgs) -> Result<(), RunnerError> {
     // `--print-schema` short-circuits the rest of `probe`: it prints the
@@ -139,7 +139,7 @@ pub fn run(args: &ProbeArgs) -> Result<(), RunnerError> {
     // `ProbeReport` — a deliberately simpler contract than composing with the
     // report (see `docs/schema.md`, "Getting the schema without a git
     // checkout"). This is safe to do unconditionally, with no ceremony about
-    // `--require-*`: `ProbeArgs::print_schema` (`src/cli.rs`) declares
+    // `--require-*`: `ProbeArgs::print_schema` (`src/cli/probe.rs`) declares
     // `conflicts_with_all` every `--require-*` flag, so clap already rejects
     // that combination as a `USAGE` (100) parse error before `run` is ever
     // called — this branch can never silently skip a requested check and
@@ -356,7 +356,7 @@ mod tests {
             // `--no-echo` (T-196) appears in the surface automatically too — same
             // live-derivation as every other `run` flag above.
             "run:--no-echo",
-            // Likewise `--detach` (T-198): declaring the flag in `src/cli.rs` is the
+            // Likewise `--detach` (T-198): declaring the flag in `src/cli/run.rs` is the
             // whole change; this module's derivation picked it up untouched.
             "run:--detach",
             // The resource-limit flags (T-180) appear in the surface automatically —
