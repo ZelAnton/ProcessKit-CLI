@@ -2,10 +2,11 @@
 
 The lane itself only runs on a schedule and needs two real binaries, so the part
 that decides *whether a difference is a defect* — the two directional schema
-relaxations and the event-shape drift classifier — would otherwise never be
-exercised on a pull request. These tests pin that logic against both synthetic
-schemas and this repository's own published fixtures, so a false pass or a false
-failure in the scheduled lane shows up here first.
+relaxations, the event-shape drift classifier, and the version pins the driver
+reads out of the published documents — would otherwise never be exercised on a
+pull request. These tests pin that logic against both synthetic schemas and this
+repository's own published fixtures, so a false pass or a false failure in the
+scheduled lane shows up here first.
 """
 
 import json
@@ -276,6 +277,15 @@ class PointerTests(unittest.TestCase):
         document = {"$defs": {}}
         self.assertEqual(interop.without_pointer(document, "/$defs/a/const"), document)
 
+    def test_without_pointer_reports_nothing_when_the_step_is_absent(self):
+        # The building block is deliberately forgiving, which is why every caller
+        # decides *whether* to strip from a pin it actually resolved first: a
+        # silent no-op here is how a document that moved a node would quietly stop
+        # being excluded from the shape comparison.
+        document = {"$defs": {"a": {"properties": {"v": {"enum": [1, 2]}}}}}
+        self.assertEqual(interop.without_pointer(document, "/$defs/a/properties/v/const"),
+                         document)
+
     def test_rooted_at_keeps_defs_resolvable(self):
         document = {"$schema": "https://json-schema.org/draft/2020-12/schema",
                     "$id": "https://example.invalid/x.json",
@@ -289,6 +299,76 @@ class PointerTests(unittest.TestCase):
             self.skipTest("jsonschema is not installed")
         self.assertEqual(interop.validate(rooted, 1), [])
         self.assertNotEqual(interop.validate(rooted, "1"), [])
+
+
+class VersionPinTests(unittest.TestCase):
+    """Both published pin forms must answer the two questions this lane asks.
+
+    `probe.schema.json` pins `probe_version` with `const`, while
+    `inspect.schema.json` enumerates the *range* of `snapshot_version` values this
+    build renders, because that number is supplied by the runner on the far side of
+    the control-plane wire (`fixtures/schema/cli/README.md`, "The
+    `snapshot_version` range"). The driver has to read either form: hard-coding one
+    keyword makes a documented change of *form* read as the version field having
+    disappeared, which both blinds the version check and downgrades every genuine
+    shape defect in that family to a declared break.
+    """
+
+    def test_a_const_pin_is_read_as_its_single_value(self):
+        pin = interop.version_pin({"const": 2, "description": "x"})
+        self.assertEqual(pin.keyword, "const")
+        self.assertEqual(pin.accepted, (2,))
+        self.assertEqual(pin.render(), "2")
+
+    def test_an_enumerated_range_is_read_as_every_value_it_admits(self):
+        pin = interop.version_pin({"enum": [1, 2], "description": "x"})
+        self.assertEqual(pin.keyword, "enum")
+        self.assertEqual(pin.accepted, (1, 2))
+        self.assertEqual(pin.render(), "one of 1, 2")
+
+    def test_a_const_pin_admits_only_its_own_value(self):
+        pin = interop.version_pin({"const": 1})
+        self.assertTrue(pin.admits(1))
+        self.assertFalse(pin.admits(2), "a bump away from a const pin is a real break")
+
+    def test_a_range_admits_an_older_runners_version_but_not_an_unpublished_one(self):
+        # The `bumped` verdict is `not admits(observed)`. Plain inequality against
+        # one value would call a released runner's snapshot_version 1 a bump here,
+        # even though this build renders it — the false negative that silently turns
+        # every shape failure in the family into a tolerated declared break.
+        pin = interop.version_pin({"enum": [1, 2]})
+        self.assertTrue(pin.admits(1), "an older runner's snapshot is still rendered")
+        self.assertTrue(pin.admits(2))
+        self.assertFalse(pin.admits(3), "a version above the range is refused, not rendered")
+        self.assertFalse(pin.admits(0), "a version below the floor is refused too")
+
+    def test_a_boolean_is_not_a_version_though_python_equates_it_with_one(self):
+        self.assertFalse(interop.version_pin({"const": 1}).admits(True))
+        self.assertFalse(interop.version_pin({"enum": [1, 2]}).admits(True))
+
+    def test_a_field_that_pins_nothing_is_reported_as_unpinned(self):
+        # The one case that really does mean the two-of-six scope changed: the node
+        # is gone, or it no longer constrains the field to a set of versions.
+        self.assertIsNone(interop.version_pin(None))
+        self.assertIsNone(interop.version_pin({"type": "integer"}))
+        self.assertIsNone(interop.version_pin({"enum": []}))
+        self.assertIsNone(interop.version_pin({"enum": ["1", "2"]}))
+
+    def test_without_version_pin_lifts_whichever_keyword_the_document_uses(self):
+        for node in ({"const": 2, "description": "x"}, {"enum": [1, 2], "description": "x"}):
+            with self.subTest(pin=node):
+                document = {"$defs": {"a": {"properties": {"v": dict(node)}}}}
+                stripped = interop.without_version_pin(document, "/$defs/a/properties/v")
+                remaining = stripped["$defs"]["a"]["properties"]["v"]
+                self.assertEqual(
+                    remaining, {"description": "x"},
+                    "only the pin is lifted — the property itself must survive, or"
+                    " `additionalProperties: false` would reject the very field being"
+                    " excluded and manufacture a defect",
+                )
+                self.assertIsNone(interop.version_pin(remaining))
+                self.assertEqual(document["$defs"]["a"]["properties"]["v"], node,
+                                 "the input document must not be mutated")
 
 
 class PublishedFixtureTests(unittest.TestCase):
@@ -328,18 +408,102 @@ class PublishedFixtureTests(unittest.TestCase):
         self.assertEqual(drift.added_events, [])
         self.assertEqual(drift.added_fields, [])
 
-    def test_the_versioned_output_pointers_still_resolve(self):
+    def _pin(self, family, pointer):
+        document = json.loads(
+            (SCHEMA_DIR / "cli" / f"{family}.schema.json").read_text(encoding="utf-8")
+        )
+        return document, interop.version_pin(interop.resolve_pointer(document, pointer))
+
+    def _first_fixture_line(self, family):
+        lines = (SCHEMA_DIR / "cli" / f"{family}.jsonl").read_text(
+            encoding="utf-8").splitlines()
+        return json.loads(next(line for line in lines if line.strip()))
+
+    def test_the_versioned_output_pins_still_resolve_in_whichever_form(self):
         # docs/compatibility.md pins exactly two of the six published CLI-output
         # families on a version field of their own. If a document moves that field,
-        # the scheduled lane must not quietly stop checking it.
+        # the scheduled lane must not quietly stop checking it. The *form* of the
+        # pin deliberately differs between the two documents (`const` for probe, an
+        # enumerated range for inspect), so what has to resolve is a usable pin, not
+        # one particular keyword: reading only `const` here is how the lane would go
+        # red — and then blind — on a documented change to the other document.
         for family, field_name, pointer in interop.VERSIONED_CLI_OUTPUTS:
-            document = json.loads(
-                (SCHEMA_DIR / "cli" / f"{family}.schema.json").read_text(encoding="utf-8")
-            )
-            self.assertIsInstance(
-                interop.resolve_pointer(document, pointer), int,
-                f"{family}.schema.json no longer pins {field_name} at {pointer}",
-            )
+            with self.subTest(family=family):
+                _, pin = self._pin(family, pointer)
+                self.assertIsNotNone(
+                    pin, f"{family}.schema.json no longer pins {field_name} at {pointer}"
+                )
+                self.assertIn(pin.keyword, interop.VERSION_PIN_KEYWORDS)
+                self.assertTrue(pin.accepted, f"{family}.schema.json admits no version")
+                for value in pin.accepted:
+                    self.assertIsInstance(
+                        value, int,
+                        f"{family}.schema.json pins {field_name} at a non-version"
+                        f" {value!r}",
+                    )
+
+    def test_a_published_pin_admits_exactly_the_versions_it_publishes(self):
+        # Written against the pin itself rather than against today's numbers, so
+        # moving either end of a range (which docs/compatibility.md licenses) does
+        # not need this test edited, while the verdict semantics stay pinned.
+        for family, _, pointer in interop.VERSIONED_CLI_OUTPUTS:
+            with self.subTest(family=family):
+                _, pin = self._pin(family, pointer)
+                for value in pin.accepted:
+                    self.assertTrue(pin.admits(value))
+                self.assertFalse(pin.admits(max(pin.accepted) + 1))
+                self.assertFalse(pin.admits(min(pin.accepted) - 1))
+
+    def test_this_builds_own_output_is_never_read_as_a_version_bump(self):
+        # The golden fixtures are the real binary's output. If a document stopped
+        # admitting the value this build actually prints, the scheduled lane would
+        # call it a declared break and tolerate every shape defect in that family.
+        for family, field_name, pointer in interop.VERSIONED_CLI_OUTPUTS:
+            with self.subTest(family=family):
+                _, pin = self._pin(family, pointer)
+                payload = self._first_fixture_line(family)
+                self.assertIn(field_name, payload, f"{family}.jsonl carries no {field_name}")
+                self.assertTrue(
+                    pin.admits(payload[field_name]),
+                    f"{family}.schema.json does not admit the {field_name}"
+                    f" {payload[field_name]!r} that {family}.jsonl carries",
+                )
+
+    def test_the_version_pin_is_genuinely_lifted_out_of_the_shape_check(self):
+        # The exclusion step must not degrade into a no-op when a document changes
+        # the form of its pin: the version difference is reported once, by the
+        # dedicated check, and the *rest* of the shape must still be compared. Both
+        # halves are asserted against the real documents — the pin bites before it
+        # is lifted, and only the pin is lifted.
+        for family, field_name, pointer in interop.VERSIONED_CLI_OUTPUTS:
+            with self.subTest(family=family):
+                branch, separator, _ = pointer.rpartition("/properties/")
+                self.assertTrue(separator, f"{pointer} does not name a property")
+                document, pin = self._pin(family, pointer)
+                unpublished = dict(self._first_fixture_line(family),
+                                   **{field_name: max(pin.accepted) + 1})
+                self.assertNotEqual(
+                    interop.validate(
+                        interop.relax_for_upgrade_read(interop.rooted_at(document, branch)),
+                        unpublished),
+                    [], f"{family}.schema.json does not constrain {field_name} at all",
+                )
+                stripped = interop.without_version_pin(document, pointer)
+                self.assertIsNone(
+                    interop.version_pin(interop.resolve_pointer(stripped, pointer)),
+                    f"the {family} pin survived the exclusion step",
+                )
+                relaxed = interop.relax_for_upgrade_read(interop.rooted_at(stripped, branch))
+                self.assertEqual(interop.validate(relaxed, unpublished), [],
+                                 f"lifting the {family} pin left the version field checked")
+                self.assertNotEqual(
+                    interop.validate(relaxed, dict(unpublished, unexpected_field=1)), [],
+                    f"lifting the {family} pin stopped the rest of the shape being checked",
+                )
+                self.assertIsNotNone(
+                    interop.version_pin(interop.resolve_pointer(document, pointer)),
+                    "the input document must not be mutated",
+                )
 
     def test_the_golden_cli_outputs_validate_under_the_upgrade_relaxation(self):
         for document_path in sorted((SCHEMA_DIR / "cli").glob("*.schema.json")):

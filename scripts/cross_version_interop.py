@@ -40,9 +40,11 @@ Two rules shape the assertions, both taken from `docs/compatibility.md`:
   binary no longer emits *is* a defect.
 
 Both relaxations are pure functions over the schema documents
-(`relax_for_upgrade_read` / `relax_for_downgrade_read`) and are unit-tested
-offline by `scripts/tests/test_cross_version_interop.py`, so this lane's own
-verdict logic cannot rot unnoticed between scheduled runs.
+(`relax_for_upgrade_read` / `relax_for_downgrade_read`), as is the reading of a
+published version pin (`version_pin`), and all of them are unit-tested offline by
+`scripts/tests/test_cross_version_interop.py` against this repository's own
+documents, so this lane's own verdict logic cannot rot unnoticed between
+scheduled runs.
 """
 
 from __future__ import annotations
@@ -96,9 +98,22 @@ SCHEMA_MAP_VALUED = ("properties", "patternProperties", "$defs", "definitions",
 # The other four (`list`, `control-ack`, `prune`, `wait`) deliberately do not and
 # ride on the CLI surface instead. Keep that 2-of-6 scope explicit here: it must
 # not be generalised in either direction.
+#
+# Each entry addresses the version field's own schema NODE, not one pinning
+# keyword inside it, because the two documents pin in two deliberately different
+# forms: `probe.schema.json` pins `probe_version` with `const` (the invoked binary
+# writes that value itself), while `inspect.schema.json` enumerates the *range* of
+# `snapshot_version` values this build renders, because that number is supplied by
+# the *runner* on the far side of the control-plane wire and a run started by an
+# older build reports that build's number (`fixtures/schema/cli/README.md`, "The
+# `snapshot_version` range"; `docs/compatibility.md`, "Machine-output schemas").
+# `version_pin()` below reads whichever form a document publishes, so a pin that
+# changes *shape* is followed rather than misread as the field having disappeared
+# — the pointer must keep naming the field, and the driver must keep following the
+# document, not the other way round.
 VERSIONED_CLI_OUTPUTS = (
-    ("probe", "probe_version", "/$defs/probeReport/properties/probe_version/const"),
-    ("inspect", "snapshot_version", "/$defs/snapshot/properties/snapshot_version/const"),
+    ("probe", "probe_version", "/$defs/probeReport/properties/probe_version"),
+    ("inspect", "snapshot_version", "/$defs/snapshot/properties/snapshot_version"),
 )
 
 
@@ -251,11 +266,8 @@ def resolve_pointer(document: Any, pointer: str) -> Any:
 def without_pointer(document: Any, pointer: str) -> Any:
     """`document` with the value at `pointer` removed, copying only along the path.
 
-    Used to lift a versioned family's `const` pin out of the *shape* check: a
-    `probe_version`/`snapshot_version` bump is one fact, and the dedicated check
-    over `VERSIONED_CLI_OUTPUTS` owns reporting it. Leaving the `const` in place
-    would also fail the payload's shape validation, reporting the same bump a
-    second time and burying any genuine field-level defect underneath it.
+    The building block of `without_version_pin` below, which is what lifts a
+    versioned family's pin out of the *shape* check.
     """
     steps = [raw.replace("~1", "/").replace("~0", "~")
              for raw in pointer.split("/") if raw != ""]
@@ -272,6 +284,89 @@ def without_pointer(document: Any, pointer: str) -> Any:
     if isinstance(node, dict):
         node.pop(steps[-1], None)
     return root
+
+
+# The keywords a published document may pin a version field's value with, most
+# specific first. `without_version_pin` strips every one of them, so a document
+# that ever carried both would still be lifted cleanly out of the shape check.
+VERSION_PIN_KEYWORDS = ("const", "enum")
+
+
+@dataclass(frozen=True)
+class VersionPin:
+    """The set of values a published document admits for one version field.
+
+    Both pin forms this repository uses collapse to the same two questions, which
+    is why the driver reads a `VersionPin` rather than one keyword's raw value:
+
+    * `admits(value)` — is a version a *reader* can be handed still published
+      here? For `probe.schema.json`'s `const` there is exactly one such value; for
+      `inspect.schema.json`'s enumerated range there are as many as this build
+      renders (`MIN_READABLE_SNAPSHOT_VERSION..=SNAPSHOT_VERSION`).
+    * "has this been bumped since the release" — which is `not admits(observed)`,
+      *not* inequality: a released runner's `snapshot_version` 1 read by a build
+      that writes 2 is inside the published range and is not a break, whereas
+      inequality against a single resolved value would report one and so downgrade
+      every genuine shape defect in that family to a declared break.
+    """
+
+    keyword: str
+    accepted: tuple[Any, ...]
+
+    def admits(self, value: Any) -> bool:
+        """Whether the document still publishes `value` for this field.
+
+        `bool` is rejected outright: Python makes `True == 1`, and a payload whose
+        version field is a boolean is not a version any of these documents admit.
+        """
+        if not isinstance(value, int) or isinstance(value, bool):
+            return False
+        return value in self.accepted
+
+    def render(self) -> str:
+        """The pin as a failure message should name it."""
+        if len(self.accepted) == 1:
+            return str(self.accepted[0])
+        return "one of " + ", ".join(str(value) for value in self.accepted)
+
+
+def version_pin(node: Any) -> VersionPin | None:
+    """Read a version field's pin from its schema `node`, in whichever form it uses.
+
+    `None` means the family genuinely stopped pinning its own version — the node
+    is absent, or it constrains the field to something that is not a set of
+    version integers — as opposed to the pin merely having changed shape, which is
+    a documented decision this driver follows (see `VERSIONED_CLI_OUTPUTS`).
+    """
+    if not isinstance(node, dict):
+        return None
+    if "const" in node:
+        keyword, values = "const", (node["const"],)
+    elif isinstance(node.get("enum"), list):
+        keyword, values = "enum", tuple(node["enum"])
+    else:
+        return None
+    if not values or not all(
+        isinstance(value, int) and not isinstance(value, bool) for value in values
+    ):
+        return None
+    return VersionPin(keyword=keyword, accepted=values)
+
+
+def without_version_pin(document: Any, pointer: str) -> Any:
+    """`document` with the version pin at `pointer` lifted out of the shape check.
+
+    A `probe_version`/`snapshot_version` difference is one fact, and the dedicated
+    check over `VERSIONED_CLI_OUTPUTS` owns reporting it. Leaving the pin in place
+    would also fail the payload's shape validation, reporting the same difference a
+    second time and burying any genuine field-level defect underneath it. Only the
+    pinning keywords are removed, never the property itself: these documents set
+    `additionalProperties: false`, so dropping the property would turn the version
+    field into an unexpected one and manufacture the very defect being excluded.
+    """
+    for keyword in VERSION_PIN_KEYWORDS:
+        document = without_pointer(document, f"{pointer}/{keyword}")
+    return document
 
 
 def rooted_at(document: dict, pointer: str) -> dict:
@@ -1245,16 +1340,33 @@ def scenario_machine_output_schemas(ctx: Context, scenario: Scenario) -> None:
         ctx.new.invoke("prune", "--json")
 
     version_pins = {family: pointer for family, _, pointer in VERSIONED_CLI_OUTPUTS}
-    # A family whose own version field was bumped has declared its break, so a
-    # shape difference in it is licensed rather than a defect (see Scenario.warn).
-    bumped = {
-        family
-        for family, field_name, pointer in VERSIONED_CLI_OUTPUTS
-        if observed.get(field_name) is not None
-        and observed[field_name] != resolve_pointer(
+    # Each versioned family's pin, read once in whichever form its document
+    # publishes (`const` or an enumerated range — see VERSIONED_CLI_OUTPUTS). A
+    # family absent from this map publishes no pin at all any more; the loop at the
+    # end of this scenario reports that, and until then nothing about the family is
+    # treated as declared, so its shape differences stay failures.
+    pins: dict[str, VersionPin] = {}
+    for family, _, pointer in VERSIONED_CLI_OUTPUTS:
+        pin = version_pin(resolve_pointer(
             json.loads((cli_dir / f"{family}.schema.json").read_text(encoding="utf-8")),
             pointer,
-        )
+        ))
+        if pin is not None:
+            pins[family] = pin
+    # A family whose own version field was bumped has declared its break, so a
+    # shape difference in it is licensed rather than a defect (see Scenario.warn).
+    # "Bumped" is "the current document no longer admits what the release
+    # publishes", not inequality against a single value: the inspect family's pin
+    # is a *range*, and a released runner's snapshot_version 1 rendered by a build
+    # that writes 2 is inside it and is no break at all. Reading that as a bump
+    # would silently downgrade every genuine defect in the family's shape to a
+    # declared break — the false negative this lane exists to catch.
+    bumped = {
+        family
+        for family, field_name, _ in VERSIONED_CLI_OUTPUTS
+        if observed.get(field_name) is not None
+        and family in pins
+        and not pins[family].admits(observed[field_name])
     }
     families: set[str] = set()
     for family, pointer, payload in payloads:
@@ -1267,8 +1379,8 @@ def scenario_machine_output_schemas(ctx: Context, scenario: Scenario) -> None:
             f"fixtures/schema/cli/{family}.schema.json has no `{pointer}` branch;"
             " this driver's pointer must be updated alongside the document",
         )
-        if family in version_pins:
-            document = without_pointer(document, version_pins[family])
+        if family in pins:
+            document = without_version_pin(document, version_pins[family])
         errors = validate(relax_for_upgrade_read(rooted_at(document, pointer)), payload)
         if errors:
             (scenario.warn if family in bumped else scenario.fail)(
@@ -1287,27 +1399,39 @@ def scenario_machine_output_schemas(ctx: Context, scenario: Scenario) -> None:
     # a deliberate breaking bump, and mixed-version operation stops working the
     # moment it lands, so it is reported loudly rather than absorbed.
     for family, field_name, pointer in VERSIONED_CLI_OUTPUTS:
-        document = json.loads((cli_dir / f"{family}.schema.json").read_text(encoding="utf-8"))
-        pinned = resolve_pointer(document, pointer)
-        if pinned is None:
+        pin = pins.get(family)
+        value = observed.get(field_name)
+        if pin is None:
+            # Reserved for the field genuinely going away: the node is absent, or
+            # it constrains `field_name` to something that is not a version at all.
+            # A pin that merely changed *form* is followed by `version_pin`, not
+            # reported here — the 2-of-6 scope is unchanged when that happens.
             scenario.fail(
                 f"fixtures/schema/cli/{family}.schema.json no longer pins"
-                f" `{field_name}` at `{pointer}`; the two-of-six versioned-output"
-                " scope in docs/compatibility.md changed and this driver must follow"
+                f" `{field_name}` at `{pointer}` — that node is absent or carries"
+                " neither a `const` nor an `enum` of versions; the two-of-six"
+                " versioned-output scope in docs/compatibility.md changed and this"
+                " driver must follow"
             )
-        elif observed.get(field_name) is None:
+        elif value is None:
             scenario.note(f"{field_name}: not observable from the released binary")
-        elif observed[field_name] != pinned:
+        elif not pin.admits(value):
             scenario.warn(
-                f"`{field_name}` was bumped from {observed[field_name]} (released) to"
-                f" {pinned} (current). That field is versioned precisely because it is"
-                " read by a party that did not invoke the binary, so the bump is the"
-                " correct way to break it — but the break is real: this must ship as a"
-                " breaking release, and a consumer pinning the old value stops working"
-                " the moment it does"
+                f"`{field_name}` was bumped: the released binary reports {value},"
+                f" which the current fixtures/schema/cli/{family}.schema.json no"
+                f" longer publishes ({pin.render()}). That field is versioned"
+                " precisely because it is read by a party that did not invoke the"
+                " binary, so the bump is the correct way to break it — but the break"
+                " is real: this must ship as a breaking release, and a consumer"
+                " pinning the old value stops working the moment it does"
             )
+        elif len(pin.accepted) == 1:
+            scenario.note(f"{field_name} is unchanged at {pin.render()}")
         else:
-            scenario.note(f"{field_name} is unchanged at {pinned}")
+            scenario.note(
+                f"{field_name} {value} (released) is still inside the range the"
+                f" current build publishes ({pin.render()})"
+            )
 
 
 # --------------------------------------------------------------------------- #
