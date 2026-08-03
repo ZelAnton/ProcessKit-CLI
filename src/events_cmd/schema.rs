@@ -42,8 +42,8 @@
 //!
 //! # Reporting: naming the branch, not just "no match"
 //!
-//! The document is a 14-way `oneOf` over the event types, so a bad line's honest
-//! root-level verdict — *"matches none of the 14 shapes"* — says nothing useful
+//! The document is a 15-way `oneOf` over the event types, so a bad line's honest
+//! root-level verdict — *"matches none of the 15 shapes"* — says nothing useful
 //! about *what* is wrong. When a failing line's own `event` tag names a branch, the
 //! report is that branch's errors instead (`/code: expected type "integer", found
 //! string`). The tag-to-branch map is derived from the document itself — every

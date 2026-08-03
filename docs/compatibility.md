@@ -88,6 +88,9 @@ is what requires a new schema version — nothing below does.
    fields it uses rather than pin an event's exact field set — validating with
    `additionalProperties: false` against a copy of a published document will fail
    on the next additive release (see "Machine-output schemas" below).
+   The new `limit_evidence` event is likewise additive: readers should route by
+   `event`, ignore the new type when they do not use resource-limit attribution,
+   and keep `schema_version` pinned at `1`.
 4. **New values in an open-ended descriptive string field** — a new `cancelled`
    `source`, a new `runner_exit` `source`, a new `hint` label. Treat an unrecognized
    value as "some other trigger" and keep routing by event type.

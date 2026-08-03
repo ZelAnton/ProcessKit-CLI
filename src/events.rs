@@ -192,6 +192,21 @@ pub enum Event {
         limit: String,
         detail: Option<String>,
     },
+    /// Post-run evidence for a run that requested at least one resource cap.
+    /// Each axis keeps ProcessKit's three-valued verdict: `tripped` means the
+    /// kernel recorded the cap engaging, `not_tripped` means authoritative
+    /// evidence recorded no engagement (or no cap was requested on that axis),
+    /// and `unknown` means the active mechanism cannot provide evidence. This
+    /// is deliberately a separate event so the pre-spawn `limit_hit` payload
+    /// and meaning remain unchanged.
+    LimitEvidence {
+        /// Memory-cap verdict: `tripped`, `not_tripped`, or `unknown`.
+        memory: &'static str,
+        /// Process-count-cap verdict: `tripped`, `not_tripped`, or `unknown`.
+        processes: &'static str,
+        /// CPU-quota verdict: `tripped`, `not_tripped`, or `unknown`.
+        cpu: &'static str,
+    },
     /// A runner deadline elapsed while the child was still running: either the
     /// whole-run `--timeout`, or the `--idle-timeout` (the child produced no output
     /// for the idle window). Both share this event, the reserved `TIMEOUT` (106)
@@ -871,6 +886,11 @@ mod tests {
             Event::LimitHit {
                 limit: "processes".to_string(),
                 detail: Some("exceeded the 64-process cap".to_string()),
+            },
+            Event::LimitEvidence {
+                memory: "tripped",
+                processes: "not_tripped",
+                cpu: "unknown",
             },
             Event::Timeout {
                 timeout_ms: 5_000,

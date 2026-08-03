@@ -10,6 +10,7 @@
     { "$ref": "#/$defs/cleanupStarted" },
     { "$ref": "#/$defs/cleanupFinished" },
     { "$ref": "#/$defs/limitHit" },
+    { "$ref": "#/$defs/limitEvidence" },
     { "$ref": "#/$defs/timeout" },
     { "$ref": "#/$defs/outputOverflow" },
     { "$ref": "#/$defs/cancelled" },
@@ -252,6 +253,20 @@
         "detail": { "type": ["string", "null"], "description": "Human-readable detail; null if none." }
       },
       "required": ["schema_version", "time", "event", "limit", "detail"],
+      "additionalProperties": false
+    },
+    "limitEvidence": {
+      "type": "object",
+      "description": "Post-run per-axis evidence for a run that requested at least one resource cap. Each value is tripped, not_tripped, or unknown; the event is absent when no cap was requested.",
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "time": { "$ref": "#/$defs/time" },
+        "event": { "const": "limit_evidence" },
+        "memory": { "type": "string", "enum": ["tripped", "not_tripped", "unknown"], "description": "Memory-cap verdict." },
+        "processes": { "type": "string", "enum": ["tripped", "not_tripped", "unknown"], "description": "Process-count-cap verdict." },
+        "cpu": { "type": "string", "enum": ["tripped", "not_tripped", "unknown"], "description": "CPU-quota verdict." }
+      },
+      "required": ["schema_version", "time", "event", "memory", "processes", "cpu"],
       "additionalProperties": false
     },
     "timeout": {

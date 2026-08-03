@@ -25,6 +25,13 @@ fn forwards_a_zero_exit_code() {
     let dir = scratch("exit0");
     let out = run(&dir, &[], shell_inline("exit 0"));
     assert_eq!(out.status.code(), Some(0), "a clean child must exit 0");
+    let events = read_run_events(&dir);
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["event"] == "limit_evidence"),
+        "a run without a requested cap emits no limit_evidence: {events:?}"
+    );
 }
 
 /// A non-zero child code is forwarded verbatim — not clamped, not aliased onto a
@@ -385,9 +392,60 @@ fn resource_limit_that_cannot_be_applied_emits_limit_hit_and_the_backend_code() 
                 "an applied cap leaves a normal child exit: {events:?}"
             );
             assert_eq!(out.status.code(), Some(0), "the trivial child exits 0");
+            let evidence = events
+                .iter()
+                .find(|event| event["event"] == "limit_evidence")
+                .expect("an applied cap emits post-run evidence");
+            assert_eq!(evidence["event"], "limit_evidence");
+            assert!(
+                position("root_exited") < position("limit_evidence"),
+                "evidence follows the child outcome: {events:?}"
+            );
+            assert!(
+                position("limit_evidence") < position("cleanup_started"),
+                "evidence is read before teardown starts: {events:?}"
+            );
+            if cfg!(windows) {
+                assert_eq!(
+                    evidence["memory"], "unknown",
+                    "Windows Job Objects cannot provide post-run cap evidence"
+                );
+            } else {
+                assert_eq!(
+                    evidence["memory"], "not_tripped",
+                    "a clean Linux cgroup-v2 cap reports authoritative no-hit evidence"
+                );
+            }
         }
     }
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A Linux cgroup-v2 process cap records a real fork refusal as `tripped`.
+/// Hosts that cannot create a delegated cgroup take the documented pre-spawn
+/// `limit_hit` path and are skipped rather than treating fallback as enforcement.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_cgroup_process_limit_evidence_distinguishes_a_tripped_cap() {
+    let dir = scratch("limit-tripped");
+    let out = run_with_flags(
+        &dir,
+        &[],
+        &["--max-processes", "1"],
+        shell_inline("true & wait"),
+    );
+    let events = read_run_events(&dir);
+    if events.iter().any(|event| event["event"] == "limit_hit") {
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    let evidence = events
+        .iter()
+        .find(|event| event["event"] == "limit_evidence")
+        .expect("an applied Linux cap emits evidence");
+    assert_eq!(evidence["processes"], "tripped");
+    assert!(out.status.code().is_some(), "the runner returned a status");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

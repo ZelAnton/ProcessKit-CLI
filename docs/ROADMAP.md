@@ -61,35 +61,12 @@ does not claim the Windows guarantee on those platforms. Any stronger contract
 requires additive, identity-safe ProcessKit-rs support and cross-platform
 abrupt-death proof.
 
-Runtime resource-limit attribution is also a core dependency. `limit_hit`
-(see [`docs/schema.md`](schema.md#limit_hit)) today covers only the pre-spawn
-"could not be applied" branch — a requested cap the platform has no container
-for, or a Linux cgroup v2 whose controllers can't be enabled. It does not, and
-currently cannot, cover a cap that *was* applied and then actually fired during
-the run (a Linux cgroup OOM-kill or `pids` fork refusal, a Windows Job Object
-memory/active-process limit): today's `processkit` 3.1.0, the version this
-repository resolves from crates.io (`Cargo.lock`), exposes no portable
-post-spawn evidence primitive for that case, so a live limit kill remains
-indistinguishable from the child failing on its own.
-
-The cross-repo request for that primitive
-(`msg-send-401e87d4625e22218e50a11de4a7f122`) has since been answered and
-implemented upstream: `ProcessGroup::limit_evidence()` landed on ProcessKit-rs
-`main` (ProcessKit-rs task T-243) with a three-valued
-`LimitVerdict::{Tripped, NotTripped, Unknown}` per axis — never a boolean —
-so a future JSONL surface for this must represent "no authoritative evidence"
-as its own state and must never collapse it into "did not fire" (see
-[`docs/resource-limits.md`](resource-limits.md#applied-limit-versus-observed-limit-hit)
-for the platform-by-platform breakdown and the read-before-drop constraint on
-where a future reader could sit). It is **not yet in a published release** —
-the latest tag remains v3.1.0 — so nothing is consumable today and this
-dependency stays open in practice. This roadmap does not bump or repoint the
-dependency; the scheduling trigger is the upstream release notification
-arriving in this project's inbox, at which point wiring `limit_evidence()`
-into the JSONL stream — an additive schema change, exact shape (a `limit_hit`
-discriminator field vs. a separate event) to be decided when it is planned —
-gets scheduled. Note that even once wired, this closes the gap on Linux
-cgroup v2 only: Windows Job Object and POSIX process groups (macOS, the BSDs,
-the Linux process-group fallback) report `Unknown` as a measured result, not
-an unfinished one, so runtime limit attribution will not become available on
-Windows despite it being a first-class platform for this CLI.
+Runtime resource-limit attribution is now consumed through `processkit` 3.2.0.
+The existing `limit_hit` event still covers only the pre-spawn "could not be
+applied" branch. Runs with a requested cap additionally emit the additive
+`limit_evidence` event with `tripped`, `not_tripped`, or `unknown` per axis,
+read before teardown consumes the group. The evidence is authoritative on
+Linux cgroup v2 only: Windows Job Objects and POSIX process groups (macOS, the
+BSDs, and the Linux process-group fallback) report `unknown` for capped axes.
+This closes the runtime-attribution gap on Linux cgroup v2 only; it does not
+claim post-run limit attribution on Windows.

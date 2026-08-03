@@ -19,7 +19,8 @@
 use std::time::Duration;
 
 use processkit::{
-    Error as PkError, ErrorReason as PkErrorReason, MemberInfo, Outcome, ProcessGroup, SoftSignal,
+    Error as PkError, ErrorReason as PkErrorReason, LimitVerdict, MemberInfo, Outcome,
+    ProcessGroup, SoftSignal,
 };
 
 use crate::capture::Capture;
@@ -58,6 +59,33 @@ pub(super) fn emit_output_captured(emitter: &mut Emitter, capture: &Option<Captu
     }
 }
 
+/// Emit the post-run resource-limit evidence while the owning group still exists.
+/// ProcessKit performs the platform-specific read; this layer only projects its
+/// stable three-valued identifiers into the CLI's v1 event shape. A run without a
+/// requested cap takes the cheap no-op path and emits no event.
+pub(super) fn emit_limit_evidence(
+    emitter: &mut Emitter,
+    group: &ProcessGroup,
+    limits_requested: bool,
+) {
+    if !limits_requested {
+        return;
+    }
+    let evidence = group.limit_evidence();
+    emitter.emit(&Event::LimitEvidence {
+        memory: limit_verdict_str(evidence.memory()),
+        processes: limit_verdict_str(evidence.processes()),
+        cpu: limit_verdict_str(evidence.cpu()),
+    });
+}
+
+/// The stable lowercase identifiers ProcessKit uses for its tri-state verdicts.
+/// Keeping this mapping at the serialization boundary prevents the upstream
+/// report type from becoming the CLI's public schema.
+fn limit_verdict_str(verdict: LimitVerdict) -> &'static str {
+    verdict.name()
+}
+
 /// The shared **hard** teardown tail — mark cleanup started, hard-kill the
 /// container immediately (no soft stop), report the capture, and drop the
 /// registry entry, in that order — for every decided ending that has no
@@ -79,7 +107,9 @@ pub(super) fn emit_hard_teardown(
     group: &ProcessGroup,
     capture: &Option<Capture>,
     registration: &Option<registry::Registration>,
+    limits_requested: bool,
 ) {
+    emit_limit_evidence(emitter, group, limits_requested);
     emit_cleanup_started(emitter, group);
     emit_cleanup_finished(emitter, group, None);
     emit_output_captured(emitter, capture);
@@ -118,6 +148,7 @@ pub(super) fn finish_foreground_failure(
     group: &ProcessGroup,
     capture: &Option<Capture>,
     registration: &Option<registry::Registration>,
+    limits_requested: bool,
     error: RunnerError,
     message: String,
 ) -> RunnerError {
@@ -126,7 +157,7 @@ pub(super) fn finish_foreground_failure(
         code: error.code(),
         message,
     });
-    emit_hard_teardown(emitter, group, capture, registration);
+    emit_hard_teardown(emitter, group, capture, registration, limits_requested);
     finish(emitter, "container_error", None, error)
 }
 
@@ -1097,7 +1128,7 @@ mod tests {
                 .expect("create the capture dir"),
         );
 
-        emit_hard_teardown(&mut emitter, &group, &capture, &None);
+        emit_hard_teardown(&mut emitter, &group, &capture, &None, false);
 
         let lines: Vec<serde_json::Value> = std::fs::read_to_string(&jsonl)
             .expect("read the events file back")
@@ -1175,6 +1206,7 @@ mod tests {
             &group,
             &None,
             &None,
+            false,
             error,
             "simulated terminal-handoff failure".to_string(),
         );
@@ -1319,5 +1351,12 @@ mod tests {
             (Vec::new(), true),
             "a read failure must not be indistinguishable from a confirmed-clean teardown"
         );
+    }
+
+    #[test]
+    fn limit_verdict_identifiers_preserve_all_three_states() {
+        assert_eq!(limit_verdict_str(LimitVerdict::Tripped), "tripped");
+        assert_eq!(limit_verdict_str(LimitVerdict::NotTripped), "not_tripped");
+        assert_eq!(limit_verdict_str(LimitVerdict::Unknown), "unknown");
     }
 }

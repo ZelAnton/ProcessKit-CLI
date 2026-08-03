@@ -30,9 +30,9 @@ use crate::registry;
 use super::signals::{deadline, effective_grace_for, idle_deadline, wait_for_cancel_signal};
 use super::teardown::{
     clear_registration, control_kill_error, duration_ms, emit_cleanup_finished,
-    emit_cleanup_started, emit_hard_teardown, emit_members_snapshot, emit_output_captured,
-    exit_code_for, finish, finish_foreground_failure, graceful_teardown, launch_failure_event,
-    launch_failure_source, map_launch_error, termination_error,
+    emit_cleanup_started, emit_hard_teardown, emit_limit_evidence, emit_members_snapshot,
+    emit_output_captured, exit_code_for, finish, finish_foreground_failure, graceful_teardown,
+    launch_failure_event, launch_failure_source, map_launch_error, termination_error,
 };
 use super::{Ending, SnapshotReason, Termination, TimeoutTrigger};
 
@@ -143,6 +143,8 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     // plain `ProcessGroup::new()` unless a `--max-*`/`--cpu-quota` flag asked for a
     // whole-tree resource cap, in which case it goes through
     // `ProcessGroup::with_options` (see that function's decision note).
+    let limits_requested =
+        args.max_memory.is_some() || args.max_processes.is_some() || args.cpu_quota.is_some();
     let group = match create_group(&args) {
         Ok(group) => group,
         Err(err) => {
@@ -401,6 +403,7 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
                     &group,
                     &capture,
                     &registration,
+                    limits_requested,
                     error,
                     err.to_string(),
                 ));
@@ -427,6 +430,7 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             &group,
             &capture,
             &registration,
+            limits_requested,
             error,
             err.to_string(),
         ));
@@ -550,7 +554,13 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
                         exit::INTERNAL,
                         format!("waiting for the child to exit failed: {err}"),
                     );
-                    emit_hard_teardown(&mut emitter, &group, &capture, &registration);
+                    emit_hard_teardown(
+                        &mut emitter,
+                        &group,
+                        &capture,
+                        &registration,
+                        limits_requested,
+                    );
                     return Err(finish(&mut emitter, "internal", None, error));
                 }
             };
@@ -571,14 +581,26 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
                     // tail as every other branch rather than returning through the
                     // bare `finish` a setup-time failure uses. Same shared hard-kill
                     // path as the sibling wait-failure arm above (T-157).
-                    emit_hard_teardown(&mut emitter, &group, &capture, &registration);
+                    emit_hard_teardown(
+                        &mut emitter,
+                        &group,
+                        &capture,
+                        &registration,
+                        limits_requested,
+                    );
                     return Err(finish(&mut emitter, "internal", None, error));
                 }
             };
             // Reap any descendant the exited child leaked behind, report the
             // capture, and drop the registry entry — the shared hard-teardown tail
             // (no soft stop is attempted on the natural-exit path).
-            emit_hard_teardown(&mut emitter, &group, &capture, &registration);
+            emit_hard_teardown(
+                &mut emitter,
+                &group,
+                &capture,
+                &registration,
+                limits_requested,
+            );
             emitter.emit(&Event::RunnerExit {
                 code: child_code,
                 source: "child_exit",
@@ -606,6 +628,7 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
                 grace_ms: grace.map(duration_ms),
                 reason: trigger.reason(),
             });
+            emit_limit_evidence(&mut emitter, &group, limits_requested);
             // `cleanup_started` brackets the whole teardown — soft stop, grace, and
             // hard kill — so `members_before` is the full tree, not a post-soft remnant.
             emit_cleanup_started(&mut emitter, &group);
@@ -626,6 +649,7 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
                 max_bytes: overflow.max_bytes,
                 grace_ms: grace.map(duration_ms),
             });
+            emit_limit_evidence(&mut emitter, &group, limits_requested);
             emit_cleanup_started(&mut emitter, &group);
             let teardown = graceful_teardown(&group, grace).await;
             emit_cleanup_finished(&mut emitter, &group, Some(&teardown));
@@ -652,6 +676,7 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
                 source: signal.source(),
                 grace_ms: grace.map(duration_ms),
             });
+            emit_limit_evidence(&mut emitter, &group, limits_requested);
             emit_cleanup_started(&mut emitter, &group);
             let teardown = graceful_teardown(&group, grace).await;
             emit_cleanup_finished(&mut emitter, &group, Some(&teardown));
@@ -670,6 +695,7 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
                 source: "control_cancel",
                 grace_ms: grace.map(duration_ms),
             });
+            emit_limit_evidence(&mut emitter, &group, limits_requested);
             emit_cleanup_started(&mut emitter, &group);
             let teardown = graceful_teardown(&group, grace).await;
             emit_cleanup_finished(&mut emitter, &group, Some(&teardown));
@@ -687,7 +713,13 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
             emitter.emit(&Event::Killed {
                 source: "control_kill",
             });
-            emit_hard_teardown(&mut emitter, &group, &capture, &registration);
+            emit_hard_teardown(
+                &mut emitter,
+                &group,
+                &capture,
+                &registration,
+                limits_requested,
+            );
             let error = control_kill_error();
             Err(finish(&mut emitter, "control_kill", None, error))
         }

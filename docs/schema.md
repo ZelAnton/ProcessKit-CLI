@@ -303,12 +303,10 @@ The emission is deliberately narrow:
   platform has no whole-tree container at all (macOS/the BSDs, the Linux
   process-group fallback), or a Linux cgroup v2 whose controllers can't be enabled
   (not the real hierarchy root — under systemd, an ordinary container, or typical
-  CI; see `README.md`, "Resource limits"). This reflects the `processkit` version
-  this repository currently consumes; an additive, not-yet-released post-spawn
-  evidence primitive and the tri-state design constraints it will impose on any
-  future JSONL surface are tracked in
-  [`docs/resource-limits.md`](resource-limits.md#applied-limit-versus-observed-limit-hit),
-  not in this schema.
+  CI; see `README.md`, "Resource limits"). This is the pre-spawn admission
+  failure only; post-run evidence for successfully applied caps is carried by
+  the additive `limit_evidence` event below and follows the platform matrix in
+  [`docs/resource-limits.md`](resource-limits.md#applied-limit-versus-observed-limit-hit).
 - **Nonsense values never reach it.** A degenerate value (`--max-memory 0`, a
   non-positive/non-finite `--cpu-quota`) is a `USAGE` (100) form error rejected at
   argument-parse time, so `limit_hit` never carries an "invalid value" reason.
@@ -318,7 +316,30 @@ The emission is deliberately narrow:
   takes. The dedicated `limit_hit` event — not the exit code — is the authoritative
   signal that the ending was a resource limit (`docs/exit-codes.md`, "Why a band is
   not enough on its own"). A run whose caps *were* applied emits no `limit_hit` at
-  all and proceeds normally.
+  all and proceeds normally. Its post-run evidence, when requested, is the
+  separate `limit_evidence` event below.
+
+### `limit_evidence`
+
+Post-run, per-axis evidence for a run that requested at least one resource cap.
+The runner reads `ProcessGroup::limit_evidence()` while the group still exists,
+after the ending event (`root_exited`, `timeout`, `cancelled`, `killed`, or
+`output_overflow`) when one exists, and before `cleanup_started` consumes the
+group.
+
+| Field | Type | Notes |
+|---|---|---|
+| `memory` | string | `tripped`, `not_tripped`, or `unknown`. |
+| `processes` | string | `tripped`, `not_tripped`, or `unknown`. |
+| `cpu` | string | `tripped`, `not_tripped`, or `unknown`. |
+
+`tripped` is emitted only for authoritative kernel evidence that the cap
+engaged; `not_tripped` is authoritative evidence that it did not engage (and is
+also ProcessKit's result for an uncapped axis); `unknown` means the mechanism
+cannot provide a post-run answer. Linux cgroup v2 can report all three states.
+Windows Job Objects and POSIX process groups (macOS, BSDs, and the Linux
+process-group fallback) report `unknown` for capped axes. The event is absent
+when no cap was requested. This is an additive event within `schema_version = 1`.
 
 ### `timeout`
 
@@ -541,6 +562,11 @@ A normal run emits, in order: `run_started`, `members_snapshot`
   `runner_exit`; or
 - **runner-imposed ending** — the reason event (`timeout`, `cancelled`, or `killed`),
   `cleanup_started`, `cleanup_finished`, `runner_exit`.
+
+When any resource cap was requested, insert `limit_evidence` after the ending
+event and before `cleanup_started`. A run without a cap emits no
+`limit_evidence`. The evidence read never moves inside or after the
+`cleanup_started`/`cleanup_finished` pair.
 
 The reason event names *which* ending it was: `timeout` (with `reason` `overall` or
 `idle`) for a `--timeout` or a `--idle-timeout`, `cancelled` (with `source` `ctrl_c`,
