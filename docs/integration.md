@@ -325,17 +325,19 @@ contact the runner at all and is described in [`docs/registry.md`](registry.md),
   restarted, or that supervises runs another process launched — and so has no
   child process to wait on. It prints nothing (the exit code is the answer),
   never touches the run, and needs no control endpoint, so it also works for a
-  run whose transport never came up. Adding **`--report-outcome`** (single-run
-  only) makes it print one JSON object naming how the run ended — `status`
-  `reported` with the terminal event's `code`/`source`/`child_code`, or `status`
-  `unknown` with all three `null` when the outcome could not be established —
-  without changing any of the exit codes below. See
+  run whose transport never came up. Adding **`--report-outcome`** makes the
+  single-run form print one JSON object, while the `--all` form prints one JSON
+  array in stable snapshot order, naming how each run ended — `status` `reported`
+  with the terminal event's `code`/`source`/`child_code`, or `status` `unknown`
+  with all three `null` when the outcome could not be established — without
+  changing any of the exit codes below. See
   [`docs/registry.md`](registry.md), "Waiting — `wait`".
 
 Each of these outputs has a published JSON Schema and golden fixture under
 `fixtures/schema/cli/`: `inspect.schema.json` (the single snapshot and the
 `--all` array), `control-ack.schema.json` (the `cancel`/`kill` ack and the
-`--all` report array), and `wait.schema.json` (`--report-outcome`).
+`--all` report array), and `wait.schema.json` (`--report-outcome` in either
+single-run or aggregate form).
 
 Both mutating verbs' outcomes are also written to the *target run's own*
 `--jsonl` stream (a `cancelled`/`killed` event with `source`

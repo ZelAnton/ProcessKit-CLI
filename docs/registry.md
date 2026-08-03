@@ -617,7 +617,7 @@ gone (reaping it is best-effort, exactly like the record/lock deletions).
 
 ## Waiting — `wait`
 
-`processkit-cli wait (--run-id <id> [--report-outcome] | --all) [--timeout <duration>]` is the *lifetime*
+`processkit-cli wait (--run-id <id> [--report-outcome] | --all [--report-outcome]) [--timeout <duration>]` is the *lifetime*
 counterpart to `list`'s discovery and `prune`'s cleanup: it blocks while its target is
 live and returns as soon as it is not. `--run-id` and `--all` are mutually exclusive
 (clap rejects both together) and exactly one is required — see "The aggregate barrier
@@ -665,9 +665,9 @@ clean exit, which deletes both files rather than handing the lock over.
   Re-checked on every probe, not just the first, since a duplicate can register at any
   moment.
 
-Nothing is printed on ordinary success. `--report-outcome`, restricted to
-`--run-id`, instead prints exactly one JSON object while leaving all exit-code
-semantics above untouched:
+Nothing is printed on ordinary success. `--report-outcome` instead prints exactly
+one JSON object for `--run-id`, or one JSON array for `--all`, while leaving all
+exit-code semantics above untouched:
 
 ```json
 {"run_id":"build-42","status":"reported","code":7,"source":"child_exit","child_code":7}
@@ -685,9 +685,7 @@ without a terminal event, or the stream cannot be read, success remains honest d
 {"run_id":"build-42","status":"unknown","code":null,"source":null,"child_code":null}
 ```
 
-The mode does not forward `code` as the wait process's exit status. Aggregate
-reporting is deliberately out of scope until it has an explicit per-target shape;
-clap therefore rejects `wait --all --report-outcome`. A registry that cannot be
+The mode does not forward `code` as the wait process's exit status. A registry that cannot be
 opened or read at all remains a `SETUP` (111) failure, exactly as for `list`/`prune`.
 
 ### An unknown `run_id` reads as "finished"
@@ -741,7 +739,7 @@ entry it could not probe.
 
 ### The aggregate barrier — `wait --all`
 
-`wait --all [--label KEY=VALUE]... [--timeout <duration>]` is the counterpart for a caller that does
+`wait --all [--label KEY=VALUE]... [--timeout <duration>] [--report-outcome]` is the counterpart for a caller that does
 not hold one `run_id` but wants a barrier on *every* run — the typical orchestrator
 teardown sequence: cancel everything, wait for it all to be gone, then `prune`. It
 reuses the exact same periodic-probing mechanism (`src/wait.rs::run_all`), differing
@@ -794,7 +792,14 @@ outstanding and, when at least one of them was only `Unprobed` on the last pass,
 so rather than confidently claiming they are all still live. There is no aggregate
 `CONTROL`/ambiguity outcome: `--all` never resolves an id at all, so the duplicate-id
 question `--run-id` answers with `CONTROL` does not arise for it. Nothing is printed on
-success, exactly like `--run-id`.
+success without `--report-outcome`, exactly like `--run-id`. With the flag, success
+prints one JSON array after the barrier clears, with one entry per original snapshot
+target in stable `run_id` then record-path order. Each entry has the same
+`run_id`/`status`/`code`/`source`/`child_code` shape as the single-run report and
+uses `reported` when its snapshotted JSONL locator yields a terminal `runner_exit`,
+or `unknown` with null outcome fields when the locator is absent, unavailable, or
+malformed. A timeout still prints no report and exits `WAIT_TIMEOUT` (112); outcome
+data never changes the barrier's exit code.
 
 ## Lifecycle
 

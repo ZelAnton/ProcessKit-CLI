@@ -250,7 +250,7 @@ processkit-cli inspect (--run-id <id> | --all [--label <KEY=VALUE>]...) [--json]
 processkit-cli cancel  (--run-id <id> | --all [--label <KEY=VALUE>]...)
 processkit-cli kill    (--run-id <id> | --all [--label <KEY=VALUE>]...)
 processkit-cli wait    --run-id <id> [--timeout <duration>] [--report-outcome]
-processkit-cli wait    --all [--label <KEY=VALUE>]... [--timeout <duration>]
+processkit-cli wait    --all [--label <KEY=VALUE>]... [--timeout <duration>] [--report-outcome]
 processkit-cli events  (--run-id <id> | --file <events.jsonl>)
                        [--json | --validate] [--follow]
 processkit-cli list    [--json] [--label <KEY=VALUE>]... [--health <live|stale|unprobed>]
@@ -399,12 +399,14 @@ elapses the run is left running and `wait` exits with its own reserved code `112
 never the run's `TIMEOUT` (`106`) — and an ambiguous `run_id` (more than one live run
 under it) is the same `CONTROL` (103) refusal every other by-`run-id` command gives.
 Nothing is printed on ordinary success; the exit code is the answer. With the
-single-run-only `--report-outcome` opt-in, `wait` remembers the live registry
-record's JSONL locator and prints one JSON object after completion:
-`run_id`, `status` (`reported` or `unknown`), and always-present `code`, `source`,
-and `child_code` fields. The latter three mirror terminal `runner_exit` when it is
-available and are `null` when it is not. This is data only — `wait` still exits `0`
-for a completed target rather than forwarding the child or runner code.
+`--report-outcome` opt-in, `wait` remembers each snapshot target's JSONL locator and
+prints one outcome entry after completion. `--run-id` prints one JSON object;
+`--all` prints one JSON array in stable `run_id`/record-path order, with one entry
+per target. Each entry has `run_id`, `status` (`reported` or `unknown`), and
+always-present `code`, `source`, and `child_code` fields. The latter three mirror
+terminal `runner_exit` when it is available and are `null` when it is not. This is
+data only — `wait` still exits `0` for a completed target or barrier rather than
+forwarding a child or runner code.
 
 One deliberate design choice deserves a caller's attention: since a clean exit
 deletes its own registry entry, an **unknown** `run_id` is indistinguishable from one
@@ -431,6 +433,17 @@ later pass for as long as its liveness cannot be re-probed, rather than being si
 dropped — the same conservative stance `--run-id` takes. See
 [`docs/registry.md`](docs/registry.md), "Waiting — `wait`", "The aggregate barrier —
 `wait --all`".
+
+`wait --all --report-outcome` is accepted alongside
+`wait --run-id <id> --report-outcome`; in aggregate mode it adds data only and
+does not change the barrier's exit-code contract.
+With `--report-outcome`, the barrier prints one JSON array only after every
+snapshotted target is over. Entries retain the snapshot's `run_id` and JSONL
+locator, are ordered by `run_id` then record path, and use the same fields and
+`reported`/`unknown` statuses as the single-run object. An unreadable, unavailable,
+or malformed stream produces an `unknown` entry with null outcome fields; it does
+not change the barrier's exit code. A timeout still prints no report and exits
+`WAIT_TIMEOUT` (112), exactly as an ordinary `wait --all` timeout does.
 
 `events` is the *story* counterpart: it reads back the JSONL lifecycle stream a run
 wrote with `run --jsonl`, so the detach → observe → conclude loop needs no external

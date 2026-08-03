@@ -2,8 +2,15 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/ZelAnton/ProcessKit-CLI/main/fixtures/schema/cli/wait.schema.json",
   "title": "processkit-cli `wait --report-outcome` report",
-  "description": "The single JSON object `processkit-cli wait --run-id <id> --report-outcome` prints to stdout once the run it waited for is no longer live. Opt-in and single-run only (clap rejects `wait --all --report-outcome`); a plain `wait` prints nothing at all. The report never changes `wait`'s exit code — a reported non-zero `code` is still exit 0 for the waiter, and the run's own outcome codes are never forwarded as the waiting process's status. The normative prose is docs/registry.md, \"Waiting — `wait`\"; the in-code source of truth is src/wait.rs. Validated against fixtures/schema/cli/wait.jsonl, and against the real binary's output, by tests/machine_output.rs.",
-  "$ref": "#/$defs/waitOutcome",
+  "description": "The `wait --run-id <id> --report-outcome` form prints one outcome object; `wait --all --report-outcome` prints one array of those objects after its snapshot barrier clears. A plain `wait` prints nothing at all. The report never changes `wait`'s exit code — a reported non-zero `code` is still exit 0 for the waiter, and the run's own outcome codes are never forwarded as the waiting process's status. The normative prose is docs/registry.md, \"Waiting — `wait`\"; the in-code source of truth is src/wait.rs. Validated against fixtures/schema/cli/wait.jsonl, and against the real binary's output, by tests/machine_output.rs.",
+  "oneOf": [
+    { "$ref": "#/$defs/waitOutcome" },
+    {
+      "type": "array",
+      "description": "The aggregate report: one entry per target in stable snapshot order.",
+      "items": { "$ref": "#/$defs/waitOutcome" }
+    }
+  ],
   "$defs": {
     "waitOutcome": {
       "type": "object",
