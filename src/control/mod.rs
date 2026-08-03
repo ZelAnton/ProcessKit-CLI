@@ -477,8 +477,10 @@ pub struct Snapshot {
     pub capture_dir: Option<String>,
     /// A point-in-time snapshot of the container's members, enriched with
     /// `ppid`/executable `name`/`start_time` wherever `members_info()` can report
-    /// them, mirroring the JSONL `members_snapshot` (`docs/schema.md`, "Enriched
-    /// member fields"). Queried at request time, so it reflects the container's
+    /// them, mirroring the JSONL `members_snapshot`'s own `members` entries
+    /// (`docs/schema.md`, "Enriched member fields") — the shared contract is the
+    /// [`Member`] shape, not that event's envelope (its `reason` is the event's
+    /// alone). Queried at request time, so it reflects the container's
     /// composition *when inspected*, not at start.
     pub members: Vec<Member>,
 }

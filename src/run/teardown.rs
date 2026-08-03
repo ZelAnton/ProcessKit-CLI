@@ -28,7 +28,7 @@ use crate::events::{Emitter, Event, Member, ShutdownInfo};
 use crate::exit::{self, RunnerError};
 use crate::registry;
 
-use super::{SoftTerminate, Termination, TimeoutTrigger};
+use super::{SnapshotReason, SoftTerminate, Termination, TimeoutTrigger};
 
 /// Emit the terminal [`Event::RunnerExit`] for a runner-own failure and return the
 /// error unchanged, so each failing path reads as one expression. `source` names
@@ -145,9 +145,22 @@ pub(super) fn clear_registration(registration: &Option<registry::Registration>) 
 /// event; it shares the same error contract as the bare-PID `members()` this
 /// replaced (`ErrorReason::Io` only — a single vanished member is skipped, not an
 /// error).
-pub(super) fn emit_members_snapshot(emitter: &mut Emitter, group: &ProcessGroup) {
+///
+/// `reason` records which trigger asked for this snapshot ([`SnapshotReason`]). The
+/// **single** enrichment path is deliberate: the post-spawn snapshot and every
+/// `--snapshot-interval` re-sample come through this one function and this one
+/// `members_info()` call, so a periodic snapshot cannot drift in shape from the
+/// first one (nor from `inspect`'s view, which reads the same call — K-043). Only
+/// the emitted `reason` differs; a failed read degrades identically for both, so a
+/// skipped sample costs the cadence one interval and nothing else.
+pub(super) fn emit_members_snapshot(
+    emitter: &mut Emitter,
+    group: &ProcessGroup,
+    reason: SnapshotReason,
+) {
     match group.members_info() {
         Ok(infos) => emitter.emit(&Event::MembersSnapshot {
+            reason: reason.reason(),
             members: infos.into_iter().map(Member::from_info).collect(),
         }),
         Err(err) => {

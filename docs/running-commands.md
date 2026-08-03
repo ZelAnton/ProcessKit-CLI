@@ -159,6 +159,23 @@ soft-stop → grace → hard-kill path. `Ctrl-C` and `cancel` use the same teard
 shape but remain distinguishable outcomes. See
 [Timeouts and cancellation](timeouts-and-cancellation.md).
 
+## Recorded tree snapshots
+
+```sh
+processkit-cli run \
+  --snapshot-interval 30s \
+  --jsonl long-run.jsonl \
+  -- ./build-fleet
+```
+
+By default the tree's shape is recorded once, right after spawn.
+`--snapshot-interval` re-emits that same `members_snapshot` event on the given
+cadence while the child runs, so a long, quiet, or detached run leaves a recorded
+history of how the tree evolved rather than one that is only observable *live*
+via `inspect`. The periodic events are told apart from the post-spawn one by the
+event's `reason` field (`interval` vs `spawn`), and stop as soon as the run's
+ending is decided. See [JSONL event schema](schema.md#members_snapshot).
+
 ## Resource limits
 
 ```sh
@@ -198,6 +215,7 @@ Windows and conflicts with both consoleless modes (`--create-no-window`, `--deta
 | `--idle-timeout` + `--capture-dir` | Valid: the shared pump drives both. |
 | `--inherit-stdio` + `--capture-dir` | Rejected: inherited output bypasses the pump. |
 | `--inherit-stdio` + `--idle-timeout` | Rejected: the runner cannot observe activity. |
+| `--inherit-stdio` + `--snapshot-interval` | Valid: snapshots read the container, not the pump. |
 | `--detach` + `--inherit-stdio` | Rejected: the caller is no longer present. |
 | `--detach` + `--capture-dir` | Valid: the detached runner still captures. |
 | `--create-no-window` + `--inherit-stdio` | Rejected on every platform at parse time. |

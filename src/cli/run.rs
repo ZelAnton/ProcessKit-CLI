@@ -18,6 +18,7 @@ use super::parse::{
 /// `run [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl> [--create-no-window]
 /// [--windows-graceful-ctrl-break]
 /// [--timeout <duration>] [--idle-timeout <duration>] [--grace <duration>]
+/// [--snapshot-interval <duration>]
 /// [--max-memory <size>] [--max-processes <n>] [--cpu-quota <cores>]
 /// [--capture-dir <dir>] [--capture-max-bytes <size>]
 /// [--capture-overflow <truncate|cancel>] [--no-echo] [--detach]
@@ -28,7 +29,9 @@ use super::parse::{
 //
 // `run` consumes every field: `cwd`, `create_no_window`,
 // `windows_graceful_ctrl_break`, `timeout`,
-// `idle_timeout`, `grace`, `max_memory`, `max_processes`, `cpu_quota` — the
+// `idle_timeout`, `grace`, `snapshot_interval` — the opt-in periodic
+// `members_snapshot` cadence (see `src/run/launch.rs`'s `snapshot_cadence`) —
+// `max_memory`, `max_processes`, `cpu_quota` — the
 // whole-tree ProcessKit resource caps (see `src/run/launch.rs`) — `command`, `jsonl`,
 // `run_id`, `argv_raw`, `capture_dir`/`capture_max_bytes` — bounded stdout/stderr
 // capture to files (see `src/capture.rs`) — `no_echo` — suppress the live echo
@@ -110,6 +113,33 @@ pub struct RunArgs {
     /// [`parse_duration`] rather than [`parse_positive_duration`].
     #[arg(long, value_name = "duration", value_parser = parse_duration)]
     pub grace: Option<Duration>,
+
+    /// Re-emit the `members_snapshot` JSONL event every `<duration>` for as long
+    /// as the child runs, instead of only once right after it is spawned. This is
+    /// **recorded** observability for the shape of the process tree over time —
+    /// when the worker fleet ballooned, whether helpers lingered, what the tree
+    /// looked like just before an idle deadline fired — for exactly the runs
+    /// (long, detached, quiet) where nobody is likely to have been watching live
+    /// with `inspect` at the interesting moment. Omit it and the stream carries
+    /// the single post-spawn snapshot it always did, unchanged.
+    ///
+    /// Each periodic event is the ordinary `members_snapshot`, enriched through
+    /// the same `ProcessGroup::members_info()` path as the post-spawn one and
+    /// told apart from it only by its `reason` field (`interval` vs `spawn`; see
+    /// `docs/schema.md`, "members_snapshot"). The cadence stops the moment the
+    /// run's ending is decided, so a periodic snapshot never interleaves into the
+    /// teardown events; a member read that fails skips that one sample with a
+    /// warning on stderr — the same honest degradation as the post-spawn snapshot
+    /// — rather than recording a tree that was never observed.
+    ///
+    /// Composes with **every** I/O mode, `--inherit-stdio` included: a snapshot
+    /// is a query of the container's own member list, not an observation of the
+    /// output pump, so — unlike `--idle-timeout` — it needs no pipes and
+    /// conflicts with nothing. Same duration grammar and parse-time validation as
+    /// `--timeout`, including the rejection of `0`, which asks for an unbounded
+    /// snapshot storm rather than a cadence — see [`parse_positive_duration`].
+    #[arg(long, value_name = "duration", value_parser = parse_positive_duration)]
+    pub snapshot_interval: Option<Duration>,
 
     /// Cap the run's **whole process tree** total memory. Accepts a byte count
     /// with an optional binary unit — `1048576`, `512k`, `256m`, `2g` (see
@@ -445,6 +475,121 @@ mod tests {
             args.idle_timeout.is_none(),
             "omitting --idle-timeout arms no idle deadline"
         );
+    }
+
+    #[test]
+    fn run_parses_snapshot_interval_into_a_duration_and_defaults_to_absent() {
+        // `--snapshot-interval` reuses `parse_positive_duration`, the one duration
+        // parser this project has (K-048): same grammar as `--timeout`, landing as
+        // a ready `Duration` rather than a string the runner would re-parse.
+        let cli = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--snapshot-interval",
+            "30s",
+            "--",
+            "true",
+        ])
+        .expect("a valid run invocation with --snapshot-interval");
+        let Command::Run(args) = cli.command else {
+            panic!("expected the run subcommand");
+        };
+        assert_eq!(args.snapshot_interval, Some(Duration::from_secs(30)));
+
+        // Omitting it arms no cadence, so the run emits exactly the one post-spawn
+        // `members_snapshot` it always did.
+        let cli = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--",
+            "true",
+        ])
+        .expect("a valid run invocation");
+        let Command::Run(args) = cli.command else {
+            panic!("expected the run subcommand");
+        };
+        assert!(
+            args.snapshot_interval.is_none(),
+            "omitting --snapshot-interval arms no periodic snapshot cadence"
+        );
+    }
+
+    #[test]
+    fn run_rejects_a_zero_or_malformed_snapshot_interval() {
+        // `--snapshot-interval 0` is rejected exactly the way `--timeout 0` is (the
+        // shared `parse_positive_duration`): a zero cadence is not a fast cadence,
+        // it is an unbounded snapshot storm, and almost certainly a typo.
+        for zero in ["0", "0ms", "0s", "0m", "0h"] {
+            assert!(
+                Cli::try_parse_from([
+                    "processkit-cli",
+                    "run",
+                    "--jsonl",
+                    "events.jsonl",
+                    "--snapshot-interval",
+                    zero,
+                    "--",
+                    "true",
+                ])
+                .is_err(),
+                "`--snapshot-interval {zero}` must be rejected as a degenerate cadence"
+            );
+        }
+
+        // A malformed value is the same `USAGE` form error as for `--timeout`,
+        // caught at parse time rather than mid-run.
+        for bad in ["soon", "-5", "1.5s", "5x", "5 s"] {
+            assert!(
+                Cli::try_parse_from([
+                    "processkit-cli",
+                    "run",
+                    "--jsonl",
+                    "events.jsonl",
+                    "--snapshot-interval",
+                    bad,
+                    "--",
+                    "true",
+                ])
+                .is_err(),
+                "a malformed `--snapshot-interval {bad}` must fail at parse time"
+            );
+        }
+    }
+
+    /// The cadence samples the *container*, never the output pump, so — unlike
+    /// `--idle-timeout`, which conflicts with `--inherit-stdio` because direct
+    /// inheritance leaves no point at which to observe the child — it composes
+    /// with every I/O mode and declares no conflict at all.
+    #[test]
+    fn run_snapshot_interval_composes_with_every_io_mode() {
+        for io_mode in [
+            vec!["--inherit-stdio"],
+            vec!["--inherit-stdin"],
+            vec!["--no-echo"],
+            vec!["--capture-dir", "cap"],
+            vec!["--detach"],
+        ] {
+            let mut argv = vec![
+                "processkit-cli",
+                "run",
+                "--jsonl",
+                "events.jsonl",
+                "--snapshot-interval",
+                "1s",
+            ];
+            argv.extend_from_slice(&io_mode);
+            argv.extend(["--", "true"]);
+            let parsed = Cli::try_parse_from(argv)
+                .unwrap_or_else(|err| panic!("--snapshot-interval must accept {io_mode:?}: {err}"));
+            let Command::Run(args) = parsed.command else {
+                panic!("expected the run subcommand");
+            };
+            assert_eq!(args.snapshot_interval, Some(Duration::from_secs(1)));
+        }
     }
 
     #[test]

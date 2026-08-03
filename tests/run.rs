@@ -1040,6 +1040,254 @@ fn no_echo_still_lets_idle_timeout_reap_a_silent_child_but_spares_a_chatty_one()
 }
 
 // ---------------------------------------------------------------------------
+// `--snapshot-interval` (T-298): the opt-in periodic `members_snapshot` cadence.
+// ---------------------------------------------------------------------------
+
+/// How long the snapshot-cadence fixtures' child occupies the container. Short
+/// enough to keep the suite quick, long enough that a sub-second cadence has room
+/// for several re-samples inside it.
+const SNAPSHOT_CHILD_SECONDS: u64 = 2;
+
+/// A child that simply holds the container for `seconds` while producing no output
+/// — the "long and quiet" run this feature exists for, and the case where nothing
+/// but a snapshot could observe the tree. On Windows `ping -n N` waits N-1 seconds
+/// between echo requests, so it is asked for one more.
+fn quiet_child_for(seconds: u64) -> Vec<String> {
+    if cfg!(windows) {
+        shell_inline(&format!("ping -n {} 127.0.0.1 >nul", seconds + 1))
+    } else {
+        shell_inline(&format!("sleep {seconds}"))
+    }
+}
+
+/// The `reason` of every `members_snapshot` in a stream, in emission order — the
+/// one field that tells the post-spawn snapshot (`spawn`) from a
+/// `--snapshot-interval` re-sample (`interval`).
+fn snapshot_reasons(events: &[Value]) -> Vec<&str> {
+    events
+        .iter()
+        .filter(|event| event["event"] == "members_snapshot")
+        .map(|event| {
+            event["reason"]
+                .as_str()
+                .unwrap_or_else(|| panic!("every members_snapshot carries a reason: {event}"))
+        })
+        .collect()
+}
+
+/// How many `reason: "interval"` snapshots a stream carries.
+fn interval_snapshot_count(events: &[Value]) -> usize {
+    snapshot_reasons(events)
+        .into_iter()
+        .filter(|reason| *reason == "interval")
+        .count()
+}
+
+/// `--snapshot-interval` re-emits `members_snapshot` on roughly the requested
+/// cadence for a long-lived child, and the *value* — not merely the flag's
+/// presence — is what paces it: over the same ~2s child a 300ms cadence yields
+/// several re-samples while a 5s cadence yields none at all (which also proves the
+/// first re-sample waits a full interval instead of firing immediately).
+///
+/// The bounds are deliberately loose in both directions. The lower bound proves the
+/// cadence repeats; the upper bound proves it is *paced* rather than a busy loop
+/// (which would emit thousands per second, not a handful) without turning a slow
+/// CI runner into a failing feature (K-058).
+#[test]
+fn snapshot_interval_re_emits_members_snapshot_on_the_requested_cadence() {
+    let fast_dir = scratch("snapshot-interval-fast");
+    let fast_out = run_with_flags(
+        &fast_dir,
+        &[],
+        &["--snapshot-interval", "300ms"],
+        quiet_child_for(SNAPSHOT_CHILD_SECONDS),
+    );
+    assert_eq!(
+        fast_out.status.code(),
+        Some(0),
+        "the cadence must not disturb the child's own exit; stderr: {}",
+        String::from_utf8_lossy(&fast_out.stderr)
+    );
+    let fast_events = read_run_events(&fast_dir);
+    let fast_reasons = snapshot_reasons(&fast_events);
+    assert_eq!(
+        fast_reasons.first().copied(),
+        Some("spawn"),
+        "the post-spawn snapshot still comes first, and still says so: {fast_reasons:?}"
+    );
+    assert!(
+        fast_reasons[1..].iter().all(|reason| *reason == "interval"),
+        "exactly one snapshot is the post-spawn one; every later one is a re-sample: \
+         {fast_reasons:?}"
+    );
+    let fast_count = interval_snapshot_count(&fast_events);
+    assert!(
+        (3..=60).contains(&fast_count),
+        "a ~{SNAPSHOT_CHILD_SECONDS}s child at a 300ms cadence must produce several \
+         re-samples, and a bounded number of them (a busy poll would produce orders of \
+         magnitude more); got {fast_count}"
+    );
+
+    // A periodic snapshot is a real `members_info()` read through the shared
+    // enrichment path, not an empty stub: at least one re-sample must actually list
+    // a member with a PID (the child is alive throughout the cadence).
+    assert!(
+        fast_events
+            .iter()
+            .filter(|event| event["event"] == "members_snapshot" && event["reason"] == "interval")
+            .any(|event| event["members"]
+                .as_array()
+                .is_some_and(|members| members.iter().any(|m| m["pid"].is_number()))),
+        "a periodic snapshot must carry the container's real members: {fast_events:?}"
+    );
+
+    // Ordering (`docs/schema.md`, "Ordering"): every snapshot lands before the
+    // ending's own event, and none is interleaved into the teardown pair.
+    let types = event_type_sequence(&fast_events);
+    let last_snapshot = types
+        .iter()
+        .rposition(|event| *event == "members_snapshot")
+        .expect("the stream carries snapshots");
+    let root_exited = types
+        .iter()
+        .position(|event| *event == "root_exited")
+        .expect("a natural exit reports root_exited");
+    assert!(
+        last_snapshot < root_exited,
+        "the cadence must stop when the ending is decided, never reach the teardown \
+         tail: {types:?}"
+    );
+    let _ = std::fs::remove_dir_all(&fast_dir);
+
+    // Same child, a cadence longer than its whole life: the interval value paces the
+    // stream, and the first re-sample is not emitted at t=0.
+    let slow_dir = scratch("snapshot-interval-slow");
+    let slow_out = run_with_flags(
+        &slow_dir,
+        &[],
+        &["--snapshot-interval", "5s"],
+        quiet_child_for(SNAPSHOT_CHILD_SECONDS),
+    );
+    assert_eq!(
+        slow_out.status.code(),
+        Some(0),
+        "the child still exits on its own under a long cadence; stderr: {}",
+        String::from_utf8_lossy(&slow_out.stderr)
+    );
+    let slow_events = read_run_events(&slow_dir);
+    let slow_count = interval_snapshot_count(&slow_events);
+    assert!(
+        slow_count <= 1,
+        "a 5s cadence must not fire repeatedly inside a ~{SNAPSHOT_CHILD_SECONDS}s child \
+         (and must not fire immediately on arming): got {slow_count}"
+    );
+    assert!(
+        fast_count > slow_count,
+        "the requested interval, not merely the flag's presence, must pace the cadence: \
+         300ms gave {fast_count} re-samples, 5s gave {slow_count}"
+    );
+    let _ = std::fs::remove_dir_all(&slow_dir);
+}
+
+/// **Differential proof that omitting the flag changes nothing** (K-059: prove an
+/// absence by comparison, never by an assertion that would pass vacuously). The
+/// identical child is run twice — once bare, once with `--snapshot-interval` — and
+/// the bare run is shown to still emit *exactly one* `members_snapshot`, while the
+/// flagged run emits strictly more. Collapsing the flagged run's snapshot repeats
+/// then reproduces the bare run's event sequence exactly, so the cadence is proven
+/// to add snapshots and nothing else: no event gained, lost, or reordered.
+#[test]
+fn a_run_without_snapshot_interval_still_emits_exactly_one_members_snapshot() {
+    let baseline_dir = scratch("snapshot-interval-baseline");
+    let baseline_out = run_with_flags(
+        &baseline_dir,
+        &[],
+        &[],
+        quiet_child_for(SNAPSHOT_CHILD_SECONDS),
+    );
+    assert_eq!(
+        baseline_out.status.code(),
+        Some(0),
+        "baseline child exits 0"
+    );
+    let baseline_events = read_run_events(&baseline_dir);
+    assert_eq!(
+        snapshot_reasons(&baseline_events),
+        vec!["spawn"],
+        "without the flag a run emits exactly one members_snapshot, the post-spawn one"
+    );
+
+    let cadence_dir = scratch("snapshot-interval-cadence");
+    let cadence_out = run_with_flags(
+        &cadence_dir,
+        &[],
+        &["--snapshot-interval", "300ms"],
+        quiet_child_for(SNAPSHOT_CHILD_SECONDS),
+    );
+    assert_eq!(cadence_out.status.code(), Some(0), "cadence child exits 0");
+    let cadence_events = read_run_events(&cadence_dir);
+    let cadence_count = interval_snapshot_count(&cadence_events);
+    assert!(
+        cadence_count >= 1,
+        "the comparison is only meaningful if the flagged run really did re-sample; \
+         got {cadence_count}"
+    );
+
+    // Collapse consecutive `members_snapshot` lines: what remains must be the
+    // baseline's stream, event for event.
+    let mut collapsed: Vec<&str> = Vec::new();
+    for event in event_type_sequence(&cadence_events) {
+        if event == "members_snapshot" && collapsed.last() == Some(&"members_snapshot") {
+            continue;
+        }
+        collapsed.push(event);
+    }
+    assert_eq!(
+        collapsed,
+        event_type_sequence(&baseline_events),
+        "the cadence must add members_snapshot events and change nothing else"
+    );
+
+    let _ = std::fs::remove_dir_all(&baseline_dir);
+    let _ = std::fs::remove_dir_all(&cadence_dir);
+}
+
+/// The cadence composes with `--inherit-stdio` — proved by running it, not asserted
+/// in prose. Under direct inheritance the runner runs no output pump at all (which
+/// is exactly why `--idle-timeout` conflicts with the flag), so this is the case
+/// that shows a snapshot is a query of the *container's* member list rather than an
+/// observation of the child's output.
+#[test]
+fn snapshot_interval_composes_with_inherit_stdio() {
+    let dir = scratch("snapshot-interval-inherit-stdio");
+    let out = run_with_flags(
+        &dir,
+        &[],
+        &["--inherit-stdio", "--snapshot-interval", "300ms"],
+        quiet_child_for(SNAPSHOT_CHILD_SECONDS),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "--inherit-stdio + --snapshot-interval is a valid combination that runs to \
+         completion; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let events = read_run_events(&dir);
+    let reasons = snapshot_reasons(&events);
+    assert_eq!(
+        reasons.first().copied(),
+        Some("spawn"),
+        "the post-spawn snapshot is unaffected by the I/O mode: {reasons:?}"
+    );
+    assert!(
+        interval_snapshot_count(&events) >= 2,
+        "the cadence must keep sampling with no output pump in the run at all: {reasons:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
 // `--detach` (T-198)
 //
 // Every test below pins its own registry directory (`PROCESSKIT_CLI_REGISTRY_DIR`),

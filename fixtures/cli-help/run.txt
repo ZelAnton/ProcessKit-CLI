@@ -34,6 +34,13 @@ Options:
       --grace <duration>
           Grace period between a cancel/timeout and the hard kill. Same duration grammar as `--timeout`/`--idle-timeout`, but — unlike them — `0` stays legal here: it means "no pause", a real and useful setting, not a degenerate one, so this flag keeps using the more permissive [`parse_duration`] rather than [`parse_positive_duration`]
 
+      --snapshot-interval <duration>
+          Re-emit the `members_snapshot` JSONL event every `<duration>` for as long as the child runs, instead of only once right after it is spawned. This is **recorded** observability for the shape of the process tree over time — when the worker fleet ballooned, whether helpers lingered, what the tree looked like just before an idle deadline fired — for exactly the runs (long, detached, quiet) where nobody is likely to have been watching live with `inspect` at the interesting moment. Omit it and the stream carries the single post-spawn snapshot it always did, unchanged.
+          
+          Each periodic event is the ordinary `members_snapshot`, enriched through the same `ProcessGroup::members_info()` path as the post-spawn one and told apart from it only by its `reason` field (`interval` vs `spawn`; see `docs/schema.md`, "members_snapshot"). The cadence stops the moment the run's ending is decided, so a periodic snapshot never interleaves into the teardown events; a member read that fails skips that one sample with a warning on stderr — the same honest degradation as the post-spawn snapshot — rather than recording a tree that was never observed.
+          
+          Composes with **every** I/O mode, `--inherit-stdio` included: a snapshot is a query of the container's own member list, not an observation of the output pump, so — unlike `--idle-timeout` — it needs no pipes and conflicts with nothing. Same duration grammar and parse-time validation as `--timeout`, including the rejection of `0`, which asks for an unbounded snapshot storm rather than a cadence — see [`parse_positive_duration`].
+
       --max-memory <size>
           Cap the run's **whole process tree** total memory. Accepts a byte count with an optional binary unit — `1048576`, `512k`, `256m`, `2g` (see [`parse_size`] for the grammar). Enforcement needs a real whole-tree container (Windows Job Object or Linux cgroup v2); where none exists the run fails fast with a `limit_hit` rather than silently running unbounded (see `README.md`, "Resource limits"). Omit to leave memory unbounded
 

@@ -109,7 +109,22 @@ pub enum Event {
     /// A point-in-time snapshot of the container's members, including the enriched
     /// per-member fields ProcessKit's `members_info()` reports (see module docs
     /// and [`Member`]).
-    MembersSnapshot { members: Vec<Member> },
+    ///
+    /// `reason` names what asked for this particular snapshot: `spawn` for the one
+    /// every run emits right after the child is spawned, `interval` for a periodic
+    /// re-sample under `run --snapshot-interval`. It is always present — a run
+    /// without the flag emits exactly the one `spawn` snapshot it always did, now
+    /// self-describing — and it is deliberately the *only* thing that distinguishes
+    /// the two: both are produced by the same `emit_members_snapshot` through the
+    /// same `members_info()` enrichment, so the shapes cannot drift
+    /// (`docs/schema.md`, "members_snapshot").
+    MembersSnapshot {
+        /// `spawn` (once, right after the child is spawned) or `interval` (a
+        /// `--snapshot-interval` re-sample). First on the wire so the discriminator
+        /// stays readable ahead of the potentially long `members` array.
+        reason: &'static str,
+        members: Vec<Member>,
+    },
     /// The root child exited on its own. `code` is set for a normal exit; `signal`
     /// for a Unix signal death; both `null` only for an outcome without either.
     RootExited {
@@ -783,7 +798,14 @@ mod tests {
             // platform that reports everything), one with every enriched field
             // absent (a platform gap, e.g. the "bare" BSDs, or a member that
             // vanished mid-read) — the fixture pins both shapes side by side.
+            //
+            // One line for this event type, not one per `reason` value: the fixture
+            // is a catalog of event *shapes*, and a `--snapshot-interval` re-sample
+            // is byte-identical to this line except for `reason: "interval"` (see
+            // `SnapshotReason`). The `spawn` value is the one every run emits, so it
+            // is the representative one pinned here.
             Event::MembersSnapshot {
+                reason: "spawn",
                 members: vec![
                     Member {
                         pid: 4242,
@@ -973,6 +995,7 @@ mod tests {
 
         let line = serialize_record(
             &Event::MembersSnapshot {
+                reason: "spawn",
                 members: vec![Member::from_pid(4242)],
             },
             fixed_time(),
@@ -1007,6 +1030,7 @@ mod tests {
         };
         let line = serialize_record(
             &Event::MembersSnapshot {
+                reason: "spawn",
                 members: vec![member],
             },
             fixed_time(),

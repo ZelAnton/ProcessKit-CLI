@@ -128,6 +128,10 @@ fn probe_reports_a_consistent_compatible_surface() {
         "run:--detach",
         // And for `probe --print-schema` (T-213) itself.
         "probe:--print-schema",
+        // And for `run --snapshot-interval` (T-298), the periodic
+        // `members_snapshot` cadence: still no hand-maintained token list in
+        // production code, so the flag advertises itself.
+        "run:--snapshot-interval",
     ] {
         assert!(
             surface.contains(&token),

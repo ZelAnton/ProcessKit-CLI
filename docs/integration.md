@@ -199,7 +199,13 @@ emits, in order:
 1. `run_started` — the child was spawned; carries `run_id`, `root_pid`,
    containment `mechanism`, the `abrupt_cleanup` tri-state, and the redacted
    `command`.
-2. `members_snapshot` — the container's members at that point.
+2. `members_snapshot` (`reason: "spawn"`) — the container's members at that
+   point. Exactly one by default; a run started with `--snapshot-interval
+   <duration>` emits **additional** `members_snapshot` events (`reason:
+   "interval"`) on that cadence, all of them after this one and all of them
+   before step 3 — never inside the teardown pair. Route by event type and treat
+   the count as open-ended: within a schema version an adapter must not assume an
+   event type it knows occurs only once.
 3. Either the natural-exit path (`root_exited`, `cleanup_started`,
    `cleanup_finished`) or a runner-imposed ending's reason event (`timeout`,
    `cancelled`, or `killed`) followed by the same `cleanup_started` /

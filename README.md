@@ -887,6 +887,17 @@ neither can reveal the command line. Member snapshots carry each member's `ppid`
 executable `name`, and start-time token wherever ProcessKit's `members_info()` can
 report them (nullable per-field on platforms/members it can't).
 
+A run records its tree shape once, right after spawn. `run --snapshot-interval
+<duration>` opts into a **periodic** re-emission of that same `members_snapshot`
+for as long as the child runs (told apart by the event's `reason` field, `spawn`
+vs `interval`), so a long, quiet, or detached run leaves a recorded history of how
+its tree evolved — when the worker fleet grew, whether helpers lingered, what the
+tree looked like just before a deadline fired — instead of only a start-of-run
+shape plus a teardown count. The cadence samples the container's own member list
+rather than the output pump, so it composes with every I/O mode including
+`--inherit-stdio`, and it stops as soon as the run's ending is decided. Omit the
+flag and the stream is exactly what it was before.
+
 - Normative field reference: [`docs/schema.md`](docs/schema.md).
 - Golden sample stream for adapters:
   [`fixtures/schema/v1/events.jsonl`](fixtures/schema/v1/events.jsonl).

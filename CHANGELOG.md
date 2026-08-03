@@ -12,6 +12,15 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- `run --snapshot-interval <duration>`, an opt-in cadence that re-emits the
+  `members_snapshot` lifecycle event while the child runs, so a long, quiet, or
+  detached run records how its process tree evolved instead of only its shape at
+  spawn. The event gained an always-present `reason` field (`spawn` for the
+  post-spawn snapshot every run emits, `interval` for a re-sample) — an additive
+  schema v1 change, like the `timeout` event's own `reason`. The cadence samples
+  the container's member list rather than the output pump, so it composes with
+  `--inherit-stdio`, and it stops as soon as the run's ending is decided, so no
+  snapshot ever lands in the teardown tail.
 - Checksum-derived winget, Scoop, and Homebrew distributor manifests attached
   to every release after the platform archives finish uploading.
 - An adoption-oriented positioning guide comparing ProcessKit CLI with common

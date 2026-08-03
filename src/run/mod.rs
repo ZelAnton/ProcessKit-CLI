@@ -156,6 +156,52 @@ impl TimeoutTrigger {
     }
 }
 
+/// What asked for a `members_snapshot` — the honest `reason` of that event, and the
+/// only thing telling the snapshot every run emits after spawn apart from an opt-in
+/// periodic re-sample.
+///
+/// **Decision (T-298): repeated `members_snapshot` events are additive within schema
+/// v1, and they say so on the wire.** Two questions had to be answered before the
+/// `--snapshot-interval` cadence could exist at all:
+///
+/// - *Does repeating an existing event break v1?* No. `schema_version` versions each
+///   event's **shape** (`docs/schema.md`, "Versioning"): a breaking change renames or
+///   removes a field, changes a field's type, or changes the meaning of a value. A
+///   second `members_snapshot` line does none of those — every field keeps its name,
+///   type, and meaning — and the normative ordering prose was already written for
+///   readers that route by event type. What the ordering section did *not* previously
+///   state was the **multiplicity**, so it now says so explicitly rather than leaving
+///   "exactly one" to be inferred from a sentence that never claimed it. The cadence
+///   is opt-in and off by default besides: a run without the flag emits the same
+///   number of snapshots, at the same point, as before.
+/// - *Should a repeat be distinguishable?* Yes, and by the same convention every
+///   other multi-trigger event in this stream already follows — `timeout.reason`
+///   (`overall`/`idle`), `cancelled.source`, `container_failed.phase`,
+///   `runner_exit.source`: when one event type can arise from more than one trigger,
+///   the event names its own trigger instead of leaving a consumer to infer it from
+///   position in the stream. Adding an always-present field to an existing event is
+///   the additive change `docs/schema.md`'s "Versioning" section explicitly blesses
+///   (the `timeout` event's own `reason` was added exactly this way), at the cost of
+///   regenerating that event's golden fixture line (K-049).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotReason {
+    /// The one snapshot every run emits, immediately after `run_started`.
+    Spawn,
+    /// A periodic re-sample armed by `run --snapshot-interval`.
+    Interval,
+}
+
+impl SnapshotReason {
+    /// The `members_snapshot` event's always-present `reason` value for this
+    /// trigger (`docs/schema.md`, "members_snapshot").
+    fn reason(self) -> &'static str {
+        match self {
+            SnapshotReason::Spawn => "spawn",
+            SnapshotReason::Interval => "interval",
+        }
+    }
+}
+
 /// Which **local stop signal** asked the runner to end the run — the honest
 /// `source` of the `cancelled` JSONL event and the trigger the stderr line names.
 ///

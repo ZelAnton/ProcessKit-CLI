@@ -162,10 +162,14 @@ A runner-imposed ending normally emits:
 ```text
 timeout | cancelled | killed
 cleanup_started
-members_snapshot
 cleanup_finished
 runner_exit
 ```
+
+`members_snapshot` is not part of that tail: one is emitted right after
+`run_started`, and — with the opt-in `--snapshot-interval <duration>` cadence —
+more of them while the child runs, but the cadence stops the instant the ending
+is decided, so none can appear between the reason event and `runner_exit`.
 
 Exact presence and ordering rules are normative in
 [JSONL event schema](schema.md#ordering).

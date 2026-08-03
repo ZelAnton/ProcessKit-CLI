@@ -146,17 +146,22 @@
     },
     "membersSnapshot": {
       "type": "object",
-      "description": "A point-in-time snapshot of the container's members.",
+      "description": "A point-in-time snapshot of the container's members. Emitted once right after run_started (reason 'spawn'); a run given --snapshot-interval additionally re-emits it on that cadence (reason 'interval') until the ending is decided (docs/schema.md, 'members_snapshot' and 'Ordering').",
       "properties": {
         "schema_version": { "$ref": "#/$defs/schemaVersion" },
         "time": { "$ref": "#/$defs/time" },
         "event": { "const": "members_snapshot" },
+        "reason": {
+          "type": "string",
+          "enum": ["spawn", "interval"],
+          "description": "What asked for this snapshot: 'spawn' (once, right after the child was spawned) or 'interval' (a --snapshot-interval re-sample)."
+        },
         "members": {
           "type": "array",
           "items": { "$ref": "#/$defs/member" }
         }
       },
-      "required": ["schema_version", "time", "event", "members"],
+      "required": ["schema_version", "time", "event", "reason", "members"],
       "additionalProperties": false
     },
     "rootExited": {

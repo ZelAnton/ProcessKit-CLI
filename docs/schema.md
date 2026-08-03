@@ -119,6 +119,7 @@ the read may be missing.
 
 | Field     | Type            | Notes                              |
 |-----------|-----------------|------------------------------------|
+| `reason`  | string          | What asked for this snapshot: `spawn` or `interval` (below). |
 | `members` | array of member | Each entry is a *member* (below).  |
 
 A **member** object:
@@ -129,6 +130,37 @@ A **member** object:
 | `ppid`       | integer, nullable | Parent pid — see "Enriched member fields".               |
 | `name`       | string, nullable  | Executable name — see "Enriched member fields".          |
 | `start_time` | string, nullable  | Opaque, platform-specific start-time token, as a decimal string — see "Enriched member fields". |
+
+**How many, and when (`reason`).** Every run emits one snapshot immediately after
+`run_started`, carrying `reason: "spawn"`. A run given `run --snapshot-interval
+<duration>` **additionally** re-emits the same event on that cadence for as long
+as the child runs, each carrying `reason: "interval"` — recorded observability for
+how the tree evolved (when the worker fleet grew, whether helpers lingered, what
+the tree looked like just before a deadline fired), for the long, quiet, or
+detached runs where nobody is likely to have been watching live with `inspect` at
+the interesting moment.
+
+- `reason` is **always present**, including on the single `spawn` snapshot a run
+  without the flag emits. It is the only difference between the two: both are
+  produced by the same code through the same `members_info()` enrichment, so a
+  periodic snapshot's `members` cannot drift in shape from the first one's.
+- The periodic snapshots stop the moment the run's ending is decided, so they
+  appear **only** between `run_started` and the ending's own event
+  (`root_exited`, or the `timeout`/`cancelled`/`killed` reason event) — never
+  interleaved into the `cleanup_started`/`cleanup_finished` teardown pair. See
+  "Ordering".
+- Repeating an existing event is **additive within schema v1** — no field is
+  renamed, retyped, or given a new meaning, and a reader that pins a version must
+  already tolerate additional events (see "Versioning"). The cadence is also
+  opt-in: without `--snapshot-interval` a run emits exactly the one snapshot, at
+  exactly the point, it always did.
+- A member read that fails skips that one sample (with a warning on the runner's
+  stderr) rather than emitting a fabricated empty snapshot, exactly as for the
+  post-spawn one; the cadence continues. A missing sample is therefore a gap in
+  the cadence, not a claim that the tree was empty.
+- Snapshots are read from the container's own member list, not from the runner's
+  output pump, so `--snapshot-interval` composes with every I/O mode —
+  `--inherit-stdio` included, unlike `--idle-timeout`.
 
 ### `root_exited`
 
@@ -466,7 +498,8 @@ before the teardown.
 
 ## Ordering
 
-A normal run emits, in order: `run_started`, `members_snapshot`, then either
+A normal run emits, in order: `run_started`, `members_snapshot`
+(`reason: "spawn"`), then either
 
 - **natural exit** — `root_exited`, `cleanup_started`, `cleanup_finished`,
   `runner_exit`; or
@@ -478,6 +511,20 @@ The reason event names *which* ending it was: `timeout` (with `reason` `overall`
 `sigterm`/`sighup` (Unix), `ctrl_break`/`ctrl_close`/`ctrl_logoff`/`ctrl_shutdown`
 (Windows), or `control_cancel`) for a local stop signal or a control-plane cancel, and
 `killed` (`source` `control_kill`) for a control-plane kill.
+
+**Multiplicity of `members_snapshot`.** The post-spawn `members_snapshot` above is
+the only one a run emits *by default*, and it always appears exactly once,
+directly after `run_started`. A run given `run --snapshot-interval <duration>`
+emits **additional** `members_snapshot` events (`reason: "interval"`) on that
+cadence, all of them after the post-spawn one and all of them **before** the
+ending's own event — `root_exited` for a natural exit, or the
+`timeout`/`cancelled`/`killed` reason event for a runner-imposed one. None is ever
+interleaved into the `cleanup_started`/`cleanup_finished` teardown pair or emitted
+after it: the cadence stops the instant the ending is decided. Every other event's
+position above is unchanged. This is an additive extension within schema v1 (see
+"Versioning"): a consumer that reads the first `members_snapshot` and routes the
+rest of the stream by event type is unaffected, and one that wants only the
+start-of-run shape can select `reason == "spawn"` instead of relying on position.
 
 When `--capture-dir` is set, an `output_captured` event is inserted after
 `cleanup_finished` and before the terminal `runner_exit`, on every ending that ran
@@ -600,7 +647,17 @@ field** to an existing event — always present, and leaving every other field's
 type, and meaning intact — is additive in the same way: a consumer that reads the
 fields it knows is unaffected and simply ignores the new one. The `output_captured`
 per-stream `write_error` flag was added this way within v1, as was the `timeout`
-event's `reason` field (when `--idle-timeout` joined `--timeout` on that event).
+event's `reason` field (when `--idle-timeout` joined `--timeout` on that event) and
+the `members_snapshot` event's own `reason` field (when `--snapshot-interval` gave
+that event a second trigger). Emitting an **existing event more times** than a
+stream previously carried it is additive for the same reason a new event type is:
+no existing event's shape changes, and a consumer pinned to a version must already
+tolerate events it did not expect at that point in the stream — within a version it
+may not assume an event type it knows occurs at most once. `members_snapshot` was
+extended this way within v1 by the opt-in `run --snapshot-interval` cadence, which
+also leaves the default stream (no flag) emitting exactly the events, in exactly the
+order and the number, that it did before; the normative statement of how many such
+events a stream may carry, and where they may appear, lives in "Ordering".
 Adding a **new value** to an open-ended
 descriptive string field — a new `cancelled` `source`, for instance, as `sigterm` and
 `sighup` were added within v1 when the runner started catching those signals — is
