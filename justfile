@@ -82,10 +82,14 @@ bench:
 
 # NOT fuzz.yml's full scheduled/dispatch budget (120s default, more on manual
 # dispatch). Default target and a short per-target budget, both overridable:
-#   just fuzz-smoke                  # registry_record, 10s
-#   just fuzz-smoke control_wire 30  # a different target/budget
-# Requires the nightly toolchain and cargo-fuzz — see CONTRIBUTING.md,
-# "Fuzzing".
+#   just fuzz-smoke                        # registry_record, 10s
+#   just fuzz-smoke control_wire 30        # a different target/budget
+#   just fuzz-smoke runner_exit_tail 10    # wait --report-outcome's read-back (T-301)
+# Default stays `registry_record` (a deliberate choice, not an oversight —
+# there is no "primary" target among the four, so the original default is left
+# undisturbed); every target fuzz.yml runs (see fuzz/fuzz_targets/*.rs) is a
+# valid `target` argument here, `runner_exit_tail` included. Requires the
+# nightly toolchain and cargo-fuzz — see CONTRIBUTING.md, "Fuzzing".
 
 # Short, bounded cargo-fuzz smoke run for a quick local sanity check (not a real fuzzing session).
 fuzz-smoke target='registry_record' seconds='10':

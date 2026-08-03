@@ -1,0 +1,269 @@
+name: Cross-version interop
+
+# Cross-version interop tier (`scripts/cross_version_interop.py`, T-300): the only
+# place anything in this repository runs TWO different versions of the binary
+# against each other. Every other tier — unit, integration, e2e, stress — is
+# same-binary, so the mixed-version promises the project documents (the registry
+# record's own version axis, the control plane's `snapshot_version`, the JSONL
+# stream's `schema_version`, and `probe`'s surface pinning) were reasoned about
+# and written down but never executed. This lane downloads the latest published
+# release binary and drives `docs/compatibility.md`'s own rolling-upgrade and
+# downgrade procedures across the two builds:
+#
+#   * the current build's `list`/`inspect`/`prune`/`cancel`/`wait` over registry
+#     state produced by the released binary — both a live detached run and the
+#     leftover record of a runner killed abruptly;
+#   * the released binary's `list`/`inspect`/`cancel`/`wait`/`prune` over the
+#     current build's runner and leftovers, the same scenarios in reverse;
+#   * `probe --require-surface`/`--require-schema-version`/`--require-exit-code-band`
+#     pinning in both directions, including that the OLDER binary fails closed
+#     (`PROBE_INCOMPATIBLE`, 110) on a token added since it shipped;
+#   * each binary's durable JSONL stream read under the other's schema, plus the
+#     released binary's stdout JSON under the current `fixtures/schema/cli/`
+#     documents.
+#
+# NON-GATING, and this file is where that decision is recorded. There is
+# deliberately no `push:`/`pull_request:` trigger: it runs on a schedule and by
+# manual dispatch only, so it is never a PR check and can never block a merge —
+# the same placement as canary.yml, fuzz.yml, mutants.yml, and stress.yml. It
+# needs the network (GitHub Releases) and a published release to exist at all,
+# neither of which belongs on a required check.
+#
+# Like stress.yml (and unlike fuzz.yml/mutants.yml) the driver step does NOT use
+# `continue-on-error`: a failure here is a real compatibility regression in
+# shipped behavior and should be plainly red in this workflow's own history.
+# Being outside the PR triggers is what makes it non-blocking; it does not need
+# its failures hidden as well. A *declared* break — a bump of `schema_version`,
+# `snapshot_version`, or `probe_version` — is reported prominently but is not a
+# failure, because bumping those fields is the sanctioned way to break them and
+# the lane would otherwise stay red from the moment a legitimate bump lands until
+# the next release.
+#
+# GRACEFUL SKIP, not a silent green: when no release has been published yet, or
+# the release carries no archive for the runner's own platform, the interop step
+# is skipped with an explicit `::notice::` and a job-summary line naming the
+# reason. The offline half below (`scripts/tests/test_cross_version_interop.py`,
+# which pins the driver's own additive-vs-breaking verdict logic against this
+# repository's published schema fixtures) runs unconditionally, so a skipped run
+# still executes something real.
+#
+# CI-only addition: no `src/`, `Cargo.toml`, or `Cargo.lock` change and no
+# user-facing behavior change, so it is covered by the CHANGELOG exemption this
+# repository applies to workflow-only work (as mutants.yml and the typos/
+# docs-links jobs were), unlike stress.yml, which shipped a Cargo feature.
+
+on:
+  schedule:
+    # Weekly, off-peak UTC on Thursday — the remaining free weekday slot next to
+    # fuzz.yml (Monday), canary.yml (Tuesday), mutants.yml (Wednesday), and
+    # stress.yml (Friday), so the scheduled tiers never compete for one window.
+    - cron: '29 4 * * 4'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Release tag to interoperate with (for example `v0.3.0`). Leave empty to
+          use the latest published release, which is what the schedule does.
+        required: false
+        default: ''
+
+permissions:
+  contents: read # `gh release download` reads this repository's own releases
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  interop:
+    name: interop (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Both platform halves of the two resources the scenarios exercise: the
+    # liveness lock is `flock` on unix and `LockFileEx` on Windows, and the
+    # control transport is a unix domain socket or a Windows named pipe, so a
+    # mixed-version defect can be genuinely platform-specific. macOS is included
+    # for the third `run` containment shape (see docs/platform-support.md) and
+    # because release.yml publishes an aarch64-apple-darwin archive for it.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    # A release build plus a few dozen short runs; well above a healthy run
+    # (minutes) without letting a wedged one sit for the runner's default cap.
+    timeout-minutes: 30
+    steps:
+      # Actions are pinned to a full commit SHA (supply-chain hardening); the
+      # trailing comment records the human-readable version.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.x'
+
+      - name: Install the driver's dependencies
+        run: pip install jsonschema
+
+      # The offline half: the driver's own additive-vs-breaking verdict logic,
+      # pinned against this repository's published schema documents. It needs no
+      # release and no network, so it runs before (and independently of) the
+      # resolution step below — a run that ends up skipping the interop half
+      # still proves this much.
+      - name: Test the driver's verdict logic
+        run: python -m unittest scripts/tests/test_cross_version_interop.py -v
+
+      - uses: dtolnay/rust-toolchain@stable # rolling toolchain selector — intentionally unpinned
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # `--locked` asserts the committed Cargo.lock is authoritative; `--release`
+      # because that is the shape a user actually installs, and it is what the
+      # published archive on the other side of this comparison contains.
+      - name: Build the current binary
+        run: cargo build --release --locked --bin processkit-cli
+
+      # Resolve the release to interoperate with, and the archive for THIS
+      # runner's own platform.
+      #
+      # The skip/fail boundary is deliberate and narrow. A graceful SKIP means
+      # "there is nothing to compare against": no release has been published yet,
+      # or release.yml builds no archive for this runner's platform. Everything
+      # else — a download that fails, an archive that will not unpack, an archive
+      # with no runnable binary in it, or a dispatch that named a tag which does
+      # not exist — is a FAILURE. Degrading those to a skip would turn a broken
+      # published artifact or a broken lane into an unexplained green tick, which
+      # is exactly the silent no-op this tier must not become.
+      - name: Resolve the released binary
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # `github.event.inputs` (not the `inputs` context) so this reads as an
+          # empty string on the scheduled event, exactly as stress.yml and
+          # fuzz.yml read their own dispatch inputs.
+          REQUESTED_TAG: ${{ github.event.inputs.tag }}
+          RUNNER_OS_NAME: ${{ runner.os }}
+          RUNNER_ARCH_NAME: ${{ runner.arch }}
+        run: |
+          set -uo pipefail
+          skip() {
+            echo "::notice::Cross-version interop skipped: $1"
+            echo "skip_reason=$1" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          die() {
+            echo "::error::Cross-version interop could not start: $1"
+            exit 1
+          }
+
+          # The archive naming and target set are release.yml's `build-artifacts`
+          # matrix; a runner outside it has no published binary to compare with.
+          case "${RUNNER_OS_NAME}/${RUNNER_ARCH_NAME}" in
+            Linux/X64)    target=x86_64-unknown-linux-gnu;   extension=tar.gz ;;
+            Linux/ARM64)  target=aarch64-unknown-linux-gnu;  extension=tar.gz ;;
+            Windows/X64)  target=x86_64-pc-windows-msvc;     extension=zip ;;
+            Windows/ARM64) target=aarch64-pc-windows-msvc;   extension=zip ;;
+            macOS/ARM64)  target=aarch64-apple-darwin;       extension=tar.gz ;;
+            *) skip "release.yml publishes no archive for ${RUNNER_OS_NAME}/${RUNNER_ARCH_NAME}" ;;
+          esac
+
+          if [ -n "${REQUESTED_TAG}" ]; then
+            # An operator typed this tag; a typo must be reported, not absorbed.
+            tag="${REQUESTED_TAG}"
+            gh release view "$tag" --json tagName >/dev/null 2>&1 \
+              || die "the dispatched release ${tag} does not exist"
+          else
+            tag=$(gh release view --json tagName --jq .tagName 2>/dev/null || true)
+            [ -n "$tag" ] || skip "this repository has no published release yet"
+          fi
+
+          # Materialise the asset list before matching: piping `gh` straight into
+          # `grep -q` lets grep exit on the first match, and the resulting SIGPIPE
+          # on `gh` would be reported by `pipefail` as a failure — turning a
+          # present archive into a false skip.
+          pattern="processkit-cli-${tag}-${target}.${extension}"
+          assets=$(gh release view "$tag" --json assets --jq '.assets[].name' 2>/dev/null || true)
+          printf '%s\n' "$assets" | grep -qxF "$pattern" \
+            || skip "${tag} carries no ${target} archive (looked for ${pattern})"
+
+          mkdir -p "$RUNNER_TEMP/released"
+          gh release download "$tag" --pattern "$pattern" --dir "$RUNNER_TEMP/released" \
+            || die "downloading ${pattern} from ${tag} failed, though the release lists it"
+
+          # Unpack in place. Every archive holds the binary bare at its root,
+          # alongside `completions/`, `man/`, and — since the release that added
+          # it — a `schema/` snapshot the driver uses when the released binary is
+          # too old to print its own schema.
+          cd "$RUNNER_TEMP/released" || die "cannot enter $RUNNER_TEMP/released"
+          if [ "$extension" = "zip" ]; then
+            # 7z, not unzip: it is the archiver release.yml itself uses from
+            # `shell: bash` on the Windows runner, so it is known to be present.
+            7z x -y "$pattern" >/dev/null || die "7z could not unpack ${pattern}"
+            binary="$RUNNER_TEMP/released/processkit-cli.exe"
+            [ -f "$binary" ] || die "${pattern} has no processkit-cli.exe at its root"
+          else
+            tar -xzf "$pattern" || die "tar could not unpack ${pattern}"
+            binary="$RUNNER_TEMP/released/processkit-cli"
+            [ -f "$binary" ] || die "${pattern} has no processkit-cli at its root"
+            # The archive records the mode, but restore it explicitly rather than
+            # rely on it: a binary that will not execute is a failure, not a skip.
+            chmod +x "$binary" || die "could not mark ${binary} executable"
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "target=$target"
+            echo "binary=$binary"
+            echo "archive_schema=$RUNNER_TEMP/released/schema/schema.json"
+          } >> "$GITHUB_OUTPUT"
+          echo "Interoperating with ${tag} (${target})."
+
+      # The mixed-version scenarios themselves. Every run the driver launches
+      # points at a scratch registry directory of its own
+      # (PROCESSKIT_CLI_REGISTRY_DIR) and self-bounds with `run --timeout`, so
+      # nothing here touches the runner's own per-user registry and a cancelled
+      # job cannot leave a runner behind.
+      - name: Run the cross-version scenarios
+        if: ${{ steps.release.outputs.skip_reason == '' }}
+        shell: bash
+        env:
+          RELEASED_BINARY: ${{ steps.release.outputs.binary }}
+          ARCHIVE_SCHEMA: ${{ steps.release.outputs.archive_schema }}
+        run: |
+          set -uo pipefail
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            current="target/release/processkit-cli.exe"
+          else
+            current="target/release/processkit-cli"
+          fi
+          python scripts/cross_version_interop.py \
+            --old-binary "$RELEASED_BINARY" \
+            --new-binary "$current" \
+            --schema-dir fixtures/schema \
+            --archive-schema "$ARCHIVE_SCHEMA" \
+            --work-dir "$RUNNER_TEMP/interop" \
+            --summary-file "$GITHUB_STEP_SUMMARY" \
+            --json-report interop-report.json
+
+      # The skip path writes its own summary line, so a skipped run is legible in
+      # the Actions UI instead of an unexplained green tick.
+      - name: Report the skip
+        if: ${{ steps.release.outputs.skip_reason != '' }}
+        shell: bash
+        env:
+          SKIP_REASON: ${{ steps.release.outputs.skip_reason }}
+        run: |
+          {
+            echo "### Cross-version interop (${{ matrix.os }}): SKIPPED"
+            echo
+            echo "No mixed-version scenario ran: ${SKIP_REASON}."
+            echo
+            echo "The driver's own verdict logic was still exercised offline by"
+            echo '`scripts/tests/test_cross_version_interop.py`.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the scenario report
+        if: ${{ always() && steps.release.outputs.skip_reason == '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: interop-report-${{ matrix.os }}
+          path: interop-report.json
+          if-no-files-found: ignore
+          retention-days: 30

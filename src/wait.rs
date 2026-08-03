@@ -150,8 +150,13 @@ const OUTCOME_SETTLE_TIMEOUT: Duration = Duration::from_millis(500);
 const OUTCOME_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Only the tail can contain the terminal event. Bounding this read prevents a
-/// large lifecycle stream from becoming `wait`'s memory cost.
-const OUTCOME_TAIL_MAX_BYTES: u64 = 64 * 1024;
+/// large lifecycle stream from becoming `wait`'s memory cost. Exposed
+/// `#[doc(hidden)] pub` so the fuzz tier's `runner_exit_tail` target
+/// (`fuzz/fuzz_targets/runner_exit_tail.rs`, T-301) can derive the identical
+/// head/tail window sizes from a simulated events file without duplicating (and
+/// risking drifting from) this value.
+#[doc(hidden)]
+pub const OUTCOME_TAIL_MAX_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -171,8 +176,13 @@ struct WaitOutcome<'a> {
     child_code: Option<i32>,
 }
 
+///
+/// `#[doc(hidden)] pub` (fields stay module-private) purely so it can appear in
+/// the return type of the `#[doc(hidden)] pub` fuzz-tier primitives below —
+/// `pub fn`s cannot return a private type (`E0446`).
 #[derive(Debug, PartialEq, Eq)]
-struct TerminalOutcome {
+#[doc(hidden)]
+pub struct TerminalOutcome {
     code: i32,
     source: String,
     child_code: Option<i32>,
@@ -350,7 +360,35 @@ fn read_terminal_outcome(
     (&mut file)
         .take(OUTCOME_TAIL_MAX_BYTES)
         .read_to_end(&mut head)?;
-    let stream_matches = head.split(|byte| *byte == b'\n').any(|line| {
+    if !head_matches_run_id(&head, expected_run_id) {
+        return Ok(None);
+    }
+
+    let start = len.saturating_sub(OUTCOME_TAIL_MAX_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+
+    let mut tail = Vec::with_capacity((len - start).min(OUTCOME_TAIL_MAX_BYTES) as usize);
+    file.take(OUTCOME_TAIL_MAX_BYTES).read_to_end(&mut tail)?;
+    Ok(scan_runner_exit_tail(&tail, start == 0))
+}
+
+/// Whether the stream's head window contains a `run_started` line naming
+/// `expected_run_id` — the read-back path's first gate, confirming the events
+/// file actually belongs to the run being asked about before it bothers scanning
+/// the tail at all (a non-matching head means [`read_terminal_outcome`] returns
+/// `None` without ever reading the tail). `head` is the stream's first
+/// `min(len, OUTCOME_TAIL_MAX_BYTES)` bytes — exactly what
+/// [`read_terminal_outcome`] itself reads into its own `head`. Pure — no I/O —
+/// which, together with [`scan_runner_exit_tail`], is what lets the read-back
+/// path be driven directly with arbitrary bytes standing in for a whole events
+/// file: the fuzz tier's `runner_exit_tail` target
+/// (`fuzz/fuzz_targets/runner_exit_tail.rs`, T-301), by the same
+/// `#[doc(hidden)] pub` exposure pattern `registry_record`/`control_wire`/
+/// `cli_parsers` already use (K-041/K-060) — and any future consumer of the same
+/// tail-read-back primitive, e.g. a prospective `events` subcommand's line reader.
+#[doc(hidden)]
+pub fn head_matches_run_id(head: &[u8], expected_run_id: &str) -> bool {
+    head.split(|byte| *byte == b'\n').any(|line| {
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
             return false;
         };
@@ -360,22 +398,30 @@ fn read_terminal_outcome(
             == Some(u64::from(crate::events::SCHEMA_VERSION))
             && value.get("event").and_then(serde_json::Value::as_str) == Some("run_started")
             && value.get("run_id").and_then(serde_json::Value::as_str) == Some(expected_run_id)
-    });
-    if !stream_matches {
-        return Ok(None);
-    }
+    })
+}
 
-    let start = len.saturating_sub(OUTCOME_TAIL_MAX_BYTES);
-    file.seek(SeekFrom::Start(start))?;
-
-    let mut bytes = Vec::with_capacity((len - start).min(OUTCOME_TAIL_MAX_BYTES) as usize);
-    file.take(OUTCOME_TAIL_MAX_BYTES).read_to_end(&mut bytes)?;
-    let usable = if start == 0 {
-        bytes.as_slice()
+/// Scan a stream's tail window, in reverse, for its last well-formed terminal
+/// `runner_exit` line — the read-back path's second step, only ever reached by
+/// [`read_terminal_outcome`] once [`head_matches_run_id`] has already confirmed
+/// the stream. `tail` is the stream's last `min(len, OUTCOME_TAIL_MAX_BYTES)`
+/// bytes — exactly what [`read_terminal_outcome`] itself reads into its own
+/// `tail`. `tail_is_file_start` is whether that window's first byte is byte 0 of
+/// the real stream: `true` means the window's first line is complete; `false`
+/// means the window was seeked into the middle of a larger stream, so its first
+/// line is necessarily partial (its own start was truncated by the seek) and
+/// must be dropped before scanning — the same distinction
+/// [`read_terminal_outcome`]'s own `start == 0` check makes. Pure — no I/O — see
+/// [`head_matches_run_id`] for why that is what lets both double as the fuzz
+/// tier's `runner_exit_tail` target primitives.
+#[doc(hidden)]
+pub fn scan_runner_exit_tail(tail: &[u8], tail_is_file_start: bool) -> Option<TerminalOutcome> {
+    let usable = if tail_is_file_start {
+        tail
     } else {
-        match bytes.iter().position(|byte| *byte == b'\n') {
-            Some(index) => &bytes[index + 1..],
-            None => return Ok(None),
+        match tail.iter().position(|byte| *byte == b'\n') {
+            Some(index) => &tail[index + 1..],
+            None => return None,
         }
     };
 
@@ -419,13 +465,13 @@ fn read_terminal_outcome(
                 Some(code)
             }
         };
-        return Ok(Some(TerminalOutcome {
+        return Some(TerminalOutcome {
             code,
             source,
             child_code,
-        }));
+        });
     }
-    Ok(None)
+    None
 }
 
 /// The give-up error: `--timeout` elapsed without the run being confirmed finished.
