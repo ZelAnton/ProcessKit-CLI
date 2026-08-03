@@ -185,11 +185,12 @@ column is the kernel-backed containment the runner *actually* reports in the
 | Linux x86_64 (glibc) | `x86_64-unknown-linux-gnu` | cgroup v2 (`cgroup_v2`) |
 | Linux aarch64 (glibc) | `aarch64-unknown-linux-gnu` | cgroup v2 (`cgroup_v2`) |
 | Linux x86_64 (musl, static) | `x86_64-unknown-linux-musl` | cgroup v2 (`cgroup_v2`) |
+| Linux aarch64 (musl, static) | `aarch64-unknown-linux-musl` | cgroup v2 (`cgroup_v2`) |
 | macOS aarch64 (Apple Silicon) | `aarch64-apple-darwin` | process group (`process_group`) |
 
-The **musl** build links libc statically, so it runs on minimal, glibc-less
-container images (Alpine, distroless) as a single dependency-free file. It is
-shipped **alongside** the glibc Linux build, not as a replacement.
+The **musl** builds link libc statically, so they run on minimal, glibc-less
+container images (Alpine, distroless) as a single dependency-free file. They are
+shipped **alongside** the corresponding glibc Linux build, not as a replacement.
 
 The three mechanisms are not equally strong, and the runner reports which one is
 in force rather than papering over the difference:

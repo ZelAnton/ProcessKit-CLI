@@ -1,4 +1,4 @@
-//! Fuzz the defensive CLI value parsers (`src/cli.rs`), each fed the same raw
+//! Fuzz the defensive CLI value parsers (`src/cli/parse.rs`), each fed the same raw
 //! text independently — they never interact, and each is expected to reject
 //! anything outside its own strict grammar rather than panic or silently
 //! reinterpret it (see each function's own doc comment for its grammar:

@@ -12,6 +12,7 @@ TARGETS = {
     "x86_64-pc-windows-msvc": ".zip",
     "aarch64-pc-windows-msvc": ".zip",
     "x86_64-unknown-linux-musl": ".tar.gz",
+    "aarch64-unknown-linux-musl": ".tar.gz",
     "aarch64-apple-darwin": ".tar.gz",
 }
 
@@ -95,10 +96,12 @@ class PackageManifestTests(unittest.TestCase):
             )
             self.assertIn("on_macos do", formula)
             self.assertIn("on_linux do", formula)
-            self.assertEqual(formula.count("on_arm do"), 1)
+            self.assertEqual(formula.count("on_arm do"), 2)
+            self.assertEqual(formula.count("on_intel do"), 1)
             self.assertIn(hashes["aarch64-apple-darwin"], formula)
             self.assertIn(hashes["x86_64-unknown-linux-musl"], formula)
-            self.assertIn("depends_on arch: :x86_64", formula)
+            self.assertIn(hashes["aarch64-unknown-linux-musl"], formula)
+            self.assertNotIn("depends_on arch: :x86_64", formula)
             self.assertIn('bin.install "processkit-cli"', formula)
 
             readme = (output / "README.md").read_text(encoding="utf-8")

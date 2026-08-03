@@ -87,12 +87,16 @@ chosen bump and ships the current `Cargo.toml` version as-is.
 Strictly downstream (`needs: release`) of the job above — it never bumps,
 publishes to crates.io, tags, or creates the Release; it only builds and
 attaches assets to the Release the `release` job already created. It fans out
-across a `fail-fast: false` matrix of six targets:
+across a `fail-fast: false` matrix of seven targets:
 
 - `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc` (Windows)
 - `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` (Linux glibc; the
   aarch64 leg cross-compiles with `gcc-aarch64-linux-gnu`)
-- `x86_64-unknown-linux-musl` (static Linux, dependency-free binary)
+- `x86_64-unknown-linux-musl` (static Linux, dependency-free binary; built on
+  `ubuntu-latest`)
+- `aarch64-unknown-linux-musl` (static Linux, dependency-free binary; built
+  *natively* on the `ubuntu-24.04-arm` hosted runner instead of
+  cross-compiling, since apt has no `aarch64-linux-musl` cross-gcc package)
 - `aarch64-apple-darwin` (macOS, Apple Silicon)
 
 For each target, the job:
@@ -100,7 +104,8 @@ For each target, the job:
 1. Checks out the exact tagged commit (`ref: needs.release.outputs.tag`), so
    the binary embeds the released version.
 2. Builds `cargo build --release --locked --target <triple>` (installing a
-   cross linker first for the aarch64-glibc leg).
+   cross linker first for the aarch64-glibc leg; the two musl legs each
+   install `musl-tools` for their own native architecture instead).
 3. Packages the binary, `build.rs`'s generated shell completions and man
    pages, and a `schema/` directory (`schema.json` + `events.jsonl`, copied
    verbatim from the tracked `fixtures/schema/v1/` — not `build.rs` output, so
@@ -139,10 +144,9 @@ external package repository. It:
    being embedded.
 3. Produces the three-file `ZelAnton.ProcessKitCLI` winget manifest, an
    architecture-aware Scoop `processkit-cli.json`, and a Homebrew
-   `processkit-cli.rb` formula for macOS Arm64 plus Linux x86_64. The Linux
-   formula deliberately uses the static musl archive rather than inheriting
-   the release runner's glibc floor; Linux Arm64 waits for a compatible static
-   archive.
+   `processkit-cli.rb` formula for macOS Arm64 plus Linux x86_64/Arm64. The
+   Linux formula deliberately uses the static musl archives rather than
+   inheriting the release runner's glibc floor, for both architectures.
 4. Syntax-checks the JSON and Ruby output, packages the complete directory as
    `processkit-cli-v<version>-package-manifests.tar.gz`, and checksums that
    bundle.

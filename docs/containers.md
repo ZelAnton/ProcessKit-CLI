@@ -10,11 +10,11 @@ lifecycle contract inside that boundary.
 | Base image | Recommended artifact |
 | --- | --- |
 | Debian / Ubuntu / glibc distroless | `x86_64-unknown-linux-gnu` or Arm64 glibc |
-| Alpine / musl / minimal static image | `x86_64-unknown-linux-musl` |
+| Alpine / musl / minimal static image | `x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl` |
 
-The musl archive is statically linked against libc and is suitable for images
-without glibc. It is a distribution option, not a different containment
-mechanism.
+The musl archives are statically linked against libc and are suitable for
+images without glibc, on both x86_64 and Arm64. They are a distribution
+option, not a different containment mechanism.
 
 ## Minimal multi-stage image
 
@@ -29,6 +29,9 @@ FROM scratch
 COPY --from=unpack /tmp/processkit-cli /usr/local/bin/processkit-cli
 ENTRYPOINT ["/usr/local/bin/processkit-cli"]
 ```
+
+On an Arm64 host, override the build argument instead of the default:
+`--build-arg ARCHIVE=processkit-cli-v${PROCESSKIT_CLI_VERSION}-aarch64-unknown-linux-musl.tar.gz`.
 
 Verify the archive checksum and attestation in the build pipeline before this
 copy step; the abbreviated example focuses on final-image shape.

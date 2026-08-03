@@ -48,3 +48,10 @@ path = "fuzz_targets/cli_parsers.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "runner_exit_tail"
+path = "fuzz_targets/runner_exit_tail.rs"
+test = false
+doc = false
+bench = false
