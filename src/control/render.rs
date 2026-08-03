@@ -1,14 +1,16 @@
 //! Human and JSON rendering for control-plane snapshots.
 //!
-//! Every [`Snapshot`] that reaches this module has already passed
-//! [`super::verify_snapshot`] — both consumers apply it before rendering — so the
-//! `snapshot_version` printed here is always this build's own
-//! [`super::SNAPSHOT_VERSION`], and the rest of the payload is a shape this build
-//! actually implements. Nothing here re-checks that (a second copy of the policy is
-//! exactly the drift the shared check exists to prevent), and nothing here may be
-//! reached by an unverified snapshot: a reply declaring a foreign version is refused
-//! with `CONTROL` (103) before it gets this far (see the parent module's "A foreign
-//! snapshot version — refused, never rendered").
+//! Every [`Snapshot`] that reaches this module came out of
+//! [`super::SnapshotReply::accept`] — that is the only way to obtain one from the
+//! wire — so the payload is a shape this build actually implements. The
+//! `snapshot_version` printed here is the value the **runner** declared, which is not
+//! always this build's own [`super::SNAPSHOT_VERSION`]: it may be any version down to
+//! [`super::MIN_READABLE_SNAPSHOT_VERSION`], and printing it unchanged is the point —
+//! it reports which build's contract the answer came from. A version outside that
+//! range never gets this far; it is refused with `CONTROL` (103) before rendering (see
+//! the parent module's "The snapshot version a runner declares — checked, and acted
+//! on"). Nothing here re-checks any of that: a second copy of the policy is exactly
+//! the drift the shared acceptance step exists to prevent.
 
 use crate::exit::{self, RunnerError};
 

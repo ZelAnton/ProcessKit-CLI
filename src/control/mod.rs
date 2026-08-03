@@ -98,49 +98,64 @@
 //! registry-record path and dispatches directly to each record's endpoint, so two
 //! duplicate ids are two independent targets rather than an ambiguity.
 //!
-//! ## A foreign snapshot version — refused, never rendered
+//! ## The snapshot version a runner declares — checked, and acted on
 //!
-//! [`SNAPSHOT_VERSION`] is spent on **breaking** changes to the snapshot's shape
-//! only: an additive field is a minor change that deliberately leaves the number
-//! alone (`docs/compatibility.md`, "Machine-output schemas"). A reply that declares
-//! any other number is therefore, by this project's own contract, a shape this build
-//! was not written to read — and nothing here decodes a foreign one, because
-//! [`Snapshot`] has exactly the fields of version [`SNAPSHOT_VERSION`] and no
-//! version-conditional decoding exists. A version field's whole job is to tell a
-//! reader "you cannot correctly interpret what follows"; acting on it is what makes
-//! it a contract rather than a decoration.
+//! `inspect` is the only verb whose reply carries a version, and the client does not
+//! merely print it. A reply is rendered only if it declares a version this build can
+//! actually decode — the range [`MIN_READABLE_SNAPSHOT_VERSION`]`..=`[`SNAPSHOT_VERSION`]
+//! — and anything outside it is refused with the same reserved [`exit::CONTROL`]
+//! (103) result every other "no snapshot you can trust" outcome reports, without
+//! reaching the rendering step at all.
 //!
-//! Both consumers of a parsed snapshot — [`inspect_async`] for `inspect --run-id`
-//! and [`inspect_snapshot_target`] for `inspect --all` — refuse such a reply through
-//! the one shared [`verify_snapshot`] step (the same step that already carries the
-//! run-identity check both call sites shared before), with the same reserved
-//! [`exit::CONTROL`] (103) result every other "no snapshot you can trust" outcome
-//! reports. The registry read side already refuses on exactly this fact — a record
-//! whose [`registry::REGISTRY_VERSION`] it does not know is skipped rather than
-//! probed under today's liveness semantics — and the control-plane read side is not
-//! softer about the same class of fact.
+//! **The refusal is one-sided on purpose, and that is the decision this policy
+//! settles rather than leaves implicit:**
 //!
-//! The refusal is **symmetric** by design, and that is the decision this policy
-//! settles rather than leaves implicit:
-//!
-//! - A **newer** runner's snapshot cannot be interpreted because the breaking change
-//!   its number announces is, by definition, unknown to this build. This is the
-//!   mixed-binaries case a mid-upgrade user really has (the one
-//!   [`registry::REGISTRY_VERSION`]'s doc plans for): an older `inspect` pointed at a
+//! - A version **above** [`SNAPSHOT_VERSION`] is refused. Its number is the runner's
+//!   statement that the shape moved on in some way this build predates, and this
+//!   build cannot know which way — there is no decoder here for a contract written
+//!   after it. Rendering it anyway would present a payload interpreted under
+//!   semantics its sender never promised, and would do so quietly: [`Snapshot`] is
+//!   not `deny_unknown_fields`, so whatever a newer runner added is dropped at
+//!   deserialization and never reaches stdout ([K-092]) — a confident rendering with
+//!   no marker of what was lost. This is the mixed-binaries case a mid-upgrade user
+//!   really has, and the one this check exists for: an older `inspect` pointed at a
 //!   newer runner.
-//! - An **older** runner's snapshot cannot be interpreted either, for the mirror-image
-//!   reason: this build carries no decoder for the shape the previous version left
-//!   behind, so rendering it would mean reading the peer's bytes under semantics the
-//!   peer never promised. Tolerating that direction would be a *softer* claim than
-//!   the registry makes about its own older records, and no more earned.
+//! - A version **below** it, down to [`MIN_READABLE_SNAPSHOT_VERSION`], is **read**,
+//!   because this build genuinely decodes it. That is not an assumption about what a
+//!   bump means in general; it is a fact about the only bump this contract has had.
+//!   1 → 2 (`7bed80c824b1`) added [`Snapshot::jsonl`] and [`Snapshot::capture_dir`],
+//!   both `Option` + `#[serde(default)]`, and changed nothing else, so a version-1
+//!   reply parses into exactly what version 1 promised with those two `None` — "not
+//!   reported", which is precisely what a version-1 runner meant. Refusing it would
+//!   delete a working, previously documented capability — every binary this project
+//!   has released so far (v0.1.0 … v0.3.1) writes version 1 — and would justify the
+//!   deletion with a claim ("no decoder for that form") this build's own
+//!   `#[serde(default)]` contradicts.
 //!
-//! Tolerating either direction would also be quieter than it looks: [`Snapshot`] is
-//! not `deny_unknown_fields`, so a newer runner's added fields are dropped at
-//! deserialization and never reach stdout ([K-092]) — the operator would be shown a
-//! confident rendering of a payload with no marker of what was lost. The refusal
-//! names both versions instead, which is the actionable fact ("run a matching
-//! build"), and it costs nothing on the happy path: a client and a runner from the
-//! same build always agree.
+//! The asymmetry is the honest reading of what a version number can tell a reader:
+//! it can say "I am newer than you", which is unknowable here and so must fail
+//! closed, but it cannot make a payload this build demonstrably parses unreadable.
+//! Where an older version *does* become unreadable — a bump that removes or renames
+//! a field, or changes an existing one's meaning — the floor moves in that same
+//! change (see [`MIN_READABLE_SNAPSHOT_VERSION`]). The range is where that judgement
+//! is recorded explicitly, instead of being inferred from the number.
+//!
+//! This is a narrower refusal than the registry read side's, which skips any record
+//! whose [`registry::REGISTRY_VERSION`] is not exactly its own, and the difference is
+//! earned rather than a softening: that check gates *destructive* action — probing a
+//! lock file and reaping the record behind it — on liveness semantics an unknown
+//! version may have redefined, so a record it cannot vouch for must not be acted on
+//! at all. A snapshot is read-only output whose only failure mode is being *misread*,
+//! which is exactly what the range check prevents.
+//!
+//! Both consumers of a reply — [`inspect_endpoint`] for `inspect --run-id` and
+//! [`inspect_snapshot_target`] for `inspect --all` — go through the one shared
+//! acceptance step ([`SnapshotReply::accept`], which also carries the run-identity
+//! check the two call sites already shared), so neither path can drift into a weaker
+//! bar than the other. The version verdict is reached **before** the payload's shape
+//! is parsed (see [`SnapshotReply`]'s `Deserialize`), so a newer runner whose shape
+//! this build cannot even deserialize still gets the version diagnostic — the
+//! actionable one — instead of a `serde` field complaint.
 //!
 //! ## Wire protocol
 //!
@@ -203,25 +218,59 @@ use render::snapshot_output_lines;
 /// the control plane's own private client/runner contract, so it versions on its own
 /// axis.
 ///
-/// **When it is bumped.** On a **breaking** change to the [`Snapshot`] shape only —
-/// a removed or renamed field, a changed type, or a changed meaning for an existing
-/// field. An *additive* field is a minor change and deliberately leaves this number
-/// where it is (`docs/compatibility.md`, "Machine-output schemas";
-/// `fixtures/schema/cli/README.md`, "Versioning"). A bump is therefore never
-/// cosmetic: it is this contract's way of saying "a reader built before this cannot
-/// correctly interpret what follows".
+/// **What a bump says — and what it does not.** It says the snapshot's shape changed
+/// in a way a reader should know about. It does **not**, on its own, say "breaking":
+/// the only bump this contract has had, 1 → 2 (`7bed80c824b1`), was purely additive —
+/// it introduced [`Snapshot::jsonl`] and [`Snapshot::capture_dir`], both `Option` +
+/// `#[serde(default)]`, and touched no existing field. A reader must therefore not
+/// infer "I cannot decode this" from the mere fact that a number differs; how far
+/// back this build really decodes is stated outright in
+/// [`MIN_READABLE_SNAPSHOT_VERSION`] and enforced by
+/// [`snapshot_version_is_readable`], which is the whole point of keeping that second
+/// constant next to this one.
 ///
-/// **The read side acts on it (T-292).** Because a difference means exactly that,
-/// the client refuses any snapshot declaring a version other than this one instead
-/// of rendering it under today's semantics — see [`verify_snapshot_version`] for the
-/// check, the module doc's "A foreign snapshot version — refused, never rendered"
-/// for why the refusal is symmetric, and `docs/control-plane.md`, "Snapshot version:
-/// a foreign version is refused, never rendered", for the operator-facing statement.
-/// Bumping this constant is consequently a real event for a mixed deployment: every
-/// client of a different version stops being able to inspect this runner (loudly,
-/// with `CONTROL` (103)), which is the point — spend the bump only on a change that
-/// genuinely earns it.
+/// **The read side acts on it (T-292).** The client refuses a reply declaring a
+/// version **newer** than this one — unknown semantics it holds no decoder for — and
+/// reads one declaring an older version down to [`MIN_READABLE_SNAPSHOT_VERSION`].
+/// See the module doc, "The snapshot version a runner declares — checked, and acted
+/// on", for why the refusal is one-sided, and `docs/control-plane.md`, "Snapshot
+/// version: a newer runner's reply is refused, an older one is read", for the
+/// operator-facing statement.
+///
+/// **What bumping it costs.** Every client older than the new number stops being
+/// able to inspect a runner that writes it — loudly, with `CONTROL` (103), rather
+/// than by misreading it. Clients *newer* than a given runner keep working as long
+/// as the floor below allows, so a bump is not automatically a fleet-wide outage;
+/// deciding whether the floor moves with it is part of making the bump.
 pub const SNAPSHOT_VERSION: u32 = 2;
+
+/// The oldest [`Snapshot::snapshot_version`] this build still decodes **correctly** —
+/// the explicit floor of the read side's accepted range, and the record of a
+/// judgement that is otherwise invisible in the code.
+///
+/// **Why it is 1.** Version 1's shape is exactly this build's minus
+/// [`Snapshot::jsonl`] and [`Snapshot::capture_dir`]: the 1 → 2 bump added those two
+/// and nothing else, leaving every other field's name, type, and meaning untouched
+/// (verified against the bump's own parent, `0661733425fc` → `7bed80c824b1`). Both
+/// are `Option` + `#[serde(default)]`, so a version-1 reply reads back with them
+/// `None` — "not reported", the same value this build publishes for a run whose
+/// capture is disabled — rather than failing to parse or, worse, being silently
+/// filled in with something its sender never said. That is the identical "old
+/// record, new reader" argument [`registry::REGISTRY_VERSION`]'s doc makes for its
+/// own additive fields, and it is a checkable fact about this repository rather than
+/// a policy about numbers. It matters in practice: every binary released so far
+/// (v0.1.0 … v0.3.1) writes version 1, so this floor is what keeps a freshly
+/// upgraded client able to inspect the runs its predecessor started.
+///
+/// **When to raise it.** In the same change as any bump that makes the older shape
+/// undecodable *or* misleading — a removed or renamed field this build still
+/// requires, a changed type, or, most importantly, an existing field whose *meaning*
+/// changed (that one still parses, which is precisely why the floor, not the parser,
+/// has to catch it). Raising it is a user-visible tightening: it is announced in
+/// `CHANGELOG.md` and it narrows the `snapshot_version` values
+/// `fixtures/schema/cli/inspect.schema.json` allows on stdout, so those two move with
+/// it.
+pub const MIN_READABLE_SNAPSHOT_VERSION: u32 = 1;
 
 /// The read-only request verb. An empty request line is treated as this too, so a
 /// bare connect-and-read probe still gets a snapshot.
@@ -390,16 +439,18 @@ const MAX_LINE_BYTES: usize = 64 * 1024;
 /// from a runner dying mid-write is caught rather than echoed).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Snapshot {
-    /// Snapshot format version ([`SNAPSHOT_VERSION`]).
+    /// Snapshot format version — [`SNAPSHOT_VERSION`] when this build is the runner.
     ///
     /// The one field here whose value genuinely originates on the *far* side of the
     /// wire rather than in this client's own re-serialization ([K-092]): the runner
-    /// declares which contract its reply follows. The client acts on that
-    /// declaration — [`verify_snapshot_version`] refuses anything but its own
-    /// [`SNAPSHOT_VERSION`], in either direction, before the snapshot reaches
-    /// rendering — so a value other than [`SNAPSHOT_VERSION`] never appears in
-    /// `inspect`'s output. See the module doc, "A foreign snapshot version —
-    /// refused, never rendered".
+    /// declares which contract its reply follows, and the client both acts on that
+    /// declaration and reports it unchanged. Acting on it means the range check in
+    /// [`snapshot_version_is_readable`] — a newer version is refused before the
+    /// snapshot reaches rendering, an older one down to
+    /// [`MIN_READABLE_SNAPSHOT_VERSION`] is read — so a rendered value is always
+    /// inside that range, and is the *runner's* number, not necessarily this
+    /// build's. See the module doc, "The snapshot version a runner declares —
+    /// checked, and acted on".
     pub snapshot_version: u32,
     /// The run's identifier — the key the client matched in the registry. Not a PID.
     pub run_id: String,
@@ -411,12 +462,14 @@ pub struct Snapshot {
     /// Run start time, RFC 3339 UTC with millisecond precision (same formatter as the
     /// JSONL events and the registry record).
     pub started_at: String,
-    /// Absolute path to the run's JSONL lifecycle stream. A runner of this
-    /// [`SNAPSHOT_VERSION`] always publishes it; the `Option` + `#[serde(default)]`
-    /// keeps a same-version peer that omits the field readable (the published schema
-    /// declares it nullable) instead of failing the whole parse. It is no longer the
-    /// way a *legacy* snapshot is read: one declaring a different `snapshot_version`
-    /// is refused before rendering (see [`verify_snapshot_version`]).
+    /// Absolute path to the run's JSONL lifecycle stream, or `null` when reading a
+    /// version-1 snapshot, which had no such field.
+    ///
+    /// A runner of this [`SNAPSHOT_VERSION`] always publishes a path. The `Option` +
+    /// `#[serde(default)]` is what makes the older contract readable at all — it is
+    /// the decoder [`MIN_READABLE_SNAPSHOT_VERSION`] rests on, not a formality — and
+    /// `None` reports exactly what a version-1 runner meant: the field was never
+    /// declared, so nothing is claimed about where the stream is.
     #[serde(default)]
     pub jsonl: Option<String>,
     /// Absolute output-capture directory, or `null` when capture is disabled.
@@ -428,6 +481,73 @@ pub struct Snapshot {
     /// member fields"). Queried at request time, so it reflects the container's
     /// composition *when inspected*, not at start.
     pub members: Vec<Member>,
+}
+
+/// An `inspect` reply as it comes off the wire, decoded in the order its contract is
+/// decided in: the declared `snapshot_version` first, the payload's shape second.
+///
+/// Deserializing straight into [`Snapshot`] settles those two in the opposite order,
+/// and the difference is precisely the case the version check exists for. Every field
+/// but [`Snapshot::jsonl`]/[`Snapshot::capture_dir`] is required, so a newer runner's
+/// genuinely breaking change — a removed, renamed, or retyped field — fails `serde`
+/// first, and the operator gets "the runner sent an unreadable response: missing
+/// field `mechanism`": a parser complaining about a payload this client was never
+/// entitled to read, instead of "the runner answered with control-plane snapshot
+/// version 3, and this client reads versions 1 to 2", the one diagnostic that names
+/// the real problem and its fix. Reading the declared version off the raw JSON first
+/// makes the version verdict unconditional, which is what lets `docs/control-plane.md`
+/// promise that *every* refused version — not only the ones that happen to still
+/// parse — is reported by naming the version that arrived and the range this build
+/// reads.
+///
+/// A reply whose `snapshot_version` is missing, negative, or not a whole number
+/// carries no version verdict to reach: it is a malformed snapshot, so it falls
+/// through to the full parse and surfaces `serde`'s own diagnostic exactly as before.
+///
+/// `#[doc(hidden)] pub` for the same reason [`ErrorReply`] is: the `control_wire`
+/// fuzz target drives the exact types [`converse`] parses a reply line into, and
+/// this is now that type for the `inspect` verb.
+#[derive(Debug)]
+#[doc(hidden)]
+pub enum SnapshotReply {
+    /// A reply declaring a version inside this build's readable range
+    /// ([`snapshot_version_is_readable`]), parsed into the shape this build
+    /// implements.
+    Readable(Snapshot),
+    /// A reply declaring a version outside that range, carrying only the number the
+    /// runner declared — the payload was deliberately *not* interpreted, and that
+    /// number is the whole actionable content of the refusal.
+    Unreadable(u64),
+}
+
+impl<'de> Deserialize<'de> for SnapshotReply {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if let Some(declared) = value
+            .get("snapshot_version")
+            .and_then(serde_json::Value::as_u64)
+            && !snapshot_version_is_readable(declared)
+        {
+            return Ok(Self::Unreadable(declared));
+        }
+        serde_json::from_value(value)
+            .map(Self::Readable)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Whether this build decodes a snapshot declaring `declared` — the read side's whole
+/// version policy, in one place both `inspect` forms reach through
+/// [`SnapshotReply`]. See [`SNAPSHOT_VERSION`] and
+/// [`MIN_READABLE_SNAPSHOT_VERSION`] for what each end of the range means and when it
+/// moves. Takes the `u64` a JSON number yields rather than a `u32`, so a wildly
+/// out-of-range declaration is refused by *this* rule, with the number the runner
+/// actually sent in the message, instead of being lost in a cast.
+fn snapshot_version_is_readable(declared: u64) -> bool {
+    (u64::from(MIN_READABLE_SNAPSHOT_VERSION)..=u64::from(SNAPSHOT_VERSION)).contains(&declared)
 }
 
 /// The error line a server sends for an unrecognized request verb. The `inspect`
@@ -748,16 +868,16 @@ async fn inspect_async(run_id: &str, json: bool) -> Result<(), RunnerError> {
 }
 
 /// The single-run `inspect`'s whole exchange with one already-resolved endpoint:
-/// connect, converse, and accept the reply only if [`verify_snapshot`] does. Returns
-/// the accepted snapshot rather than printing it, exactly as [`mutate_one`] returns
-/// its parsed ack, so lookup, exchange, and rendering stay separate steps.
+/// connect, converse, and accept the reply only if [`SnapshotReply::accept`] does.
+/// Returns the accepted snapshot rather than printing it, exactly as [`mutate_one`]
+/// returns its parsed ack, so lookup, exchange, and rendering stay separate steps.
 ///
 /// Split out of [`inspect_async`] so the whole path from the wire to the
 /// accept/refuse decision is drivable against a *specific* endpoint: [`inspect_async`]
 /// resolves through the process-wide, env-resolved registry, which a unit test cannot
 /// point at a scratch directory without racing every other test in the binary. The
 /// aggregate path's equivalent step ([`inspect_snapshot_target`]) already takes its
-/// registry and target explicitly, so both consumers of a [`Snapshot`] can now be
+/// registry and target explicitly, so both consumers of a [`SnapshotReply`] can now be
 /// covered by the same regression test with a real transport in front of them.
 async fn inspect_endpoint(endpoint: &str, run_id: &str) -> Result<Snapshot, RunnerError> {
     // Connect under a deadline: a runner that died between the liveness probe and now
@@ -766,10 +886,9 @@ async fn inspect_endpoint(endpoint: &str, run_id: &str) -> Result<Snapshot, Runn
 
     // Converse under a deadline: a runner that died mid-write, or accepted but never
     // answers, is bounded here — a distinguishable CONTROL result, not a hang.
-    let snapshot: Snapshot =
+    let reply: SnapshotReply =
         converse_under_deadline(stream, INSPECT_REQUEST, "inspect", run_id).await?;
-    verify_snapshot(&snapshot, run_id)?;
-    Ok(snapshot)
+    reply.accept(run_id)
 }
 
 /// Inspect every run confirmed live in one registry snapshot, optionally restricted
@@ -852,78 +971,86 @@ async fn inspect_all_async(
 
 /// Drive one aggregate inspect target through [`dispatch_snapshot_target`] — the same
 /// ladder `cancel --all` / `kill --all` run per target (see [`mutate_snapshot_target`])
-/// — adding only the read-only verb's own final step: [`verify_snapshot`], the same
-/// acceptance test the single-run [`inspect_endpoint`] applies.
+/// — adding only the read-only verb's own final step: [`SnapshotReply::accept`], the
+/// same acceptance test the single-run [`inspect_endpoint`] applies.
 async fn inspect_snapshot_target(
     registry: &registry::Registry,
     target: &SnapshotTarget,
 ) -> Result<SnapshotDispatch<Snapshot>, RunnerError> {
-    dispatch_snapshot_target(registry, target, "inspect", INSPECT_REQUEST, |snapshot| {
-        verify_snapshot(snapshot, &target.run_id)
-    })
+    dispatch_snapshot_target(
+        registry,
+        target,
+        "inspect",
+        INSPECT_REQUEST,
+        |reply: SnapshotReply| reply.accept(&target.run_id),
+    )
     .await
 }
 
-/// Everything a client must establish about a parsed [`Snapshot`] before it may
-/// render it: the reply follows a contract this build can interpret, and it describes
-/// the run that was addressed. **The** acceptance test for a snapshot — both consumers
-/// call exactly this one function ([`inspect_endpoint`] for `inspect --run-id`, the
-/// closure in [`inspect_snapshot_target`] for `inspect --all`), so neither path can
-/// drift into a weaker bar than the other, the way both already shared the identity
-/// half alone.
-///
-/// Version first: a reply this build cannot interpret at all is a more fundamental
-/// failure than one it can read but which names the wrong run — and on an
-/// uninterpretable payload, "the `run_id` field disagrees" would itself be a
-/// conclusion drawn under semantics the peer never promised.
-fn verify_snapshot(snapshot: &Snapshot, expected_run_id: &str) -> Result<(), RunnerError> {
-    verify_snapshot_version(snapshot, expected_run_id)?;
-    verify_snapshot_identity(snapshot, expected_run_id)
+impl SnapshotReply {
+    /// Everything a client must establish about a reply before it may render it: the
+    /// runner's declared contract is one this build decodes, and the snapshot
+    /// describes the run that was addressed. **The** acceptance test for an `inspect`
+    /// reply — both consumers call exactly this one method ([`inspect_endpoint`] for
+    /// `inspect --run-id`, the closure in [`inspect_snapshot_target`] for `inspect
+    /// --all`) — so neither path can drift into a weaker bar than the other, the way
+    /// both already shared the identity half alone. Consuming `self` and returning the
+    /// [`Snapshot`] is what makes that structural: an unaccepted reply has no path to
+    /// the renderer, because the renderer's input only exists on the other side of
+    /// this call.
+    ///
+    /// Version first — and, by [`SnapshotReply`]'s own decoding, already decided
+    /// before the shape was parsed at all: a reply this build cannot interpret is a
+    /// more fundamental failure than one it can read but which names the wrong run,
+    /// and on an uninterpretable payload "the `run_id` field disagrees" would itself
+    /// be a conclusion drawn under semantics the peer never promised.
+    fn accept(self, expected_run_id: &str) -> Result<Snapshot, RunnerError> {
+        match self {
+            Self::Unreadable(declared) => Err(refuse_snapshot_version(declared, expected_run_id)),
+            Self::Readable(snapshot) => {
+                verify_snapshot_identity(&snapshot, expected_run_id)?;
+                Ok(snapshot)
+            }
+        }
+    }
 }
 
-/// Refuse a snapshot that declares any [`Snapshot::snapshot_version`] other than the
-/// [`SNAPSHOT_VERSION`] this build implements (T-292).
+/// Refuse a reply whose declared `snapshot_version` falls outside the range this build
+/// decodes (T-292) — see [`snapshot_version_is_readable`] for the range itself and the
+/// module doc for why it is one-sided.
 ///
-/// A difference in either direction means a breaking difference in the snapshot's
-/// shape — that is the only thing this project spends the number on
-/// (`docs/compatibility.md`, "Machine-output schemas") — and nothing in this client
-/// decodes a foreign shape, so rendering the reply anyway would present a payload
-/// interpreted under semantics its sender never promised. The refusal reuses the
-/// established [`unreachable_run`] wording and the reserved [`exit::CONTROL`] (103)
-/// code, exactly as [`verify_snapshot_identity`] does for a snapshot naming the wrong
-/// run: from the operator's side, "this runner cannot give me a snapshot I can trust"
-/// is the same class of outcome, and it must not be reported as success. The message
-/// names both numbers and which side is newer, since the actionable fix is to run a
-/// matching build rather than to retry.
+/// The refusal reuses the established [`unreachable_run`] wording and the reserved
+/// [`exit::CONTROL`] (103) code, exactly as [`verify_snapshot_identity`] does for a
+/// snapshot naming the wrong run: from the operator's side, "this runner cannot give
+/// me a snapshot I can trust" is the same class of outcome, and it must not be
+/// reported as success. The message names the number that arrived, the range this
+/// build reads, and which way the runner falls outside it, because the fix is to pick
+/// a build that speaks the runner's version rather than to retry.
 ///
-/// Nothing peer-supplied is spliced into the message except the declared version, a
-/// `u32` — so, unlike a peer's free-text error ([`normalize_peer_error_text`]), this
+/// Nothing peer-supplied is spliced into the message except that declared version, an
+/// integer — so, unlike a peer's free-text error ([`normalize_peer_error_text`]), this
 /// diagnostic needs no sanitizing to stay one honest line.
-fn verify_snapshot_version(snapshot: &Snapshot, expected_run_id: &str) -> Result<(), RunnerError> {
-    if snapshot.snapshot_version == SNAPSHOT_VERSION {
-        return Ok(());
-    }
-    let side = if snapshot.snapshot_version > SNAPSHOT_VERSION {
-        "the runner is a newer build than this client"
+fn refuse_snapshot_version(declared: u64, expected_run_id: &str) -> RunnerError {
+    let side = if declared > u64::from(SNAPSHOT_VERSION) {
+        "the runner is a newer build than this client, so what its version changed is unknown here"
     } else {
-        "the runner is an older build than this client"
+        "the runner is older than any build this client still decodes"
     };
-    Err(unreachable_run(
+    unreachable_run(
         "inspect",
         expected_run_id,
         format!(
-            "the runner answered with control-plane snapshot version {} and this client \
-             implements version {SNAPSHOT_VERSION} ({side}); a differing snapshot_version marks \
-             a breaking change to the snapshot's shape, so this reply cannot be read as if it \
-             were version {SNAPSHOT_VERSION} — inspect this run with a matching \
-             processkit-cli build",
-            snapshot.snapshot_version
+            "the runner answered with control-plane snapshot version {declared}, and this client \
+             reads versions {MIN_READABLE_SNAPSHOT_VERSION} to {SNAPSHOT_VERSION} ({side}); the \
+             reply was refused rather than rendered under semantics its sender never promised — \
+             inspect this run with a processkit-cli build that implements its snapshot version \
+             (for a newer runner, one at least as new as the binary that started the run)"
         ),
-    ))
+    )
 }
 
 /// Refuse a snapshot describing a run other than the one that was addressed — the
-/// identity half of [`verify_snapshot`].
+/// identity half of [`SnapshotReply::accept`].
 fn verify_snapshot_identity(snapshot: &Snapshot, expected_run_id: &str) -> Result<(), RunnerError> {
     if snapshot.run_id == expected_run_id {
         return Ok(());
@@ -1227,24 +1354,31 @@ fn snapshot_live_targets(
 ///    **only** when the re-probe confirms the record is now absent or stale. An
 ///    unprobeable or identity-changed record stays a hard failure — unknown liveness
 ///    is not evidence the target ended (see [`snapshot_target_state`]).
-/// 4. Hand the parsed reply to the caller's `verify` step (identity for a snapshot,
-///    ack matching for a mutation), which alone decides whether the reply belongs to
-///    the target that was addressed.
+/// 4. Hand the parsed reply to the caller's `accept` step (version and identity for an
+///    `inspect` reply, ack matching for a mutation), which alone decides whether the
+///    reply may be used at all, and yields what the verb actually wanted from it.
+///
+/// The reply type off the wire (`T`) and the accepted value (`U`) are separate
+/// parameters because for `inspect` they genuinely differ: what `converse` parses is a
+/// [`SnapshotReply`], which still carries an undecided version verdict, and only
+/// [`SnapshotReply::accept`] turns it into a [`Snapshot`] a caller may render. Letting
+/// the accept step *produce* that value, rather than merely inspect it, is what keeps
+/// the refusal impossible to bypass here without also bypassing this ladder.
 ///
 /// `action` names the verb in every operator-facing message, while `verb` is the text
 /// actually written to the wire; they read the same today for both call sites, but the
 /// module keeps the diagnostic label and the protocol token separate everywhere else
 /// ([`converse_under_deadline`] takes both too), so this driver does not fuse them.
-async fn dispatch_snapshot_target<T, V>(
+async fn dispatch_snapshot_target<T, U, A>(
     registry: &registry::Registry,
     target: &SnapshotTarget,
     action: &str,
     verb: &str,
-    verify: V,
-) -> Result<SnapshotDispatch<T>, RunnerError>
+    accept: A,
+) -> Result<SnapshotDispatch<U>, RunnerError>
 where
     T: serde::de::DeserializeOwned,
-    V: FnOnce(&T) -> Result<(), RunnerError>,
+    A: FnOnce(T) -> Result<U, RunnerError>,
 {
     if snapshot_target_state(registry, target, action)? == SnapshotTargetState::AlreadyGone {
         return Ok(SnapshotDispatch::AlreadyGone);
@@ -1271,8 +1405,7 @@ where
         Err(err) => return reclassify_target_failure(registry, target, action, err),
     };
 
-    verify(&reply)?;
-    Ok(SnapshotDispatch::Dispatched(reply))
+    Ok(SnapshotDispatch::Dispatched(accept(reply)?))
 }
 
 /// Decide what a transport-level failure against one snapshot target *means*: it is
@@ -1302,16 +1435,22 @@ async fn mutate_snapshot_target(
     command: ControlCommand,
 ) -> Result<SnapshotDispatch<ControlAck>, RunnerError> {
     let action = command.verb();
-    dispatch_snapshot_target(registry, target, action, command.verb(), |ack| {
-        if ack_matches(ack, action, &target.run_id) {
-            return Ok(());
-        }
-        Err(unreachable_run(
-            action,
-            &target.run_id,
-            "the runner did not acknowledge the command for the snapshotted target".to_string(),
-        ))
-    })
+    dispatch_snapshot_target(
+        registry,
+        target,
+        action,
+        command.verb(),
+        |ack: ControlAck| {
+            if ack_matches(&ack, action, &target.run_id) {
+                return Ok(ack);
+            }
+            Err(unreachable_run(
+                action,
+                &target.run_id,
+                "the runner did not acknowledge the command for the snapshotted target".to_string(),
+            ))
+        },
+    )
     .await
 }
 

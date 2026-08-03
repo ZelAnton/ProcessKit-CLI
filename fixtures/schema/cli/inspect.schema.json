@@ -41,8 +41,8 @@
       "description": "One live run's state, as `inspect --run-id <id> --json` prints it and as the runner replies to the control-plane `inspect` verb. Queried at request time, so it reflects the container's composition *when inspected*, not at start.",
       "properties": {
         "snapshot_version": {
-          "const": 2,
-          "description": "Snapshot format version (src/control/mod.rs, SNAPSHOT_VERSION) — the control plane's own client/runner axis, independent of the JSONL `schema_version` and the `registry_version`. Pinned here: a bump is a breaking change to this shape and updates this document with it. The client acts on the value it receives over the wire: a snapshot declaring any other version is refused with CONTROL (103) rather than rendered, so this field can only ever hold the pinned value on stdout (docs/control-plane.md, 'Snapshot version: a foreign version is refused, never rendered')."
+          "enum": [1, 2],
+          "description": "Snapshot format version — the control plane's own client/runner axis, independent of the JSONL `schema_version` and the `registry_version`. This is the value the **runner** declared, so it names the contract that answered, not the version of the binary you invoked: a run started by an older build reports that build's number (this binary writes 2 — src/control/mod.rs, SNAPSHOT_VERSION). The client acts on the value it receives: a version newer than it implements is refused with CONTROL (103) rather than rendered, and one older than it still decodes (MIN_READABLE_SNAPSHOT_VERSION, currently 1) is refused too — so the values this field can hold on stdout are exactly the ones enumerated here, and this enumeration moves whenever either end of that range does (docs/control-plane.md, 'Snapshot version: a newer runner's reply is refused, an older one is read'). The rest of the object is always this build's own shape, because the client re-serializes what it parsed."
         },
         "run_id": {
           "type": "string",
@@ -57,7 +57,7 @@
         "started_at": { "$ref": "#/$defs/rfc3339Millis", "description": "Run start time." },
         "jsonl": {
           "type": ["string", "null"],
-          "description": "Absolute path to the run's JSONL lifecycle stream. A runner of this snapshot_version always publishes it; the type stays nullable because the client's parser defaults a missing field to null instead of failing the whole reply. It is not how an older contract's snapshot is read — that one is refused before rendering."
+          "description": "Absolute path to the run's JSONL lifecycle stream; null only when reading a snapshot_version 1 snapshot, which had no such field. A runner of snapshot_version 2 always publishes a path — the nullability here is what lets this build read the older contract at all, not a caveat about the current one."
         },
         "capture_dir": {
           "type": ["string", "null"],

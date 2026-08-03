@@ -398,7 +398,7 @@ fn inspect_snapshot_identity_rejects_a_foreign_run() {
 /// side of the wire ([K-092]). Built through the real [`Snapshot`] type so a shape
 /// change cannot leave a hand-written JSON template silently stale, the same
 /// discipline `registry::test_support` applies to its record fixtures.
-fn foreign_version_snapshot(run_id: &str, snapshot_version: u32) -> Snapshot {
+fn snapshot_declaring(run_id: &str, snapshot_version: u32) -> Snapshot {
     Snapshot {
         snapshot_version,
         run_id: run_id.to_string(),
@@ -412,56 +412,179 @@ fn foreign_version_snapshot(run_id: &str, snapshot_version: u32) -> Snapshot {
 }
 
 /// The same snapshot serialized for the wire by the server's own serializer.
-fn foreign_version_snapshot_line(run_id: &str, snapshot_version: u32) -> String {
-    serialize_snapshot(&foreign_version_snapshot(run_id, snapshot_version))
+fn snapshot_line_declaring(run_id: &str, snapshot_version: u32) -> String {
+    serialize_snapshot(&snapshot_declaring(run_id, snapshot_version))
 }
 
-/// (T-292) The read-side `snapshot_version` policy itself: a declared version other
-/// than this build's own [`SNAPSHOT_VERSION`] is refused in **both** directions —
-/// a newer runner announces a breaking change this build does not know, and an older
-/// one left behind a shape this build carries no decoder for — while a matching
-/// version passes. The reserved `CONTROL` (103) code and the [`unreachable_run`]
-/// wording are the same ones a snapshot naming the wrong run already gets, and the
-/// message names both numbers plus which side is newer, because the actionable fix is
-/// a matching build rather than a retry. The two end-to-end tests below then prove
-/// both `inspect` paths actually run this check.
+/// A reply line in the **historical version-1 shape**, as the released binaries
+/// (v0.1.0 … v0.3.1) actually wrote it: `jsonl` and `capture_dir` are *absent*, not
+/// `null`, because the fields did not exist yet. It is hand-written on purpose —
+/// unlike [`snapshot_declaring`], no type in this tree still produces this shape, and
+/// re-serializing today's [`Snapshot`] with `None`s would emit `"jsonl":null` and so
+/// test something a version-1 runner never sent. The field values are the same sample
+/// values the rest of these tests use; the shape is copied from `src/control.rs` at
+/// tag `v0.3.1`.
+fn version_one_snapshot_line(run_id: &str) -> String {
+    format!(
+        "{{\"snapshot_version\":1,\"run_id\":\"{run_id}\",\"mechanism\":\"job_object\",\
+         \"root_pid\":4242,\"started_at\":\"2026-07-20T21:00:00.000Z\",\
+         \"members\":[{{\"pid\":4242,\"ppid\":null,\"name\":null,\"start_time\":null}}]}}"
+    )
+}
+
+/// (T-292) The read-side `snapshot_version` policy itself, decided where it lives —
+/// in [`SnapshotReply`]'s own decoding, before the payload's shape is parsed. The
+/// refusal is deliberately **one-sided**: a version newer than [`SNAPSHOT_VERSION`]
+/// is unknowable here and refused, while every version down to
+/// [`MIN_READABLE_SNAPSHOT_VERSION`] is read, because this build demonstrably decodes
+/// it (see the next test for the version-1 wire shape itself). Only below that floor
+/// does an older version become a refusal too. The reserved `CONTROL` (103) code and
+/// the [`unreachable_run`] wording are the same ones a snapshot naming the wrong run
+/// already gets, and the message names the arrived version, the range this build
+/// reads, and which side is newer, because the fix is a different build rather than a
+/// retry.
 #[test]
-fn foreign_snapshot_version_is_refused_in_both_directions() {
-    let newer = foreign_version_snapshot("run-a", SNAPSHOT_VERSION + 1);
-    let err = verify_snapshot(&newer, "run-a")
+fn a_newer_snapshot_version_is_refused_and_the_readable_range_is_accepted() {
+    let newer = serde_json::from_str::<SnapshotReply>(&snapshot_line_declaring(
+        "run-a",
+        SNAPSHOT_VERSION + 1,
+    ))
+    .expect("a newer reply still decodes — as an undecided version verdict, not a snapshot");
+    assert!(
+        matches!(newer, SnapshotReply::Unreadable(declared) if declared == u64::from(SNAPSHOT_VERSION) + 1),
+        "a newer version is classified without interpreting the payload"
+    );
+    let err = newer
+        .accept("run-a")
         .expect_err("a snapshot from a newer contract is never interpreted under this one");
     assert_eq!(err.code(), exit::CONTROL);
     assert_eq!(
         err.to_string(),
         format!(
             "cannot inspect run `run-a`: the runner answered with control-plane snapshot version \
-             {} and this client implements version {SNAPSHOT_VERSION} (the runner is a newer \
-             build than this client); a differing snapshot_version marks a breaking change to \
-             the snapshot's shape, so this reply cannot be read as if it were version \
-             {SNAPSHOT_VERSION} — inspect this run with a matching processkit-cli build",
+             {}, and this client reads versions {MIN_READABLE_SNAPSHOT_VERSION} to \
+             {SNAPSHOT_VERSION} (the runner is a newer build than this client, so what its \
+             version changed is unknown here); the reply was refused rather than rendered under \
+             semantics its sender never promised — inspect this run with a processkit-cli build \
+             that implements its snapshot version (for a newer runner, one at least as new as \
+             the binary that started the run)",
             SNAPSHOT_VERSION + 1
         )
     );
 
-    let older = foreign_version_snapshot("run-a", SNAPSHOT_VERSION - 1);
-    let err = verify_snapshot(&older, "run-a")
-        .expect_err("an older contract's snapshot is refused just as symmetrically");
+    for readable in MIN_READABLE_SNAPSHOT_VERSION..=SNAPSHOT_VERSION {
+        let reply =
+            serde_json::from_str::<SnapshotReply>(&snapshot_line_declaring("run-a", readable))
+                .expect("a reply inside the readable range parses into a snapshot");
+        let snapshot = reply
+            .accept("run-a")
+            .expect("every version this build decodes is inspected, not refused");
+        assert_eq!(
+            snapshot.snapshot_version, readable,
+            "the runner's own declared version is what reaches the renderer, unchanged"
+        );
+    }
+
+    let below_floor = serde_json::from_str::<SnapshotReply>(&snapshot_line_declaring(
+        "run-a",
+        MIN_READABLE_SNAPSHOT_VERSION - 1,
+    ))
+    .expect("a below-floor reply decodes as a version verdict too");
+    let err = below_floor
+        .accept("run-a")
+        .expect_err("below the floor this build no longer claims to decode the shape");
     assert_eq!(err.code(), exit::CONTROL);
     assert!(
-        err.to_string()
-            .contains(&format!("snapshot version {}", SNAPSHOT_VERSION - 1)),
+        err.to_string().contains(&format!(
+            "snapshot version {}",
+            MIN_READABLE_SNAPSHOT_VERSION - 1
+        )),
         "the refusal names the version that actually arrived: {err}"
     );
     assert!(
-        err.to_string().contains("older build"),
-        "the refusal says which side is older, since the fix is a matching build: {err}"
+        err.to_string().contains("older than any build"),
+        "the refusal says which side is older, since the fix is a different build: {err}"
+    );
+}
+
+/// (T-292, R-01) The floor is a **checkable** claim, not a promise: a reply in the
+/// real version-1 shape — the one every released binary writes, with `jsonl` and
+/// `capture_dir` absent rather than `null` — is read, and read *correctly*. The two
+/// later fields come back `None` ("not reported", which is exactly what a version-1
+/// runner meant), every other field is preserved, and the rendered output carries the
+/// runner's own declared version rather than this client's. This is the capability
+/// [`Snapshot::jsonl`]'s `#[serde(default)]` exists for and the reason the refusal is
+/// not symmetric; if a future bump ever breaks it, this test fails and
+/// [`MIN_READABLE_SNAPSHOT_VERSION`] is what has to move.
+#[test]
+fn the_version_one_wire_shape_is_still_decoded_correctly() {
+    let reply = serde_json::from_str::<SnapshotReply>(&version_one_snapshot_line("legacy-run"))
+        .expect("the version-1 shape parses under this build's decoder");
+    let snapshot = reply
+        .accept("legacy-run")
+        .expect("a version-1 snapshot is inspected, not refused");
+
+    assert_eq!(snapshot.snapshot_version, 1);
+    assert_eq!(snapshot.run_id, "legacy-run");
+    assert_eq!(snapshot.mechanism, "job_object");
+    assert_eq!(snapshot.root_pid, Some(4242));
+    assert_eq!(snapshot.started_at, "2026-07-20T21:00:00.000Z");
+    assert_eq!(
+        snapshot.jsonl, None,
+        "a field version 1 never declared is reported as `null`, never invented"
+    );
+    assert_eq!(snapshot.capture_dir, None);
+    assert_eq!(snapshot.members.len(), 1);
+
+    let json = snapshot_output_lines(&snapshot, true).expect("serialize the JSON snapshot");
+    assert!(
+        json[0].contains("\"snapshot_version\":1"),
+        "stdout reports the version the runner declared, not the client's: {}",
+        json[0]
+    );
+}
+
+/// (T-292, R-04) The version verdict is reached **before** the shape is parsed, so the
+/// diagnostic an operator actually needs survives the case that motivates the whole
+/// check: a newer runner whose snapshot this build cannot deserialize at all. Every
+/// field but `jsonl`/`capture_dir` is required, so a removed or renamed one would fail
+/// `serde` first and surface "the runner sent an unreadable response: missing field
+/// ..." — a parser complaint about a payload this client was never entitled to read.
+/// The reverse direction is pinned too: a **same-version** reply with a broken shape
+/// must still surface the parser's own diagnostic, because the version pre-check must
+/// not swallow the case where the version is fine and the payload genuinely is not.
+#[tokio::test]
+async fn a_newer_version_is_named_even_when_its_shape_cannot_be_parsed() {
+    let unparsable_newer = format!(
+        "{{\"snapshot_version\":{},\"run_id\":\"solo-run\"}}",
+        SNAPSHOT_VERSION + 1
+    );
+    let runner = FakeRunner::answering(unparsable_newer);
+    let err = inspect_endpoint(&runner.endpoint, "solo-run")
+        .await
+        .expect_err("a newer contract's reply is refused however unparsable it is");
+    assert_eq!(err.code(), exit::CONTROL);
+    assert!(
+        err.to_string()
+            .contains(&format!("snapshot version {}", SNAPSHOT_VERSION + 1)),
+        "the version, not the parser, explains the refusal: {err}"
+    );
+    assert!(
+        !err.to_string().contains("unreadable response"),
+        "the actionable diagnostic is not replaced by a serde field complaint: {err}"
     );
 
-    verify_snapshot(
-        &foreign_version_snapshot("run-a", SNAPSHOT_VERSION),
-        "run-a",
-    )
-    .expect("a snapshot declaring this build's own version is accepted");
+    let broken_same_version =
+        format!("{{\"snapshot_version\":{SNAPSHOT_VERSION},\"run_id\":\"solo-run\"}}");
+    let runner = FakeRunner::answering(broken_same_version);
+    let err = inspect_endpoint(&runner.endpoint, "solo-run")
+        .await
+        .expect_err("a malformed reply is refused whatever version it declares");
+    assert_eq!(err.code(), exit::CONTROL);
+    assert!(
+        err.to_string().contains("unreadable response"),
+        "a version this build does implement leaves the parser's own diagnostic intact: {err}"
+    );
 }
 
 /// A test-only runner that answers exactly one `inspect` exchange with a canned reply
@@ -565,92 +688,107 @@ where
         .expect("answer the client with the canned reply");
 }
 
-/// (T-292) The **single-run** `inspect --run-id` path runs the version check for
-/// real: driven over the actual transport rather than by calling the check directly,
-/// an older *and* a newer runner are both refused with `CONTROL` (103) before
-/// anything reaches rendering, while a same-version runner's snapshot comes back
-/// intact — so the refusal cannot degenerate into "this client rejects everything".
-/// Its aggregate counterpart is the next test; both call sites are pinned so the one
-/// shared [`verify_snapshot`] step cannot start applying to one path only.
+/// (T-292) The **single-run** `inspect --run-id` path runs the version policy for
+/// real, driven over the actual transport rather than by calling the check directly:
+/// a newer runner is refused with `CONTROL` (103) before anything reaches rendering,
+/// while both a same-version runner *and* one still speaking the version-1 wire shape
+/// come back intact — so the refusal can neither degenerate into "this client rejects
+/// everything" nor quietly become symmetric again. Its aggregate counterpart is the
+/// next test; both call sites are pinned so the one shared [`SnapshotReply::accept`]
+/// step cannot start applying to one path only.
 #[tokio::test]
-async fn single_run_inspect_refuses_a_foreign_snapshot_version() {
-    for declared in [SNAPSHOT_VERSION - 1, SNAPSHOT_VERSION + 1] {
-        let runner = FakeRunner::answering(foreign_version_snapshot_line("solo-run", declared));
-        let err = inspect_endpoint(&runner.endpoint, "solo-run")
-            .await
-            .expect_err("a foreign snapshot version never reaches the rendering step");
-        assert_eq!(err.code(), exit::CONTROL);
-        assert!(
-            err.to_string()
-                .contains(&format!("snapshot version {declared}")),
-            "the refusal names the version that arrived: {err}"
-        );
-    }
+async fn single_run_inspect_refuses_a_newer_snapshot_version_and_reads_older_ones() {
+    let runner = FakeRunner::answering(snapshot_line_declaring("solo-run", SNAPSHOT_VERSION + 1));
+    let err = inspect_endpoint(&runner.endpoint, "solo-run")
+        .await
+        .expect_err("a newer snapshot version never reaches the rendering step");
+    assert_eq!(err.code(), exit::CONTROL);
+    assert!(
+        err.to_string()
+            .contains(&format!("snapshot version {}", SNAPSHOT_VERSION + 1)),
+        "the refusal names the version that arrived: {err}"
+    );
 
-    let runner = FakeRunner::answering(foreign_version_snapshot_line("solo-run", SNAPSHOT_VERSION));
+    let runner = FakeRunner::answering(snapshot_line_declaring("solo-run", SNAPSHOT_VERSION));
     let snapshot = inspect_endpoint(&runner.endpoint, "solo-run")
         .await
         .expect("a snapshot declaring this build's own version is inspected normally");
     assert_eq!(snapshot.snapshot_version, SNAPSHOT_VERSION);
     assert_eq!(snapshot.run_id, "solo-run");
+
+    let runner = FakeRunner::answering(version_one_snapshot_line("solo-run"));
+    let snapshot = inspect_endpoint(&runner.endpoint, "solo-run")
+        .await
+        .expect("a run started by a released binary is still inspectable after an upgrade");
+    assert_eq!(snapshot.snapshot_version, MIN_READABLE_SNAPSHOT_VERSION);
+    assert_eq!(snapshot.run_id, "solo-run");
+    assert_eq!(snapshot.jsonl, None);
 }
 
-/// (T-292, [K-090]) The **aggregate** `inspect --all` path runs the same check
+/// (T-292, [K-090]) The **aggregate** `inspect --all` path runs the same policy
 /// through the shared [`dispatch_snapshot_target`] ladder, proved in the default
 /// `cargo test` tier rather than left to the opt-in `e2e` one: a target answering
-/// with an older or newer `snapshot_version` is a genuine per-target failure (the
-/// reserved `CONTROL` (103) that makes the aggregate command fail after printing its
-/// report), never laundered into the successful `already_gone` — the record is still
-/// registered live throughout, so the runner did not end, it answered something this
-/// client cannot read. A same-version target is dispatched normally.
+/// with a newer `snapshot_version` is a genuine per-target failure (the reserved
+/// `CONTROL` (103) that makes the aggregate command fail after printing its report),
+/// never laundered into the successful `already_gone` — the record is still registered
+/// live throughout, so the runner did not end, it answered something this client
+/// cannot read. A target inside the readable range — including one still on the
+/// version-1 wire shape, which is what a fleet mid-upgrade actually contains — is
+/// dispatched normally, so one legacy runner cannot fail the whole `--all` invocation.
 #[tokio::test]
-async fn aggregate_inspect_refuses_a_foreign_snapshot_version() {
+async fn aggregate_inspect_refuses_a_newer_snapshot_version_and_reads_older_ones() {
     let dir = scratch_registry_dir("aggregate-inspect-version");
     let registry = registry::Registry::open_in(dir.clone()).expect("open registry");
 
-    for declared in [SNAPSHOT_VERSION - 1, SNAPSHOT_VERSION + 1] {
-        let run_id = format!("fleet-run-{declared}");
-        let runner = FakeRunner::answering(foreign_version_snapshot_line(&run_id, declared));
+    let runner = FakeRunner::answering(snapshot_line_declaring(
+        "fleet-run-newer",
+        SNAPSHOT_VERSION + 1,
+    ));
+    let registration = registry
+        .register_plain("fleet-run-newer", Some(&runner.endpoint), SystemTime::now())
+        .expect("register the live target");
+    let mut targets = snapshot_live_targets(&registry, &[]).expect("snapshot live targets");
+    assert_eq!(targets.len(), 1, "exactly one live target at a time");
+    let target = targets.pop().expect("the target is in the snapshot");
+
+    let err = inspect_snapshot_target(&registry, &target)
+        .await
+        .expect_err("a newer snapshot version is a per-target failure, not a snapshot");
+    assert_eq!(err.code(), exit::CONTROL);
+    assert!(
+        err.to_string()
+            .contains(&format!("snapshot version {}", SNAPSHOT_VERSION + 1)),
+        "the per-target error names the version that arrived: {err}"
+    );
+    drop(registration);
+
+    for (run_id, reply) in [
+        (
+            "fleet-run-current",
+            snapshot_line_declaring("fleet-run-current", SNAPSHOT_VERSION),
+        ),
+        (
+            "fleet-run-legacy",
+            version_one_snapshot_line("fleet-run-legacy"),
+        ),
+    ] {
+        let runner = FakeRunner::answering(reply);
         let registration = registry
-            .register_plain(&run_id, Some(&runner.endpoint), SystemTime::now())
+            .register_plain(run_id, Some(&runner.endpoint), SystemTime::now())
             .expect("register the live target");
         let mut targets = snapshot_live_targets(&registry, &[]).expect("snapshot live targets");
-        assert_eq!(targets.len(), 1, "exactly one live target per iteration");
         let target = targets.pop().expect("the target is in the snapshot");
 
-        let err = inspect_snapshot_target(&registry, &target)
+        let dispatch = inspect_snapshot_target(&registry, &target)
             .await
-            .expect_err("a foreign snapshot version is a per-target failure, not a snapshot");
-        assert_eq!(err.code(), exit::CONTROL);
-        assert!(
-            err.to_string()
-                .contains(&format!("snapshot version {declared}")),
-            "the per-target error names the version that arrived: {err}"
-        );
-
+            .expect("a snapshot inside the readable range is dispatched normally");
+        let SnapshotDispatch::Dispatched(snapshot) = dispatch else {
+            panic!("a live, answering target is inspected, never `already_gone`");
+        };
+        assert_eq!(snapshot.run_id, run_id);
         drop(registration);
     }
 
-    let runner = FakeRunner::answering(foreign_version_snapshot_line(
-        "fleet-run-ok",
-        SNAPSHOT_VERSION,
-    ));
-    let registration = registry
-        .register_plain("fleet-run-ok", Some(&runner.endpoint), SystemTime::now())
-        .expect("register the live target");
-    let mut targets = snapshot_live_targets(&registry, &[]).expect("snapshot live targets");
-    let target = targets.pop().expect("the target is in the snapshot");
-
-    let dispatch = inspect_snapshot_target(&registry, &target)
-        .await
-        .expect("a snapshot declaring this build's own version is dispatched normally");
-    let SnapshotDispatch::Dispatched(snapshot) = dispatch else {
-        panic!("a live, answering target is inspected, never `already_gone`");
-    };
-    assert_eq!(snapshot.snapshot_version, SNAPSHOT_VERSION);
-    assert_eq!(snapshot.run_id, "fleet-run-ok");
-
-    drop(registration);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

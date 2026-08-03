@@ -32,9 +32,11 @@ and treat the schema as needing a fix.
 ## Versioning: two of these six are versioned, four deliberately are not
 
 `probe --json` carries `probe_version` and `inspect --json` carries
-`snapshot_version`; both documents pin the current value with `const`, so a bump
-is visible in the payload itself. The other four families here carry no version
-field, and that was an explicit decision, not an oversight (see
+`snapshot_version`, so a bump is visible in the payload itself. `probe.schema.json`
+pins its value with `const`; `inspect.schema.json` enumerates a *range* instead,
+because that field is the only value published here that the far side of a wire
+supplies — see "The `snapshot_version` range" below. The other four families here
+carry no version field, and that was an explicit decision, not an oversight (see
 `docs/compatibility.md`, "Machine-output schemas", for the consumer-facing
 statement of it).
 
@@ -97,7 +99,8 @@ directory:
   For `probe --json` and `inspect --json` the pin already exists *inside* the
   document — a breaking change to those shapes bumps `probe_version` /
   `snapshot_version`, and that field, not a directory name, is what a consumer
-  checks.
+  checks. For `snapshot_version` the client checks it as well, which is the next
+  section.
 - **Additive changes stay additive.** A new field on one of these objects, or a
   new value in an open-ended string field, is a minor/patch change; a reader that
   consumes the fields it knows is unaffected. Note that these documents set
@@ -105,6 +108,28 @@ directory:
   drift-detection tests* (an added field must be published here in the same
   commit); an adapter that copies a document into its own pipeline and wants to
   tolerate a future additive field can relax that keyword on its copy.
+
+## The `snapshot_version` range
+
+`inspect.schema.json`'s `snapshot_version` is the one value published in this
+directory that the *far side of a wire* supplies: every other field on every other
+form is produced by the binary the caller just invoked, but this number is what the
+**runner** declared, echoed unchanged. A run started by an older build therefore
+reports that build's number even though the surrounding object is the invoked
+binary's own shape (the client re-serializes what it parsed — see the ack discussion
+above, which is the same mechanism).
+
+That is why the document enumerates `[1, 2]` rather than pinning `const: 2`, and the
+enumeration is exact rather than permissive: the client **acts** on the value before
+printing anything. A version newer than it implements is refused with `CONTROL` (103)
+instead of being rendered under semantics its sender never promised; a version older
+than it still decodes correctly is refused too. What remains — the range between the
+floor and the current version, `MIN_READABLE_SNAPSHOT_VERSION..=SNAPSHOT_VERSION` in
+`src/control/mod.rs` — is exactly what can reach stdout, so this enumeration moves
+whenever either end of that range does, in the same change. The normative statement of
+the policy, including why the refusal is one-sided and what moves the floor, is
+[`docs/control-plane.md`](../../../docs/control-plane.md), "Snapshot version: a newer
+runner's reply is refused, an older one is read".
 
 ## The fixtures
 
