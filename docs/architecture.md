@@ -54,8 +54,11 @@ reusable dependency. Keeping the runner's internals in a `[lib]` target lets:
 - **fuzz targets** (`cargo-fuzz`, `fuzz/`, T-186) link the library and drive
   parsers of untrusted/semi-trusted input — the registry's bytes → parse/
   validate path, the control plane's request-line classifier and
-  response-line decode, and the CLI's `--timeout`/`--grace`/
-  `--require-exit-code-band`/`--env`/`--run-id` value parsers — a `[lib]` target is a
+  response-line decode, the CLI's `--timeout`/`--grace`/
+  `--require-exit-code-band`/`--env`/`--run-id` value parsers, and
+  `wait --report-outcome`'s terminal-outcome read-back over a run's JSONL
+  events file (`src/wait.rs`, bounded head/tail scan for a terminal
+  `runner_exit`, T-301) — a `[lib]` target is a
   hard prerequisite `cargo-fuzz` cannot work without (see `CONTRIBUTING.md`,
   "Fuzzing");
 - **benchmarks** (criterion, `benches/`, T-187) reach internal primitives —

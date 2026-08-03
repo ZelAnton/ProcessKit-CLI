@@ -8,10 +8,22 @@
 //!
 //! The two pure steps the real file-backed path composes,
 //! [`processkit_cli::wait::head_matches_run_id`] and
-//! [`processkit_cli::wait::scan_runner_exit_tail`], are newly exposed
-//! `#[doc(hidden)] pub` by the exact same pattern `registry_record`/
-//! `control_wire`/`cli_parsers` already use (K-041/K-060) — visibility is the
-//! only change, behavior is untouched. This target treats fuzz input `data` as a
+//! [`processkit_cli::wait::scan_runner_exit_tail`], did not exist on BASE —
+//! they are newly **extracted** from `read_terminal_outcome`'s body (the head
+//! check, the `usable`-window computation, the partial-first-line drop, and
+//! the reverse tail scan) and exposed `#[doc(hidden)] pub`, unlike the
+//! visibility-only exposure `registry_record`/`control_wire`/`cli_parsers`
+//! use (K-041/K-060), where the functions already existed pre-extraction.
+//! They stay two functions rather than merging into one bytes-in function so
+//! the real path's short-circuit is preserved — the tail is never read when
+//! the head doesn't match `expected_run_id` — which is also why this target
+//! below `return`s on a failed `head_matches_run_id` check before ever
+//! touching `scan_runner_exit_tail`. The extraction is behavior-preserving:
+//! verified line-by-line against `read_terminal_outcome`'s pre-extraction
+//! body and covered by the existing
+//! `terminal_outcome_reader_finds_the_last_runner_exit_in_a_bounded_tail`
+//! test (`src/wait.rs`), which exercises both the `start != 0` window and the
+//! partial-first-line drop. This target treats fuzz input `data` as a
 //! whole simulated events file and derives the identical head/tail windows
 //! [`processkit_cli::wait`]'s own `read_terminal_outcome` reads from a real file
 //! (first `min(len, OUTCOME_TAIL_MAX_BYTES)` bytes as the head, last
@@ -25,8 +37,8 @@
 //! as "no reportable outcome" (`None`), not an error.
 //!
 //! If a future `events` subcommand's line reader routes through the same
-//! primitive (see `src/wait.rs`'s module doc), it is covered by this same target
-//! for free.
+//! primitive (see [`processkit_cli::wait::head_matches_run_id`]'s doc
+//! comment), it is covered by this same target for free.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
