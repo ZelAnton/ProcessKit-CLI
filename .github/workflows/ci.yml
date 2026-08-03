@@ -62,6 +62,38 @@ jobs:
             exit 1
           }
 
+  # install.ps1's Windows twin of the installer-lint job above:
+  # scripts/tests/install.Tests.ps1 exercises it end to end (checksum
+  # verification, destination-identity refusal, -Version pinning, custom
+  # -InstallDir) against a local HttpListener fixture server, mirroring what
+  # scripts/tests/test-install.sh already does for install.sh in
+  # installer-lint. Runs on windows-latest since that's the only runner OS
+  # that can execute a .exe fixture the way install.ps1 expects.
+  installer-lint-windows:
+    name: installer (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # windows-latest images ship a Pester build already, but which version
+      # varies by image roll; pin explicitly rather than trust whatever is
+      # preinstalled, matching this workflow's general policy of pinned
+      # versions over floating ones. -SkipPublisherCheck sidesteps the
+      # signature-mismatch prompt against the older Pester 3.x module the
+      # image also ships (Update-Module territory, not a real trust issue —
+      # both are Microsoft-signed).
+      - name: Install pinned Pester
+        shell: pwsh
+        run: Install-Module -Name Pester -RequiredVersion 5.7.1 -Force -SkipPublisherCheck -Scope CurrentUser
+      - name: Run Windows installer Pester suite
+        shell: pwsh
+        run: |
+          Import-Module Pester -RequiredVersion 5.7.1 -ErrorAction Stop
+          $config = New-PesterConfiguration
+          $config.Run.Path = 'scripts/tests/install.Tests.ps1'
+          $config.Run.Exit = $true
+          $config.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $config
+
   examples-smoke:
     name: runnable examples (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
