@@ -914,7 +914,7 @@ fn set_terminal_foreground(fd: libc::c_int, pgrp: libc::pid_t) -> std::io::Resul
 /// **Exit-code decision (reserved runner band `100`–`119`).** When `with_options`
 /// cannot apply a requested cap it returns [`processkit::ErrorReason::ResourceLimit`], and it does
 /// so **pre-spawn** — the child never started, so no child code is ever at risk.
-/// Because the CLI parsers (`src/cli.rs`) already reject every nonsensical value as
+/// Because the CLI parsers (`src/cli/parse.rs`) already reject every nonsensical value as
 /// a `USAGE` (100) form error *before* we reach here, the only reasons that survive
 /// to this point are the "could not be applied" ones — `Unsupported` (macOS/BSD and
 /// the Linux process-group fallback have no whole-tree container at all) and
@@ -940,7 +940,7 @@ fn create_group(args: &RunArgs) -> processkit::Result<ProcessGroup> {
 /// flags, or `None` when the operator set none — the signal [`create_group`] uses
 /// to keep the plain, unchanged `ProcessGroup::new()` path. Each flag maps straight
 /// onto the matching `ProcessGroupOptions` builder; the values were already
-/// validated for form by the CLI parsers (`src/cli.rs` is the single source of
+/// validated for form by the CLI parsers (`src/cli/parse.rs` is the single source of
 /// truth for that), so nothing is re-validated here.
 fn build_limit_options(args: &RunArgs) -> Option<ProcessGroupOptions> {
     if args.max_memory.is_none() && args.max_processes.is_none() && args.cpu_quota.is_none() {

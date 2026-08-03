@@ -71,6 +71,8 @@ to a dated version section.
   existing public CLI, lifecycle schema, and MSRV contracts.
 - Split the registry into a stable facade, platform-specific implementation files,
   and an isolated test module before further record/control-plane growth.
+- Split the command-line surface into one module per subcommand family plus a
+  shared value-parser module before further flag and subcommand growth.
 - Split the live control plane into a stable facade with separate platform,
   rendering, and test modules before adding further fleet operations.
 - Human-readable registry identity and endpoint fields are visibly truncated at a
