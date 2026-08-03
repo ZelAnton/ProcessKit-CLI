@@ -321,11 +321,14 @@ The emission is deliberately narrow:
 
 ### `limit_evidence`
 
-Post-run, per-axis evidence for a run that requested at least one resource cap.
-The runner reads `ProcessGroup::limit_evidence()` while the group still exists,
+Post-run, per-axis evidence for a run that requested at least one resource cap
+and whose `ProcessGroup::with_options` call successfully created the container.
+The runner reads `ProcessGroup::limit_evidence()` while that group still exists,
 after the ending event (`root_exited`, `timeout`, `cancelled`, `killed`, or
 `output_overflow`) when one exists, and before `cleanup_started` consumes the
-group.
+group. If group creation returns ProcessKit's `ResourceLimit` error, the group
+does not exist: the runner emits the pre-spawn `limit_hit` event and its existing
+backend-error tail, with no `limit_evidence` event.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -335,11 +338,13 @@ group.
 
 `tripped` is emitted only for authoritative kernel evidence that the cap
 engaged; `not_tripped` is authoritative evidence that it did not engage (and is
-also ProcessKit's result for an uncapped axis); `unknown` means the mechanism
-cannot provide a post-run answer. Linux cgroup v2 can report all three states.
-Windows Job Objects and POSIX process groups (macOS, BSDs, and the Linux
-process-group fallback) report `unknown` for capped axes. The event is absent
-when no cap was requested. This is an additive event within `schema_version = 1`.
+also ProcessKit's result for an uncapped axis); `unknown` means a successfully
+created group's mechanism cannot provide a post-run answer. Linux cgroup v2 can
+report all three states. A successfully created Windows Job Object reports
+`unknown` for capped axes. POSIX process-group fallback and macOS/BSD process
+groups fail before a capped group exists, so they emit `limit_hit` and no
+`limit_evidence`. The event is absent when no cap was requested. This is an
+additive event within `schema_version = 1`.
 
 ### `timeout`
 
@@ -563,10 +568,11 @@ A normal run emits, in order: `run_started`, `members_snapshot`
 - **runner-imposed ending** — the reason event (`timeout`, `cancelled`, or `killed`),
   `cleanup_started`, `cleanup_finished`, `runner_exit`.
 
-When any resource cap was requested, insert `limit_evidence` after the ending
-event and before `cleanup_started`. A run without a cap emits no
-`limit_evidence`. The evidence read never moves inside or after the
-`cleanup_started`/`cleanup_finished` pair.
+When any resource cap was requested and ProcessGroup creation succeeded, insert
+`limit_evidence` after the ending event and before `cleanup_started`. A run
+without a cap emits no `limit_evidence`; a pre-spawn `limit_hit` path also emits
+none because no group exists to query. The evidence read never moves inside or
+after the `cleanup_started`/`cleanup_finished` pair.
 
 The reason event names *which* ending it was: `timeout` (with `reason` `overall` or
 `idle`) for a `--timeout` or a `--idle-timeout`, `cancelled` (with `source` `ctrl_c`,

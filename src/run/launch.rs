@@ -149,8 +149,10 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
         Ok(group) => group,
         Err(err) => {
             // A requested resource cap the active mechanism cannot honor surfaces as
-            // `ErrorReason::ResourceLimit`, *pre-spawn* (no child ran). Emit the
-            // resource-specific `limit_hit` first — the dedicated, machine-readable
+            // `ErrorReason::ResourceLimit`, *pre-spawn* (no child ran). No
+            // `ProcessGroup` exists on this path, so post-run evidence is
+            // impossible; emit the resource-specific `limit_hit` first — the
+            // dedicated, machine-readable
             // signal that this creation failure was a limit, not a generic backend
             // fault — then take the *same* `container_failed{create}` →
             // `container_error`/`BACKEND` (102) tail every other group-creation

@@ -339,6 +339,10 @@ fn resource_limit_that_cannot_be_applied_emits_limit_hit_and_the_backend_code() 
                 position("run_started").is_none(),
                 "a pre-spawn limit failure never starts the child: {events:?}"
             );
+            assert!(
+                position("limit_evidence").is_none(),
+                "a pre-spawn limit failure has no ProcessGroup to query: {events:?}"
+            );
             // The shared container-creation-failure tail follows, reusing BACKEND(102).
             let container_failed = events
                 .iter()
@@ -405,17 +409,14 @@ fn resource_limit_that_cannot_be_applied_emits_limit_hit_and_the_backend_code() 
                 position("limit_evidence") < position("cleanup_started"),
                 "evidence is read before teardown starts: {events:?}"
             );
-            if cfg!(windows) {
-                assert_eq!(
-                    evidence["memory"], "unknown",
-                    "Windows Job Objects cannot provide post-run cap evidence"
-                );
-            } else {
-                assert_eq!(
-                    evidence["memory"], "not_tripped",
-                    "a clean Linux cgroup-v2 cap reports authoritative no-hit evidence"
-                );
-            }
+            assert!(
+                ["tripped", "not_tripped", "unknown"].contains(
+                    &evidence["memory"]
+                        .as_str()
+                        .expect("memory verdict is a string")
+                ),
+                "the applied cap keeps the three-state contract: {evidence}"
+            );
         }
     }
 
@@ -446,6 +447,93 @@ fn linux_cgroup_process_limit_evidence_distinguishes_a_tripped_cap() {
         .expect("an applied Linux cap emits evidence");
     assert_eq!(evidence["processes"], "tripped");
     assert!(out.status.code().is_some(), "the runner returned a status");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A successful Windows Job Object exists, but ProcessKit cannot retain a
+/// post-run limit counter for it. The CLI must preserve `Unknown` instead of
+/// flattening the capped axis to `not_tripped`.
+#[cfg(windows)]
+#[test]
+fn windows_job_limit_evidence_reports_unknown_for_the_capped_axis() {
+    let dir = scratch("limit-windows-unknown");
+    let out = run_with_flags(&dir, &[], &["--max-memory", "64m"], shell_inline("exit 0"));
+    let events = read_run_events(&dir);
+    assert!(
+        events.iter().all(|event| event["event"] != "limit_hit"),
+        "Windows Job Object creation should succeed for a valid memory cap: {events:?}"
+    );
+    assert_eq!(out.status.code(), Some(0), "the child exits normally");
+    let evidence = events
+        .iter()
+        .find(|event| event["event"] == "limit_evidence")
+        .expect("an applied Windows cap emits post-run evidence");
+    assert_eq!(evidence["memory"], "unknown");
+    assert_ne!(evidence["memory"], "not_tripped");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// macOS and the BSDs use a POSIX process group. ProcessKit rejects a capped
+/// group during `with_options`, so the observable contract is the pre-spawn
+/// `limit_hit` tail and no post-run evidence event.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+#[test]
+fn posix_process_group_limit_fallback_has_no_post_run_evidence() {
+    let dir = scratch("limit-posix-fallback");
+    let out = run_with_flags(&dir, &[], &["--max-memory", "64m"], shell_inline("exit 0"));
+    let events = read_run_events(&dir);
+    assert_pre_spawn_limit_failure_without_evidence(&events, &out);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Linux can use the process-group fallback when cgroup-v2 delegation is not
+/// available. In that environment the fallback is the same pre-spawn contract;
+/// when cgroup-v2 is available, the separate clean/tripped tests cover evidence.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_process_group_fallback_has_no_post_run_evidence() {
+    let dir = scratch("limit-linux-fallback");
+    let out = run_with_flags(&dir, &[], &["--max-memory", "64m"], shell_inline("exit 0"));
+    let events = read_run_events(&dir);
+    if events.iter().any(|event| event["event"] == "limit_hit") {
+        assert_pre_spawn_limit_failure_without_evidence(&events, &out);
+    } else {
+        assert!(
+            events
+                .iter()
+                .any(|event| event["event"] == "limit_evidence"),
+            "a successfully created Linux cgroup has post-run evidence: {events:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A clean Linux cgroup-v2 run reports authoritative `not_tripped` evidence
+/// separately from the process-count `tripped` scenario above. Hosts without
+/// usable cgroup delegation take the pre-spawn fallback and are skipped.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_cgroup_memory_limit_evidence_distinguishes_a_clean_cap() {
+    let dir = scratch("limit-clean");
+    let out = run_with_flags(&dir, &[], &["--max-memory", "64m"], shell_inline("exit 0"));
+    let events = read_run_events(&dir);
+    if events.iter().any(|event| event["event"] == "limit_hit") {
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    assert_eq!(out.status.code(), Some(0), "the clean child exits normally");
+    let evidence = events
+        .iter()
+        .find(|event| event["event"] == "limit_evidence")
+        .expect("an applied Linux cap emits post-run evidence");
+    assert_eq!(evidence["memory"], "not_tripped");
+    assert_eq!(evidence["processes"], "not_tripped");
+    assert_eq!(evidence["cpu"], "not_tripped");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1887,6 +1975,44 @@ fn write_overflow_stdout_script(dir: &Path) -> std::path::PathBuf {
         std::fs::write(&path, body).expect("write overflow_stdout.sh");
         path
     }
+}
+
+/// Assert the complete pre-spawn contract for a cap request that ProcessKit
+/// cannot install. There is no group to query, so `limit_hit` is the only
+/// resource-specific event and the existing backend tail remains unchanged.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn assert_pre_spawn_limit_failure_without_evidence(events: &[Value], out: &Output) {
+    let position = |name: &str| events.iter().position(|event| event["event"] == name);
+    let limit_hit = events
+        .iter()
+        .find(|event| event["event"] == "limit_hit")
+        .expect("the pre-spawn fallback emits limit_hit");
+    assert_eq!(limit_hit["limit"], "memory");
+    assert!(
+        !limit_hit["detail"].is_null(),
+        "the limit failure retains its detail: {limit_hit}"
+    );
+    assert!(position("run_started").is_none());
+    assert!(position("limit_evidence").is_none());
+    assert_eq!(out.status.code(), Some(102));
+    let container_failed = events
+        .iter()
+        .find(|event| event["event"] == "container_failed")
+        .expect("container_failed follows limit_hit");
+    assert_eq!(container_failed["phase"], "create");
+    assert_eq!(container_failed["code"], 102);
+    let terminal = events.last().expect("the stream has a terminal event");
+    assert_eq!(terminal["event"], "runner_exit");
+    assert_eq!(terminal["source"], "container_error");
+    assert_eq!(terminal["code"], 102);
+    assert!(position("limit_hit") < position("container_failed"));
+    assert!(position("container_failed") < position("runner_exit"));
 }
 
 /// Parse the emitted JSONL event stream for `dir`, one object per non-empty line.

@@ -61,8 +61,10 @@ pub(super) fn emit_output_captured(emitter: &mut Emitter, capture: &Option<Captu
 
 /// Emit the post-run resource-limit evidence while the owning group still exists.
 /// ProcessKit performs the platform-specific read; this layer only projects its
-/// stable three-valued identifiers into the CLI's v1 event shape. A run without a
-/// requested cap takes the cheap no-op path and emits no event.
+/// stable three-valued identifiers into the CLI's v1 event shape. This helper is
+/// reachable only after `ProcessGroup` creation succeeded; the pre-spawn
+/// `ResourceLimit` error path has no group to query and emits only `limit_hit`.
+/// A run without a requested cap takes the cheap no-op path and emits no event.
 pub(super) fn emit_limit_evidence(
     emitter: &mut Emitter,
     group: &ProcessGroup,

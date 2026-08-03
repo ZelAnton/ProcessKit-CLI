@@ -94,6 +94,15 @@ With `processkit` 3.2.0, a run that requested at least one cap emits a separate
 the teardown pair. It carries one verdict for each axis (`memory`, `processes`,
 and `cpu`):
 
+This event exists only when `ProcessGroup::with_options` successfully creates a
+container. On macOS, the BSDs, and the Linux process-group fallback, ProcessKit
+returns `ResourceLimit` during group creation because that mechanism has no
+whole-tree limit primitive. The runner therefore emits the existing pre-spawn
+`limit_hit` event and its backend-error tail, but there is no group from which to
+read `limit_evidence`; the event is not emitted on that path. `unknown` is
+reserved for a successfully created group whose active mechanism cannot provide
+the post-run answer.
+
 - **Three-valued, never a boolean.** The JSONL `limit_evidence` event represents
   `Tripped` / `NotTripped` / `Unknown` as `tripped` / `not_tripped` / `unknown`.
   `Unknown` never collapses into "did not fire": that would silently misreport
@@ -102,11 +111,13 @@ and `cpu`):
 - **Authoritative on Linux cgroup v2 only.** There, `Tripped`/`NotTripped`
   come from real kernel counters (`memory.events`' `oom`, `pids.events`'
   `max`, `cpu.stat`'s `nr_throttled`). On Windows Job Object and on a POSIX
-  process group (macOS, the BSDs, the Linux process-group fallback), every
-  capped axis instead reports `Unknown` as a *measured* result, not an
-  omission — those mechanisms keep no post-mortem record that a cap fired.
-  Windows is a first-class platform for this CLI, and runtime limit attribution
-  remains `unknown` there; this closes the gap on Linux cgroup v2 only.
+  process group that was successfully created, a capped axis instead reports
+  `Unknown` as a *measured* result, not an omission — those mechanisms keep no
+  post-mortem record that a cap fired. In practice the POSIX limit request fails
+  during group creation as described above, so POSIX fallback runs have no
+  post-run event at all. Windows is a first-class platform for this CLI, and
+  runtime limit attribution remains `unknown` there; this closes the gap on
+  Linux cgroup v2 only.
 - **Readable only while the container still exists.** The evidence lives in
   the container itself, so the runner reads it before `ProcessGroup` is dropped
   or consumed by shutdown. `limit_evidence` therefore precedes
@@ -140,8 +151,10 @@ limit request attached to this specific run.
 2. Launch a harmless limited command in the real deployment environment.
 3. Read `run_started.mechanism` rather than assuming cgroup availability.
 4. Treat pre-spawn `limit_hit` as a hard configuration failure.
-5. Read `limit_evidence` for post-run attribution, and preserve `unknown` as
-   distinct from `not_tripped`.
+5. For a successfully created capped run, read `limit_evidence` for post-run
+   attribution and preserve `unknown` as distinct from `not_tripped`. For a
+   pre-spawn `limit_hit`, do not expect post-run evidence: the container did not
+   exist to be queried.
 6. Keep a separate outer-runtime signal for limits imposed outside this run.
 
 ## See also

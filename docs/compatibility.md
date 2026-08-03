@@ -91,6 +91,11 @@ is what requires a new schema version — nothing below does.
    The new `limit_evidence` event is likewise additive: readers should route by
    `event`, ignore the new type when they do not use resource-limit attribution,
    and keep `schema_version` pinned at `1`.
+
+   A requested cap that fails during `ProcessGroup` creation remains the
+   pre-spawn `limit_hit` path. Since no group exists on that path, it has no
+   `limit_evidence` event; readers must not synthesize an `unknown` evidence
+   record for it.
 4. **New values in an open-ended descriptive string field** — a new `cancelled`
    `source`, a new `runner_exit` `source`, a new `hint` label. Treat an unrecognized
    value as "some other trigger" and keep routing by event type.

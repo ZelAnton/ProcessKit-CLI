@@ -257,7 +257,7 @@
     },
     "limitEvidence": {
       "type": "object",
-      "description": "Post-run per-axis evidence for a run that requested at least one resource cap. Each value is tripped, not_tripped, or unknown; the event is absent when no cap was requested.",
+      "description": "Post-run per-axis evidence for a run whose requested cap was successfully installed in a ProcessGroup. Each value is tripped, not_tripped, or unknown; the event is absent when no cap was requested or ProcessGroup creation failed before spawn.",
       "properties": {
         "schema_version": { "$ref": "#/$defs/schemaVersion" },
         "time": { "$ref": "#/$defs/time" },

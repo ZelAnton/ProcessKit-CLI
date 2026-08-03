@@ -187,12 +187,15 @@ pub enum Event {
     /// `create_group`, and `docs/schema.md`, "limit_hit"). Nonsensical values
     /// (`--max-memory 0`, a non-positive `--cpu-quota`) are rejected earlier as a
     /// `USAGE` form error, so this event never carries ProcessKit's `Invalid` reason.
+    /// Because this failure happens before a `ProcessGroup` exists, it has no
+    /// accompanying `limit_evidence` event.
     LimitHit {
         /// Which limit could not be applied: `memory` / `processes` / `cpu`.
         limit: String,
         detail: Option<String>,
     },
-    /// Post-run evidence for a run that requested at least one resource cap.
+    /// Post-run evidence for a run whose requested cap was installed in a
+    /// successfully created `ProcessGroup`.
     /// Each axis keeps ProcessKit's three-valued verdict: `tripped` means the
     /// kernel recorded the cap engaging, `not_tripped` means authoritative
     /// evidence recorded no engagement (or no cap was requested on that axis),

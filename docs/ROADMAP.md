@@ -67,6 +67,9 @@ applied" branch. Runs with a requested cap additionally emit the additive
 `limit_evidence` event with `tripped`, `not_tripped`, or `unknown` per axis,
 read before teardown consumes the group. The evidence is authoritative on
 Linux cgroup v2 only: Windows Job Objects and POSIX process groups (macOS, the
-BSDs, and the Linux process-group fallback) report `unknown` for capped axes.
+BSDs, and the Linux process-group fallback) do not provide the same successful
+Linux path. A successfully created Windows Job Object reports `unknown` for
+capped axes; a POSIX limit request fails before a capped group exists and
+therefore emits the existing pre-spawn `limit_hit` with no `limit_evidence`.
 This closes the runtime-attribution gap on Linux cgroup v2 only; it does not
-claim post-run limit attribution on Windows.
+claim post-run limit attribution on Windows or POSIX fallback runs.
