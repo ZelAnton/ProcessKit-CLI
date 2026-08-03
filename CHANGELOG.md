@@ -61,6 +61,12 @@ to a dated version section.
   expanded snapshots, while preserving the original `--json` array.
 - Conjunctive `prune --label KEY=VALUE` filtering for scoped real and dry-run
   cleanup, conservatively excluding ownerless orphan locks when filtered.
+- A seventh release target, `aarch64-unknown-linux-musl`, for a single
+  dependency-free binary on Arm64 containers (Alpine/distroless, Graviton,
+  Apple-Silicon Docker hosts), built and test-executed natively on a
+  GitHub-hosted `ubuntu-24.04-arm` runner, with matching `install.sh`
+  `--target` support, package-manifest generation (Homebrew Linux Arm64), and
+  documentation.
 
 ### Changed
 

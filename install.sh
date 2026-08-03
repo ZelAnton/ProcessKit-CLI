@@ -49,6 +49,10 @@ printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || {
 if [ -z "$target" ]; then
   system=$(uname -s)
   machine=$(uname -m)
+  # Auto-detection always picks the glibc target for Linux, on both
+  # architectures — pass --target x86_64-unknown-linux-musl or
+  # --target aarch64-unknown-linux-musl explicitly when the static musl
+  # archive is required (see docs/installation.md).
   case "$system:$machine" in
     Linux:x86_64|Linux:amd64) target=x86_64-unknown-linux-gnu ;;
     Linux:aarch64|Linux:arm64) target=aarch64-unknown-linux-gnu ;;
