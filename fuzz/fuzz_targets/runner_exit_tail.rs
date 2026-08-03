@@ -11,9 +11,13 @@
 //! [`processkit_cli::wait::scan_runner_exit_tail`], did not exist on BASE —
 //! they are newly **extracted** from `read_terminal_outcome`'s body (the head
 //! check, the `usable`-window computation, the partial-first-line drop, and
-//! the reverse tail scan) and exposed `#[doc(hidden)] pub`, unlike the
-//! visibility-only exposure `registry_record`/`control_wire`/`cli_parsers`
-//! use (K-041/K-060), where the functions already existed pre-extraction.
+//! the reverse tail scan) and exposed `#[doc(hidden)] pub`. This is the same
+//! technique T-186 used to expose `registry_record`'s
+//! `parse_and_validate_record` (extracted from `Registry::scan`'s inline
+//! guards) and `control_wire`'s `classify_request`/`RequestVerb` (extracted
+//! from `serve_one`'s inline `match request.trim()`); of those three
+//! precedents, only `cli_parsers` (K-041/K-060) was visibility-only, i.e.
+//! made `#[doc(hidden)] pub` without being extracted from surrounding code.
 //! They stay two functions rather than merging into one bytes-in function so
 //! the real path's short-circuit is preserved — the tail is never read when
 //! the head doesn't match `expected_run_id` — which is also why this target
