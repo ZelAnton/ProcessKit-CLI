@@ -89,11 +89,45 @@ rejects negatives, `NaN`, and infinities.
 applied before launch**. It does not prove that a successfully installed limit
 later fired.
 
-The public ProcessKit API does not yet expose portable post-spawn evidence for
-a cgroup OOM/pids event or a Windows Job Object notification. A child terminated
-by an enforced live limit may therefore be indistinguishable from another
-nonzero or signalled child outcome. Do not claim runtime attribution from the
-exit code alone.
+The `processkit` version this repository resolves from crates.io
+(`Cargo.lock`, currently 3.1.0) does not yet expose portable post-spawn
+evidence for a cgroup OOM/pids event or a Windows Job Object notification. A
+child terminated by an enforced live limit may therefore be indistinguishable
+from another nonzero or signalled child outcome. Do not claim runtime
+attribution from the exit code alone.
+
+ProcessKit-rs has since implemented such a primitive on its `main` branch
+(`ProcessGroup::limit_evidence()`, per-axis `LimitVerdict::{Tripped,
+NotTripped, Unknown}`), but it is **not yet in a published release** — it
+ships when a new version reaches crates.io and this project's `Cargo.lock` is
+updated to consume it, which this document does not do. The design carries
+constraints worth recording now, before anything is wired against it:
+
+- **Three-valued, never a boolean.** A future reader of this evidence — and
+  any JSONL surface built on it — must represent `Tripped` / `NotTripped` /
+  `Unknown` as three distinct states. `Unknown` must never collapse into "did
+  not fire": that would silently misreport a platform's inability to answer
+  as a clean run on every axis where evidence is unavailable.
+- **Authoritative on Linux cgroup v2 only.** There, `Tripped`/`NotTripped`
+  come from real kernel counters (`memory.events`' `oom`, `pids.events`'
+  `max`, `cpu.stat`'s `nr_throttled`). On Windows Job Object and on a POSIX
+  process group (macOS, the BSDs, the Linux process-group fallback), every
+  capped axis instead reports `Unknown` as a *measured* result, not an
+  omission — those mechanisms keep no post-mortem record that a cap fired.
+  Windows is a first-class platform for this CLI, and runtime limit
+  attribution will not become available there even once this primitive is
+  wired in; only the Linux cgroup v2 gap can close.
+- **Readable only while the container still exists.** The evidence lives in
+  the container itself, so it must be read before `ProcessGroup` is dropped
+  or consumed by shutdown. That constrains where a future reader could sit
+  relative to this runner's teardown and `cleanup_finished`/`cleanup_started`
+  ordering — it has to run ahead of, not after, whatever drops or shuts down
+  the group.
+
+None of this changes what `limit_hit` means today: it stays the pre-spawn
+"the requested cap could not be applied" event, and a cap-dependent adapter
+still treats it as a hard failure signal in that scope (see
+[`docs/schema.md`](schema.md#limit_hit)).
 
 ## Limits and outer containers
 

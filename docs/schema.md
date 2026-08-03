@@ -235,7 +235,12 @@ The emission is deliberately narrow:
   platform has no whole-tree container at all (macOS/the BSDs, the Linux
   process-group fallback), or a Linux cgroup v2 whose controllers can't be enabled
   (not the real hierarchy root — under systemd, an ordinary container, or typical
-  CI; see `README.md`, "Resource limits").
+  CI; see `README.md`, "Resource limits"). This reflects the `processkit` version
+  this repository currently consumes; an additive, not-yet-released post-spawn
+  evidence primitive and the tri-state design constraints it will impose on any
+  future JSONL surface are tracked in
+  [`docs/resource-limits.md`](resource-limits.md#applied-limit-versus-observed-limit-hit),
+  not in this schema.
 - **Nonsense values never reach it.** A degenerate value (`--max-memory 0`, a
   non-positive/non-finite `--cpu-quota`) is a `USAGE` (100) form error rejected at
   argument-parse time, so `limit_hit` never carries an "invalid value" reason.
