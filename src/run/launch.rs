@@ -10,7 +10,8 @@
 //! triggers it races against live in [`super::signals`]; the `--detach` wrapper
 //! that never enters this path at all lives in [`super::detach`].
 
-use std::time::SystemTime;
+use std::convert::Infallible;
+use std::time::{Duration, SystemTime};
 
 use processkit::{
     Command as PkCommand, LimitKind, Mechanism, Outcome, OutputBufferPolicy, ProcessGroup,
@@ -33,7 +34,7 @@ use super::teardown::{
     exit_code_for, finish, finish_foreground_failure, graceful_teardown, launch_failure_event,
     launch_failure_source, map_launch_error, termination_error,
 };
-use super::{Ending, Termination, TimeoutTrigger};
+use super::{Ending, SnapshotReason, Termination, TimeoutTrigger};
 
 /// Own a group, spawn the child into it, stream its output live, write the JSONL
 /// lifecycle events, and report how the run ended. The group drops when this
@@ -441,7 +442,7 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
         command: events::CommandInfo::for_argv(&args.command, args.argv_raw),
         labels: labels.clone(),
     });
-    emit_members_snapshot(&mut emitter, &group);
+    emit_members_snapshot(&mut emitter, &group, SnapshotReason::Spawn);
 
     // What the control server answers an `inspect` with. `members` is a live query of
     // the owning container, so a snapshot reflects the tree's composition *when
@@ -504,9 +505,15 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     // client); the control-server branch itself **never resolves** (its output is
     // `Infallible`) — it serves clients concurrently with the output pump, so it
     // neither delays the child's exit nor blocks teardown, and is dropped (tearing the
-    // transport down) when another branch wins.
+    // transport down) when another branch wins. The `--snapshot-interval` cadence is
+    // the second such never-resolving branch, and is deliberately polled **last**: it
+    // is the one branch that acts on its own timer rather than only when a client
+    // shows up, so giving every *deciding* branch the earlier tie-break is what keeps
+    // a periodic snapshot from being appended in the very poll a child exits or a
+    // deadline fires (see [`snapshot_cadence`]).
     let capturing = capture.is_some();
     let cancel_on_capture_overflow = args.capture_overflow == Some(CaptureOverflowPolicy::Cancel);
+    let snapshot_interval = args.snapshot_interval;
     let ending = tokio::select! {
         biased;
         signal = wait_for_cancel_signal() => Ending::Cancelled(signal),
@@ -523,6 +530,7 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
         () = idle_deadline(idle_timeout, &idle_clock) => Ending::TimedOut(TimeoutTrigger::Idle),
         overflow = capture_overflow(&capture, cancel_on_capture_overflow) => Ending::OutputOverflow(overflow),
         never = control::serve(control_server, &snapshot_source, &command_tx) => match never {},
+        never = snapshot_cadence(snapshot_interval, &mut emitter, &group) => match never {},
     };
 
     match ending {
@@ -691,6 +699,78 @@ async fn capture_overflow(capture: &Option<Capture>, cancel: bool) -> CaptureOve
     match (capture.as_ref(), cancel) {
         (Some(capture), true) => capture.overflowed().await,
         _ => std::future::pending().await,
+    }
+}
+
+/// The opt-in periodic `members_snapshot` cadence (`run --snapshot-interval`): sleep
+/// one interval, re-emit the snapshot through the shared
+/// [`emit_members_snapshot`]/`members_info()` path, repeat for as long as the run
+/// races. With no `--snapshot-interval` it parks forever, so a run without the flag
+/// never reads the clock, never touches the container, and **adds no event**: the
+/// number, type, and position of the events such a run emits are exactly what they
+/// were before this arm existed, which is what
+/// `a_run_without_snapshot_interval_still_emits_exactly_one_members_snapshot`
+/// actually proves (an event-type sequence comparison plus a snapshot count, not a
+/// byte comparison). The *wire form* of `members_snapshot` did change for every run,
+/// flag or no flag — it gained the always-present `reason` and `read_error` fields
+/// (additive within schema v1; see [`SnapshotReason`] and `docs/schema.md`,
+/// "Versioning") — so this arm's inertness is a claim about the event stream's
+/// shape, never about its bytes.
+///
+/// **No thread, no task: it is one more arm of the race that already exists.** The
+/// runner deliberately runs on a small current-thread runtime ([`super::run_inner`]),
+/// and this timer is coalesced straight into [`run_async`]'s `select!` rather than
+/// given a `tokio::spawn` or an OS thread of its own. Three properties fall out of
+/// that, and all three are the point:
+///
+/// - **No snapshot can escape into the teardown tail.** The moment any other branch
+///   wins, this future is dropped mid-sleep, so a periodic snapshot is structurally
+///   incapable of landing after `root_exited`/`timeout`/`cancelled`/`killed` — the
+///   ordering invariant `docs/schema.md` now states is enforced by the shape of the
+///   code, not by a check that could be forgotten.
+/// - **No shared state, no second emitter.** The `&mut Emitter` is borrowed by this
+///   branch alone for the life of the race (no other branch writes events), so the
+///   JSONL stream keeps its single writer and needs no lock.
+/// - **It is not a busy poll.** Each iteration sleeps the *whole* interval, so a run
+///   with a 10-minute cadence wakes six times an hour — the same
+///   sleep-the-remaining-window discipline [`idle_deadline`] uses, rather than a
+///   tight loop re-checking a clock. (The older `wait_grace_or_empty` bounded-poll
+///   helper this would otherwise have mirrored no longer exists in this crate: since
+///   the ProcessKit 3 migration the grace wait is the library's own
+///   `ProcessGroup::stop` driver, and `graceful_teardown` only projects its report.)
+///
+/// A `members_info()` read that fails still emits its sample, flagged
+/// `read_error: true` with an empty `members` list — the honest degradation
+/// [`emit_members_snapshot`] applies identically to the post-spawn snapshot — and
+/// the cadence keeps going, so one bad read costs one interval's member detail, not
+/// the feature. The flag, not the accompanying stderr warning, is the contract: a
+/// detached runner's stderr is `Stdio::null()`, so in the cadence's own headline
+/// scenario the stream is the only place a failure can be reported (see
+/// [`SnapshotReason`]).
+///
+/// **The stream this arms is unbounded by design**: one line per interval per run,
+/// so a `--jsonl` file grows as `duration / interval`, with each line sized by the
+/// tree. Nothing here caps, rotates, or samples it — the operator's chosen interval
+/// is the only bound, and the sizing arithmetic for picking one is written down in
+/// `docs/running-commands.md`, "Recorded tree snapshots".
+///
+/// Nothing here touches the output pump, the capture tee, or the echo sinks — a
+/// snapshot is a query of the container's own membership — which is exactly why the
+/// flag composes with `--inherit-stdio`, where no pump exists to observe (unlike
+/// `--idle-timeout`, which conflicts with it for precisely that reason).
+async fn snapshot_cadence(
+    interval: Option<Duration>,
+    emitter: &mut Emitter,
+    group: &ProcessGroup,
+) -> Infallible {
+    let Some(interval) = interval else {
+        // No cadence armed: park forever so this arm stays inert for every run that
+        // did not ask for it.
+        return std::future::pending().await;
+    };
+    loop {
+        tokio::time::sleep(interval).await;
+        emit_members_snapshot(emitter, group, SnapshotReason::Interval);
     }
 }
 

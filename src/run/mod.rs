@@ -156,6 +156,85 @@ impl TimeoutTrigger {
     }
 }
 
+/// What asked for a `members_snapshot` — the honest `reason` of that event, and the
+/// only thing telling the snapshot every run emits after spawn apart from an opt-in
+/// periodic re-sample.
+///
+/// **Decision (T-298): repeated `members_snapshot` events are additive within schema
+/// v1, and they say so on the wire.** Two questions had to be answered before the
+/// `--snapshot-interval` cadence could exist at all:
+///
+/// - *Does repeating an existing event break v1?* No. `schema_version` versions each
+///   event's **shape** (`docs/schema.md`, "Versioning"): a breaking change renames or
+///   removes a field, changes a field's type, or changes the meaning of a value. A
+///   second `members_snapshot` line does none of those — every field keeps its name,
+///   type, and meaning — and the normative ordering prose was already written for
+///   readers that route by event type. What the ordering section did *not* previously
+///   state was the **multiplicity**, so it now says so explicitly rather than leaving
+///   "exactly one" to be inferred from a sentence that never claimed it. The cadence
+///   is opt-in and off by default besides: a run without the flag emits the same
+///   number of snapshots, at the same point, as before.
+/// - *Should a repeat be distinguishable?* Yes, and by the same convention every
+///   other multi-trigger event in this stream already follows — `timeout.reason`
+///   (`overall`/`idle`), `cancelled.source`, `container_failed.phase`,
+///   `runner_exit.source`: when one event type can arise from more than one trigger,
+///   the event names its own trigger instead of leaving a consumer to infer it from
+///   position in the stream. Adding an always-present field to an existing event is
+///   the additive change `docs/schema.md`'s "Versioning" section explicitly blesses
+///   (the `timeout` event's own `reason` was added exactly this way), at the cost of
+///   regenerating that event's golden fixture line (K-049).
+///
+/// **Decision (T-298, review R-04): a failed sample is reported in the stream, not
+/// only on stderr.** `emit_members_snapshot` originally warned on the runner's stderr
+/// and skipped the event entirely when `ProcessGroup::members_info()` failed. That
+/// degradation is unobservable in the cadence's own headline scenario: a detached
+/// runner is spawned with `stdin`/`stdout`/`stderr` set to `Stdio::null()`
+/// (`detach::spawn_detached`), so its stderr reaches nobody, and the JSONL file —
+/// the only artifact such a run has — showed a failed sample as *nothing at all*,
+/// indistinguishable from a tree that simply had not changed. An observability
+/// feature that cannot report its own failure to its main audience is not honest, so
+/// the event is now always emitted, carrying an always-present `read_error` flag with
+/// an empty `members` fallback on failure.
+///
+/// This follows the project's own established precedent rather than inventing one:
+/// `cleanup_started.read_error` and `cleanup_finished.read_error` already qualify a
+/// fallback count/PID list exactly this way instead of letting it pass as a confirmed
+/// observation (`teardown::snapshot_members_or_unknown` is the third sibling of
+/// `members_len_or_unknown`/`remaining_pids_or_unknown`). It is additive within schema
+/// v1 on the same terms as `reason` above — a new always-present field on an existing
+/// event — and it makes the ordering contract stricter rather than looser: the
+/// post-spawn `members_snapshot` now really does appear exactly once in every stream,
+/// as `docs/schema.md`'s "Ordering" section asserts, where before a failed read
+/// silently removed it.
+///
+/// The stderr warning is kept for a foreground operator, but is deliberately *not*
+/// the contract any more — `docs/schema.md`, `docs/detached-runs.md`, and the
+/// `--snapshot-interval` help text all state that it is absent under `--detach` and
+/// that `read_error` is the channel that always works. What remains outside this
+/// event's reach is a JSONL write failure itself: `Emitter::poison` disables logging
+/// after one stderr warning, so a full disk (or any unwritable `--jsonl`) truncates
+/// the stream rather than annotating it. That boundary is documented where an
+/// operator meets it (`docs/running-commands.md`, "Recorded tree snapshots"), because
+/// no event can report the failure of the channel that would carry it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotReason {
+    /// The one snapshot every run emits, immediately after `run_started`.
+    Spawn,
+    /// A periodic re-sample armed by `run --snapshot-interval`.
+    Interval,
+}
+
+impl SnapshotReason {
+    /// The `members_snapshot` event's always-present `reason` value for this
+    /// trigger (`docs/schema.md`, "members_snapshot").
+    fn reason(self) -> &'static str {
+        match self {
+            SnapshotReason::Spawn => "spawn",
+            SnapshotReason::Interval => "interval",
+        }
+    }
+}
+
 /// Which **local stop signal** asked the runner to end the run — the honest
 /// `source` of the `cancelled` JSONL event and the trigger the stderr line names.
 ///

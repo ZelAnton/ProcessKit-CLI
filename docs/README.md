@@ -74,6 +74,7 @@ an old command at an unrelated process.
 | Finite input | `--stdin-file FILE`. |
 | Durable bounded transcripts | `--capture-dir DIR`, optionally `--no-echo`. |
 | A stuck-worker detector | `--idle-timeout DURATION`. |
+| A recorded history of how the process tree evolved | `--snapshot-interval DURATION` (composes with every I/O mode and with `--detach`). |
 | External tools launched by an automation agent | A foreground run with a unique id, finite deadlines, JSONL, and bounded capture. |
 | Launch now, supervise from another process | `--detach` plus a durable JSONL path and run id. |
 | Whole-tree resource caps | `--max-memory`, `--max-processes`, `--cpu-quota` where supported. |

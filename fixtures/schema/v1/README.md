@@ -15,8 +15,14 @@ extension never rewrites an existing shipped line. It is a catalog of event
 **types**, not an exhaustive enumeration of every value an event's string fields can
 take: `docs/schema.md` and `schema.json` remain the complete list (the `cancelled`
 event's Unix `sigterm`/`sighup` sources and Windows `ctrl_break`/`ctrl_close`/
-`ctrl_logoff`/`ctrl_shutdown` sources, for instance, are documented and validated
-there without a line of their own here). Adapters (for example the
+`ctrl_logoff`/`ctrl_shutdown` sources, the `members_snapshot` event's
+`interval` reason — the opt-in `run --snapshot-interval` re-sample, byte-identical
+to the `spawn` line below but for that one value — and that same event's
+`read_error: true` degraded form, which carries an empty `members` array, are
+documented and validated there without a line of their own here; the degraded
+form's wire shape is additionally pinned by a unit test in `src/events.rs`,
+`members_snapshot_records_a_failed_read_as_an_empty_flagged_sample`).
+Adapters (for example the
 processkit-py CLI) that pin `schema_version` can use it as the reference material to
 build and test their readers against.
 

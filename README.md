@@ -236,7 +236,8 @@ processkit-cli run     [--run-id <id>] [--label <KEY=VALUE>]... [--cwd <dir>]
                        [--create-no-window] [--windows-graceful-ctrl-break]
                        [--timeout <duration>]
                        [--idle-timeout <duration>]
-                       [--grace <duration>] [--max-memory <size>]
+                       [--grace <duration>] [--snapshot-interval <duration>]
+                       [--max-memory <size>]
                        [--max-processes <n>] [--cpu-quota <cores>]
                        [--capture-dir <dir>] [--capture-max-bytes <size>]
                        [--capture-overflow <truncate|cancel>]
@@ -926,6 +927,30 @@ neither can reveal the command line. Member snapshots carry each member's `ppid`
 executable `name`, and start-time token wherever ProcessKit's `members_info()` can
 report them (nullable per-field on platforms/members it can't).
 
+A run records its tree shape once, right after spawn. `run --snapshot-interval
+<duration>` opts into a **periodic** re-emission of that same `members_snapshot`
+for as long as the child runs (told apart by the event's `reason` field, `spawn`
+vs `interval`), so a long, quiet, or detached run leaves a recorded history of how
+its tree evolved — when the worker fleet grew, whether helpers lingered, what the
+tree looked like just before a deadline fired — instead of only a start-of-run
+shape plus a teardown count. The cadence samples the container's own member list
+rather than the output pump, so it composes with every I/O mode including
+`--inherit-stdio`, and it stops as soon as the run's ending is decided. A sample
+whose member read fails is still recorded, flagged `read_error: true` with an empty
+member list, because a detached runner's stderr goes nowhere and the stream is the
+only place such a failure can be reported.
+
+Omitting the flag adds no event: the run emits the same one `members_snapshot`, at
+the same point in the stream, that it always did. The event's **wire form** did
+change for every run, flag or not — `members_snapshot` now always carries `reason`
+and `read_error` — which is additive within schema v1 (see
+[`docs/schema.md`](docs/schema.md), "Versioning") but is not "unchanged", so an
+adapter that pinned this event's exact field set rather than the fields it reads
+will see the difference on the default path too. The cadence is also the first
+thing that makes the stream's size grow with a run's duration; that boundary is
+deliberate and its arithmetic is in
+[`docs/running-commands.md`](docs/running-commands.md), "Recorded tree snapshots".
+
 - Normative field reference: [`docs/schema.md`](docs/schema.md).
 - Golden sample stream for adapters:
   [`fixtures/schema/v1/events.jsonl`](fixtures/schema/v1/events.jsonl).
@@ -956,7 +981,9 @@ enforces `--timeout`, `--grace`, and stop-signal cancellation (`Ctrl-C`, plus
 on Windows) with a guaranteed
 teardown of the whole tree (see "Timeouts, cancel, and grace"), and writes the
 versioned JSONL event stream to `--jsonl` (see "JSONL event schema"). `--run-id`
-and `--argv-raw` are consumed by that stream, and `--capture-dir` records a bounded
+and `--argv-raw` are consumed by that stream, `--snapshot-interval` adds a recorded
+cadence of `members_snapshot` events to it while the child runs, and
+`--capture-dir` records a bounded
 stdout/stderr transcript with per-stream byte counts, hashes, and truncation flags
 (see "Bounded output capture"). `inspect`, `cancel`, and `kill` all reach live runs
 through the local control plane: `inspect` prints a snapshot, `cancel` ends a run

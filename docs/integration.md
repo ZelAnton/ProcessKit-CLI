@@ -139,8 +139,11 @@ processkit-cli run \
   the child's result must read it there, or via `wait` plus the event stream.
   It conflicts with `--inherit-stdio`/`--inherit-stdin` (nothing interactive
   survives detaching) and implies `--no-echo`'s discarding sinks, while
-  `--jsonl`, `--capture-dir`, and `--idle-timeout` behave exactly as they do in
-  the foreground. On Windows, pair it with `--create-no-window` for a console
+  `--jsonl`, `--capture-dir`, `--idle-timeout`, and `--snapshot-interval` behave
+  exactly as they do in the foreground. The detached runner's own stderr is
+  `null`, so `--jsonl` is the only channel that reports anything — including a
+  failed member read, which is why that failure is a flagged event rather than a
+  warning (§3). On Windows, pair it with `--create-no-window` for a console
   child: the detached runner has no console to lend it, so the OS gives the
   child one of its own. See [`docs/exit-codes.md`](exit-codes.md), "Detached
   runs".
@@ -239,7 +242,18 @@ emits, in order:
 1. `run_started` — the child was spawned; carries `run_id`, `root_pid`,
    containment `mechanism`, the `abrupt_cleanup` tri-state, and the redacted
    `command`.
-2. `members_snapshot` — the container's members at that point.
+2. `members_snapshot` (`reason: "spawn"`) — the container's members at that
+   point. Exactly one by default; a run started with `--snapshot-interval
+   <duration>` emits **additional** `members_snapshot` events (`reason:
+   "interval"`) on that cadence, all of them after this one and all of them
+   before step 3 — never inside the teardown pair. Route by event type and treat
+   the count as open-ended: within a schema version an adapter must not assume an
+   event type it knows occurs only once (the full list of what a reader must
+   tolerate within a version is in
+   [`docs/compatibility.md`](compatibility.md#what-a-reader-must-tolerate-within-one-version)).
+   Every one of these events carries `read_error`; when it is `true` the read
+   failed and `members` is an empty fallback, not a confirmed-empty tree — check
+   the flag before drawing a conclusion about the tree from an empty array.
 3. Either the natural-exit path (`root_exited`, `cleanup_started`,
    `cleanup_finished`) or a runner-imposed ending's reason event (`timeout`,
    `cancelled`, or `killed`) followed by the same `cleanup_started` /

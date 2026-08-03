@@ -132,7 +132,12 @@ implemented in `run::execute` (`src/run/mod.rs`) and `run::launch::run_async`
    group during cleanup. A `members_snapshot` event records the container's
    member list — enriched with `ppid`/executable `name`/`start_time` via
    ProcessKit's `members_info()` wherever the platform can report them
-   (`docs/schema.md`, "Enriched member fields") — in either path.
+   (`docs/schema.md`, "Enriched member fields") — in either path. With
+   `--snapshot-interval` the same event is re-emitted on that cadence
+   (`reason: "interval"`) until the ending is decided, from an extra
+   never-resolving arm of the run's existing `select!` race rather than a thread
+   or a spawned task, and reading the container's member list rather than the
+   pump — which is why it composes with `--inherit-stdio` too.
 3. **Capture and hash.** `src/capture.rs`'s `CaptureTee` mirrors every byte the
    pump observes into a bounded capture file per stream — independent of
    whether that byte is also echoed (`--no-echo` does not change what is

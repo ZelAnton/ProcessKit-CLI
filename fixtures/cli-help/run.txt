@@ -34,6 +34,17 @@ Options:
       --grace <duration>
           Grace period between a cancel/timeout and the hard kill. Same duration grammar as `--timeout`/`--idle-timeout`, but — unlike them — `0` stays legal here: it means "no pause", a real and useful setting, not a degenerate one, so this flag keeps using the more permissive [`parse_duration`] rather than [`parse_positive_duration`]
 
+      --snapshot-interval <duration>
+          Re-emit the `members_snapshot` JSONL event every `<duration>` for as long as the child runs, instead of only once right after it is spawned. This is **recorded** observability for the shape of the process tree over time — when the worker fleet ballooned, whether helpers lingered, what the tree looked like just before an idle deadline fired — for exactly the runs (long, detached, quiet) where nobody is likely to have been watching live with `inspect` at the interesting moment. Omit it and the run emits the single post-spawn snapshot it always did, at the same point in the stream and with no event added — but note that the event itself now always carries `reason` (`spawn`) and `read_error`, on the default path too: additive fields within schema v1, not an unchanged wire form (see `docs/schema.md`, "Versioning").
+          
+          Each periodic event is the ordinary `members_snapshot`, enriched through the same `ProcessGroup::members_info()` path as the post-spawn one and told apart from it only by its `reason` field (`interval` vs `spawn`; see `docs/schema.md`, "members_snapshot"). The cadence stops the moment the run's ending is decided, so a periodic snapshot never interleaves into the teardown events.
+          
+          A member read that fails does not invent a tree that was never observed: it emits that sample with `read_error: true` and an empty `members` list, the same honest degradation `cleanup_started`/`cleanup_finished` already apply, and the cadence continues. That flag is the contract, not the accompanying stderr warning — a `--detach`ed runner's stderr is `null`, so there the JSONL stream is the only channel that reports the failure at all.
+          
+          **The resulting stream is deliberately unbounded**: roughly `duration / interval` extra lines, each sized by the tree, with no ceiling, rotation, or sampling. On a day-long run a 1s cadence over a 100-process tree writes several hundred megabytes; pick the interval accordingly (see `docs/running-commands.md`, "Recorded tree snapshots", for the arithmetic).
+          
+          Composes with **every** I/O mode, `--inherit-stdio` included: a snapshot is a query of the container's own member list, not an observation of the output pump, so — unlike `--idle-timeout` — it needs no pipes and conflicts with nothing. Same duration grammar and parse-time validation as `--timeout`, including the rejection of `0`, which asks for an unbounded snapshot storm rather than a cadence — see [`parse_positive_duration`].
+
       --max-memory <size>
           Cap the run's **whole process tree** total memory. Accepts a byte count with an optional binary unit — `1048576`, `512k`, `256m`, `2g` (see [`parse_size`] for the grammar). Enforcement needs a real whole-tree container (Windows Job Object or Linux cgroup v2); where none exists the run fails fast with a `limit_hit` rather than silently running unbounded (see `README.md`, "Resource limits"). Omit to leave memory unbounded
 
@@ -67,7 +78,9 @@ Options:
           
           **The exit code changes meaning under this flag**, and only under it: it reports whether the run *started*, never how the child finished. A successful start is `0` even for a child that later fails, and a start that failed keeps the same reserved-band code the run itself would have reported. The child's real code stays fully available where a detached caller can actually observe it — the terminal `runner_exit` event in `--jsonl` (see `docs/exit-codes.md`, "Detached runs").
           
-          Cannot be combined with the interactive stdio modes (`--inherit-stdio`, `--inherit-stdin`): a detached run has no terminal to hand over and nobody left to type at it. There is no live echo either — the detached runner runs with `--no-echo`'s discarding sinks — while `--jsonl` (still required), `--capture-dir`, and `--idle-timeout` all keep observing the child's output exactly as they do in the foreground.
+          Cannot be combined with the interactive stdio modes (`--inherit-stdio`, `--inherit-stdin`): a detached run has no terminal to hand over and nobody left to type at it. There is no live echo either — the detached runner runs with `--no-echo`'s discarding sinks — while `--jsonl` (still required), `--capture-dir`, and `--idle-timeout` all keep observing the child's output exactly as they do in the foreground, and `--snapshot-interval` keeps recording the tree's shape (this is the mode it exists for — nobody is watching a detached run live with `inspect`).
+          
+          **The detached runner's own stdin/stdout/stderr are `null`**, so every warning the foreground runner would print reaches nobody: `--jsonl` is the only diagnostic channel a detached run has. That is why a failed member read is recorded as a `members_snapshot` with `read_error: true` rather than only warned about — and why a `--jsonl` write failure (a full disk, say) is invisible: event logging switches itself off after one unseen warning and the stream simply ends mid-run.
 
       --inherit-stdin
           Give the child the runner's own stdin (terminal, file, or pipe). This does not create a PTY and cannot be combined with `--stdin-file`

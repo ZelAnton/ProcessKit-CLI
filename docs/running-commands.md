@@ -159,6 +159,76 @@ soft-stop → grace → hard-kill path. `Ctrl-C` and `cancel` use the same teard
 shape but remain distinguishable outcomes. See
 [Timeouts and cancellation](timeouts-and-cancellation.md).
 
+## Recorded tree snapshots
+
+```sh
+processkit-cli run \
+  --snapshot-interval 30s \
+  --jsonl long-run.jsonl \
+  -- ./build-fleet
+```
+
+By default the tree's shape is recorded once, right after spawn.
+`--snapshot-interval` re-emits that same `members_snapshot` event on the given
+cadence while the child runs, so a long, quiet, or detached run leaves a recorded
+history of how the tree evolved rather than one that is only observable *live*
+via `inspect`. The periodic events are told apart from the post-spawn one by the
+event's `reason` field (`interval` vs `spawn`), and stop as soon as the run's
+ending is decided. A sample whose member read fails is still recorded, carrying
+`read_error: true` and an empty member list rather than being dropped. See
+[JSONL event schema](schema.md#members_snapshot).
+
+It composes with every I/O mode, including `--inherit-stdio`, and it is forwarded
+by `--detach` — see [Detached runs](detached-runs.md), the scenario it exists for.
+
+### Sizing the stream: there is intentionally no ceiling
+
+Before this flag, a run's JSONL file held a fixed handful of events regardless of
+how long the run took. A cadence changes that: the file now grows with the run's
+*duration*, and the runner imposes **no** ceiling, rotation, or sampling on it.
+That is a deliberate choice, not an oversight, and it is the opposite of the choice
+made for captured child output (`--capture-max-bytes` with an explicit
+`--capture-overflow truncate|cancel` policy). Three reasons:
+
+- **The operator already holds the dial.** Output volume is dictated by the child
+  and is unknowable in advance, which is why capture needs a runtime ceiling. Here
+  the volume is a direct, computable consequence of a number the operator typed —
+  a ceiling would only second-guess an explicit instruction.
+- **Neither truncation policy fits.** Silently dropping later snapshots would
+  destroy exactly the end-of-run history the feature exists to record, and ending
+  the run over a diagnostics budget would let an observability option kill the
+  payload it was only meant to watch.
+- **The bound belongs where the file does.** The stream's destination is the
+  operator's `--jsonl` path; disk budgets, retention, and rotation are properties
+  of that location, not of the runner.
+
+**The arithmetic.** One snapshot line costs roughly **130 bytes** of envelope plus
+about **80 bytes per member** of the tree, and the run writes
+`duration / interval` of them:
+
+| Run | Cadence | Tree | Lines | Added to `--jsonl` |
+| --- | --- | --- | --- | --- |
+| 1 hour | `30s` | 10 | 120 | ≈ 110 KB |
+| 8 hours | `1m` | 100 | 480 | ≈ 4 MB |
+| 24 hours | `1m` | 100 | 1 440 | ≈ 12 MB |
+| 24 hours | `1s` | 100 | 86 400 | ≈ 700 MB |
+
+**Choosing an interval.** Pick the coarsest cadence that still answers the question
+you expect to ask; the resolution that matters is usually "when did this change",
+not "what was it at every instant". Seconds-scale intervals are for short
+investigations, minutes-scale for day-long or detached runs. As a rule of thumb keep
+the projected line count in the thousands rather than the millions — with a
+100-process tree that is a few tens of megabytes, which any run that was worth
+supervising can afford.
+
+**If the file cannot be written**, the runner reports the failure once on stderr and
+then stops emitting events for the rest of the run; the run itself continues. A full
+disk therefore shows up as a stream that simply ends mid-run, and in a detached run
+(whose stderr is `null`) with no warning anywhere. This is the pre-existing behavior
+of the JSONL emitter, not something the cadence introduces, but a long cadence is the
+most likely way to meet it — one more reason to size the interval rather than rely on
+a ceiling that does not exist.
+
 ## Resource limits
 
 ```sh
@@ -198,6 +268,7 @@ Windows and conflicts with both consoleless modes (`--create-no-window`, `--deta
 | `--idle-timeout` + `--capture-dir` | Valid: the shared pump drives both. |
 | `--inherit-stdio` + `--capture-dir` | Rejected: inherited output bypasses the pump. |
 | `--inherit-stdio` + `--idle-timeout` | Rejected: the runner cannot observe activity. |
+| `--inherit-stdio` + `--snapshot-interval` | Valid: snapshots read the container, not the pump. |
 | `--detach` + `--inherit-stdio` | Rejected: the caller is no longer present. |
 | `--detach` + `--capture-dir` | Valid: the detached runner still captures. |
 | `--create-no-window` + `--inherit-stdio` | Rejected on every platform at parse time. |

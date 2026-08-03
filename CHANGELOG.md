@@ -30,6 +30,29 @@ to a dated version section.
   run on anything it does not implement, and is held to a real JSON Schema engine's
   verdict — line for line, over the golden fixture and a generated mutation corpus
   — by the test tier.
+- `run --snapshot-interval <duration>`, an opt-in cadence that re-emits the
+  `members_snapshot` lifecycle event while the child runs, so a long, quiet, or
+  detached run records how its process tree evolved instead of only its shape at
+  spawn. The event gained two always-present fields — `reason` (`spawn` for the
+  post-spawn snapshot every run emits, `interval` for a re-sample) and
+  `read_error` — on **every** run, flagged or not; both are additive schema v1
+  changes, like the `timeout` event's own `reason`, but an adapter that pinned
+  this event's exact field set rather than the fields it reads will see them on
+  the default path too. The cadence samples the container's member list rather
+  than the output pump, so it composes with `--inherit-stdio`, is forwarded by
+  `--detach`, and stops as soon as the run's ending is decided, so no snapshot
+  ever lands in the teardown tail. The stream it produces is deliberately
+  unbounded (`duration / interval` lines); `docs/running-commands.md` records
+  that decision with the sizing arithmetic for choosing an interval.
+- `members_snapshot` now reports a failed member read in the stream instead of
+  skipping the sample: the event is emitted with `read_error: true` and an empty
+  `members` array, matching `cleanup_started`/`cleanup_finished`'s existing
+  `read_error` convention. The previous stderr-only warning could not reach a
+  detached run's operator at all (its stderr is `null`), which left a failed
+  sample indistinguishable from an unchanged tree in the one artifact such a run
+  has. As a side effect the post-spawn `members_snapshot` now appears exactly
+  once in every stream, as `docs/schema.md`'s ordering contract states, where a
+  failed read previously removed it.
 - Checksum-derived winget, Scoop, and Homebrew distributor manifests attached
   to every release after the platform archives finish uploading.
 - An adoption-oriented positioning guide comparing ProcessKit CLI with common
@@ -98,6 +121,17 @@ to a dated version section.
   crosses — and states explicitly that the `cargo-fuzz` tier covers `wait
   --report-outcome`'s read-back but **not** those parsers, so the document no
   longer implies more coverage than exists.
+- `docs/compatibility.md`'s "Schema pinning" section now states the full set of
+  changes a reader must tolerate within one schema version — new event types,
+  repeats of an event type that previously occurred at most once, new fields
+  including always-present ones, new values in open-ended string fields, and
+  unknown fields — and names `docs/schema.md` as the normative source for all of
+  them. It previously mentioned only "additive optional fields and unknown event
+  fields", which covered neither multiplicity nor always-present fields.
+- The zero-duration rejection message shared by `--timeout`, `--idle-timeout`,
+  `wait --timeout`, and `--snapshot-interval` no longer describes only the
+  deadline case ("tearing the child down immediately after spawn … omit the flag
+  to leave it unbounded"), which was misleading for a rejected cadence.
 - `inspect` and `inspect --all` now check the `snapshot_version` a runner declares
   instead of rendering whatever arrives. A runner answering with a version **newer**
   than the invoked binary implements is refused with `CONTROL` (103) — for `--all`,

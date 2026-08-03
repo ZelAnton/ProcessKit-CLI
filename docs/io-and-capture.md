@@ -52,6 +52,15 @@ therefore unavailable and rejected at parse time:
 - `--inherit-stdin` and `--stdin-file`;
 - `--detach`.
 
+That list is bounded by the pump, not by observability in general.
+`--snapshot-interval` composes with **every** I/O mode, `--inherit-stdio`
+included: a snapshot queries the container's own member list, so it needs no pipes
+to observe and conflicts with nothing here. `--idle-timeout` is the contrast that
+makes the boundary concrete — it is rejected above precisely because it can only
+re-arm on bytes the pump observes, while `--snapshot-interval` never looks at the
+child's output at all. `--jsonl` likewise keeps recording the full lifecycle under
+inheritance; only the child's *bytes* are outside the runner's view in this mode.
+
 Terminal signal behavior is platform-dependent. On Unix a child in a separate
 foreground process group may receive `Ctrl-C` directly and report a signal exit;
 on Windows both child and runner can observe the console event. Use the local

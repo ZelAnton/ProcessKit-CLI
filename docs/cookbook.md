@@ -316,7 +316,10 @@ append-only sequence of complete lines. A reader should:
 1. buffer until newline;
 2. parse one object;
 3. verify `schema_version`;
-4. dispatch on `event` while tolerating unknown additive fields;
+4. dispatch on the `event` discriminator, tolerating unknown event types, unknown
+   fields, new always-present fields on an event it already parses, and repeats of
+   an event type that previously occurred only once (see
+   [Compatibility and upgrades](compatibility.md#what-a-reader-must-tolerate-within-one-version));
 5. stop only after terminal `runner_exit` or an explicit external recovery
    decision.
 

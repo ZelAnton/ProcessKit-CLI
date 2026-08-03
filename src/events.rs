@@ -109,7 +109,34 @@ pub enum Event {
     /// A point-in-time snapshot of the container's members, including the enriched
     /// per-member fields ProcessKit's `members_info()` reports (see module docs
     /// and [`Member`]).
-    MembersSnapshot { members: Vec<Member> },
+    ///
+    /// `reason` names what asked for this particular snapshot: `spawn` for the one
+    /// every run emits right after the child is spawned, `interval` for a periodic
+    /// re-sample under `run --snapshot-interval`. It is always present — a run
+    /// without the flag emits exactly the one `spawn` snapshot it always did, now
+    /// self-describing — and it is deliberately the *only* thing that distinguishes
+    /// the two on a successful read: both are produced by the same
+    /// `emit_members_snapshot` through the same `members_info()` enrichment, so the
+    /// shapes cannot drift (`docs/schema.md`, "members_snapshot").
+    ///
+    /// `read_error` is `true` when the member read itself failed — in that case
+    /// `members` is an empty fallback rather than an observation, exactly as
+    /// `cleanup_started`'s `members_before` `0` and `cleanup_finished`'s empty
+    /// `remaining_pids` are under their own `read_error` flags. The event is emitted
+    /// either way, so a failed sample is recorded **in the stream** instead of being
+    /// silently dropped (see `src/run/mod.rs`, `SnapshotReason`, for why that
+    /// matters most in a detached run, whose stderr is `null`).
+    MembersSnapshot {
+        /// `spawn` (once, right after the child is spawned) or `interval` (a
+        /// `--snapshot-interval` re-sample). First on the wire so the discriminator
+        /// stays readable ahead of the potentially long `members` array.
+        reason: &'static str,
+        /// `true` when `members_info()` failed: `members` is then the empty
+        /// fallback, not a confirmed-empty tree. Ahead of `members` for the same
+        /// readability reason as `reason`.
+        read_error: bool,
+        members: Vec<Member>,
+    },
     /// The root child exited on its own. `code` is set for a normal exit; `signal`
     /// for a Unix signal death; both `null` only for an outcome without either.
     RootExited {
@@ -783,7 +810,18 @@ mod tests {
             // platform that reports everything), one with every enriched field
             // absent (a platform gap, e.g. the "bare" BSDs, or a member that
             // vanished mid-read) — the fixture pins both shapes side by side.
+            //
+            // One line for this event type, not one per `reason` value: the fixture
+            // is a catalog of event *shapes*, and a `--snapshot-interval` re-sample
+            // is byte-identical to this line except for `reason: "interval"` (see
+            // `SnapshotReason`). The `spawn` value is the one every run emits, so it
+            // is the representative one pinned here. `read_error: false` is likewise
+            // the shape every successful read takes; its `true` fallback carries no
+            // members at all and is documented in `docs/schema.md` rather than
+            // pinned as a second line, exactly like the `reason` values.
             Event::MembersSnapshot {
+                reason: "spawn",
+                read_error: false,
                 members: vec![
                     Member {
                         pid: 4242,
@@ -973,6 +1011,8 @@ mod tests {
 
         let line = serialize_record(
             &Event::MembersSnapshot {
+                reason: "spawn",
+                read_error: false,
                 members: vec![Member::from_pid(4242)],
             },
             fixed_time(),
@@ -1007,6 +1047,8 @@ mod tests {
         };
         let line = serialize_record(
             &Event::MembersSnapshot {
+                reason: "spawn",
+                read_error: false,
                 members: vec![member],
             },
             fixed_time(),
@@ -1020,6 +1062,39 @@ mod tests {
         assert_eq!(
             member["start_time"], "133456789000000000",
             "start_time is the opaque token's decimal string, not a JSON number: {line}"
+        );
+    }
+
+    /// The degraded form of `members_snapshot` — the one a failed
+    /// `members_info()` read produces — serializes as documented: the event is
+    /// still written, `read_error` is `true`, and `members` is an **empty array**,
+    /// not an omitted field and not a fabricated tree (`docs/schema.md`,
+    /// "members_snapshot"). This shape is deliberately absent from the golden
+    /// fixture (a catalog of event *types*, not of every field value), so it is
+    /// pinned here instead — it is the only form in which a detached run, whose
+    /// stderr is `null`, can learn that a sample failed at all.
+    #[test]
+    fn members_snapshot_records_a_failed_read_as_an_empty_flagged_sample() {
+        let line = serialize_record(
+            &Event::MembersSnapshot {
+                reason: "interval",
+                read_error: true,
+                members: Vec::new(),
+            },
+            fixed_time(),
+        )
+        .expect("serializes");
+        let value: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
+        assert_eq!(value["event"], "members_snapshot");
+        assert_eq!(value["reason"], "interval");
+        assert_eq!(
+            value["read_error"], true,
+            "a failed sample is flagged, not silently dropped: {line}"
+        );
+        assert_eq!(
+            value["members"],
+            serde_json::json!([]),
+            "the fallback is an explicit empty array, never an omitted field: {line}"
         );
     }
 

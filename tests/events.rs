@@ -667,6 +667,17 @@ fn members_snapshot_reports_enriched_fields() {
         .iter()
         .find(|e| e["event"] == "members_snapshot")
         .expect("a members_snapshot event");
+    assert_eq!(
+        snapshot["reason"], "spawn",
+        "the snapshot every run emits after spawn names itself as such, live through \
+         the binary and not only in the golden fixture: {snapshot}"
+    );
+    assert_eq!(
+        snapshot["read_error"], false,
+        "`read_error` is always present, and `false` on a successful read, on the \
+         default (no `--snapshot-interval`) path too — so an empty `members` array \
+         is never ambiguous between an observation and a failed read: {snapshot}"
+    );
     let members = snapshot["members"].as_array().expect("members is an array");
     let root = members
         .iter()

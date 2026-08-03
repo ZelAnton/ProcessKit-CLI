@@ -58,11 +58,42 @@ These features remain active:
 - `--jsonl` (still required);
 - `--capture-dir` and `--capture-max-bytes`;
 - `--idle-timeout`;
+- `--snapshot-interval` (see below);
 - overall timeout, grace, environment, cwd, and resource limits.
 
 `--inherit-stdio` and `--inherit-stdin` are rejected because there is no caller
 left to provide those handles. Use `--stdin-file` when a detached payload needs
 finite input.
+
+## Recorded tree snapshots without a live watcher
+
+`--snapshot-interval <duration>` works under `--detach` — the launcher forwards it
+to the detached copy like any other run flag — and this is the mode it was designed
+for. A detached run is precisely the one nobody is watching with `inspect` at the
+interesting moment, so the periodic `members_snapshot` events are the only record
+of how the tree evolved between spawn and teardown.
+
+```sh
+processkit-cli run --detach \
+  --run-id nightly-index \
+  --snapshot-interval 5m \
+  --jsonl /var/lib/my-orchestrator/runs/nightly-index.jsonl \
+  -- indexer
+```
+
+Two consequences are specific to detaching:
+
+- **The JSONL file is the only diagnostic channel.** The detached runner's
+  stdin/stdout/stderr are `null`, so every warning the foreground runner would print
+  reaches nobody. This is why a failed member read is recorded *in the stream* as a
+  `members_snapshot` with `read_error: true` rather than merely warned about (see
+  [JSONL event schema](schema.md#members_snapshot)). It is also why a JSONL write
+  failure — a full disk, most plausibly — is invisible: the runner disables event
+  logging after one unseen warning and the stream simply stops mid-run.
+- **Detached runs are the longest ones, so size the cadence first.** The stream
+  grows as `duration / interval`; a day-scale run wants minutes, not seconds. The
+  arithmetic and the recorded decision not to impose a ceiling are in
+  [Running commands](running-commands.md#recorded-tree-snapshots).
 
 ## Windows
 
