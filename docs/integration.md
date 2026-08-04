@@ -306,7 +306,7 @@ an adapter can query, steer, and wait for it while it is still live. Every
 command resolves the target purely by `run_id` through the per-user registry —
 never by PID. This is also the whole supervision story for a run launched with
 `--detach` (§2): a detached run is an ordinary run in the registry, and these
-four commands are how an adapter that is no longer its parent steers it —
+five commands are how an adapter that is no longer its parent steers it —
 alongside `events` (§3), which reads that run's stream back without contacting it
 at all:
 

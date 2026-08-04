@@ -489,9 +489,9 @@ pub struct ErrorEnvelope<'a> {
     pub code: u8,
     /// The finer name of what failed. See [`ErrorKind`].
     pub kind: ErrorKind,
-    /// The subcommand that failed (`run`, `inspect`, `cancel`, `kill`, `wait`,
-    /// `events`, `list`, `prune`, `probe`) — always a `&'static str` from the CLI's
-    /// own definition, never caller-supplied text.
+    /// The subcommand that failed (`run`, `inspect`, `cancel`, `kill`, `attest`,
+    /// `wait`, `events`, `list`, `prune`, `probe`) — always a `&'static str` from the
+    /// CLI's own definition, never caller-supplied text.
     pub operation: &'static str,
     /// The run id the invocation named, or `null` when it named none: an `--all`
     /// fan-out, a whole-registry command (`list`/`prune`), a self-contained `probe`,
