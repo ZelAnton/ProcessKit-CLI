@@ -343,9 +343,16 @@ contact the runner at all and is described in [`docs/registry.md`](registry.md),
   refusal a platform that cannot name its callers gives instead of an unproven
   "ok" (pin `attest:peer-identity` at preflight, §1, to rule that out up front).
   The attestation is printed on stdout for every verdict, including the failing
-  ones. Read `mechanism` if you need to know how strong the containment behind a
-  `member` answer is; nested runs and the per-mechanism scope are covered in
-  [`docs/control-plane.md`](control-plane.md), "`attest`".
+  ones, and carries its own `attestation_version` (§1) — this answer's contract
+  axis, independent of `inspect`'s `snapshot_version`. The client reads it
+  **strictly**: a reply declaring any number other than the single one this build
+  implements is refused with `CONTROL` (103) and `kind: "incompatible_contract"`
+  (§6) instead of being read as a verdict its sender never promised, because unlike
+  a snapshot this answer is one an adapter gates access on — there is deliberately
+  no read-down range. Read `mechanism` if you need to know how strong the
+  containment behind a `member` answer is; nested runs, the per-mechanism scope, and
+  why this axis has no read-down range are covered in
+  [`docs/control-plane.md`](control-plane.md), "`attest`" and "Attestation version".
 - **`wait`** blocks until the run is no longer live and exits `0`. It is the
   answer for an adapter that is **not** the runner's parent — one that
   restarted, or that supervises runs another process launched — and so has no
@@ -417,14 +424,16 @@ esac
 **`CONTROL` (103)** is the one exit code all five of these clients' by-`run_id`
 form can return, and for all five the usual reason is the same: the command could
 not be resolved to *the* single target run. Two further reasons belong to the
-read-only verbs, where the target *was* resolved and reached and did answer:
-`inspect`'s reply declared a control-plane snapshot version this client does not
-read, so the answer was refused rather than rendered (see `docs/control-plane.md`,
-"Snapshot version: a newer runner's reply is refused, an older one is read"), and
-`attest` was answered `peer_identity_unsupported` — the runner could not name the
-caller, so it declined to decide. `attest`'s *decided* negative is not a `103` at
-all but `NOT_A_MEMBER` (115). See §6 for the concrete
-situations that produce a `103`, those included. `cancel --all` / `kill --all`
+read-only verbs, where the target *was* resolved and reached and did answer. The
+first is shared by both of them: a reply declaring a contract version this client
+does not read is refused rather than acted on — `inspect`'s `snapshot_version` (see
+`docs/control-plane.md`, "Snapshot version: a newer runner's reply is refused, an
+older one is read") or `attest`'s `attestation_version` (ibid., "Attestation
+version"). The second is `attest`'s alone: it was answered
+`peer_identity_unsupported` — the runner could not name the caller, so it declined
+to decide. `attest`'s *decided* negative is not a `103` at all but `NOT_A_MEMBER`
+(115). See §6 for the concrete situations that produce a `103`, those included.
+`cancel --all` / `kill --all`
 reuse the same code for a different reason — one or more snapshot targets failed,
 not "no single target run" — see the `--all` paragraph above and
 `docs/control-plane.md`.
@@ -516,19 +525,26 @@ The `kind` column is noted per bullet; §7 has the full contract.
   rather than guessing which entry the scan happened to return first. Keep
   `run_id`s unique among an adapter's own concurrently-live runs (§2) to avoid
   this entirely.
-- **An unreadable snapshot version (`inspect` only).** (`kind: "incompatible_contract"`) The runner was reached and
-  answered, but its reply declared a control-plane `snapshot_version` outside the
-  range this client reads — newer than the version it implements, or older than the
-  version it still decodes — so `inspect` refuses the answer instead of rendering it
-  under semantics its sender never promised. Also a `CONTROL` (103), with a message
-  naming the version that arrived and the range this build reads. Unlike the four
-  above it says nothing about the run's liveness: the target is registered, live,
-  reachable, and healthy, and `cancel`/`kill`/`wait`/`list` against it are
-  unaffected (an ack carries no version). Do not treat it as a lost runner or retry
-  it; inspect that run with a build that speaks its version — for a newer runner,
-  one at least as new as the binary that started the run. See
+- **An unreadable contract version (`inspect` and `attest`).** (`kind: "incompatible_contract"`) The runner was reached and
+  answered, but the reply declared a contract version this client does not read, so
+  it was refused instead of being acted on under semantics its sender never
+  promised. Both read-only verbs can hit this, each on its own version axis: an
+  `inspect` reply carrying a control-plane `snapshot_version` outside the range this
+  client reads — newer than the version it implements, or older than the version it
+  still decodes — and an `attest` reply carrying an `attestation_version` other than
+  the single one this client reads (that axis is read strictly, with no range, since
+  a misread membership verdict is a security answer rather than a diagnostic; §4).
+  Also a `CONTROL` (103), with a message naming the version that arrived and the
+  version — or range — this build reads. Unlike the four above it says nothing about
+  the run's liveness: the target is registered, live, reachable, and healthy, and
+  the run stays fully controllable, since `cancel`/`kill` acks carry no version and
+  `wait`/`list` ask the runner for nothing. Do not treat it as a lost runner or
+  retry it; re-run the *same* command with a build that implements the runner's
+  version of that contract — for `inspect`, its snapshot version (for a newer
+  runner, a build at least as new as the binary that started the run); for `attest`,
+  its attestation version. See
   [`docs/control-plane.md`](control-plane.md), "Snapshot version: a newer runner's
-  reply is refused, an older one is read", and
+  reply is refused, an older one is read" and "Attestation version", and
   [`docs/compatibility.md`](compatibility.md), "Machine-output schemas".
 - **A caller the runner cannot name (`attest` only).** (`kind:
   "peer_identity_unsupported"`) The runner was reached and refused to decide

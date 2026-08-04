@@ -102,8 +102,10 @@
 //!
 //! ## The snapshot version a runner declares — checked, and acted on
 //!
-//! `inspect` is the only verb whose reply carries a version, and the client does not
-//! merely print it. A reply is rendered only if it declares a version this build can
+//! `inspect`'s reply is one of the two that carry a version — `attest`'s is the
+//! other, on the separate and deliberately stricter [`ATTESTATION_VERSION`] axis
+//! documented there — and the client does not merely print it. A reply is rendered
+//! only if it declares a version this build can
 //! actually decode — the range [`MIN_READABLE_SNAPSHOT_VERSION`]`..=`[`SNAPSHOT_VERSION`]
 //! — and anything outside it is refused with the same reserved [`exit::CONTROL`]
 //! (103) result every other "no snapshot you can trust" outcome reports, without

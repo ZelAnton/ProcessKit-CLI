@@ -203,13 +203,18 @@ pub enum ErrorKind {
     /// it is the one that is [`Self::retryable`].
     IpcDeadline,
     /// A contract this build does not implement was declared by the other side and
-    /// the answer was refused rather than misread ([`exit::CONTROL`], 103): today,
-    /// `inspect`'s reply carrying a control-plane `snapshot_version` outside the
-    /// range this client reads. It says **nothing** about the run's liveness — the
-    /// target is registered, live, and reachable, and `cancel`/`kill`/`wait`/`list`
-    /// against it are unaffected. Do not retry it; use a build that speaks that
-    /// version. See `docs/control-plane.md`, "Snapshot version: a newer runner's
-    /// reply is refused, an older one is read".
+    /// the answer was refused rather than misread ([`exit::CONTROL`], 103). Either
+    /// read-only verb can produce it, each on its own version axis: an `inspect`
+    /// reply carrying a control-plane `snapshot_version` outside the range this
+    /// client reads — a range, because an older snapshot shape is still decoded —
+    /// or an `attest` reply carrying an `attestation_version` other than the single
+    /// one this client reads, read strictly with no such range because a misread
+    /// membership verdict is a security answer rather than a diagnostic. It says
+    /// **nothing** about the run's liveness — the target is registered, live, and
+    /// reachable, and `cancel`/`kill`/`wait`/`list` are unaffected. Do not retry; use
+    /// a build that implements the runner's version of *that* contract. See
+    /// `docs/control-plane.md`, "Snapshot version: a newer runner's reply is
+    /// refused, an older one is read" and "Attestation version".
     IncompatibleContract,
     /// An unexpected runner fault — the runner reached a state its own logic rules
     /// out ([`exit::INTERNAL`], 104). **A genuine bug**, never an environment

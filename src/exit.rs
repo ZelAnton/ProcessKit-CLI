@@ -54,15 +54,18 @@ pub const BACKEND: u8 = 102;
 /// because it is the same verdict: there is no single target run to act on (see
 /// `docs/registry.md`, "Run id resolution — ambiguity is a hard failure").
 ///
-/// [`crate::control`]'s `inspect` mints it for one further reason that is *not* an
-/// unreachable target: the runner was reached and answered, and its **answer** was
-/// refused because it declared a `snapshot_version` outside the range this build
-/// reads (see the control module's "The snapshot version a runner declares — checked,
-/// and acted on"). The run itself is live and controllable — `cancel`/`kill` against
+/// [`crate::control`]'s read-only verbs mint it for one further reason that is *not*
+/// an unreachable target, and both of them can: the runner was reached and answered,
+/// and its **answer** was refused because it declared a contract version this build
+/// does not read — an `inspect` reply's `snapshot_version` outside the range this
+/// build decodes (see the control module's "The snapshot version a runner declares —
+/// checked, and acted on"), or an `attest` reply's `attestation_version` other than
+/// the single one this build implements ([`crate::control::ATTESTATION_VERSION`]).
+/// The run itself is live and controllable — `cancel`/`kill` against
 /// it are unaffected, their ack carrying no version — so a consumer must not read that
 /// `103` as "the runner is gone".
 ///
-/// `attest` adds the second such reason, and the same caveat applies to it: the
+/// `attest` adds a second such reason of its own, and the same caveat applies: the
 /// runner was reached and declined to answer because it could not obtain a
 /// kernel-authenticated identity for the caller (`peer_identity_unsupported`). A
 /// *decided* "you are not a member" is deliberately **not** this code — that is

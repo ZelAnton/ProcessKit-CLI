@@ -142,14 +142,16 @@ nothing to any run; **`cancel --all` / `kill --all` are the exception** — see
 "`cancel --all` / `kill --all` and a partial `103`" below before assuming
 nothing happened.
 
-**Diagnose.** stderr names which reason applied — three of them mean the runner
-itself was not reached, and the read-only verbs add refusals of their own below,
-where the target *was* reached and did answer. If you are diagnosing this from a
-script rather than by eye, re-run the same command with `--error-format json`,
-which prints the reason as a machine-readable `kind` (`stale` / `unprobed` /
-`control_unreachable`, plus `not_found`, `ambiguous_run_id`, `ipc_deadline`,
-`incompatible_contract`, and `peer_identity_unsupported`) instead of a
-sentence: a **stale registry
+**Diagnose.** stderr names which reason applied. Most of them mean the runner
+itself was never reached: a `run_id` the registry names nowhere (`not_found`) or
+names more than once ("An ambiguous `run_id`" below), plus the three described
+here, where an entry was found but no answer came back. The read-only verbs then
+add two refusals of their own below, where the target *was* reached and did
+answer. If you are diagnosing this from a script rather than by eye, re-run the
+same command with `--error-format json`, which prints the reason as a
+machine-readable `kind` (`stale` / `unprobed` / `control_unreachable`, plus
+`not_found`, `ambiguous_run_id`, `ipc_deadline`, `incompatible_contract`, and
+`peer_identity_unsupported`) instead of a sentence: a **stale registry
 entry** (the runner died abruptly, so the entry's record is left behind but
 its liveness lock has been released, detected *before* connecting), an
 **unprobeable registry entry** (the liveness lock could not be probed at all,
@@ -167,25 +169,38 @@ with that one — in short, do not hand-delete it). See
 reached: a distinguishable result, never a hang", and the `CONTROL` (103) row
 of the reserved-band table in [`docs/exit-codes.md`](exit-codes.md).
 
-**`inspect` has a fourth reason of its own, and it is not a lost runner.** If
-the message says the runner answered with a **control-plane snapshot version**
-outside the range this client reads, the runner is reachable and healthy: the
-exchange completed, and it is the *answer* that was rejected, because it declares
-a snapshot contract this binary does not read — in practice a runner newer than
-the client you are running. `cancel`/`kill` cannot hit this, and neither can
-`list`/`wait`/`prune`, so the run itself is still fully controllable. Retrying
-will not help: inspect that run with a build that speaks its version — for a
-newer runner, one at least as new as the binary that started the run. The message
-quotes the version that arrived and the range this build reads; `processkit-cli
-probe --json` reports the `version` of **whichever binary you run**, which is how
-you tell two installed builds apart (no preflight can report a *runner's*
-snapshot version — that number only arrives in its reply). See
-[`docs/control-plane.md`](control-plane.md), "Snapshot version: a newer runner's
-reply is refused, an older one is read".
+**The read-only verbs add a refusal the three above cannot produce, and it is not
+a lost runner.** If the message says the runner answered with a **control-plane
+version** this client does not read (`kind: "incompatible_contract"`), the runner
+is reachable and healthy: the exchange completed, and it is the *answer* that was
+rejected, because it declares a contract this binary does not implement — in
+practice a runner newer than the client you are running. `inspect` and `attest`
+each carry a version axis of their own, and either one can be refused this way —
+the same `kind`, a different contract, a different fix:
 
-**`attest` has a fifth reason of its own, and it is neither a lost runner nor a
-negative verdict.** If the message says the runner could not obtain a
-kernel-authenticated identity for this client from the control transport
+- `inspect` says "the runner answered with control-plane **snapshot** version …",
+  naming the number that arrived and the range this build reads. Retrying will not
+  help: inspect that run with a build that implements its snapshot version — for a
+  newer runner, one at least as new as the binary that started the run.
+- `attest` says "the runner answered with control-plane **attestation** version …",
+  naming the number that arrived and the single version this build reads. There is
+  no read-down range on that axis on purpose — a misread membership verdict is a
+  security answer rather than a diagnostic — so retrying is equally useless: attest
+  that run with a build that implements its attestation version.
+
+`cancel`/`kill` cannot hit either refusal (their ack carries no version), and
+neither can `list`/`wait`/`prune`, which ask no runner for one, so in both cases the
+run itself is still fully controllable. `processkit-cli probe --json` reports the
+`version` of **whichever binary you run**, which is how you tell two installed
+builds apart (no preflight can report a *runner's* snapshot or attestation version —
+those numbers only arrive in its reply). See
+[`docs/control-plane.md`](control-plane.md), "Snapshot version: a newer runner's
+reply is refused, an older one is read" and "Attestation version", and
+[`docs/integration.md`](integration.md) §6 ("An unreadable contract version").
+
+**Beyond that shared refusal, `attest` has one more of its own, and it is neither
+a lost runner nor a negative verdict.** If the message says the runner could not
+obtain a kernel-authenticated identity for this client from the control transport
 (`kind: "peer_identity_unsupported"`), the runner is reachable and healthy: the
 exchange completed, and it *declined to decide* membership because a transport
 that cannot name the caller leaves it nothing to decide on — reporting an
