@@ -842,12 +842,22 @@ impl Session {
     ///
     /// **`available` is only ever written when this check reached a verdict.** Every
     /// way the check could not be *performed* — no budget left for it, a scratch run
-    /// that would not spawn, a wait that could not complete — fails the phase and
-    /// leaves `resource_controller` `null` instead, because "the controller is not
+    /// that would not spawn, a wait that could not complete, or a run that ended for
+    /// some reason other than the cap — fails the phase and leaves
+    /// `resource_controller` `null` instead, because "the controller is not
     /// available" and "nobody looked" are different answers and only one of them was
     /// established. (`--require-resource-controller` then reports the requirement as
     /// unmet on the honest ground that the fact was never observed, rather than on a
     /// negative nobody proved — see [`Session::evaluate`].)
+    ///
+    /// That last case is why the verdict is [`classify_resource_outcome`]'s and not
+    /// the exit code's: a non-zero scratch run is *not* on its own evidence that the
+    /// cap could not be installed. `BACKEND` (102) is the code for every container
+    /// creation failure, and a run can also end on an unwritable stream
+    /// ([`exit::SETUP`]), a deadline ([`exit::TIMEOUT`]), or a signal. The dedicated
+    /// machine-readable signal that *this* ending was the cap is the run's own
+    /// `limit_hit` event (`src/run/launch.rs`, `docs/schema.md`), so that is what
+    /// `available: false` is written on.
     fn phase_resource_controller(&mut self) {
         let started = Instant::now();
         let requested = format!("--max-processes {RESOURCE_CHECK_MAX_PROCESSES}");
@@ -884,29 +894,24 @@ impl Session {
             child,
             endpoint: None,
         };
-        let outcome = run.wait_for_exit(self.deadline);
-        let (available, detail) = match outcome {
-            Ok(Some(0)) => (true, None),
+        let code = match run.wait_for_exit(self.deadline) {
+            Ok(code) => code,
             Err(detail) => {
                 self.fail("resource_controller", started, detail);
                 return;
             }
-            Ok(code) => {
-                let events = read_events(&run.jsonl).unwrap_or_default();
-                let reported = event(&events, "limit_hit")
-                    .and_then(|value| value.get("detail"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                (
-                    false,
-                    Some(reported.unwrap_or_else(|| match code {
-                        Some(code) => format!(
-                            "the scratch run exited with code {code} without reporting which \
-                             limit could not be applied"
-                        ),
-                        None => "the scratch run was terminated by a signal".to_string(),
-                    })),
-                )
+        };
+        // The scratch run's own account of its ending, which is what decides this
+        // verdict — the exit code alone cannot, since `BACKEND` (102) is equally the
+        // code for a container that could not be created for reasons having nothing
+        // to do with a cap (`src/run/launch.rs`, `create_group`).
+        let events = read_events(&run.jsonl).unwrap_or_default();
+        let (available, detail) = match classify_resource_outcome(code, &events) {
+            ResourceOutcome::Installed => (true, None),
+            ResourceOutcome::Refused(detail) => (false, Some(detail)),
+            ResourceOutcome::Undecided(detail) => {
+                self.fail("resource_controller", started, detail);
+                return;
             }
         };
         self.resource_controller = Some(ResourceControllerFacts {
@@ -1084,12 +1089,16 @@ impl Session {
                         .map(|detail| format!(": {detail}"))
                         .unwrap_or_default()
                 )),
-                // Unreachable through the CLI: clap requires `--check-resource-controller`
-                // alongside this flag. Reported rather than asserted, so a future caller
-                // of this function cannot turn an unobserved fact into a silent pass.
+                // Not "nobody asked" — clap requires `--check-resource-controller`
+                // alongside this flag — but "the check reached no verdict": it ran and
+                // could not establish the fact either way, which its own phase has
+                // already failed and explained. The requirement is reported unmet on
+                // that honest ground rather than on a negative nobody proved, and a
+                // future caller of this function cannot turn an unobserved fact into a
+                // silent pass either.
                 None => mismatches.push(
-                    "requires an enforceable whole-tree resource controller, but the check that \
-                     observes it was not run"
+                    "requires an enforceable whole-tree resource controller, but this \
+                     qualification never established whether this host has one"
                         .to_string(),
                 ),
             }
@@ -1284,6 +1293,86 @@ impl Scratch {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// What the optional resource-controller check established about this host.
+///
+/// Three outcomes, not two: the check can also fail to establish anything, and that
+/// is deliberately *not* spelled as a negative verdict. Keeping it apart is the whole
+/// point of the type — see [`Session::phase_resource_controller`].
+#[derive(Debug, PartialEq, Eq)]
+enum ResourceOutcome {
+    /// The container was created with the requested cap installed.
+    Installed,
+    /// The cap could not be installed, and the scratch run said so itself.
+    Refused(String),
+    /// Nothing was established either way: the scratch run ended for some reason
+    /// other than the cap. Fails the phase, and leaves the facts `null`.
+    Undecided(String),
+}
+
+/// Decide what one resource-controller scratch run established, from its exit code
+/// and its own event stream.
+///
+/// A pure function of the two pieces of evidence, so the rule can be exercised
+/// directly against every ending a run has (see this module's tests) rather than only
+/// against the one this host happens to produce.
+///
+/// The rule: exit `0` installed the cap; the run's own `limit_hit` event — under the
+/// [`exit::BACKEND`] code that event accompanies — is what makes "this host cannot
+/// enforce a whole-tree cap" an observation rather than an inference. Every other
+/// ending is [`ResourceOutcome::Undecided`], because `BACKEND` is equally the code
+/// for a generic container-creation failure, and a scratch run can also end on a
+/// setup error, a deadline, or a signal — none of which says anything about a
+/// resource controller. Requiring **both** halves of the signal is the strict
+/// direction to be wrong in: a run that reported a limit under some other code is a
+/// pairing this build does not recognize, and reporting "nobody established it" for
+/// it is the honest answer.
+fn classify_resource_outcome(code: Option<i32>, events: &[Value]) -> ResourceOutcome {
+    if code == Some(0) {
+        return ResourceOutcome::Installed;
+    }
+    let limit_hit = event(events, "limit_hit");
+    match (code, limit_hit) {
+        (Some(code), Some(limit_hit)) if code == i32::from(exit::BACKEND) => {
+            ResourceOutcome::Refused(limit_refusal(limit_hit))
+        }
+        (Some(code), _) => ResourceOutcome::Undecided(format!(
+            "the scratch run asking for `--max-processes {RESOURCE_CHECK_MAX_PROCESSES}` exited \
+             with code {code} without reporting a `limit_hit`, so it ended for some reason other \
+             than the cap and nothing was established about this host's resource controller"
+        )),
+        (None, _) => ResourceOutcome::Undecided(
+            "the scratch run asking for a resource cap was ended by a signal rather than an exit, \
+             so nothing was established about this host's resource controller"
+                .to_string(),
+        ),
+    }
+}
+
+/// The refusal a `limit_hit` event describes, as the report's `detail` states it.
+///
+/// Both of the event's fields are read: `limit` names *which* cap could not be
+/// applied (`memory` / `processes` / `cpu`) and `detail` carries the backend's own
+/// words for why. Each is treated as absent-able, because this reads a stream as data
+/// rather than trusting a shape.
+fn limit_refusal(limit_hit: &Value) -> String {
+    let limit = limit_hit.get("limit").and_then(Value::as_str);
+    let reason = limit_hit.get("detail").and_then(Value::as_str);
+    match (limit, reason) {
+        (Some(limit), Some(reason)) => {
+            format!("the scratch run's `limit_hit` names the `{limit}` limit: {reason}")
+        }
+        (Some(limit), None) => {
+            format!("the scratch run's `limit_hit` names the `{limit}` limit")
+        }
+        (None, Some(reason)) => {
+            format!("the scratch run reported a limit it could not apply: {reason}")
+        }
+        (None, None) => {
+            "the scratch run reported a limit it could not apply, without naming which".to_string()
+        }
+    }
+}
 
 /// A unique run id for a scratch run, marked as `doctor`'s so an operator who finds
 /// one in `list` — after a `doctor` that was itself killed — knows what it was.
@@ -1486,4 +1575,147 @@ fn render_human(report: &DoctorReport) -> String {
     // The trailing newline belongs to `println!`, not to the body.
     out.pop();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use serde_json::json;
+
+    /// A `limit_hit` line as `run` really emits it (`src/run/launch.rs`): the cap that
+    /// could not be applied, and the backend's own words for why.
+    fn limit_hit(limit: &str) -> Value {
+        json!({
+            "event": "limit_hit",
+            "limit": limit,
+            "detail": "the active mechanism cannot enforce a whole-tree process cap",
+        })
+    }
+
+    /// The generic container-creation failure that carries the *same* exit code and
+    /// no `limit_hit` — the ending this verdict has to tell apart from a refused cap.
+    fn container_failed() -> Value {
+        json!({
+            "event": "container_failed",
+            "phase": "create",
+            "code": 102,
+            "message": "the container could not be created",
+        })
+    }
+
+    #[test]
+    fn a_clean_scratch_run_is_the_only_way_the_cap_installs() {
+        assert_eq!(
+            classify_resource_outcome(Some(0), &[]),
+            ResourceOutcome::Installed
+        );
+    }
+
+    #[test]
+    fn a_limit_hit_under_backend_is_what_establishes_an_unavailable_controller() {
+        // The whole pairing: the dedicated machine-readable signal, under the code it
+        // accompanies. Nothing else may write `available: false`.
+        let outcome =
+            classify_resource_outcome(Some(i32::from(exit::BACKEND)), &[limit_hit("processes")]);
+        let ResourceOutcome::Refused(detail) = outcome else {
+            panic!("a reported limit is a decided verdict: {outcome:?}");
+        };
+        assert!(
+            detail.contains("processes"),
+            "the detail names which cap could not be applied: {detail}"
+        );
+        assert!(
+            detail.contains("whole-tree process cap"),
+            "and carries the backend's own explanation: {detail}"
+        );
+    }
+
+    #[test]
+    fn a_container_failure_that_is_not_a_limit_establishes_nothing() {
+        // `BACKEND` (102) is equally the code for a container that could not be
+        // created for reasons having nothing to do with a cap. Reading it as a verdict
+        // would publish `available: false` about a host nobody asked the question of.
+        let outcome =
+            classify_resource_outcome(Some(i32::from(exit::BACKEND)), &[container_failed()]);
+        let ResourceOutcome::Undecided(detail) = outcome else {
+            panic!("a generic container failure decides nothing: {outcome:?}");
+        };
+        assert!(
+            detail.contains("102") && detail.contains("limit_hit"),
+            "the phase failure says what it saw and what was missing: {detail}"
+        );
+    }
+
+    #[test]
+    fn every_other_ending_establishes_nothing_either() {
+        for code in [
+            exit::SETUP,
+            exit::TIMEOUT,
+            exit::SPAWN,
+            exit::CONTROL_CANCELLED,
+            exit::INTERNAL,
+        ] {
+            let outcome = classify_resource_outcome(Some(i32::from(code)), &[container_failed()]);
+            assert!(
+                matches!(outcome, ResourceOutcome::Undecided(_)),
+                "code {code} says nothing about a resource controller: {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reported_limit_under_an_unrecognized_code_is_not_a_verdict_either() {
+        // The strict direction: this build knows the `limit_hit` + `BACKEND` pairing,
+        // and a stream that reports a limit under some other ending is a combination
+        // it does not recognize — "nobody established it" rather than a negative read
+        // off half a signal.
+        let outcome = classify_resource_outcome(Some(i32::from(exit::SETUP)), &[limit_hit("cpu")]);
+        assert!(
+            matches!(outcome, ResourceOutcome::Undecided(_)),
+            "an unrecognized pairing decides nothing: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_signal_ending_establishes_nothing() {
+        let outcome = classify_resource_outcome(None, &[]);
+        let ResourceOutcome::Undecided(detail) = outcome else {
+            panic!("a killed scratch run decides nothing: {outcome:?}");
+        };
+        assert!(
+            detail.contains("signal"),
+            "the phase failure names how the run ended: {detail}"
+        );
+    }
+
+    #[test]
+    fn a_limit_hit_missing_its_own_fields_still_reads_as_data() {
+        // The stream is read as data, never trusted for a shape: an event without its
+        // `limit`/`detail` fields still yields a usable refusal rather than a panic or
+        // an empty string.
+        let bare = json!({ "event": "limit_hit" });
+        let outcome = classify_resource_outcome(Some(i32::from(exit::BACKEND)), &[bare]);
+        let ResourceOutcome::Refused(detail) = outcome else {
+            panic!("the pairing still decides: {outcome:?}");
+        };
+        assert!(
+            detail.contains("without naming which"),
+            "the detail is still a sentence, and says what it could not read: {detail}"
+        );
+    }
+
+    #[test]
+    fn the_last_limit_hit_in_a_stream_is_the_one_read() {
+        // `event` reads the last occurrence; a stream carrying more than one must not
+        // silently report the first.
+        let outcome = classify_resource_outcome(
+            Some(i32::from(exit::BACKEND)),
+            &[limit_hit("memory"), limit_hit("cpu")],
+        );
+        let ResourceOutcome::Refused(detail) = outcome else {
+            panic!("a reported limit is a decided verdict: {outcome:?}");
+        };
+        assert!(detail.contains("cpu"), "{detail}");
+    }
 }

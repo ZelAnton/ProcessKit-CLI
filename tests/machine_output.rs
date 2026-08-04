@@ -841,16 +841,18 @@ fn prune_reports_match_their_schema_and_fixture() {
 
 /// `--error-format json`: the bounded failure envelope, in the variants worth
 /// pinning — a run id that is named versus one that cannot be (`null`), a retryable
-/// verdict versus a final one, and three different reserved codes.
+/// verdict versus a final one, and every reserved code that belongs to a single
+/// subcommand's own verdict (110, 114, 115, 116) alongside the shared `CONTROL` (103).
 ///
-/// The scenarios are deliberately the cheap, deterministic ones (no live run is
-/// needed to fail a lookup), and two of them also pin the invariant that gives this
-/// family its own channel: `probe --json` prints its full report to stdout *and*
-/// exits 110, and `events --validate` prints its human summary to stdout *and* exits
-/// 114 — in both cases the envelope is on stderr and stdout is exactly what it always
-/// was. The kinds not pinned here are covered by `tests/error_envelope.rs`, which
-/// drives the remaining taxonomy against the live binary without re-pinning the
-/// shape.
+/// The scenarios are deliberately the cheap, deterministic ones wherever a fact
+/// allows it (no live run is needed to fail a lookup), and several of them also pin
+/// the invariant that gives this family its own channel: `probe --json` prints its
+/// full report to stdout *and* exits 110, `events --validate` prints its human
+/// summary to stdout *and* exits 114, `attest --json` prints its attestation *and*
+/// exits 115, and `doctor --json` prints its qualification report *and* exits 116 —
+/// in every case the envelope is on stderr and stdout is exactly what it always was.
+/// The kinds not pinned here are covered by `tests/error_envelope.rs`, which drives
+/// the remaining taxonomy against the live binary without re-pinning the shape.
 #[test]
 fn error_envelopes_match_their_schema_and_fixture() {
     let dir = scratch("machine-error");
@@ -996,6 +998,46 @@ fn error_envelopes_match_their_schema_and_fixture() {
     );
     lines.extend(outsider_lines);
     cancel_run(&registry, "build-42", child);
+
+    // The other decided verdict, and the one about the *machine* rather than about a
+    // run or a document: `doctor` qualified this host and was told to require a
+    // mechanism no platform reports. The only scenario here that is genuinely
+    // side-effecting — it drives a real scratch run — which is the price of the fact
+    // it pins: the code no other kind carries (116), an `operation` of `doctor`, and a
+    // `run_id` that is null because the only run involved is the one `doctor` minted
+    // for itself and nobody asked about.
+    let unqualified = cli(
+        &registry,
+        &[
+            "doctor",
+            "--json",
+            "--require-mechanism",
+            "no-such-mechanism",
+            "--error-format",
+            "json",
+        ],
+    );
+    let unqualified_lines = machine_stderr(
+        &unqualified,
+        116,
+        "`doctor --json` with an unmeetable requirement",
+    );
+    assert_eq!(unqualified_lines[0]["kind"], json!("host_unqualified"));
+    assert_eq!(unqualified_lines[0]["operation"], json!("doctor"));
+    assert_eq!(
+        unqualified_lines[0]["run_id"],
+        Value::Null,
+        "`doctor` never names a run of the caller's"
+    );
+    let qualification: Value =
+        serde_json::from_str(String::from_utf8_lossy(&unqualified.stdout).trim())
+            .expect("the qualification report is still valid JSON on stdout");
+    assert_eq!(
+        qualification["qualified"],
+        json!(false),
+        "stdout still carries the qualification report itself, unchanged: {qualification}"
+    );
+    lines.extend(unqualified_lines);
 
     check_family("error", &lines);
 

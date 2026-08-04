@@ -25,11 +25,26 @@ exiting 115) leaves its stdout byte-for-byte unchanged and adds the envelope bes
 it. It is not another *success* shape; it is the failure-side counterpart to all
 eight, which is also why success-output fixtures could never have covered it.
 
-**`attest --json` is the one success-side family whose stdout accompanies a
-non-zero exit as a matter of course.** Two of its three verdicts make the invocation
-fail, and the attestation is printed for all three: the verdict is the answer the
-caller asked for, and the exit code says what to do about it — so both channels
-carry the same fact, in the same invocation, without either replacing the other.
+**A family whose own verdict can make the invocation fail prints its stdout alongside
+that non-zero exit as a matter of course — `attest --json` and `doctor --json` both
+do, and no flag is involved in either.** Two of `attest`'s three verdicts fail
+(`not_a_member` → 115, `peer_identity_unsupported` → 103), and a host that does not
+qualify fails `doctor` (`HOST_UNQUALIFIED` → 116); the report is printed for every
+verdict all the same, because the verdict is the answer the caller asked for and the
+exit code only says what to do about it — so both channels carry the same fact, in the
+same invocation, without either replacing the other.
+
+Two neighbouring shapes look like that rule and are not it. `probe --json` also prints
+its report under a non-zero exit, but only when the caller supplied a `--require-*`
+expectation the binary did not meet — the report is the same either way, and without
+such a flag a probe never fails at all. The `inspect --all` and `cancel`/`kill --all`
+report arrays are printed before a `CONTROL` (103) exit too, but there the non-zero
+code reports what could not be *done* to some target, not what was *decided* about
+one. (`wait --report-outcome` is the counter-example that shows the difference is
+real: it prints its outcome only when the wait *succeeded*, and a `WAIT_TIMEOUT` (112)
+prints nothing on stdout at all.) The practical rule a consumer needs is the same in
+every case, and it is why none of this is a footnote: **a non-zero exit is never on its
+own a reason to skip reading stdout.**
 
 **Why `events --json` is not a family here.** It is not a *non-event* output:
 `events --json` passes the runner's own JSONL lines through byte for byte, so the
@@ -225,7 +240,7 @@ own line:
 | `control-ack.jsonl` | a `cancel` ack; a `kill` ack; the `cancel --all` report array |
 | `prune.jsonl` | the plain tally; the `--dry-run` report with both candidate kinds |
 | `wait.jsonl` | a `reported` outcome; an `unknown` one; the `wait --all` report array |
-| `error.jsonl` | the variants of the one envelope shape: a named run id versus a `null` one, a retryable verdict versus a final one, four different reserved codes — `not_found`, `stale`, `unprobed`, `probe_incompatible`, `events_invalid`, `not_a_member` |
+| `error.jsonl` | the variants of the one envelope shape: a named run id versus a `null` one, a retryable verdict versus a final one, and every reserved code a single subcommand's own verdict carries beside the shared `CONTROL` (103) — `not_found`, `stale`, `unprobed`, `probe_incompatible`, `events_invalid`, `not_a_member`, `host_unqualified` |
 | `attest.jsonl` | the two verdicts a platform that can name its peers produces: `member` (from a client inside the run) and `not_a_member` (from one outside it) |
 | `doctor.jsonl` | the qualified report a healthy host produces, and the unqualified one an unmeetable `--require-*` expectation produces — the same shape either way, which is the point of printing it either way |
 
@@ -358,4 +373,7 @@ default prose, and the kinds no fixture line pins) lives in
 `tests/error_envelope.rs`, and its vocabulary is held against `src/error_envelope.rs`
 by that module's own unit tests: one asserts the schema's `kind` enum lists exactly
 the kinds the build can emit, in the same order, so a kind can never be added in
-code without being published here.
+code without being published here; another asserts that every kind carrying a
+reserved code of its own is pinned by an `allOf` conditional to that code and to the
+single subcommand that mints it, so a new verdict kind cannot be published without
+the conditional that stops this contract from accepting it under any other command.

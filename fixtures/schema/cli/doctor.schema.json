@@ -225,7 +225,7 @@
         "remaining": {
           "type": ["integer", "null"],
           "minimum": 0,
-          "description": "Members still in the post-kill snapshot (`cleanup_finished.remaining`), or `null` if the run reported no teardown. On the `process_group` mechanism a non-zero value is **not** on its own a failed teardown: that snapshot is a `kill(pid, 0)` probe, which a just-exited child nobody has reaped yet still answers (docs/schema.md, \"cleanup_finished\"), so it is reported as an observed fact and noted on the phase rather than treated as a survivor. On every other mechanism it is conclusive and fails the phase."
+          "description": "Members still in the post-kill snapshot (`cleanup_finished.remaining`), or `null` if the run reported no teardown. On the `process_group` mechanism a non-zero value is **not** on its own a failed teardown: that snapshot is a `kill(pid, 0)` probe, which a just-exited child nobody has reaped yet still answers (docs/schema.md, \"cleanup_finished\"), so it is published as an observed fact alongside `teardown_snapshot_conclusive` — the field that says which of the two readings applies — rather than treated as a survivor. On every other mechanism it is conclusive and fails the phase."
         },
         "remaining_pids": {
           "type": "array",
@@ -272,7 +272,7 @@
     },
     "resourceControllerFacts": {
       "type": "object",
-      "description": "The optional whole-tree resource-controller check, present only when `--check-resource-controller` asked for it **and** the check reached a verdict. It runs as a second, separate scratch run *after* every mandatory phase has finished, so a host without a controller still gets a complete report about everything else. Every way the check could not be *performed* — no budget left, a scratch run that would not spawn, a wait that could not complete — fails the `resource_controller` phase and leaves this object `null` rather than writing a negative nobody established.",
+      "description": "The optional whole-tree resource-controller check, present only when `--check-resource-controller` asked for it **and** the check reached a verdict. It runs as a second, separate scratch run *after* every mandatory phase has finished, so a host without a controller still gets a complete report about everything else. Every way the check could not be *performed* — no budget left, a scratch run that would not spawn, a wait that could not complete, or a scratch run that ended for some reason other than the cap — fails the `resource_controller` phase and leaves this object `null` rather than writing a negative nobody established.",
       "properties": {
         "requested": {
           "type": "string",
@@ -280,11 +280,11 @@
         },
         "available": {
           "type": "boolean",
-          "description": "Whether the container could be created with that cap installed. `false` means this host's containment mechanism cannot enforce whole-tree resource limits (docs/resource-limits.md), which is a property of the platform rather than a fault — it fails nothing by itself, and only `--require-resource-controller` turns it into a verdict."
+          "description": "Whether the container could be created with that cap installed. `false` means this host's containment mechanism cannot enforce whole-tree resource limits (docs/resource-limits.md), which is a property of the platform rather than a fault — it fails nothing by itself, and only `--require-resource-controller` turns it into a verdict. It is written **only on the scratch run's own evidence that the cap was refused**: its `limit_hit` event, under the `BACKEND` (102) code that event accompanies. A scratch run that ended any other way (a generic container-creation failure under that same code, a setup error, a deadline, a signal) establishes nothing about a resource controller, so it fails the `resource_controller` phase and leaves the whole object `null` instead — \"this host cannot\" and \"nobody found out\" are different answers."
         },
         "detail": {
           "type": ["string", "null"],
-          "description": "What the scratch run said when the cap could not be installed, taken from its own `limit_hit` event where there was one. `null` when the cap installed cleanly. Free text: a diagnostic, not a contract."
+          "description": "What the scratch run's own `limit_hit` event reported when the cap could not be installed — which limit (`memory` / `processes` / `cpu`) and the backend's own explanation. `null` exactly when the cap installed cleanly, since an `available: false` is only ever written on that event. Free text: a diagnostic, not a contract."
         }
       },
       "required": ["requested", "available", "detail"],
@@ -315,7 +315,7 @@
         },
         "detail": {
           "type": ["string", "null"],
-          "description": "Why it failed — or, on a phase that succeeded, a qualifying note about what it could and could not establish (today: a post-teardown member count on the one mechanism where such a count is inconclusive). `null` when there is neither. Free text: a diagnostic, not a contract."
+          "description": "Why it failed; `null` on a phase that succeeded. Free text: a diagnostic, not a contract — which is also why nothing else is ever put here: a fact worth acting on gets a field of its own instead of a note only a human could read. The mechanism-dependent qualification a reader might expect here is published as `cleanupFacts.teardown_snapshot_conclusive`, and a successful phase leaves this `null` even then (`tests/doctor.rs` asserts that for every phase of a qualified host)."
         }
       },
       "required": ["phase", "ok", "elapsed_ms", "detail"],

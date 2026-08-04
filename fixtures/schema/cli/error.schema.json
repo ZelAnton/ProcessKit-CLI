@@ -69,7 +69,7 @@
         },
         "run_id": {
           "type": ["string", "null"],
-          "description": "The run id the invocation named, or null when it named none: an `--all` fan-out (whose targets are a snapshot, not one id), a whole-registry command (`list`/`prune`), the self-contained `probe`, or a `run` that let the runner generate its id — a generated id is minted inside the run and is not knowable at this point, so null is the truthful answer rather than a guess. Always present rather than omitted, so a consumer never has to distinguish absent from unknown."
+          "description": "The run id the invocation named, or null when it named none: an `--all` fan-out (whose targets are a snapshot, not one id), a whole-registry command (`list`/`prune`), the self-contained `probe`, a `doctor` (whose only run is the scratch one it mints for itself, which no caller asked about), or a `run` that let the runner generate its id — a generated id is minted inside the run and is not knowable at this point, so null is the truthful answer rather than a guess. Always present rather than omitted, so a consumer never has to distinguish absent from unknown."
         },
         "retryable": {
           "type": "boolean",
@@ -201,14 +201,28 @@
         },
         {
           "if": {
+            "properties": { "kind": { "const": "host_unqualified" } },
+            "required": ["kind"]
+          },
+          "then": {
             "properties": {
-              "operation": { "enum": ["list", "prune", "probe"] }
+              "code": { "const": 116 },
+              "operation": { "const": "doctor" },
+              "run_id": { "type": "null" }
+            },
+            "description": "The structural twin of the row above, one axis over: a decided verdict about the *host* rather than about this binary, produced only by `doctor`. The only run involved is the scratch one it mints for itself, which no caller asked about, so there is no run id to name either. Which phase failed, or which `--require-*` expectation went unmet, is in `doctor --json`'s own report on stdout — printed for a negative verdict exactly as for a positive one."
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": { "enum": ["list", "prune", "probe", "doctor"] }
             },
             "required": ["operation"]
           },
           "then": {
             "properties": { "run_id": { "type": "null" } },
-            "description": "These three take no `--run-id` at all, so they can never name one."
+            "description": "None of these accepts a `--run-id` at all — `list` and `prune` act on the whole registry, `probe` reports on this binary, and `doctor` on this host — so none of them can ever name one."
           }
         }
       ]

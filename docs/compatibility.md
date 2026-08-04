@@ -190,10 +190,23 @@ it describes a *failure* rather than a success, which is exactly why the eight
 success shapes beside it could never have covered it. It is opt-in: without
 `--error-format json`, a failure prints the same free-text prose it always did.
 
-`attest --json` is the one success-side row routinely printed *alongside* a
-non-zero exit: two of its three verdicts make the command fail, and the attestation
-is printed for all three, because the verdict is the answer while the exit code is
-what to do about it (see [`docs/control-plane.md`](control-plane.md), "`attest`").
+Two of the table's rows are *verdict* shapes, and both are routinely printed
+**alongside** a non-zero exit, with no flag involved in either. Two of
+`attest --json`'s three
+verdicts make the command fail, and the attestation is printed for all three (see
+[`docs/control-plane.md`](control-plane.md), "`attest`"); `doctor --json` exits
+`HOST_UNQUALIFIED` (116) whenever a phase failed or a `--require-*` expectation about
+the host went unmet, and prints the same report either way (see
+[`docs/integration.md`](integration.md) §1 and
+[`docs/troubleshooting.md`](troubleshooting.md), "Qualifying a host: `doctor`"). In
+both cases the verdict is the answer and the exit code only says what to do about it,
+so neither channel replaces the other: **do not treat a non-zero exit as "there is no
+stdout to parse"**. (`probe --json` behaves the same way but only when the caller
+asked for a `--require-*` expectation the binary did not meet, and `inspect --all`'s
+and `cancel`/`kill --all`'s report arrays precede a `CONTROL` (103) that reports what
+could not be *done* rather than what was *decided* — a different fact, the same
+reading discipline. `wait --report-outcome` is neither: it prints only when the wait
+succeeded.)
 
 `events --json` is deliberately absent from that table: it passes the runner's own
 JSONL lines through byte for byte, so the document that describes it is the event

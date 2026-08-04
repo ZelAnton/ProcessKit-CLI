@@ -632,20 +632,44 @@ mod tests {
         ErrorKind::Unknown,
     ];
 
+    /// The kinds a failing `run` reports, spelled as the terminal `runner_exit`
+    /// event's `source` values. Named once because two tests need the same set: one
+    /// holds those spellings against the event schema, and one excludes them from the
+    /// per-subcommand conditionals below — `run` mints this family as a whole rather
+    /// than one verdict per reserved code, which is why the schema pins none of them
+    /// to an operation.
+    const RUN_FAMILY: &[ErrorKind] = &[
+        ErrorKind::SpawnError,
+        ErrorKind::ContainerError,
+        ErrorKind::Timeout,
+        ErrorKind::Cancelled,
+        ErrorKind::ControlCancel,
+        ErrorKind::ControlKill,
+        ErrorKind::OutputOverflow,
+        ErrorKind::Setup,
+        ErrorKind::Internal,
+    ];
+
     fn envelope_of(error: &RunnerError) -> Value {
         serde_json::from_str(&ErrorEnvelope::new(error, "inspect", Some("build-42")).render_line())
             .expect("the envelope is valid JSON")
     }
 
-    #[test]
-    fn the_published_schema_enumerates_exactly_the_kinds_this_build_can_emit() {
-        // The schema document is the consumer-facing half of this vocabulary; a kind
-        // added here and not published there would be invisible to every adapter.
+    /// The published schema document itself, read off disk — the consumer-facing half
+    /// of this vocabulary, and the only honest thing to check this build against.
+    fn published_schema() -> Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("fixtures/schema/cli/error.schema.json");
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
-        let schema: Value = serde_json::from_str(&text).expect("the schema document is valid JSON");
+        serde_json::from_str(&text).expect("the schema document is valid JSON")
+    }
+
+    #[test]
+    fn the_published_schema_enumerates_exactly_the_kinds_this_build_can_emit() {
+        // A kind added here and not published there would be invisible to every
+        // adapter.
+        let schema = published_schema();
         let published: Vec<&str> = schema["$defs"]["errorEnvelope"]["properties"]["kind"]["enum"]
             .as_array()
             .expect("the schema enumerates the kind vocabulary")
@@ -658,6 +682,93 @@ mod tests {
             published, emitted,
             "fixtures/schema/cli/error.schema.json must publish exactly the kinds this build \
              emits, in the same order"
+        );
+    }
+
+    #[test]
+    fn a_kind_with_a_reserved_code_of_its_own_is_pinned_to_the_command_that_mints_it() {
+        // Some codes in the band name exactly one verdict, and each of those verdicts
+        // is minted by exactly one subcommand. The schema states both facts as an
+        // `allOf` conditional keyed on `kind` — which is what makes a *dishonest*
+        // envelope (`{"kind":"host_unqualified","operation":"run","code":102}`)
+        // invalid rather than merely unusual, and is the reason a kind must never be
+        // assigned to a failure it does not describe.
+        //
+        // A missing conditional is invisible to a review that reads one task's diff
+        // (it can only be seen by comparing the edit against a sibling kind's shape),
+        // so it is asserted here instead. The set is **derived** from this build's own
+        // code-to-kind table rather than listed, so the next kind given a code of its
+        // own cannot land without its conditional: what is excluded is only what
+        // genuinely has no single command — `usage` (any subcommand, in practice a
+        // relayed detached start), the two codes several kinds refine (`CONTROL`,
+        // `SETUP`), and the `run` family above.
+        let schema = published_schema();
+        let envelope = &schema["$defs"]["errorEnvelope"];
+        let branches = envelope["allOf"]
+            .as_array()
+            .expect("the schema states its conditionals as an `allOf`");
+        let operations: Vec<&str> = envelope["properties"]["operation"]["enum"]
+            .as_array()
+            .expect("the schema enumerates the operations")
+            .iter()
+            .map(|value| value.as_str().expect("each operation is a string"))
+            .collect();
+
+        let mut pinned = Vec::new();
+        for code in exit::RUNNER_RANGE_START..=exit::RUNNER_RANGE_END {
+            let kind = ErrorKind::for_code(code);
+            if kind == ErrorKind::Unknown
+                || matches!(code, exit::USAGE | exit::CONTROL | exit::SETUP)
+                || RUN_FAMILY.contains(&kind)
+            {
+                continue;
+            }
+            let branch = branches
+                .iter()
+                .find(|branch| branch["if"]["properties"]["kind"]["const"] == json!(kind.as_str()))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "fixtures/schema/cli/error.schema.json must pin `{}` to the one \
+                         subcommand that mints it and to code {code}, the way every sibling \
+                         verdict kind is pinned — without it the published contract accepts an \
+                         envelope claiming that kind for any command",
+                        kind.as_str()
+                    )
+                });
+            assert_eq!(
+                branch["then"]["properties"]["code"]["const"],
+                json!(code),
+                "`{}`'s conditional must pin the code this build assigns it",
+                kind.as_str()
+            );
+            let operation = branch["then"]["properties"]["operation"]["const"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`{}`'s conditional must pin the subcommand that mints it",
+                        kind.as_str()
+                    )
+                });
+            assert!(
+                operations.contains(&operation),
+                "`{}` is pinned to `{operation}`, which is not one of the published operations \
+                 {operations:?}",
+                kind.as_str()
+            );
+            pinned.push(kind.as_str());
+        }
+        // A guard on the derivation itself: if the exclusions above ever swallowed
+        // everything, the loop would pass by checking nothing at all.
+        assert_eq!(
+            pinned,
+            vec![
+                "probe_incompatible",
+                "wait_timeout",
+                "events_invalid",
+                "not_a_member",
+                "host_unqualified"
+            ],
+            "the verdict kinds this build gives a code of their own"
         );
     }
 
@@ -681,17 +792,7 @@ mod tests {
             .map(|value| value.as_str().expect("each source is a string"))
             .collect();
 
-        for kind in [
-            ErrorKind::SpawnError,
-            ErrorKind::ContainerError,
-            ErrorKind::Timeout,
-            ErrorKind::Cancelled,
-            ErrorKind::ControlCancel,
-            ErrorKind::ControlKill,
-            ErrorKind::OutputOverflow,
-            ErrorKind::Setup,
-            ErrorKind::Internal,
-        ] {
+        for kind in RUN_FAMILY.iter().copied() {
             assert!(
                 sources.contains(&kind.as_str()),
                 "`{}` must stay spelled as the runner_exit.source value it mirrors; \

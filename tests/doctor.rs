@@ -136,6 +136,13 @@ fn report(out: &Output, code: i32, what: &str) -> Value {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    parse_report(out, what)
+}
+
+/// Parse that report **without** judging the exit code — for the one case whose
+/// expected code is decided by the report itself (an optional check that may or may
+/// not reach a verdict on the host running these tests).
+fn parse_report(out: &Output, what: &str) -> Value {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let line = stdout
         .lines()
@@ -599,10 +606,19 @@ fn the_scratch_child_cannot_replace_a_requested_qualification() {
 }
 
 /// The optional resource-controller check is absent unless asked for — `null` meaning
-/// "not checked", never "not available" — and asking for it never fails a host by
-/// itself. Only `--require-resource-controller` turns its answer into a verdict, and
-/// this asserts that pairing in whichever direction this host actually goes, rather
-/// than hard-coding an availability that differs per platform.
+/// "nothing was established", never "not available" — and asking for it never fails a
+/// host by itself. Only `--require-resource-controller` turns its answer into a
+/// verdict, and this asserts that pairing in whichever direction this host actually
+/// goes, rather than hard-coding an availability that differs per platform.
+///
+/// The pairing asserted here is the one the module's own invariant rests on: the facts
+/// are published **exactly** when the phase reached a verdict. A check that could not
+/// be performed at all — a scratch run that ended for some reason other than the cap,
+/// a budget that ran out — fails its phase and leaves `resource_controller` `null`,
+/// never `available: false`, because "this host cannot enforce a cap" and "nobody found
+/// out" are different answers. Which of the two branches this host takes is a property
+/// of the platform; that the report and the phase agree is not
+/// (`src/doctor.rs`'s `classify_resource_outcome` tests drive every ending directly).
 #[test]
 fn the_resource_controller_check_is_opt_in_and_only_a_requirement_gates_it() {
     let workspace = Workspace::new("doctor-resources");
@@ -617,50 +633,88 @@ fn the_resource_controller_check_is_opt_in_and_only_a_requirement_gates_it() {
         "and runs no phase: {bare}"
     );
 
-    let checked = report(
-        &workspace.doctor(&["--json", "--check-resource-controller"]),
-        0,
-        "a requested resource-controller check",
-    );
-    let facts = &checked["resource_controller"];
-    assert!(facts.is_object(), "the check reports its facts: {checked}");
-    assert!(
-        facts["requested"]
-            .as_str()
-            .is_some_and(|requested| requested.contains("--max-processes")),
-        "it names the cap it asked for, as the flag that asks for it: {checked}"
-    );
-    let available = facts["available"]
-        .as_bool()
-        .unwrap_or_else(|| panic!("the check reaches a verdict: {checked}"));
+    let out = workspace.doctor(&["--json", "--check-resource-controller"]);
+    let checked = parse_report(&out, "a requested resource-controller check");
+    let phases = checked["phases"].as_array().expect("phases is an array");
+    let phase = phases
+        .last()
+        .expect("a requested check runs a phase")
+        .clone();
     assert_eq!(
-        facts["detail"].is_null(),
-        available,
-        "an unavailable controller says why, an available one has nothing to explain: {checked}"
-    );
-    assert_eq!(
-        checked["qualified"], true,
-        "the check alone never fails a host — only a requirement does: {checked}"
-    );
-    assert_eq!(
-        phase_names(&checked).last().map(String::as_str),
-        Some("resource_controller"),
+        phase["phase"], "resource_controller",
         "the optional phase runs after every mandatory one: {checked}"
     );
 
-    // Now the requirement, in whichever direction this host goes.
+    let facts = &checked["resource_controller"];
+    let verdict = facts["available"].as_bool();
+    assert_eq!(
+        verdict.is_some(),
+        phase["ok"] == Value::Bool(true),
+        "the verdict is published exactly when the phase reached one — never a negative \
+         on a check that could not be performed: {checked}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(if verdict.is_some() {
+            0
+        } else {
+            HOST_UNQUALIFIED
+        }),
+        "a check that reached a verdict fails nothing; one that could not be performed is a \
+         failed phase: {checked}"
+    );
+
+    match verdict {
+        Some(available) => {
+            assert!(
+                facts["requested"]
+                    .as_str()
+                    .is_some_and(|requested| requested.contains("--max-processes")),
+                "it names the cap it asked for, as the flag that asks for it: {checked}"
+            );
+            assert_eq!(
+                facts["detail"].is_null(),
+                available,
+                "an unavailable controller says why — from the scratch run's own `limit_hit` \
+                 event — and an available one has nothing to explain: {checked}"
+            );
+            assert_eq!(
+                checked["qualified"], true,
+                "the check alone never fails a host — only a requirement does: {checked}"
+            );
+        }
+        None => {
+            assert!(
+                facts.is_null(),
+                "a check that reached no verdict publishes none: {checked}"
+            );
+            assert!(
+                phase["detail"]
+                    .as_str()
+                    .is_some_and(|detail| !detail.is_empty()),
+                "and its failed phase says what stopped it: {checked}"
+            );
+        }
+    }
+
+    // Now the requirement, in whichever direction this host goes. It is met exactly
+    // when the controller was *observed* available — an unestablished fact is a
+    // mismatch too, on the honest ground that nothing was observed rather than on a
+    // negative nobody proved.
     let required = workspace.doctor(&[
         "--json",
         "--check-resource-controller",
         "--require-resource-controller",
     ]);
-    let expected = if available { 0 } else { HOST_UNQUALIFIED };
+    let met = verdict == Some(true);
+    let expected = if met { 0 } else { HOST_UNQUALIFIED };
     let required = report(&required, expected, "a required resource controller");
-    assert_eq!(required["qualified"], available, "{required}");
+    assert_eq!(required["qualified"], met, "{required}");
     assert_eq!(
         required["mismatches"].as_array().map(Vec::len),
-        Some(usize::from(!available)),
-        "the requirement is unmet exactly when the controller is unavailable: {required}"
+        Some(usize::from(!met)),
+        "the requirement is unmet exactly when the controller was not observed available: \
+         {required}"
     );
 
     // And the requirement cannot be asked about a fact that was never observed.
