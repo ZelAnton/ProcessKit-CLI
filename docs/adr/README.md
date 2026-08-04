@@ -15,6 +15,7 @@ useful when the code around the decision moves.
 | [0004](0004-container-scoped-cleanup.md) | Scope cleanup to owned containers | Accepted |
 | [0005](0005-shell-free-command-contract.md) | Keep command execution shell-free | Accepted |
 | [0006](0006-registry-polled-wait.md) | Poll the registry for detached waits | Accepted |
+| [0007](0007-no-terminal-receipt-file.md) | No terminal receipt file for a run's outcome | Accepted |
 
 ## Adding a decision
 

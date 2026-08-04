@@ -7,9 +7,9 @@ repository (see [`docs/architecture.md`](architecture.md) for that audience). It
 ties together, in the order an adapter actually exercises them, the five
 normative documents that each cover one part of the compatibility surface on
 their own: [`docs/schema.md`](schema.md), [`docs/exit-codes.md`](exit-codes.md),
-[`docs/control-plane.md`](control-plane.md), and
-[`docs/registry.md`](registry.md). This document does not restate their
-normative text — every concrete claim below is a pointer to, and a minimal
+[`docs/control-plane.md`](control-plane.md), [`docs/registry.md`](registry.md),
+and [`docs/compatibility.md`](compatibility.md). This document does not restate
+their normative text — every concrete claim below is a pointer to, and a minimal
 worked example of, the contract those documents define; **on any disagreement,
 the linked document is the source of truth.**
 
@@ -365,6 +365,34 @@ source means the child's own exit code was never produced or is not what
 [`docs/schema.md`](schema.md#runner_exit) and the exit-code contract in
 [`docs/exit-codes.md`](exit-codes.md).
 
+**Telling the two readings of a reserved-band code apart without opening the
+stream.** The table above is the authoritative answer, and it costs a file read after
+every call: a `106` is the runner's `TIMEOUT` *or* a child that happened to exit
+`106`, and only `runner_exit.source` settles it. There is a cheaper answer for the
+common case — and it is why this guide offers no terminal receipt file (§8). Under the
+global `--error-format json` (§7), a **runner-owned** ending prints exactly one
+envelope line on stderr and a child's own exit prints none, so the envelope's
+*presence* — not the numeric code — separates the two readings:
+
+```sh
+processkit-cli --error-format json run --run-id build-42 \
+  --jsonl .processkit/build-42.jsonl --no-echo -- ./build.sh 2>build-42.err
+rc=$?
+# rc=106, build-42.err empty        -> the child itself exited 106
+# rc=106, one envelope line in it   -> {"error_version":1,"code":106,"kind":"timeout",...}
+```
+
+The envelope's `kind` is spelled exactly like the `source` column of the table above,
+so the two channels need no separate vocabulary. Pair the flag with `--no-echo` (or
+`--capture-dir`) as shown, so the runner's stderr carries only the runner's own text:
+with the live echo on, the child's stderr is interleaved with it.
+
+This does not make the stream optional, and it is not a second outcome artifact.
+`--jsonl` is required on every `run`, the envelope reports only the runner-owned
+endings, and everything else a supervisor reads — the containment `mechanism` and
+`abrupt_cleanup` level, `root_pid`, the tree snapshots, the capture accounting —
+lives in the stream and only there.
+
 ## 4. Supervising a live run: `inspect` / `cancel` / `kill` / `attest` / `wait`
 
 Once a run has started (its `run_id` is known — supplied at launch, per §2),
@@ -710,6 +738,51 @@ The shape is published like every other machine-readable output in this guide:
 `fixtures/schema/cli/error.schema.json` with a golden `error.jsonl` beside it. The
 normative field-by-field contract, the full `kind` table, and the `retryable` rule
 are in [`docs/exit-codes.md`](exit-codes.md#machine-readable-failures---error-format-json).
+
+## 8. Decided: no terminal receipt file
+
+An adapter reading this guide may reasonably ask for one more thing: a small file the
+runner drops at the end of a run — a `run --outcome-json <path>`, atomically replaced
+at terminal completion with the outcome, a cleanup confirmation, and artifact
+locators — so the common path costs one tiny read instead of a walk over the lifecycle
+stream. It was proposed, evaluated against a real adapter, and **declined**. This
+section records why, so the question does not have to be reopened from scratch; the
+durable record, including the one alternative that was deferred rather than rejected,
+is [ADR 0007](adr/0007-no-terminal-receipt-file.md).
+
+- **It would not remove the read it exists to remove.** A supervising adapter does not
+  read the stream *only* for the terminal event. The one this decision was measured
+  against consumes four event types after every call — `run_started` (for `root_pid`,
+  `mechanism`, `abrupt_cleanup`), `members_snapshot`, `output_captured`, and
+  `runner_exit` — and treats a missing `run_started` or
+  `output_captured` as a failure reason of its own. A *terminal* receipt carries
+  terminal facts; the start-time facts exist only in the stream (§3). Such an adapter
+  would gain a second artifact and keep the loop.
+- **The read is six lines.** A foreground run emits six events — seven with
+  `--capture-dir`. The stream grows past that only when a caller passes
+  `--snapshot-interval`, that is, asks for more events on purpose.
+- **A cheaper answer already exists**, and it is the recipe in §3: the
+  `--error-format json` envelope resolves exactly this ambiguity with no path to
+  allocate, no artifact to clean up, and no second durable shape to version.
+- **A receipt could not report its own failure.** It would be written after the
+  child's exit code is already decided. If that write, or its atomic replace, failed,
+  the runner's options would be to fail the run — rewriting the child's exit code,
+  which [`docs/exit-codes.md`](exit-codes.md) forbids outright — or to say nothing,
+  which would make the receipt's *absence* mean either "the runner died abruptly" or
+  "the receipt could not be written". The property that made the idea attractive is
+  the first thing its own failure mode would take away. The lifecycle stream is not
+  exposed this way: it carries the whole run, so a write failure truncates it visibly
+  rather than turning one expected artifact into a silent nothing.
+
+What this does **not** claim: that every terminal read is already as cheap as it could
+be. There is no first-party bounded terminal read over an arbitrary stream file today.
+`events --json` (§3) is a whole-stream pass-through, and `wait --report-outcome` (§4)
+reports an outcome only for a run that invocation observed live — a finished
+foreground run has already deleted its own registry record, so it answers
+`status: "unknown"` for one. If that ever becomes a measured cost rather than an
+anticipated one, ADR 0007 records why the answer would be a read-side flag over
+`--file`, reusing the shape `wait --report-outcome` already publishes, rather than a
+second write path out of the runner.
 
 ## See also
 

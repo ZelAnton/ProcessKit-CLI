@@ -227,6 +227,12 @@ to a dated version section.
   Code marketplace entry, contained-run recipes, and live contract drift tests.
 - An indexed ADR journal with a reusable template and six retrospective records for
   the project's settled stream, redaction, control, cleanup, shell, and wait choices.
+- ADR 0007 and an integration-guide section recording the decision **not** to add a
+  terminal receipt file (`run --outcome-json`): `run` keeps one durable outcome
+  artifact, the required `--jsonl` stream, and an adapter that wants a reserved-band
+  exit code disambiguated without opening it reads the `--error-format json` envelope
+  instead — present for a runner-owned ending, absent for the child's own exit. No
+  flag, event, schema, or exit code changed.
 - Cross-platform runnable examples for compatibility preflight, foreground event
   parsing, detached supervision, and label-scoped fleet cancellation, smoke-tested in CI.
 - `wait --report-outcome` for a single observed run, returning terminal

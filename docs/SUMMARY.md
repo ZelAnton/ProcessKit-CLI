@@ -54,5 +54,6 @@
   - [Scope cleanup to owned containers](adr/0004-container-scoped-cleanup.md)
   - [Keep command execution shell-free](adr/0005-shell-free-command-contract.md)
   - [Poll the registry for wait](adr/0006-registry-polled-wait.md)
+  - [No terminal receipt file](adr/0007-no-terminal-receipt-file.md)
 - [Release process](release-process.md)
 - [Roadmap](ROADMAP.md)
