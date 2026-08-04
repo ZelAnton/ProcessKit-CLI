@@ -166,8 +166,9 @@ This final job publishes the formula and Scoop manifest `package-manifests` just
 attached to the Release into the package repositories the project owns — the
 step that turns a release asset into an installable
 `brew install <owner>/tap/processkit-cli`. It is the only job in the workflow
-that writes outside this repository, and it is off until an operator provisions
-the target repositories:
+that pushes into another git repository — the `release` job already writes
+outside this repository too, publishing the crate to crates.io — and it is off
+until an operator provisions the target repositories:
 
 1. **Resolve publication targets** — a channel is enabled by the presence of its
    token secret (`HOMEBREW_TAP_TOKEN`, `SCOOP_BUCKET_TOKEN`); the token is only

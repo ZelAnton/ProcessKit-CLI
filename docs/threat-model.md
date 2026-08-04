@@ -188,34 +188,44 @@ code/docs it is implemented and described in.
   `actions/attest-build-provenance` attestation
   (`.github/workflows/release.yml`) a consumer can verify against the exact
   commit and workflow that produced them.
-  One job in that workflow, `publish-package-repos`, is the only step anywhere
-  in this project that writes **outside this repository**: it pushes the
-  generated Homebrew formula — and, independently, the Scoop manifest — into
-  the tap/bucket repositories this project owns, which is what would make a
-  `brew install`/`scoop install` work at all. Several properties bound it. It
-  does nothing unless an operator has set that channel's token secret
-  (`HOMEBREW_TAP_TOKEN` / `SCOOP_BUCKET_TOKEN`) — with none set it skips with
-  a notice rather than failing, and each channel is enabled on its own. Its
-  own `GITHUB_TOKEN` is narrowed to `contents: read` (a job-level
+  That workflow writes **outside this repository** in two places. The
+  long-standing one is the `release` job's `cargo publish --locked` step:
+  every release uploads the crate to crates.io under `CARGO_REGISTRY_TOKEN`
+  (`secrets.CRATES_IO_TOKEN`), a standing credential that lives in this
+  repository's own Actions secrets, publishing to a registry users are
+  pointed at today ([`docs/installation.md`](installation.md), "Install from
+  crates.io"). The second is `publish-package-repos`, the only job that
+  pushes into another *git* repository: it pushes the generated Homebrew
+  formula — and, independently, the Scoop manifest — into the tap/bucket
+  repositories this project owns, which is what would make a `brew
+  install`/`scoop install` work at all. Several properties bound it. It does
+  nothing unless an operator has set that channel's token secret
+  (`HOMEBREW_TAP_TOKEN` / `SCOOP_BUCKET_TOKEN`) — with none set it skips
+  with a notice rather than failing, and each channel is enabled on its own.
+  Its own `GITHUB_TOKEN` is narrowed to `contents: read` (a job-level
   `permissions:` block replaces the workflow's top-level `contents: write`
   rather than merging with it), so it cannot write to *this* repository, and
   every write it does perform is authenticated by the channel's own token
   instead. That token is required to be scoped to the tap/bucket alone (a
   fine-grained PAT holding `Contents: read and write` on it, or a GitHub App
   credential); the built-in `GITHUB_TOKEN` cannot stand in, as it reaches no
-  other repository. The operator-set target variables
-  (`HOMEBREW_TAP_REPOSITORY` / `SCOOP_BUCKET_REPOSITORY`) are accepted only in
-  an exact, whole-string-anchored `owner/name` shape before they can reach a
-  clone URL or the step's own outputs. The job adds no third-party action, so
-  it widens no pinning surface, and it runs after crates.io, the tag, the
-  Release, and every asset upload under `continue-on-error: true`, so it can
-  neither gate a release nor alter one that already happened (see
+  other repository. That scoping is an obligation on whoever mints the
+  secret, though, not a property the workflow can check — see "What is not
+  closed" below. The operator-set target variables (`HOMEBREW_TAP_REPOSITORY`
+  / `SCOOP_BUCKET_REPOSITORY`) are accepted only in an exact,
+  whole-string-anchored `owner/name` shape before they can reach a clone URL
+  or the step's own outputs. The job adds no third-party action, so it widens
+  no pinning surface, and it runs after crates.io, the tag, the Release, and
+  every asset upload under `continue-on-error: true`, so it can neither gate
+  a release nor alter one that already happened (see
   [`docs/release-process.md`](release-process.md), "What the
-  `publish-package-repos` job does"). Neither channel is configured for this
-  repository today — no tap or bucket exists, so nothing has been published
-  through it yet ([`docs/installation.md`](installation.md), "Publishing to a
-  tap or bucket"); what this arrangement accepts once one *is* configured is
-  stated under "What is not closed" below. A dedicated fuzz tier
+  `publish-package-repos` job does"). Neither the tap nor the bucket is
+  configured for this repository today — neither repository exists, so
+  nothing has been published through them yet
+  ([`docs/installation.md`](installation.md), "Publishing to a tap or
+  bucket"), unlike the crates.io publication above, which happens on every
+  release; what this arrangement accepts once a tap or bucket *is* configured
+  is stated under "What is not closed" below. A dedicated fuzz tier
   (`fuzz/`) exercises **four** of the parsers that sit closest to the untrusted
   inputs above, under `cargo-fuzz`: the registry's byte-to-record parser, the
   control-plane's request/reply decoders, the CLI's own value parsers, and
@@ -260,12 +270,30 @@ explicitly **out of scope** for this project's own security mechanisms:
   enabled channel is only as isolated as this repository's secrets and the set
   of actors who can run its release workflow: whoever can read that secret, or
   dispatch a release carrying it, can put content into the repository users
-  install from. The scoping above bounds the blast radius — the token reaches
-  the tap/bucket and nothing else, and the job holds no write access to this
-  repository — but a cross-repository write capability is what the automation
-  fundamentally is, and the project accepts that residual risk as the price of
-  a channel that publishes itself instead of by hand. The alternative it
-  rejects is not "a safer token"; it is publishing every release manually.
+  install from. That much is not new with the tap: crates.io is already
+  published on every release from a `CRATES_IO_TOKEN` sitting in these same
+  secrets. What a tap or bucket adds is a *cross-repository git write*
+  capability, which is what the automation fundamentally is, and the project
+  accepts that residual risk as the price of a channel that publishes itself
+  instead of by hand. The alternative it rejects is not "a safer token"; it is
+  publishing every release manually.
+
+  The two bounds stated on that capability above are **not** equally strong,
+  and the weaker one is the residual risk this entry accepts. That the
+  publishing job holds no write access to *this* repository is enforced: its
+  `GITHUB_TOKEN` is narrowed by a job-level `permissions: contents: read`
+  block, and every write it performs is authenticated by the channel's own
+  token instead. That the channel token reaches the tap/bucket and nothing
+  else is not enforced anywhere — it is a requirement this project documents
+  for the operator who mints the secret, and nothing here verifies it or could
+  detect its violation: the `Resolve publication targets` step tests the token
+  only for emptiness, and a classic PAT carrying `repo` scope over every
+  repository its owner can reach would clone, commit, and push exactly the
+  same way, on an otherwise green release. The anchored `owner/name`
+  validation bounds the target the job writes *to*, not what the credential is
+  permitted to do. So the blast radius of an enabled channel is whatever scope
+  the operator actually granted, not the scope asked for here — enabling a
+  channel accepts that gap along with the capability itself.
 - **Build-provenance verification of a package installed from that channel.**
   The formula/manifest such a channel serves is **not** covered by the
   attestation described above. Homebrew and Scoop trust a formula because of
@@ -279,8 +307,11 @@ explicitly **out of scope** for this project's own security mechanisms:
   URL/digest pair would install whatever it names. A consumer who needs
   provenance should run that verification against a downloaded archive itself
   (see [`README.md`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/README.md), "Prebuilt binaries"), rather than
-  infer it from the channel. Neither channel is configured today, so this is a
-  property of the mechanism being accepted in advance, not a live exposure.
+  infer it from the channel. Neither the tap nor the bucket is configured
+  today, so this particular gap is a property of that mechanism accepted in
+  advance rather than a live exposure through those two channels — which says
+  nothing about crates.io, a live channel whose published source crate this
+  attestation does not cover either.
 - **Denial of service through the operating system itself.** Beyond the
   opt-in, best-effort `--max-memory`/`--max-processes`/`--cpu-quota` caps on
   the child's own process tree (platform-limited: real Windows Job Object or

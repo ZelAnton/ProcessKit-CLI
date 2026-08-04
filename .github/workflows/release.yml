@@ -725,8 +725,10 @@ jobs:
   # Publish the generated distributor files into the package repositories this
   # project itself owns — what turns an attached release asset into an actually
   # installable `brew install <owner>/tap/processkit-cli`. This is the only job
-  # in this workflow that writes outside this repository, so it is deliberately
-  # last and deliberately incapable of gating a release.
+  # in this workflow that pushes into another git repository (the `release` job
+  # already writes outside this repository as well, publishing the crate to
+  # crates.io), so it is deliberately last and deliberately incapable of gating
+  # a release.
   #
   # Operator setup — nothing below runs until this exists:
   #   1. Homebrew: create the repository
