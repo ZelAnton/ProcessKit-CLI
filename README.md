@@ -82,11 +82,14 @@ for Linux and macOS, `.zip` for Windows — and each ships a matching
 `<archive>.sha256`.
 
 Each release also attaches checksum-derived distributor manifests for winget,
-Scoop, and a Homebrew tap. They are ready for the channels' external
-publication workflows, but an attached manifest is not a claim that the public
-channel has accepted that release. See the [package-manager availability
-table](docs/installation.md#package-manager-manifests) before using a `winget`,
-`scoop`, or `brew` install command.
+Scoop, and a Homebrew tap. The release workflow publishes the Homebrew formula
+(and the Scoop manifest) into a tap/bucket repository of the project's own as
+soon as an operator creates it and adds the matching token secret; winget is
+submitted by hand, since its review happens in `microsoft/winget-pkgs`. Neither
+a tap nor a bucket is published yet, and an attached manifest is not a claim
+that a public channel has accepted a release, so check the [package-manager
+availability table](docs/installation.md#package-manager-manifests) before using
+a `winget`, `scoop`, or `brew` install command.
 
 Every archive also carries a signed [build-provenance
 attestation](https://docs.github.com/actions/security-guides/using-artifact-attestations).

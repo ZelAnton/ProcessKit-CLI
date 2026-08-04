@@ -124,18 +124,78 @@ manifest will download, so URLs and digests cannot be paired accidentally.
 
 Package managers need a repository of their own; a manifest attached to this
 project's GitHub Release is distributor input, not a public package source. The
-current publication boundary is explicit:
+release workflow can publish the Homebrew and Scoop files into repositories this
+project owns, but that publication stays off until an operator provisions those
+repositories (see "Publishing to a tap or bucket" below), and winget's is
+external by nature. The current publication boundary is explicit:
 
 | Channel | Generated release asset | Availability |
 | --- | --- | --- |
-| winget | Three-file `ZelAnton.ProcessKitCLI` manifest for x86_64 and Arm64 | Submit all three files to `microsoft/winget-pkgs`; installation is available only after Microsoft's external review accepts the version. |
-| Scoop | `processkit-cli.json` for x86_64 and Arm64 | Ready for `bucket/processkit-cli.json` in an account-owned bucket; no canonical public bucket is advertised yet. |
-| Homebrew | `processkit-cli.rb` for macOS Arm64 and Linux x86_64/Arm64 | Ready for `Formula/processkit-cli.rb` in an account-owned tap; both Linux architectures use their static musl archive so the formula does not inherit the release runner's glibc floor. No canonical public tap is advertised yet. |
+| winget | Three-file `ZelAnton.ProcessKitCLI` manifest for x86_64 and Arm64 | Submit all three files to `microsoft/winget-pkgs`; installation is available only after Microsoft's external review accepts the version. Deliberately not automated — see "Why winget is submitted by hand" below. |
+| Scoop | `processkit-cli.json` for x86_64 and Arm64 | Ready for `bucket/processkit-cli.json` in an account-owned bucket, and published there by every release once the operator sets `SCOOP_BUCKET_TOKEN`; no canonical public bucket is advertised yet. |
+| Homebrew | `processkit-cli.rb` for macOS Arm64 and Linux x86_64/Arm64 | Ready for `Formula/processkit-cli.rb` in an account-owned tap, and published there by every release once the operator sets `HOMEBREW_TAP_TOKEN`; both Linux architectures use their static musl archive so the formula does not inherit the release runner's glibc floor. No canonical public tap is advertised yet. |
 
 Once a source is actually published, that package manager provides its normal
 install and upgrade lifecycle. Until its availability row changes, use the
 verified installer, `cargo-binstall`, or `cargo install`; do not paste a future
 bucket/tap name into automation and assume it exists.
+
+### Publishing to a tap or bucket
+
+The last job of `.github/workflows/release.yml`, `publish-package-repos`, takes
+the formula and Scoop manifest the job before it attached to the Release and
+pushes each into the package repository it belongs in. It is inert until an
+operator sets that up, and it cannot fail a release:
+
+| Channel | Target repository (default) | Enabling secret | Published path |
+| --- | --- | --- | --- |
+| Homebrew | `<owner>/homebrew-tap` | `HOMEBREW_TAP_TOKEN` | `Formula/processkit-cli.rb` |
+| Scoop | `<owner>/scoop-bucket` | `SCOOP_BUCKET_TOKEN` | `bucket/processkit-cli.json` |
+
+To turn a channel on:
+
+1. Create the target repository under the same owner. For Homebrew the name is
+   not free-form: `brew tap <owner>/tap` resolves to `<owner>/homebrew-tap`.
+2. Add the repository secret (Settings → Secrets and variables → Actions) with a
+   token that can push to *that* repository and nothing else — a fine-grained
+   personal access token with `Contents: read and write` on the tap/bucket
+   alone, or a GitHub App installation token. The workflow's built-in
+   `GITHUB_TOKEN` cannot be used: it is scoped to this repository.
+3. Optionally set the repository variable `HOMEBREW_TAP_REPOSITORY` or
+   `SCOOP_BUCKET_REPOSITORY` when the target is named differently. The token
+   secret alone decides whether a channel publishes; the variable only renames
+   the target.
+4. After a release has actually published, update the availability table above.
+   That table, not this section, is what a reader is told to trust.
+
+The two channels are independent — configure either, both, or neither. The job
+publishes exactly the bytes attached to the Release rather than regenerating
+them, pushes nothing when the target already holds identical bytes, and can be
+re-run on its own. Without the secret it skips and logs a notice naming the
+repository and secret to create. A configured channel that fails (repository
+missing, token expired, protected branch) is reported as an annotation but
+leaves the release green, because publication runs after crates.io, the tag, the
+GitHub Release, and every asset upload.
+
+For this repository today, neither `ZelAnton/homebrew-tap` nor
+`ZelAnton/scoop-bucket` exists, so no release has published to either and the
+availability rows above still say so. As soon as the operator creates
+`ZelAnton/homebrew-tap` and sets `HOMEBREW_TAP_TOKEN`, the next release publishes
+the formula there automatically and `brew install ZelAnton/tap/processkit-cli`
+becomes a working command — the point at which that row has to change.
+
+### Why winget is submitted by hand
+
+winget has no repository under this project's control. A version becomes
+installable only after a pull request to `microsoft/winget-pkgs` passes
+Microsoft's automated validation and human review. Automating that submission
+with `wingetcreate submit` — the standard tool — would require a maintained fork
+of that repository plus a token scoped broadly enough to push to it, and a green
+release step still would not mean the version is installable, because the
+decision belongs to reviewers outside this project and a rejected or stalled
+pull request is not something a release workflow can act on. The three-file
+manifest is therefore attached to the Release and submitted deliberately, by
+hand or with `wingetcreate submit`, when the maintainer chooses to.
 
 ## Install with cargo-binstall
 

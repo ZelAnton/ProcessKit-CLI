@@ -43,11 +43,17 @@ name: Release
 # Package managers: after the archive matrix settles, `package-manifests`
 # downloads the published checksum sidecars and generates winget, Scoop, and
 # Homebrew distributor inputs from those exact digests. It attaches the files
-# and a checksumed bundle to the existing Release. No external package repo is
-# mutated here: winget keeps its required external review, while the Scoop and
-# Homebrew files are ready to copy into an account-owned bucket/tap. The job is
-# downstream of crates.io, the tag, the Release, and all archive uploads, so it
-# cannot alter or strand the established release path.
+# and a checksumed bundle to the existing Release, and mutates nothing outside
+# this repository. A final `publish-package-repos` job then pushes the generated
+# Homebrew formula — and, optionally, the Scoop manifest — into the tap/bucket
+# repositories this project owns, but ONLY once an operator has created them and
+# added the matching token secret (`HOMEBREW_TAP_TOKEN` / `SCOOP_BUCKET_TOKEN`).
+# Until then it skips with a notice in the log, and even a configured channel
+# that fails cannot fail the release (`continue-on-error: true`). winget keeps
+# its required external review in `microsoft/winget-pkgs` and is deliberately
+# not automated; see that job's comment and docs/installation.md. Both jobs are
+# downstream of crates.io, the tag, the Release, and all archive uploads, so
+# they cannot alter or strand the established release path.
 
 on:
   workflow_dispatch:
@@ -659,7 +665,9 @@ jobs:
   # failure happens after the archive upload and must not suppress generation;
   # a genuinely missing required sidecar instead makes the generator fail with
   # a precise error. Like `build-artifacts`, this job only adds assets to an
-  # already-published Release and never updates an external package repository.
+  # already-published Release and never updates an external package repository;
+  # pushing the files it generates into a tap/bucket is the separate,
+  # operator-enabled `publish-package-repos` job below.
   package-manifests:
     needs: [release, build-artifacts]
     if: ${{ !cancelled() && needs.release.result == 'success' }}
@@ -713,3 +721,267 @@ jobs:
             "$MANIFEST_OUTPUT"/scoop/processkit-cli.json \
             "$MANIFEST_OUTPUT"/homebrew/processkit-cli.rb \
             --clobber
+
+  # Publish the generated distributor files into the package repositories this
+  # project itself owns — what turns an attached release asset into an actually
+  # installable `brew install <owner>/tap/processkit-cli`. This is the only job
+  # in this workflow that pushes into another git repository (the `release` job
+  # already writes outside this repository as well, publishing the crate to
+  # crates.io), so it is deliberately last and deliberately incapable of gating
+  # a release.
+  #
+  # Operator setup — nothing below runs until this exists:
+  #   1. Homebrew: create the repository
+  #      `<owner>/homebrew-tap` (the name `brew tap <owner>/tap` expands to) and
+  #      add the repository secret `HOMEBREW_TAP_TOKEN` — a token that can push
+  #      to THAT repository and nothing else (a fine-grained PAT with Contents:
+  #      read and write scoped to the tap, or a GitHub App installation token).
+  #      The built-in `GITHUB_TOKEN` cannot be used: it is scoped to this
+  #      repository only.
+  #   2. Scoop (optional, fully independent): create `<owner>/scoop-bucket` and
+  #      add `SCOOP_BUCKET_TOKEN` the same way. Either, both, or neither channel
+  #      may be configured.
+  #   3. Repository variables `HOMEBREW_TAP_REPOSITORY` / `SCOOP_BUCKET_REPOSITORY`
+  #      override those default `<owner>/...` targets when the repository is
+  #      named differently. They are the only knob; the token secret alone
+  #      decides whether a channel publishes at all.
+  # docs/installation.md ("Package-manager manifests") documents the same setup
+  # for readers, and its availability table — not this comment — is what users
+  # are told to trust about a channel actually serving the package.
+  #
+  # winget is intentionally NOT automated here: there is no project-owned winget
+  # repository to push to. Publication is a pull request into
+  # `microsoft/winget-pkgs` gated by Microsoft's own automated and human review,
+  # so an automated submission would need a maintained fork plus a broadly
+  # scoped token, and a green step still would not mean the version is
+  # installable. The three-file manifest stays an attached release asset for a
+  # manual (or `wingetcreate submit`) submission the operator chooses to make.
+  #
+  # Why this can never break a release, in three independent layers:
+  #   1. Placement — it `needs:` both `release` and `package-manifests`, so
+  #      crates.io, the tag, the GitHub Release, every archive, and every
+  #      manifest are already published before it starts.
+  #   2. Unconfigured is a skip, not a failure — a missing token secret prints a
+  #      notice naming the repository and secret to create, and the publish
+  #      steps do not run. `secrets` is unavailable to `if:` expressions, so the
+  #      check is made in the shell below and republished as a plain output.
+  #   3. `continue-on-error: true` — even a fully configured channel that fails
+  #      (repository deleted, token expired or revoked, protected branch) leaves
+  #      the release itself green. The failure is reported as an annotation and
+  #      the fix is to re-run this one job; publication is idempotent. Re-run
+  #      the FAILED release's own run, though: this job always publishes the
+  #      version of the release it belongs to, so re-running an older release's
+  #      run would move the tap/bucket back to that older version.
+  publish-package-repos:
+    needs: [release, package-manifests]
+    name: publish tap and bucket
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    # Narrower than the top-level `contents: write`, which a job-level
+    # `permissions:` block REPLACES rather than merges with (the same rule
+    # `build-artifacts` documents above). This job only READS this repository's
+    # release assets; every write goes to an external repository and is
+    # authenticated by that channel's own token, never by `GITHUB_TOKEN`.
+    permissions:
+      contents: read
+    steps:
+      # Presence of a channel's token secret is the enable switch. `secrets` is
+      # not available to `if:` at job or step level, so the decision is made
+      # here and republished as ordinary outputs the steps below can branch on.
+      # The token values are only tested for emptiness — never printed, written
+      # to a file, or passed anywhere else from this step.
+      - name: Resolve publication targets
+        id: targets
+        env:
+          HOMEBREW_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          SCOOP_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          HOMEBREW_REPOSITORY: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
+          SCOOP_REPOSITORY: ${{ vars.SCOOP_BUCKET_REPOSITORY }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          # An operator-set variable ends up inside a clone URL and in this
+          # step's own outputs, so require the exact `owner/name` shape and skip
+          # the channel loudly rather than hand git something surprising. A
+          # rejected value is never republished as an output either.
+          #
+          # Bash's own `=~` (as the version parser above already uses), NOT
+          # `grep -E`: grep matches line by line, so it would accept a
+          # multi-line variable whose FIRST line is a valid slug — and that
+          # value, written to $GITHUB_OUTPUT, could forge additional outputs.
+          # `=~` anchors `^`/`$` to the whole string, so such a value is
+          # rejected outright.
+          slug_ok() {
+            [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+          }
+
+          homebrew=false
+          homebrew_repository="${HOMEBREW_REPOSITORY:-${OWNER}/homebrew-tap}"
+          if [ -z "${HOMEBREW_TOKEN}" ]; then
+            echo "::notice::Homebrew tap publication is off: repository secret HOMEBREW_TAP_TOKEN is not set. Create ${homebrew_repository} and add a token that can push to it, and every release will publish Formula/processkit-cli.rb there."
+          elif ! slug_ok "${homebrew_repository}"; then
+            echo "::warning::Skipping the Homebrew tap: HOMEBREW_TAP_REPOSITORY ('${homebrew_repository}') is not an owner/name repository slug."
+          else
+            homebrew=true
+            echo "Homebrew tap target: ${homebrew_repository}"
+          fi
+          [ "${homebrew}" = true ] || homebrew_repository=""
+
+          scoop=false
+          scoop_repository="${SCOOP_REPOSITORY:-${OWNER}/scoop-bucket}"
+          if [ -z "${SCOOP_TOKEN}" ]; then
+            echo "::notice::Scoop bucket publication is off: repository secret SCOOP_BUCKET_TOKEN is not set. Create ${scoop_repository} and add a token that can push to it, and every release will publish bucket/processkit-cli.json there."
+          elif ! slug_ok "${scoop_repository}"; then
+            echo "::warning::Skipping the Scoop bucket: SCOOP_BUCKET_REPOSITORY ('${scoop_repository}') is not an owner/name repository slug."
+          else
+            scoop=true
+            echo "Scoop bucket target: ${scoop_repository}"
+          fi
+          [ "${scoop}" = true ] || scoop_repository=""
+
+          any=false
+          if [ "${homebrew}" = true ] || [ "${scoop}" = true ]; then
+            any=true
+          fi
+
+          {
+            echo "homebrew=${homebrew}"
+            echo "homebrew_repository=${homebrew_repository}"
+            echo "scoop=${scoop}"
+            echo "scoop_repository=${scoop_repository}"
+            echo "any=${any}"
+          } >> "$GITHUB_OUTPUT"
+
+      # A tap/bucket must serve exactly the bytes the Release advertises, so the
+      # files are fetched back from the Release instead of being regenerated
+      # here: same generator run, same digests, and this job stays re-runnable
+      # on its own. `package-manifests` is a `needs:` of this job and always
+      # uploads both files, so both patterns are guaranteed to match.
+      - name: Download the published manifests
+        if: ${{ steps.targets.outputs.any == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p manifests
+          gh release download "$TAG" --dir manifests \
+            --pattern 'processkit-cli.rb' \
+            --pattern 'processkit-cli.json'
+
+      # One publisher, invoked once per channel. The two publications must
+      # behave identically — same idempotence check, same commit shape, same
+      # failure text — and a second inline copy is exactly how those two
+      # silently drift apart, so the script is written once here.
+      - name: Stage the publisher
+        if: ${{ steps.targets.outputs.any == 'true' }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/publish-package-repo.sh" <<'SH'
+          set -euo pipefail
+
+          work="${RUNNER_TEMP}/publish-${CHANNEL_ID}"
+          rm -rf "${work}"
+
+          # The token is a registered secret (masked in logs) and this checkout
+          # is thrown away with the ephemeral runner.
+          git clone --quiet "https://x-access-token:${TOKEN}@github.com/${TARGET_REPOSITORY}.git" "${work}"
+          git -C "${work}" config user.name "Zhelezniakou Anton"
+          git -C "${work}" config user.email "github@zelanton.net"
+
+          mkdir -p "${work}/$(dirname "${TARGET_PATH}")"
+          cp "${SOURCE_FILE}" "${work}/${TARGET_PATH}"
+          git -C "${work}" add -- "${TARGET_PATH}"
+
+          # Re-running this job after a successful publication must be a no-op,
+          # not an empty commit: generation is deterministic from the tagged
+          # script plus the release checksums, so identical bytes mean the
+          # channel already serves this version.
+          if git -C "${work}" diff --cached --quiet; then
+            echo "::notice::${CHANNEL_NAME} already serves processkit-cli ${VERSION}; nothing to push."
+            exit 0
+          fi
+
+          git -C "${work}" commit --quiet -m "processkit-cli ${VERSION}"
+          # Push to the target's own default branch (`main`, `master`, ...),
+          # resolved from the clone rather than assumed.
+          branch="$(git -C "${work}" symbolic-ref --short HEAD)"
+          git -C "${work}" push --quiet origin "HEAD:refs/heads/${branch}"
+          echo "::notice::Published processkit-cli ${VERSION} to ${TARGET_REPOSITORY} (${TARGET_PATH})."
+          SH
+
+      - name: Publish the Homebrew formula
+        id: homebrew
+        if: ${{ steps.targets.outputs.homebrew == 'true' }}
+        # Per-step, so a broken tap cannot also skip the independent Scoop half
+        # below; the job-level flag then keeps the release itself green.
+        continue-on-error: true
+        env:
+          TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TARGET_REPOSITORY: ${{ steps.targets.outputs.homebrew_repository }}
+          TARGET_PATH: Formula/processkit-cli.rb
+          SOURCE_FILE: manifests/processkit-cli.rb
+          CHANNEL_ID: homebrew
+          CHANNEL_NAME: The Homebrew tap
+          VERSION: ${{ needs.release.outputs.version }}
+        run: bash "$RUNNER_TEMP/publish-package-repo.sh"
+
+      - name: Publish the Scoop manifest
+        id: scoop
+        if: ${{ steps.targets.outputs.scoop == 'true' }}
+        continue-on-error: true
+        env:
+          TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          TARGET_REPOSITORY: ${{ steps.targets.outputs.scoop_repository }}
+          TARGET_PATH: bucket/processkit-cli.json
+          SOURCE_FILE: manifests/processkit-cli.json
+          CHANNEL_ID: scoop
+          CHANNEL_NAME: The Scoop bucket
+          VERSION: ${{ needs.release.outputs.version }}
+        run: bash "$RUNNER_TEMP/publish-package-repo.sh"
+
+      # A `continue-on-error` failure is easy to miss on an otherwise green
+      # release, so state each channel's outcome explicitly — as an annotation
+      # and in the run summary — including "not configured".
+      - name: Report publication outcome
+        if: ${{ always() }}
+        env:
+          HOMEBREW_ENABLED: ${{ steps.targets.outputs.homebrew }}
+          HOMEBREW_OUTCOME: ${{ steps.homebrew.outcome }}
+          HOMEBREW_REPOSITORY: ${{ steps.targets.outputs.homebrew_repository }}
+          SCOOP_ENABLED: ${{ steps.targets.outputs.scoop }}
+          SCOOP_OUTCOME: ${{ steps.scoop.outcome }}
+          SCOOP_REPOSITORY: ${{ steps.targets.outputs.scoop_repository }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          report() {
+            label="$1"
+            enabled="$2"
+            outcome="$3"
+            repository="$4"
+            secret="$5"
+            if [ -z "${enabled}" ]; then
+              # Only reachable if target resolution itself never completed —
+              # report that, rather than misreading it as "not configured".
+              line="${label}: unknown — this job did not get as far as resolving its target."
+              echo "::error::${line}"
+            elif [ "${enabled}" != true ]; then
+              line="${label}: not configured — set ${secret} to publish there."
+            elif [ "${outcome}" = success ]; then
+              line="${label}: up to date at ${repository} for v${VERSION}."
+            elif [ "${outcome}" = skipped ]; then
+              line="${label}: not attempted — an earlier step in this job failed."
+              echo "::error::${line}"
+            else
+              line="${label}: FAILED for ${repository}. Release v${VERSION} is unaffected; repair the repository or its token and re-run this job."
+              echo "::error::${line}"
+            fi
+            echo "- ${line}" >> "$GITHUB_STEP_SUMMARY"
+            echo "${line}"
+          }
+          echo "### Package repository publication" >> "$GITHUB_STEP_SUMMARY"
+          report "Homebrew tap" "${HOMEBREW_ENABLED}" "${HOMEBREW_OUTCOME}" "${HOMEBREW_REPOSITORY}" HOMEBREW_TAP_TOKEN
+          report "Scoop bucket" "${SCOOP_ENABLED}" "${SCOOP_OUTCOME}" "${SCOOP_REPOSITORY}" SCOOP_BUCKET_TOKEN

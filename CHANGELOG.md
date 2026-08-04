@@ -84,6 +84,16 @@ to a dated version section.
   failed read previously removed it.
 - Checksum-derived winget, Scoop, and Homebrew distributor manifests attached
   to every release after the platform archives finish uploading.
+- Automatic publication of those Homebrew and Scoop files into the project's own
+  tap/bucket repositories, as the release workflow's last job. It is off until
+  an operator creates the target repository and adds a token secret scoped to it
+  (`HOMEBREW_TAP_TOKEN` / `SCOOP_BUCKET_TOKEN`, each channel independent), skips
+  with a notice while unconfigured, pushes nothing when the target already holds
+  identical bytes, and cannot fail a release even when a configured channel
+  breaks. No tap or bucket is published yet, so every install command stays as
+  documented in the package-manager availability table; winget remains a
+  deliberate manual submission, since its review lives in `microsoft/winget-pkgs`
+  and no automated step there could report real availability.
 - An adoption-oriented positioning guide comparing ProcessKit CLI with common
   deadline, process-group, service-manager, container, init, and PowerShell
   alternatives without overstating the platform-specific cleanup guarantees.
