@@ -119,9 +119,9 @@ to a dated version section.
   `run` its values are the terminal `runner_exit` event's own `source` spellings
   rather than a second vocabulary for the same endings. A `run --detach` still relays
   the reserved *code* of the copy it respawned, but not a meaning for it: a code
-  `run` itself never mints (`110`/`112`/`114`/`115`, or one no build assigns yet) reports
-  `kind: "unknown"` rather than borrowing another subcommand's verdict, since that
-  copy can be a different build. `message` is deliberately
+  `run` itself never mints (`110`/`112`/`114`/`115`/`116`, or one no build assigns
+  yet) reports `kind: "unknown"` rather than borrowing another subcommand's
+  verdict, since that copy can be a different build. `message` is deliberately
   *not* part of the contract and may be reworded in any release. Invariants: stdout
   is never touched (a command that prints a report and then fails, like
   `probe --json` exiting 110, still prints exactly what it always did), the default
