@@ -349,7 +349,9 @@ pub struct RunArgs {
     /// an explicit `--env <KEY>=…` for this very key: two flags asking for two
     /// different values of one variable is a caller mistake, so it fails at parse
     /// time as a `USAGE` (100) error instead of silently discarding the value the
-    /// caller typed (see [`RunArgs::validate`]).
+    /// caller typed (see [`RunArgs::validate`]). "The same key" means the same key
+    /// *to this platform*: byte-exact off Windows, and case-insensitive on Windows,
+    /// where `KEY` and `key` are one child variable rather than two.
     ///
     /// **The value is correlation data, not a credential.** It proves nothing
     /// about who started the run, carries no authority, and is trivially forgeable
@@ -386,6 +388,15 @@ impl RunArgs {
     /// discovering a dropped variable in production), and it is the choice
     /// `README.md` and `docs/running-commands.md` document.
     ///
+    /// Whether two keys *are* the same key is decided the way the platform decides
+    /// it — [`names_one_child_variable`] — because that, not byte equality, is what
+    /// settles whether one child variable or two are at stake. Byte equality on
+    /// Windows would refuse `--env RID=mine --run-id-env RID` while accepting
+    /// `--env RID=mine --run-id-env rid`, and the accepted pair would then resolve
+    /// in exactly the way this refusal exists to prevent: one case-insensitive
+    /// child variable, the injected id landing last and winning, and `mine` gone
+    /// without a word.
+    ///
     /// Deliberately **not** refused, because those are resolved rather than
     /// contradictory (`README.md`, "Environment"):
     ///
@@ -403,18 +414,82 @@ impl RunArgs {
         let Some(key) = self.run_id_env.as_deref() else {
             return Ok(());
         };
-        if self.env.iter().any(|(env_key, _)| env_key == key) {
-            return Err(format!(
-                "`--run-id-env {}` and `--env {}=…` both set the same child variable: \
-                 the run id would always win, whichever order the two flags were given. \
-                 Drop one of them — `--run-id-env` to keep your own value, or the `--env` \
-                 entry to let the runner publish this run's id",
-                key.escape_debug(),
-                key.escape_debug()
-            ));
-        }
-        Ok(())
+        let Some((env_key, _)) = self
+            .env
+            .iter()
+            .find(|(env_key, _)| names_one_child_variable(env_key, key))
+        else {
+            return Ok(());
+        };
+        // Each flag is quoted back with the spelling the caller actually typed, so
+        // the message never invents an `--env` entry they did not write. The two can
+        // only differ where the platform folds case (Windows today), and there the
+        // difference is precisely what needs explaining.
+        let case_note = if env_key == key {
+            ""
+        } else {
+            " (environment variable names are case-insensitive on Windows)"
+        };
+        Err(format!(
+            "`--run-id-env {}` and `--env {}=…` both set the same child variable{case_note}: \
+             the run id would always win, whichever order the two flags were given. \
+             Drop one of them — `--run-id-env` to keep your own value, or the `--env` \
+             entry to let the runner publish this run's id",
+            key.escape_debug(),
+            env_key.escape_debug()
+        ))
     }
+}
+
+/// Whether two child-environment variable **names** address one and the same
+/// variable *on this platform* — the question [`RunArgs::validate`]'s refusal turns
+/// on, and the one place this crate decides it.
+///
+/// Windows environment blocks are case-insensitive: `PATH`, `Path`, and `path` name
+/// one variable there, and the environment map `std::process::Command` builds for a
+/// child folds them together the same way. So a pair differing only in case is the
+/// same contradiction as an identical spelling, and comparing bytes there would let
+/// the injected run id silently replace an explicit `--env` value for every
+/// spelling but one — the outcome the refusal exists to prevent.
+///
+/// Off Windows the comparison stays byte-exact, because names are genuinely
+/// case-sensitive there: `PATH` and `Path` are two variables, and refusing that pair
+/// would reject a legal invocation over a collision that does not exist.
+#[cfg(windows)]
+fn names_one_child_variable(left: &str, right: &str) -> bool {
+    // Compared per character rather than with `str::eq_ignore_ascii_case`, because
+    // the shared key grammar (`super::parse_env_key`) accepts non-ASCII names, and
+    // `é`/`É` is one Windows variable exactly as `a`/`A` is — an ASCII-only fold
+    // would leave that class of spellings in the silent-substitution hole this
+    // function closes.
+    left.chars()
+        .map(simple_uppercase)
+        .eq(right.chars().map(simple_uppercase))
+}
+
+/// The **simple** (one-to-one) uppercase form of `character`, matching how Windows
+/// folds an environment name per character, rather than Unicode's full mapping:
+/// where the full mapping produces more than one character (`ß` → `SS`), the
+/// platform's own table leaves the character alone, so this does too.
+///
+/// The two tables can still disagree on exotic code points; that residue is far
+/// narrower than the whole-case axis it replaces, and it cannot reach a name in the
+/// conventional `[A-Za-z0-9_]` shape.
+#[cfg(windows)]
+fn simple_uppercase(character: char) -> char {
+    let mut mapped = character.to_uppercase();
+    match (mapped.next(), mapped.next()) {
+        (Some(single), None) => single,
+        _ => character,
+    }
+}
+
+/// The byte-exact half of the same rule (see the Windows arm above): off Windows,
+/// environment variable names are case-sensitive, so `PATH` and `Path` are two
+/// child variables and only the identical spelling is a collision.
+#[cfg(not(windows))]
+fn names_one_child_variable(left: &str, right: &str) -> bool {
+    left == right
 }
 
 /// Policy applied when a bounded output transcript reaches its ceiling.
@@ -1097,6 +1172,15 @@ mod tests {
     /// mode: it composes with all four `--env-*` flags, and — since the applied order
     /// is fixed in `src/run/launch.rs` rather than read off the command line — the
     /// parsed result cannot depend on where it was written among them.
+    ///
+    /// This pins the **parse** only: which fields a command line populates. What the
+    /// child ends up observing when those flags meet on one key is decided by the
+    /// builder chain in `src/run/launch.rs`, out of this module's reach, and is
+    /// proven through the built binary in `tests/run.rs` —
+    /// `run_id_env_is_set_on_a_slate_env_clear_emptied`,
+    /// `run_id_env_outlives_an_env_remove_for_the_same_key`,
+    /// `run_id_env_wins_over_an_env_file_entry_for_the_same_key`, and
+    /// `run_id_env_wins_over_every_other_environment_flag_at_once`.
     #[test]
     fn run_id_env_composes_with_every_environment_flag_in_any_order() {
         let env_flags: [&[&str]; 2] = [
@@ -1188,6 +1272,95 @@ mod tests {
         // And with the flag absent, an `--env` for any key stays exactly as legal as
         // it was before this flag existed.
         assert!(run_is_accepted(&["--env", "SHARED=mine"]));
+    }
+
+    /// The refusal turns on what the *platform* calls one variable, not on byte
+    /// equality (T-304, R-01). Windows environment blocks are case-insensitive, so
+    /// `--env RID_TEST=mine --run-id-env rid_test` is the very contradiction the
+    /// rule is about: accepting it resolves the pair the one way the refusal exists
+    /// to prevent — one child variable, the injected id landing last, and the
+    /// caller's own `mine` discarded without a word.
+    #[cfg(windows)]
+    #[test]
+    fn run_id_env_refuses_a_case_variant_env_key_on_windows() {
+        for (entry, injected) in [
+            ("RID_TEST=mine", "rid_test"),
+            ("rid_test=mine", "RID_TEST"),
+            ("Rid_Test=mine", "rID_tEST"),
+            // The shared key grammar accepts non-ASCII names, and Windows folds
+            // their case too, so an ASCII-only comparison would leave this class of
+            // spellings in exactly the hole the rule closes.
+            ("RID_É=mine", "rid_é"),
+        ] {
+            assert!(
+                !run_is_accepted(&["--env", entry, "--run-id-env", injected]),
+                "`--env {entry}` and `--run-id-env {injected}` name one Windows variable"
+            );
+            assert!(
+                !run_is_accepted(&["--run-id-env", injected, "--env", entry]),
+                "the refusal cannot depend on which flag was written first"
+            );
+        }
+
+        // Folding case is not fuzzy matching: names differing by more than case stay
+        // two variables, and naming both remains as legal as it ever was.
+        assert!(run_is_accepted(&[
+            "--env",
+            "RID_TEST=mine",
+            "--run-id-env",
+            "rid_test_2"
+        ]));
+        assert!(run_is_accepted(&[
+            "--env",
+            "RID_TEST=mine",
+            "--run-id-env",
+            "other"
+        ]));
+
+        // The diagnostic quotes each flag with the spelling the caller actually
+        // typed — it must not render an `--env` entry they never wrote — and still
+        // never repeats the value beside it.
+        let args = run_args(&["--env", "RID_TEST=mine", "--run-id-env", "rid_test"]);
+        let error = args.validate().expect_err("the pair is refused");
+        assert!(
+            error.contains("`--run-id-env rid_test`") && error.contains("`--env RID_TEST=…`"),
+            "each flag is quoted as it was written: {error:?}"
+        );
+        assert!(
+            error.contains("case-insensitive on Windows"),
+            "two visibly different keys are one variable, and the message says why: {error:?}"
+        );
+        assert!(
+            !error.contains("mine"),
+            "the refusal must not disclose the --env value: {error:?}"
+        );
+    }
+
+    /// The mirror of the rule above off Windows, where environment names really are
+    /// case-sensitive: `RID_TEST` and `rid_test` are two child variables, so the
+    /// pair is not a collision at all and refusing it would reject a legal
+    /// invocation. The identical spelling is still refused.
+    #[cfg(not(windows))]
+    #[test]
+    fn run_id_env_treats_a_case_variant_env_key_as_a_second_variable_off_windows() {
+        assert!(run_is_accepted(&[
+            "--env",
+            "RID_TEST=mine",
+            "--run-id-env",
+            "rid_test"
+        ]));
+        assert!(run_is_accepted(&[
+            "--run-id-env",
+            "rid_test",
+            "--env",
+            "RID_TEST=mine"
+        ]));
+        assert!(!run_is_accepted(&[
+            "--env",
+            "RID_TEST=mine",
+            "--run-id-env",
+            "RID_TEST"
+        ]));
     }
 
     #[test]

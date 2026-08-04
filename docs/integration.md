@@ -163,7 +163,9 @@ processkit-cli run \
   default) and it composes with `--detach` — the detached copy is re-spawned with
   an explicit `--run-id` for the id its caller already reported, so the child sees
   the same value the caller has. An explicit `--env <KEY>=…` for the same key is
-  refused as a `USAGE` (100) parse error rather than silently overridden. Treat the
+  refused as a `USAGE` (100) parse error rather than silently overridden — "the
+  same key" by the platform's own rule, so on Windows an `--env` entry differing
+  from `<KEY>` only in case is that same refusal. Treat the
   value as **correlation data only**: it identifies a run, it does not
   authenticate one, and any process able to set an environment variable can forge
   it.

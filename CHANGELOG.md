@@ -28,7 +28,10 @@ to a dated version section.
   is *refused* rather than resolved is an explicit `--env <KEY>=…` for the same key,
   which fails at parse time as a `USAGE` (100) error before anything runs (asking
   for two values of one variable is a caller mistake, and the outcome must not
-  depend on argument order either way). `<KEY>` is held to the same rule as an
+  depend on argument order either way); "the same key" follows the platform's own
+  rule, so on Windows — where environment names are case-insensitive — a pair
+  differing only in case is that same collision and is refused too. `<KEY>` is
+  held to the same rule as an
   `--env` KEY, through the same validator. The value is **correlation data, not a
   credential**: it identifies a run, proves nothing about who started it, and is
   forgeable by anything that can set an environment variable. New probe surface

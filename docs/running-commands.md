@@ -123,6 +123,12 @@ for a different value of one variable, and silently discarding what the caller
 typed would be worse than refusing the pair. The refusal names the key and never
 repeats the value beside it.
 
+"The same key" is decided the way the platform decides it. Windows environment
+names are case-insensitive, so `--env KEY=value --run-id-env key` names one child
+variable there and is refused just like the identical spelling; on other
+platforms `KEY` and `key` are two variables, so that pair is accepted and each
+keeps its own value.
+
 The value is **correlation data, not a credential or a security proof**. It says
 which run some work belongs to; it does not establish who started that run,
 carries no authority, and can be set by anything able to write an environment

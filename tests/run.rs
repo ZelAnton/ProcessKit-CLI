@@ -291,10 +291,24 @@ fn malformed_env_file_is_a_pre_run_setup_failure() {
 // ---------------------------------------------------------------------------
 
 /// The destination key these scenarios inject into. Deliberately *not* set in the
-/// runner's own environment anywhere in this file: if the injection failed, the
+/// runner's own environment by the identity scenarios: if the injection failed, the
 /// child would observe an unset variable rather than an inherited one, so a passing
 /// assertion cannot be an accident of inheritance.
+///
+/// The precedence scenarios further below are the deliberate exception — they *do*
+/// pre-set it (to [`RUN_ID_ENV_INHERITED`]) or fill it from an `--env-file` (with
+/// [`RUN_ID_ENV_FROM_FILE`]), because `--env-clear`/`--env-remove` need something
+/// real to act on. There the same guarantee is kept by a different means: those
+/// values are distinctive, and an assertion that the child observed the *run id*
+/// fails on either of them just as it fails on an unset variable.
 const RUN_ID_ENV_KEY: &str = "PROCESSKIT_TEST_RUN_ID";
+
+/// What the precedence scenarios give [`RUN_ID_ENV_KEY`] in the runner's own
+/// environment, so the child inherits it unless a flag says otherwise.
+const RUN_ID_ENV_INHERITED: &str = "inherited-value-the-run-id-replaces";
+
+/// What an `--env-file` entry gives [`RUN_ID_ENV_KEY`] in the precedence scenarios.
+const RUN_ID_ENV_FROM_FILE: &str = "env-file-value-the-run-id-replaces";
 
 /// How long a `--run-id-env` scenario waits for something the child or the run must
 /// do on its own. Generous: it bounds a failure, never a healthy path.
@@ -620,6 +634,247 @@ fn run_id_env_colliding_with_an_explicit_env_is_refused_before_the_run_starts() 
 
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&ok_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Applied order, end to end (T-304, R-02).
+//
+// The three "Also given → Result" rows README.md and `docs/running-commands.md`
+// publish — `--env-clear` → the key survives; `--env-remove KEY` → the key is
+// still set; an `--env-file` entry for `KEY` → the run id wins — are claims about
+// what the *child* observes, decided by where the injection sits in
+// `src/run/launch.rs`'s builder chain. A `src/cli/run.rs` unit test cannot reach
+// that: it sees which fields a command line populated, not which value survived to
+// the child. These scenarios drive the built binary and read the value out of the
+// child itself.
+//
+// Every scenario writes `--run-id-env` *before* the `--env-*` flag it is paired
+// with, and the two order-sensitive ones run both orders, so "the outcome does not
+// depend on argument order" is tested rather than declared. Each has a control run
+// (K-059) proving the flag it is competing with really does something on its own —
+// otherwise "the run id won" would also pass against a clear that cleared nothing
+// or a file entry that never reached the child.
+// ---------------------------------------------------------------------------
+
+/// A child that prints what it observes for [`RUN_ID_ENV_KEY`], prefixed so the
+/// value can be lifted out of the runner's live echo.
+///
+/// `cmd /c echo %VAR%` prints the literal `%VAR%` for an unset variable while `sh`
+/// prints nothing; neither rendering can be mistaken for a run id or for one of the
+/// sentinel values above, so no assertion here keys off how "unset" looks.
+fn echo_run_id_env_program() -> Vec<String> {
+    let script = if cfg!(windows) {
+        format!("echo run-id-env:%{RUN_ID_ENV_KEY}%")
+    } else {
+        format!("echo \"run-id-env:${RUN_ID_ENV_KEY}\"")
+    };
+    shell_inline(&script)
+}
+
+/// Run one precedence scenario to completion and return the two values the
+/// documented table is about: what the child observed for [`RUN_ID_ENV_KEY`], and
+/// this run's own `run_started.run_id`.
+///
+/// `runner_envs` is set on the runner process and therefore inherited by the child —
+/// that is how a scenario gives `--env-clear`/`--env-remove` something real to act
+/// on. No `--run-id` is passed, so every scenario also runs against a *generated*
+/// id: the value cannot have been read off the command line.
+fn observe_run_id_env_with(
+    tag: &str,
+    runner_envs: &[(&str, &Path)],
+    flags: &[&str],
+) -> (String, String) {
+    let dir = scratch(tag);
+    let out = run_with_flags(&dir, runner_envs, flags, echo_run_id_env_program());
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the child exits cleanly for {flags:?}; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let observed = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("run-id-env:").map(str::to_string))
+        .unwrap_or_else(|| panic!("the child echoed the variable it read: {stdout:?}"));
+
+    let events = read_run_events(&dir);
+    let run_id = events
+        .iter()
+        .find(|event| event["event"] == "run_started")
+        .unwrap_or_else(|| panic!("the run reported itself started: {events:?}"))["run_id"]
+        .as_str()
+        .expect("run_started names its run")
+        .to_string();
+
+    let _ = std::fs::remove_dir_all(&dir);
+    (observed, run_id)
+}
+
+/// Row 1: with `--env-clear`, the injection is applied *after* the clear, so the key
+/// is set on the emptied slate rather than wiped along with everything else.
+///
+/// What this scenario can and cannot catch, stated rather than implied: unlike the
+/// two rows below, this one does not depend on where the injection sits among the
+/// builder calls, because `processkit::Command::env_clear()` is an order-independent
+/// flag (it decides whether the *inherited* environment is carried over) while
+/// explicit sets are a separate ordered list. Moving the injection ahead of the
+/// `env_clear()` call therefore does not change what the child observes — verified
+/// by doing exactly that during this test's own self-check, where the two rows below
+/// failed and this one did not. Its job is the user-facing promise itself: that this
+/// key survives a cleared slate, which would break if the injection were dropped, or
+/// if that library property ever changed.
+#[test]
+fn run_id_env_is_set_on_a_slate_env_clear_emptied() {
+    let inherited: &[(&str, &Path)] = &[(RUN_ID_ENV_KEY, Path::new(RUN_ID_ENV_INHERITED))];
+
+    // Control: the clear really empties the slate this key was on.
+    let (cleared, _) =
+        observe_run_id_env_with("run-id-env-clear-control", inherited, &["--env-clear"]);
+    assert_ne!(
+        cleared, RUN_ID_ENV_INHERITED,
+        "control: --env-clear must actually wipe the inherited value, or the run below \
+         would pass without the injection having done anything"
+    );
+
+    let (observed, run_id) = observe_run_id_env_with(
+        "run-id-env-clear",
+        inherited,
+        &["--run-id-env", RUN_ID_ENV_KEY, "--env-clear"],
+    );
+    assert_eq!(
+        observed, run_id,
+        "the run id is injected after the clear, so the child observes it on the cleared slate"
+    );
+}
+
+/// Row 2: an `--env-remove` for the very key being injected does not win — removals
+/// are applied before every set, so the key is still set when the child starts.
+#[test]
+fn run_id_env_outlives_an_env_remove_for_the_same_key() {
+    let inherited: &[(&str, &Path)] = &[(RUN_ID_ENV_KEY, Path::new(RUN_ID_ENV_INHERITED))];
+
+    // Two controls: the value really is inherited by default, and the removal really
+    // removes it. Without both, "the child observed the run id" could pass against a
+    // removal that never happened.
+    let (baseline, _) = observe_run_id_env_with("run-id-env-remove-baseline", inherited, &[]);
+    assert_eq!(
+        baseline, RUN_ID_ENV_INHERITED,
+        "control: the runner's own environment reaches the child by default"
+    );
+    let (removed, _) = observe_run_id_env_with(
+        "run-id-env-remove-control",
+        inherited,
+        &["--env-remove", RUN_ID_ENV_KEY],
+    );
+    assert_ne!(
+        removed, RUN_ID_ENV_INHERITED,
+        "control: --env-remove must actually strip the inherited value"
+    );
+
+    let orders: [&[&str]; 2] = [
+        &[
+            "--run-id-env",
+            RUN_ID_ENV_KEY,
+            "--env-remove",
+            RUN_ID_ENV_KEY,
+        ],
+        &[
+            "--env-remove",
+            RUN_ID_ENV_KEY,
+            "--run-id-env",
+            RUN_ID_ENV_KEY,
+        ],
+    ];
+    for flags in orders {
+        let (observed, run_id) = observe_run_id_env_with("run-id-env-remove", inherited, flags);
+        assert_eq!(
+            observed, run_id,
+            "the injection lands after the removal, whichever order the flags were \
+             written: {flags:?}"
+        );
+    }
+}
+
+/// Row 3: an `--env-file` entry for the same key loses to the injection, which is
+/// applied last — the case the parser cannot decide, since a file's contents are
+/// read at run time rather than compared at parse time.
+#[test]
+fn run_id_env_wins_over_an_env_file_entry_for_the_same_key() {
+    let dir = scratch("run-id-env-file");
+    let env_file = dir.join("base.env");
+    std::fs::write(
+        &env_file,
+        format!("{RUN_ID_ENV_KEY}={RUN_ID_ENV_FROM_FILE}\n"),
+    )
+    .expect("write the env-file fixture");
+    let env_file = path_arg(&env_file);
+
+    // Control: the file entry does reach the child on its own, so losing to the
+    // injection below is a real precedence outcome and not an unread file.
+    let (from_file, _) =
+        observe_run_id_env_with("run-id-env-file-control", &[], &["--env-file", &env_file]);
+    assert_eq!(
+        from_file, RUN_ID_ENV_FROM_FILE,
+        "control: the file's own value reaches the child without --run-id-env"
+    );
+
+    let orders: [&[&str]; 2] = [
+        &["--run-id-env", RUN_ID_ENV_KEY, "--env-file", &env_file],
+        &["--env-file", &env_file, "--run-id-env", RUN_ID_ENV_KEY],
+    ];
+    for flags in orders {
+        let (observed, run_id) = observe_run_id_env_with("run-id-env-file-wins", &[], flags);
+        assert_eq!(
+            observed, run_id,
+            "the injection is applied last, so the run id replaces the file's value \
+             whichever order the flags were written: {flags:?}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The whole chain at once, with `--run-id-env` written first: a cleared slate, a
+/// removal of the very key, and a file entry that sets it to something else still
+/// end with the child observing this run's id. This is the applied-order claim
+/// (`clear → remove → env-file → env → run-id injection`) as one statement, and the
+/// end-to-end counterpart of the parse-level
+/// `run_id_env_composes_with_every_environment_flag_in_any_order` unit test.
+#[test]
+fn run_id_env_wins_over_every_other_environment_flag_at_once() {
+    let dir = scratch("run-id-env-chain");
+    let env_file = dir.join("base.env");
+    std::fs::write(
+        &env_file,
+        format!("{RUN_ID_ENV_KEY}={RUN_ID_ENV_FROM_FILE}\n"),
+    )
+    .expect("write the env-file fixture");
+    let env_file = path_arg(&env_file);
+    let inherited: &[(&str, &Path)] = &[(RUN_ID_ENV_KEY, Path::new(RUN_ID_ENV_INHERITED))];
+
+    let (observed, run_id) = observe_run_id_env_with(
+        "run-id-env-chain-run",
+        inherited,
+        &[
+            "--run-id-env",
+            RUN_ID_ENV_KEY,
+            "--env-clear",
+            "--env-remove",
+            RUN_ID_ENV_KEY,
+            "--env-file",
+            &env_file,
+            "--env",
+            "PROCESSKIT_TEST_OTHER=untouched",
+        ],
+    );
+    assert_eq!(
+        observed, run_id,
+        "the injection closes the chain, so nothing earlier in it decides this key"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A program that cannot be started is a runner-own failure, so the runner exits

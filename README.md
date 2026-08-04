@@ -863,6 +863,10 @@ since a generated id is not knowable outside the run until the run has started.
   caller mistake, and it fails at parse time as a `USAGE` (100) error before
   anything runs. The outcome never depends on the order the two flags were
   written — that is the reason it is a refusal rather than a precedence rule.
+  "The same key" follows the platform's own rule for environment names: on
+  Windows they are case-insensitive, so `--env KEY=…` collides with
+  `--run-id-env key` exactly as it does with `--run-id-env KEY`; elsewhere the
+  two really are different variables and only the identical spelling collides.
 - **The value is correlation data, not a credential or a security proof.** It
   identifies which run some work belongs to; it proves nothing about who started
   that run, grants no authority, and is trivially forgeable by anything that can

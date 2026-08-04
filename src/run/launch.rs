@@ -269,7 +269,10 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     // on the command line (README.md, "Environment"). The one case a caller could
     // reasonably have meant differently — an explicit `--env <KEY>=…` for this very
     // key — never reaches here: `RunArgs::validate` refuses that pair at parse time
-    // rather than letting this line silently discard the caller's own value.
+    // rather than letting this line silently discard the caller's own value. That
+    // refusal compares the two keys the way the platform itself does (case-
+    // insensitively on Windows, byte-exact elsewhere), so no spelling of an
+    // explicit `--env` for this variable slips past it into this line.
     //
     // The value is `run_id` as resolved above — the single site that decides it, so
     // the child sees exactly what `run_started`, the registry record, and every
