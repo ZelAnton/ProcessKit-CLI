@@ -131,7 +131,7 @@ above is unaffected and keeps only the top-level permission it already had.
 
 ## What the `package-manifests` job does
 
-This final job waits for the release and every archive-matrix leg to settle. It
+This job waits for the release and every archive-matrix leg to settle. It
 still runs when a leg failed only in its final provenance-attestation step,
 because the archive and checksum were already uploaded; a missing required
 checksum instead fails generation honestly. The job never publishes to an
@@ -154,10 +154,65 @@ external package repository. It:
    existing GitHub Release with `--clobber` idempotence.
 
 Winget retains its external `microsoft/winget-pkgs` review. Scoop and Homebrew
-receive ready-to-copy files for an account-owned bucket/tap, but those separate
-repositories are not mutated and need no credentials in this project. This
-keeps all external channel availability out of the crate/tag/Release critical
-path.
+receive ready-to-copy files for an account-owned bucket/tap; this job itself
+mutates nothing outside the repository and needs no external credentials.
+Pushing those two files into the tap/bucket is the separate, optional job
+below, which keeps all external channel availability out of the
+crate/tag/Release critical path either way.
+
+## What the `publish-package-repos` job does
+
+This final job publishes the formula and Scoop manifest `package-manifests` just
+attached to the Release into the package repositories the project owns — the
+step that turns a release asset into an installable
+`brew install <owner>/tap/processkit-cli`. It is the only job in the workflow
+that writes outside this repository, and it is off until an operator provisions
+the target repositories:
+
+1. **Resolve publication targets** — a channel is enabled by the presence of its
+   token secret (`HOMEBREW_TAP_TOKEN`, `SCOOP_BUCKET_TOKEN`); the token is only
+   tested for emptiness, never printed or forwarded. The target defaults to
+   `<owner>/homebrew-tap` / `<owner>/scoop-bucket` and can be renamed with the
+   repository variables `HOMEBREW_TAP_REPOSITORY` / `SCOOP_BUCKET_REPOSITORY`, a
+   value the step accepts only in the exact `owner/name` shape since it ends up
+   in a clone URL. An unconfigured or rejected channel is skipped with a notice
+   or warning naming what to create. (`secrets` is unavailable to `if:`
+   expressions at either job or step level, which is why the check happens in a
+   shell step and is republished as a plain step output.)
+2. **Download the published manifests** — fetches `processkit-cli.rb` and
+   `processkit-cli.json` back from the Release rather than regenerating them, so
+   a tap serves exactly the bytes the Release advertises and the job stays
+   re-runnable on its own.
+3. **Publish** each enabled channel: clone the target with its own token, write
+   the file to `Formula/processkit-cli.rb` / `bucket/processkit-cli.json`,
+   commit as `processkit-cli <version>` and push to the target's own default
+   branch. Identical bytes push nothing (a re-run is a no-op, not an empty
+   commit). Both channels run the same staged publisher script, so they cannot
+   drift apart, and each is `continue-on-error` on its own so a broken tap does
+   not also skip the bucket.
+4. **Report publication outcome** — always runs, and states per channel whether
+   it published, is not configured, or failed (as an `::error::` annotation plus
+   a run-summary line), since a swallowed failure is easy to miss on an
+   otherwise green release.
+
+The job declares `permissions: contents: read` — narrower than the top-level
+`contents: write`, which a job-level block replaces rather than merges with (the
+same rule `build-artifacts` documents above). It only reads this repository's
+release assets; every write goes to an external repository authenticated by that
+channel's own token. The built-in `GITHUB_TOKEN` cannot serve that purpose: it
+is scoped to this repository, which is why a separate secret is required.
+
+The job is `continue-on-error: true` at job level as well, so a configured
+channel that fails — repository deleted, token expired or revoked, protected
+branch on the tap — cannot turn the release red. It runs after crates.io, the
+tag, the Release, every archive, and every manifest upload, so at that point
+there is nothing left it could strand.
+
+winget is deliberately not automated here; `docs/installation.md` ("Why winget
+is submitted by hand") records the reasoning: there is no project-owned winget
+repository, publication is a reviewed pull request into `microsoft/winget-pkgs`,
+and a green automated `wingetcreate submit` would still not mean the version is
+installable.
 
 ## Required repository configuration
 
@@ -173,6 +228,19 @@ path.
   artifacts and package manifests is the default one GitHub Actions provides;
   no setup needed beyond the job-level `permissions:` blocks already in the
   workflow.
+- **`HOMEBREW_TAP_TOKEN`** (secret) — optional. Enables `publish-package-repos`
+  to push `Formula/processkit-cli.rb` into the tap repository. Use a token that
+  can push to the tap and nothing else: a fine-grained PAT with `Contents: read
+  and write` scoped to that repository, or a GitHub App installation token.
+  Until it is set, the Homebrew half is skipped with a notice.
+- **`SCOOP_BUCKET_TOKEN`** (secret) — optional, same shape, for
+  `bucket/processkit-cli.json` in the Scoop bucket repository. Independent of
+  the Homebrew half.
+- **`HOMEBREW_TAP_REPOSITORY`** / **`SCOOP_BUCKET_REPOSITORY`** (variables) —
+  optional. Override the default `<owner>/homebrew-tap` / `<owner>/scoop-bucket`
+  targets. They only rename the target; the token secret is what enables
+  publication. See `docs/installation.md`, "Publishing to a tap or bucket", for
+  the operator walkthrough and the naming constraint on a Homebrew tap.
 
 ## Recovering from a failure partway through a release
 
@@ -216,6 +284,14 @@ already-complete release:
   sidecar, then re-run this job; generation is deterministic from the tagged
   script plus those sidecars, and every upload uses `--clobber`. Do not trigger
   a new release merely to repair these distributor inputs.
+- **Failure in `publish-package-repos`**: the release is complete and green —
+  this job is `continue-on-error` and only the tap/bucket is behind. Its
+  "Report publication outcome" step names the channel and target repository
+  that failed. Fix the cause (create the missing repository, refresh the token,
+  allow the release identity to push to a protected branch), then re-run just
+  this job: it re-downloads the same published files and pushes nothing if the
+  target already holds them. Copying the file in by hand achieves the same
+  thing. Never trigger a new release to repair a tap.
 
 ## GitHub App bypass for a protected `main`
 

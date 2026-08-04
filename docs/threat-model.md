@@ -187,7 +187,35 @@ code/docs it is implemented and described in.
   Released artifacts carry a SHA-256 checksum and a signed
   `actions/attest-build-provenance` attestation
   (`.github/workflows/release.yml`) a consumer can verify against the exact
-  commit and workflow that produced them. A dedicated fuzz tier
+  commit and workflow that produced them.
+  One job in that workflow, `publish-package-repos`, is the only step anywhere
+  in this project that writes **outside this repository**: it pushes the
+  generated Homebrew formula — and, independently, the Scoop manifest — into
+  the tap/bucket repositories this project owns, which is what would make a
+  `brew install`/`scoop install` work at all. Several properties bound it. It
+  does nothing unless an operator has set that channel's token secret
+  (`HOMEBREW_TAP_TOKEN` / `SCOOP_BUCKET_TOKEN`) — with none set it skips with
+  a notice rather than failing, and each channel is enabled on its own. Its
+  own `GITHUB_TOKEN` is narrowed to `contents: read` (a job-level
+  `permissions:` block replaces the workflow's top-level `contents: write`
+  rather than merging with it), so it cannot write to *this* repository, and
+  every write it does perform is authenticated by the channel's own token
+  instead. That token is required to be scoped to the tap/bucket alone (a
+  fine-grained PAT holding `Contents: read and write` on it, or a GitHub App
+  credential); the built-in `GITHUB_TOKEN` cannot stand in, as it reaches no
+  other repository. The operator-set target variables
+  (`HOMEBREW_TAP_REPOSITORY` / `SCOOP_BUCKET_REPOSITORY`) are accepted only in
+  an exact, whole-string-anchored `owner/name` shape before they can reach a
+  clone URL or the step's own outputs. The job adds no third-party action, so
+  it widens no pinning surface, and it runs after crates.io, the tag, the
+  Release, and every asset upload under `continue-on-error: true`, so it can
+  neither gate a release nor alter one that already happened (see
+  [`docs/release-process.md`](release-process.md), "What the
+  `publish-package-repos` job does"). Neither channel is configured for this
+  repository today — no tap or bucket exists, so nothing has been published
+  through it yet ([`docs/installation.md`](installation.md), "Publishing to a
+  tap or bucket"); what this arrangement accepts once one *is* configured is
+  stated under "What is not closed" below. A dedicated fuzz tier
   (`fuzz/`) exercises **four** of the parsers that sit closest to the untrusted
   inputs above, under `cargo-fuzz`: the registry's byte-to-record parser, the
   control-plane's request/reply decoders, the CLI's own value parsers, and
@@ -225,6 +253,34 @@ explicitly **out of scope** for this project's own security mechanisms:
   stable/MSRV toolchain; a compromise of that action's owner or repository
   could change what CI or a release build runs, and the project accepts that
   residual risk rather than freezing the toolchain version.
+- **A package channel published from this repository's own secrets.**
+  Automatic publication to a Homebrew tap or Scoop bucket requires a standing
+  credential that can push to that *other* repository to sit in **this**
+  repository's Actions secrets for as long as the channel is enabled. So an
+  enabled channel is only as isolated as this repository's secrets and the set
+  of actors who can run its release workflow: whoever can read that secret, or
+  dispatch a release carrying it, can put content into the repository users
+  install from. The scoping above bounds the blast radius — the token reaches
+  the tap/bucket and nothing else, and the job holds no write access to this
+  repository — but a cross-repository write capability is what the automation
+  fundamentally is, and the project accepts that residual risk as the price of
+  a channel that publishes itself instead of by hand. The alternative it
+  rejects is not "a safer token"; it is publishing every release manually.
+- **Build-provenance verification of a package installed from that channel.**
+  The formula/manifest such a channel serves is **not** covered by the
+  attestation described above. Homebrew and Scoop trust a formula because of
+  the repository it came from; `gh attestation verify`, which a consumer can
+  run against a release archive downloaded directly, has no place in the
+  `brew install` path, and neither the formula nor the manifest bundle is
+  itself attested. The only thing tying an install through that channel to the
+  attested release artifacts is the per-archive `sha256` the generated
+  formula/manifest pins, taken from the Release's own `.sha256` sidecars
+  (`scripts/generate_package_manifests.py`) — a formula pushed with some other
+  URL/digest pair would install whatever it names. A consumer who needs
+  provenance should run that verification against a downloaded archive itself
+  (see [`README.md`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/README.md), "Prebuilt binaries"), rather than
+  infer it from the channel. Neither channel is configured today, so this is a
+  property of the mechanism being accepted in advance, not a live exposure.
 - **Denial of service through the operating system itself.** Beyond the
   opt-in, best-effort `--max-memory`/`--max-processes`/`--cpu-quota` caps on
   the child's own process tree (platform-limited: real Windows Job Object or
