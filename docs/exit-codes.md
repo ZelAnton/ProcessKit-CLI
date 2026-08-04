@@ -54,7 +54,7 @@ failure is not mistaken for a child result.
 Codes `115`–`119` are **reserved** for future runner-own conditions. `--help`
 and `--version` are not failures: they print to stdout and exit `0`.
 
-A code is deliberately coarse — `CONTROL` (103) alone covers six different
+A code is deliberately coarse — `CONTROL` (103) alone covers seven different
 situations. A consumer that needs the finer verdict without parsing the stderr
 prose asks for it with the global `--error-format json`, which prints one bounded
 JSON object naming this same code plus a more specific `kind`; see
@@ -245,6 +245,19 @@ is *not* a reserved-band code — including a `0` — is likewise reported as `S
 never relayed, because no run path can exit successfully without having written
 `run_started` first.
 
+**The code is relayed; the machine-readable `kind` is not borrowed.** Under
+`--error-format json` (below), a relayed code that `run` itself mints reports the kind
+the foreground failure would have reported — `spawn_error`, `container_error`, `setup`,
+and so on. A reserved-band code `run` *cannot* mint reports `kind: "unknown"` instead:
+that is `PROBE_INCOMPATIBLE` (110), `WAIT_TIMEOUT` (112), and `EVENTS_INVALID` (114),
+which only `probe`, `wait`, and `events --validate` produce, plus any number no build
+assigns yet. The respawned copy can be a *different build* — the binary on disk may have
+been replaced between the spawn and the exec — so reading its number through this
+build's table would invent a verdict: a relayed `112` would say `wait_timeout`, the one
+kind that reports `retryable: true` and means "the run is still going, wait again",
+about a run that never started. The number itself still reaches the caller unchanged;
+only the claim about its meaning is withheld.
+
 **What the events file holds after a failed start.** Whatever the detached copy managed
 to write, and nothing invented on its behalf. A copy that started and *then* failed
 records the failure itself — a `spawn_failed`/`container_failed` and a terminal
@@ -278,11 +291,16 @@ number. A child's own code is never lost or aliased, because the runner's failur
 are additionally recorded out of band.
 
 There is a second way the band is not enough, and it applies to the commands that
-never start a run at all: a code is **coarse**. `CONTROL` (103) alone covers six
+never start a run at all: a code is **coarse**. `CONTROL` (103) alone covers seven
 genuinely different situations — no such run id, a confirmed-stale entry, an
-unprobeable one, an ambiguous id, a runner that could not be reached, and a reply
-whose version this build refuses — and `inspect`/`cancel`/`kill`/`wait`/`events`
-have no event stream of their own to disambiguate them in. Historically the only
+unprobeable one, an ambiguous id, a runner that could not be reached, one that was
+reached but let a bounded window elapse, and a reply whose version this build
+refuses — and `inspect`/`cancel`/`kill`/`wait`/`events`
+have no event stream of their own to disambiguate them in. (Those seven are the ones
+that exist *to split* `103`, and the seven the `kind` table below lists against it.
+An unreadable registry can arrive under the same code as well, reported as
+`registry` — the one kind published under two codes, since it is *why* a by-`run-id`
+client could not resolve its target.) Historically the only
 finer signal was the English sentence on stderr. The next section is the machine-readable
 answer to that.
 
@@ -351,9 +369,10 @@ either: every assigned code has at least one kind of its own, so branching on
 | `control_cancel` | 108 | A control-plane `cancel` ended the run. |
 | `control_kill` | 109 | A control-plane `kill` ended the run. |
 | `output_overflow` | 113 | A capture stream exceeded `--capture-max-bytes` under `--capture-overflow cancel`. |
-| `unknown` | any | A reserved-band code this build has no name for. Read `code`. Reachable only when a `run --detach` relays the code of a respawned copy that turned out to be a different build. |
+| `unknown` | any | A reserved-band code this build will not name here. Read `code`. Reachable only when a `run --detach` relays the code of a respawned copy that turned out to be a different build, and covering both shapes of that: a code no build assigns yet (the retired `105`, the reserved `115`–`119`), and a code this build assigns to a *different* subcommand (`110`, `112`, `114` — minted only by `probe`, `wait`, and `events --validate`, never by `run`), which the relay refuses to read as a verdict about a run. |
 
-The nine values in that table's `run` block (`usage` aside) are **not a second
+The nine `run`-family values in that table (`usage` is not one of them: a
+`run --detach` can relay it, but it names no run *ending*) are **not a second
 vocabulary**: `spawn_error`, `container_error`, `timeout`, `cancelled`,
 `control_cancel`, `control_kill`, `output_overflow`, `setup`, and `internal` are
 spelled exactly as the terminal `runner_exit` event's `source` spells the same

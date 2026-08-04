@@ -42,11 +42,16 @@
 //! is the failure-side counterpart to all of them: under the global
 //! `--error-format json` it renders whatever any of these commands failed with as
 //! one bounded, versioned JSON object on stderr, so an adapter branches on a
-//! published `kind` instead of on prose. The compatibility
-//! surface — CLI flags (see [`cli`]), the exit-code
-//! contract (see [`exit`] and `docs/exit-codes.md`), the JSONL `schema_version`
-//! (see [`events`] and `docs/schema.md`), and the machine-error envelope's own
-//! `error_version` (see [`error_envelope`] and `docs/exit-codes.md`) — is fixed.
+//! published `kind` instead of on prose. It adds no fourth compatibility surface:
+//! like every other machine-readable output it rides on the flag that turns it on
+//! and on the reserved code it carries, and pins its own shape in the payload with
+//! `error_version` — the same relationship `probe --json`'s `probe_version` and
+//! `inspect`'s `snapshot_version` have to that surface (see `docs/compatibility.md`,
+//! "Machine-output schemas"). The compatibility
+//! surface itself — CLI flags (see [`cli`]), the exit-code
+//! contract (see [`exit`] and `docs/exit-codes.md`), and the JSONL `schema_version`
+//! (see [`events`] and `docs/schema.md`) — is fixed, and is the same three-item list
+//! this page opens with.
 
 #[doc(hidden)]
 pub mod capture;

@@ -35,7 +35,7 @@ Responsibilities, in the order data flows through a `run`:
 | [`src/events_cmd/`](https://github.com/ZelAnton/ProcessKit-CLI/tree/main/src/events_cmd) | The `events` subcommand: the read-back counterpart to `src/events.rs`'s emitter. Resolves a stream by `--run-id` through `Registry::entries` (or takes `--file`), hands out only complete lines as the file grows, and renders them (`render.rs`, through `src/text.rs`'s terminal barrier), passes them through verbatim (`--json`), or checks them against the embedded schema document (`--validate`: `validate.rs` runs the pass and owns the exit verdict, `schema.rs` interprets the document over the keyword subset it uses — refusing to run on anything it does not implement rather than skipping it — and `pattern.rs` is the tiny anchored matcher its `pattern` keywords need; `tests/events.rs` holds that checker's verdict against the `jsonschema` dev-dependency's, so the binary links no JSON Schema engine of its own). Read-only in the same sense `list`/`wait` are: no control transport, no mutation. |
 | [`src/probe.rs`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/src/probe.rs) | The side-effect-free `probe` subcommand: reports (and, with `--require-*`, verifies) this binary's version/`schema_version`/exit-code band/CLI surface as one JSON line. |
 | [`src/exit.rs`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/src/exit.rs) | The reserved runner-own exit-code band (`100`–`119`) constants — the exit-code half of the compatibility surface (see [`docs/exit-codes.md`](exit-codes.md)). |
-| [`src/error_envelope.rs`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/src/error_envelope.rs) | The machine-error half of that same surface: the versioned, bounded JSON object the global `--error-format json` prints on stderr for any post-parse failure, and the `ErrorKind` taxonomy behind it — a finer axis over `src/exit.rs`'s codes (it splits `CONTROL` six ways and `SETUP` two), never a competing set of them. Shared by `src/main.rs`'s `report_result` and `run::execute`, so the two cannot drift; the `run`-family kinds reuse `runner_exit.source`'s own spellings rather than forking that vocabulary (see [`docs/exit-codes.md`](exit-codes.md), "Machine-readable failures"). |
+| [`src/error_envelope.rs`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/src/error_envelope.rs) | The machine-readable rendering of those same codes: the versioned, bounded JSON object the global `--error-format json` prints on stderr for any post-parse failure, and the `ErrorKind` taxonomy behind it — a finer axis over `src/exit.rs`'s codes (it splits `CONTROL` seven ways and `SETUP` two), never a competing set of them. Not a compatibility surface of its own: it rides on the flag that turns it on and on the code it carries, and pins its own shape in the payload with `error_version`, exactly as the other machine-readable outputs do (see [`docs/compatibility.md`](compatibility.md), "Machine-output schemas"). Shared by `src/main.rs`'s `report_result` and `run::execute`, so the two cannot drift; the `run`-family kinds reuse `runner_exit.source`'s own spellings rather than forking that vocabulary (see [`docs/exit-codes.md`](exit-codes.md), "Machine-readable failures"). |
 
 ## Target structure: library and binary
 
@@ -76,10 +76,13 @@ Because the crate is published to crates.io, the library surface is deliberately
 **not** a stable public Rust API: every module is `#[doc(hidden)]`, the crate-root
 rustdoc says so in as many words, and no item carries a semver guarantee. The only
 supported compatibility surface stays the *binary's* contract — the CLI flags
-(`src/cli/`), the reserved exit-code band and the `--error-format json` envelope
-built over it (`src/exit.rs`, `src/error_envelope.rs`,
+(`src/cli/`), the reserved exit-code band (`src/exit.rs`,
 [`docs/exit-codes.md`](exit-codes.md)), and the JSONL `schema_version`
-(`src/events.rs`, [`docs/schema.md`](schema.md)) — exactly as before this split.
+(`src/events.rs`, [`docs/schema.md`](schema.md)) — exactly as before this split. The
+`--error-format json` envelope (`src/error_envelope.rs`) adds no fourth item to that
+list: it is a machine-readable rendering built *over* the first two, versioned in its
+own payload by `error_version` like the other machine-output schemas (see
+[`docs/compatibility.md`](compatibility.md), "Machine-output schemas").
 This document records only the target structure; the fuzz and benchmark tiers
 themselves (T-186, T-187) are documented in `CONTRIBUTING.md` ("Fuzzing") and
 `README.md` ("Benchmarks") respectively.

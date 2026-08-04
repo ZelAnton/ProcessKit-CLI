@@ -18,13 +18,17 @@ to a dated version section.
   JSON object on **stderr** instead of the `processkit-cli: <message>` prose —
   `error_version`, `code`, `kind`, `operation`, `run_id`, `retryable`, `message` —
   so an adapter branches on a published `kind` rather than on English. The point is
-  that an exit code is coarse: `CONTROL` (103) alone covers six situations, and
+  that an exit code is coarse: `CONTROL` (103) alone covers seven situations, and
   `kind` splits it into `not_found` / `stale` / `unprobed` / `ambiguous_run_id` /
   `control_unreachable` / `ipc_deadline` / `incompatible_contract` (and splits
   `SETUP` 111 into `registry` versus `setup`). **No exit code was minted or
   changed**: the taxonomy is a finer axis over the existing band, and for a failing
   `run` its values are the terminal `runner_exit` event's own `source` spellings
-  rather than a second vocabulary for the same endings. `message` is deliberately
+  rather than a second vocabulary for the same endings. A `run --detach` still relays
+  the reserved *code* of the copy it respawned, but not a meaning for it: a code
+  `run` itself never mints (`110`/`112`/`114`, or one no build assigns yet) reports
+  `kind: "unknown"` rather than borrowing another subcommand's verdict, since that
+  copy can be a different build. `message` is deliberately
   *not* part of the contract and may be reworded in any release. Invariants: stdout
   is never touched (a command that prints a report and then fails, like
   `probe --json` exiting 110, still prints exactly what it always did), the default

@@ -6,6 +6,19 @@ ProcessKit CLI has three public compatibility surfaces:
 2. the reserved runner exit-code band;
 3. JSONL `schema_version`.
 
+**Three, and only three — a versioned payload is not a fourth surface.** Several
+machine-readable outputs carry a version field of their own: `probe --json`'s
+`probe_version`, `inspect`'s `snapshot_version`, and the `--error-format json`
+failure envelope's `error_version`. Each of those *rides on* the list above — on the
+command and flag that produce it (surface 1), and, for the failure envelope, on the
+reserved code it reports (surface 2) — and pins its own shape inside the payload
+rather than adding a fourth thing to pin before launching. The registry record's
+`registry_version` is not on the list either, for a different reason: the per-user
+registry is a private contract between this binary and itself, not something a caller
+reads off an invocation (see [`docs/registry.md`](registry.md)). Which outputs carry a
+version field, and why the rest deliberately do not, is "Machine-output schemas"
+below.
+
 The human CLI surface is guarded by through-binary golden snapshots for the root
 help and every public subcommand in `fixtures/cli-help/`. An intentional flag,
 value-name, default, or help change must be regenerated with
@@ -13,9 +26,9 @@ value-name, default, or help change must be regenerated with
 The test normalizes only the Windows `.exe` suffix and line endings; all contract
 text and ordering remain exact.
 
-Breaking any of them requires a major release. An adapter should verify the
-exact pieces it uses before launching a payload rather than discovering an
-incompatible binary after work has started.
+Breaking any of those three surfaces requires a major release. An adapter should
+verify the exact pieces it uses before launching a payload rather than discovering
+an incompatible binary after work has started.
 
 ## Fail-closed preflight
 

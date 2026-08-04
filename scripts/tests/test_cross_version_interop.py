@@ -347,8 +347,9 @@ class VersionPinTests(unittest.TestCase):
         self.assertFalse(interop.version_pin({"enum": [1, 2]}).admits(True))
 
     def test_a_field_that_pins_nothing_is_reported_as_unpinned(self):
-        # The one case that really does mean the two-of-six scope changed: the node
-        # is gone, or it no longer constrains the field to a set of versions.
+        # The one case that really does mean the checked versioned-output scope
+        # changed: the node is gone, or it no longer constrains the field to a set
+        # of versions.
         self.assertIsNone(interop.version_pin(None))
         self.assertIsNone(interop.version_pin({"type": "integer"}))
         self.assertIsNone(interop.version_pin({"enum": []}))
@@ -420,8 +421,11 @@ class PublishedFixtureTests(unittest.TestCase):
         return json.loads(next(line for line in lines if line.strip()))
 
     def test_the_versioned_output_pins_still_resolve_in_whichever_form(self):
-        # docs/compatibility.md pins exactly two of the six published CLI-output
-        # families on a version field of their own. If a document moves that field,
+        # docs/compatibility.md pins three of the seven published CLI-output families
+        # on a version field of their own; this lane compares a released binary, so
+        # it checks the two of them a released binary emits (the `--error-format
+        # json` envelope is new and unreleased — see `VERSIONED_CLI_OUTPUTS`).
+        # If a document moves that field,
         # the scheduled lane must not quietly stop checking it. The *form* of the
         # pin deliberately differs between the two documents (`const` for probe, an
         # enumerated range for inspect), so what has to resolve is a usable pin, not

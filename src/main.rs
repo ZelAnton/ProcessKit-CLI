@@ -5,9 +5,11 @@
 //! subcommand into that library. Keeping the binary thin lets the runner's
 //! internals be exercised directly by the crate's unit/property/fuzz/bench tiers
 //! through the library target, while the shipped binary — its CLI flags, exit
-//! codes, JSONL `schema_version`, and the `--error-format json` envelope's
-//! `error_version` — remains the only supported compatibility
-//! surface. The library is explicitly **not** a stable public Rust API; see the
+//! codes, and JSONL `schema_version` — remains the only supported compatibility
+//! surface. (The `--error-format json` envelope is not a fourth: it rides on that
+//! flag and on the reserved code it carries, pinning its own shape in the payload
+//! with `error_version` — see `docs/compatibility.md`, "Machine-output schemas".)
+//! The library is explicitly **not** a stable public Rust API; see the
 //! library crate's own docs (`src/lib.rs`) for that disclaimer and the module map.
 
 use std::process::ExitCode;

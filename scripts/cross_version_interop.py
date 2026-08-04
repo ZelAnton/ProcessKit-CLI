@@ -93,12 +93,17 @@ SCHEMA_LIST_VALUED = ("oneOf", "anyOf", "allOf", "prefixItems")
 SCHEMA_MAP_VALUED = ("properties", "patternProperties", "$defs", "definitions",
                      "dependentSchemas")
 
-# `docs/compatibility.md`, "Machine-output schemas": of the six published
-# `fixtures/schema/cli/` families, exactly TWO carry a version field of their own
-# — `probe --json` (`probe_version`) and `inspect --json` (`snapshot_version`).
-# The other four (`list`, `control-ack`, `prune`, `wait`) deliberately do not and
-# ride on the CLI surface instead. Keep that 2-of-6 scope explicit here: it must
-# not be generalised in either direction.
+# `docs/compatibility.md`, "Machine-output schemas": of the seven published
+# `fixtures/schema/cli/` families, THREE carry a version field of their own —
+# `probe --json` (`probe_version`), `inspect --json` (`snapshot_version`), and the
+# `--error-format json` failure envelope (`error_version`). The other four (`list`,
+# `control-ack`, `prune`, `wait`) deliberately do not and ride on the CLI surface
+# instead. This lane compares a *released* binary against the current documents, so
+# it checks the two of those three a released binary can actually be compared on:
+# the envelope is new in the current release and no published binary emits it yet,
+# leaving nothing on the other side of the comparison. Add it here the first time a
+# release ships `--error-format`. Keep that scope explicit either way: it must not
+# be generalised in either direction.
 #
 # Each entry addresses the version field's own schema NODE, not one pinning
 # keyword inside it, because the two documents pin in two deliberately different
@@ -1408,13 +1413,12 @@ def scenario_machine_output_schemas(ctx: Context, scenario: Scenario) -> None:
             # Reserved for the field genuinely going away: the node is absent, or
             # it constrains `field_name` to something that is not a version at all.
             # A pin that merely changed *form* is followed by `version_pin`, not
-            # reported here — the 2-of-6 scope is unchanged when that happens.
+            # reported here — the checked scope is unchanged when that happens.
             scenario.fail(
                 f"fixtures/schema/cli/{family}.schema.json no longer pins"
                 f" `{field_name}` at `{pointer}` — that node is absent or carries"
-                " neither a `const` nor an `enum` of versions; the two-of-six"
-                " versioned-output scope in docs/compatibility.md changed and this"
-                " driver must follow"
+                " neither a `const` nor an `enum` of versions; the versioned-output"
+                " scope in docs/compatibility.md changed and this driver must follow"
             )
         elif value is None:
             scenario.note(f"{field_name}: not observable from the released binary")

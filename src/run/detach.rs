@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 
 use crate::cli::RunArgs;
 use crate::duration_fmt::format_duration;
+use crate::error_envelope::ErrorKind;
 use crate::events::{self, Emitter};
 use crate::exit::{self, RunnerError};
 
@@ -429,6 +430,22 @@ fn run_started_recorded(jsonl: &Path, run_id: &str) -> bool {
 /// exit without having written `run_started` first, so such a status is not a run
 /// result to relay but an unexplained death of the runner — and relaying `0` would
 /// report a start that provably did not happen.
+///
+/// **The machine-readable `kind` is *not* forwarded on the same terms.** The code is
+/// a number produced by a *different process*, and — as [`spawn_detached`] already
+/// acknowledges — possibly by a different build, if the binary on disk was replaced
+/// between this process spawning the copy and the copy reaching `exec`. Reading such
+/// a number through this build's own table would let a code no `run` can mint arrive
+/// dressed as a real verdict about this run (a relayed `112` would claim
+/// `kind: "wait_timeout"`, `retryable: true` — "the run is still going, wait again" —
+/// for a run that never started, and would contradict
+/// `fixtures/schema/cli/error.schema.json`'s own `wait_timeout ⇒ operation: "wait"`
+/// conditional, letting this binary print an object its published schema rejects).
+/// [`relayed_kind`] therefore names only the codes `run` itself produces and leaves
+/// every other reserved-band number as [`ErrorKind::Unknown`], which exists for
+/// exactly this "read `code`, not `kind`" case. The exit code is still forwarded
+/// verbatim either way: it is the caller's contract, and unlike the kind it claims
+/// nothing beyond the number the copy returned.
 fn detached_start_failure(status: ExitStatus, run_id: &str, jsonl: &Path) -> RunnerError {
     let band = exit::RUNNER_RANGE_START..=exit::RUNNER_RANGE_END;
     let reserved = status
@@ -436,14 +453,28 @@ fn detached_start_failure(status: ExitStatus, run_id: &str, jsonl: &Path) -> Run
         .and_then(|code| u8::try_from(code).ok())
         .filter(|code| band.contains(code));
     match reserved {
-        Some(code) => RunnerError::new(
-            code,
-            format!(
-                "run `{run_id}` did not start: the detached runner failed with the same code it \
-                 would have reported in the foreground ({code}); see `{}`",
-                jsonl.display()
-            ),
-        ),
+        Some(code) => {
+            let kind = relayed_kind(code);
+            let message = if kind == ErrorKind::Unknown {
+                // Deliberately not "the same code it would have reported in the
+                // foreground": this build's `run` reports no such code, so saying so
+                // would be the same borrowed claim the kind refuses to make.
+                format!(
+                    "run `{run_id}` did not start: the detached runner exited with the \
+                     reserved-band code {code}, which this build's own `run` never reports — the \
+                     binary on disk may have been replaced between the spawn and the exec; see \
+                     `{}`",
+                    jsonl.display()
+                )
+            } else {
+                format!(
+                    "run `{run_id}` did not start: the detached runner failed with the same code \
+                     it would have reported in the foreground ({code}); see `{}`",
+                    jsonl.display()
+                )
+            };
+            RunnerError::new(code, message).with_kind(kind)
+        }
         None => RunnerError::new(
             exit::SETUP,
             format!(
@@ -452,6 +483,44 @@ fn detached_start_failure(status: ExitStatus, run_id: &str, jsonl: &Path) -> Run
                 jsonl.display()
             ),
         ),
+    }
+}
+
+/// The [`ErrorKind`] a relayed reserved-band code is allowed to carry.
+///
+/// A relayed code is only as trustworthy as the process that produced it, and that
+/// process is not this one. The codes below are the ones **`run` itself mints** —
+/// [`exit::SPAWN`], [`exit::BACKEND`], [`exit::SETUP`], [`exit::INTERNAL`] and the
+/// runner-imposed endings ([`exit::TIMEOUT`], [`exit::CANCELLED`],
+/// [`exit::CONTROL_CANCELLED`], [`exit::CONTROL_KILLED`], [`exit::OUTPUT_OVERFLOW`]),
+/// plus [`exit::USAGE`], which a respawned copy reports when it will not parse the
+/// argv this process handed it. For those, this build's own table names the same
+/// failure the foreground path would have named, so [`ErrorKind::for_code`] is
+/// honest. (The endings imply a `run_started` was already written and so are not
+/// expected on this path at all; they are listed because they are `run`'s own codes,
+/// not because relaying one is a normal outcome.)
+///
+/// Every **other** reserved-band number gets [`ErrorKind::Unknown`], and there are
+/// two ways to be one: a code no build assigns yet (`105`, `115`-`119` — already
+/// [`ErrorKind::for_code`]'s answer), and a code this build assigns to a *different
+/// subcommand* — [`exit::PROBE_INCOMPATIBLE`] (110), [`exit::WAIT_TIMEOUT`] (112),
+/// [`exit::EVENTS_INVALID`] (114), minted only by `probe`/`wait`/`events --validate`
+/// and unreachable from `run`. Naming the second group from this build's table would
+/// invent a verdict about a run out of a foreign build's number; naming nothing is
+/// the honest answer, and the numeric `code` still reaches the caller untouched.
+fn relayed_kind(code: u8) -> ErrorKind {
+    match code {
+        exit::USAGE
+        | exit::SPAWN
+        | exit::BACKEND
+        | exit::INTERNAL
+        | exit::TIMEOUT
+        | exit::CANCELLED
+        | exit::CONTROL_CANCELLED
+        | exit::CONTROL_KILLED
+        | exit::OUTPUT_OVERFLOW
+        | exit::SETUP => ErrorKind::for_code(code),
+        _ => ErrorKind::Unknown,
     }
 }
 
@@ -639,7 +708,9 @@ mod tests {
 
     /// A detached copy that died before reporting a started run surfaces **its own**
     /// reserved-band code, so `run --detach`'s start failures read exactly like
-    /// `run`'s (K-047: reuse the existing code, do not mint a new one).
+    /// `run`'s (K-047: reuse the existing code, do not mint a new one) — and, for a
+    /// code `run` genuinely mints, the same machine-readable `kind` the foreground
+    /// path would have reported.
     #[test]
     fn a_failed_detached_start_forwards_the_runners_own_reserved_code() {
         let jsonl = Path::new("events.jsonl");
@@ -656,11 +727,94 @@ mod tests {
                 code,
                 "a detached start failure keeps the code the run itself reported"
             );
+            assert_eq!(
+                err.kind(),
+                ErrorKind::for_code(code),
+                "a code `run` itself mints keeps the kind the foreground path would report"
+            );
             assert!(
                 err.to_string().contains("run-9"),
                 "the message names the run: {err}"
             );
         }
+    }
+
+    /// A relayed code that **`run` cannot produce** is reported as `unknown`, never
+    /// as the kind this build happens to give that number for some other subcommand.
+    ///
+    /// The relayed status comes from a re-exec'd copy that can be a different build
+    /// (see `spawn_detached`), so borrowing the meaning would (a) state a materially
+    /// false verdict — a relayed `112` would claim `wait_timeout`, the one
+    /// `retryable: true` kind, meaning "the run is still going, wait again", for a run
+    /// that never started — and (b) print an object
+    /// `fixtures/schema/cli/error.schema.json` itself rejects, since it requires
+    /// `wait_timeout ⇒ operation: "wait"` while this failure's operation is `run`.
+    /// The number is still forwarded: only the *claim about its meaning* is withheld.
+    #[test]
+    fn a_relayed_code_run_cannot_mint_is_named_unknown_rather_than_borrowed() {
+        let jsonl = Path::new("events.jsonl");
+        for code in [
+            exit::PROBE_INCOMPATIBLE,
+            exit::WAIT_TIMEOUT,
+            exit::EVENTS_INVALID,
+            exit::NOT_IMPLEMENTED,
+            exit::RUNNER_RANGE_END,
+        ] {
+            let err = detached_start_failure(exited_with(i32::from(code)), "run-9", jsonl);
+            assert_eq!(
+                err.code(),
+                code,
+                "the relayed code itself is still forwarded verbatim"
+            );
+            assert_eq!(
+                err.kind(),
+                ErrorKind::Unknown,
+                "code {code} is not one `run` mints, so this build must not name it"
+            );
+            assert!(
+                err.to_string().contains("never reports"),
+                "the message says the code is not this build's own: {err}"
+            );
+        }
+    }
+
+    /// The two halves of that rule are exhaustive over the reserved band and agree
+    /// with `run`'s own code set: every band member is either a code `run` mints
+    /// (named after the foreground path) or `unknown`, and nothing else.
+    #[test]
+    fn every_reserved_code_is_either_runs_own_or_unknown() {
+        let runs_own = [
+            exit::USAGE,
+            exit::SPAWN,
+            exit::BACKEND,
+            exit::INTERNAL,
+            exit::TIMEOUT,
+            exit::CANCELLED,
+            exit::CONTROL_CANCELLED,
+            exit::CONTROL_KILLED,
+            exit::OUTPUT_OVERFLOW,
+            exit::SETUP,
+        ];
+        for code in exit::RUNNER_RANGE_START..=exit::RUNNER_RANGE_END {
+            let kind = relayed_kind(code);
+            if runs_own.contains(&code) {
+                assert_eq!(
+                    kind,
+                    ErrorKind::for_code(code),
+                    "a code `run` mints keeps its own name: {code}"
+                );
+            } else {
+                assert_eq!(
+                    kind,
+                    ErrorKind::Unknown,
+                    "a code `run` cannot mint is unnamed here: {code}"
+                );
+            }
+        }
+        // `CONTROL` (103) is the one assigned code deliberately absent from the set
+        // above: `run` never speaks to a control plane as a client, so a relayed 103
+        // would be a foreign build's verdict about someone else's target.
+        assert_eq!(relayed_kind(exit::CONTROL), ErrorKind::Unknown);
     }
 
     /// A status that is *not* a reserved-band code is not relayed as one — including

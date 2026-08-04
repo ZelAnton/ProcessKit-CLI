@@ -280,7 +280,7 @@ subcommand and every subcommand honors it. `--error-format json` replaces the
 bounded, versioned JSON object — `{"error_version":1,"code":103,"kind":"stale",
 "operation":"inspect","run_id":"build-42","retryable":false,"message":"…"}` — so an
 adapter can branch on a stable `kind` instead of parsing English (a single `103`
-covers six different situations). It is opt-in and stdout-safe: without it stderr
+covers seven different situations). It is opt-in and stdout-safe: without it stderr
 is byte-for-byte what it always was, and with it stdout is untouched, so it can be
 left on for every invocation. clap's own parse-time usage errors stay
 human-readable in v1. See [the exit-code contract](docs/exit-codes.md), and
@@ -647,7 +647,7 @@ from the run's own `TIMEOUT` (`106`). `events --validate` adds `EVENTS_INVALID`
 (`114`) in the same spirit — a verdict about a *document*, not about any run: the
 stream it checked does not conform to this binary's event schema.
 
-A code is necessarily coarse — `CONTROL` (`103`) alone covers six different
+A code is necessarily coarse — `CONTROL` (`103`) alone covers seven different
 situations, from a stale registry entry to an ambiguous run id. A consumer that
 needs the finer verdict without parsing prose adds the global `--error-format json`,
 which prints one bounded JSON object on stderr naming that same code plus a more

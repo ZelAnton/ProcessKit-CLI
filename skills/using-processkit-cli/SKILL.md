@@ -61,7 +61,7 @@ end the run.
 When a command *fails*, add the global `--error-format json` (it parses before or
 after the subcommand) instead of reading the stderr prose: the failure prints one
 JSON object on stderr with a stable `code`, `kind`, `operation`, `run_id`, and
-`retryable`. This is how to tell the six situations behind a single `CONTROL (103)`
+`retryable`. This is how to tell the seven situations behind a single `CONTROL (103)`
 apart — `stale` (the runner is gone) from `unprobed` (nothing established, worth one
 retry) from `ambiguous_run_id` (fix the id) from `not_found`. It never touches
 stdout, so it is safe to leave on for every invocation; `message` is free text and

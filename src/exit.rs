@@ -16,7 +16,9 @@
 //! that cannot read the event stream.
 //!
 //! A shell has one byte to read, so these codes are necessarily coarse: [`CONTROL`]
-//! alone covers six genuinely different situations. A caller that wants the finer
+//! alone covers seven genuinely different situations — a target that is missing,
+//! confirmed stale, unprobeable, ambiguous, unreachable, too slow within a bounded
+//! window, or speaking a version this build refuses. A caller that wants the finer
 //! verdict without parsing prose asks for it explicitly with `--error-format json`,
 //! which prints one bounded JSON object naming both this code and an
 //! [`ErrorKind`](crate::error_envelope::ErrorKind) — a *finer axis over these very

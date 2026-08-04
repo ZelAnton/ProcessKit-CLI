@@ -533,8 +533,11 @@ The `kind` column is noted per bullet; §7 has the full contract.
 ## 7. Machine-readable failures: `--error-format json`
 
 Everything in §6 is a real distinction the CLI already makes — but by default an
-adapter can only read it as English on stderr, because the exit code is coarse
-(`CONTROL` (103) covers six of those bullets at once). The global, opt-in
+adapter can only read it as English on stderr, because the exit code is coarse: one
+`CONTROL` (103) covers five of those bullets at once — seven `kind` values in all,
+since the "died mid-conversation" bullet is two of them (`control_unreachable` and
+`ipc_deadline`) and `not_found`, a run id the registry names nowhere, gets no bullet
+of its own above. The global, opt-in
 `--error-format json` publishes the distinction instead:
 
 ```sh

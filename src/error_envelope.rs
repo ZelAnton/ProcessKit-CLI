@@ -1,11 +1,11 @@
 //! The machine-readable error envelope printed under `--error-format json` — the
-//! *machine-error* half of processkit-cli's compatibility surface.
+//! *machine-error* rendering of [`crate::exit`]'s codes.
 //!
 //! # What this is for
 //!
 //! Without this flag, a failed invocation gives a machine consumer exactly two
 //! things: a reserved-band exit code ([`crate::exit`]) and a line of free-text prose
-//! on stderr. The code is a coarse verdict — six genuinely different situations all
+//! on stderr. The code is a coarse verdict — seven genuinely different situations all
 //! exit [`exit::CONTROL`] (103) — and the prose is not a contract, so an adapter
 //! that must tell a stale registry entry from an unprobeable one, or an ambiguous
 //! run id from a runner that died mid-conversation, has to parse English or
@@ -32,17 +32,21 @@
 //! `kind` is the finer name of what actually happened, and it is *never coarser*
 //! than the code:
 //!
-//! - it splits [`exit::CONTROL`] (103) six ways — [`ErrorKind::NotFound`],
+//! - it splits [`exit::CONTROL`] (103) **seven** ways — [`ErrorKind::NotFound`],
 //!   [`ErrorKind::Stale`], [`ErrorKind::Unprobed`], [`ErrorKind::AmbiguousRunId`],
 //!   [`ErrorKind::ControlUnreachable`], [`ErrorKind::IpcDeadline`], and
 //!   [`ErrorKind::IncompatibleContract`] — which are exactly the distinctions
 //!   `docs/integration.md` §6 ("Typical errors") already draws in prose, and
 //!   [`crate::control`]'s `no_live_entry`/`ambiguous_run`/`refuse_snapshot_version`
-//!   already make in code;
+//!   already make in code (that count is the kinds that exist *to split* 103, which
+//!   is what `fixtures/schema/cli/error.schema.json` conditions on; the one further
+//!   kind that can arrive under 103 is [`ErrorKind::Registry`], below);
 //! - it splits [`exit::SETUP`] (111) into [`ErrorKind::Registry`] (the per-user run
 //!   registry itself could not be opened or scanned) and [`ErrorKind::Setup`]
 //!   (every other prerequisite: an unwritable output, a runtime that would not
-//!   build, a reply that would not serialize); and
+//!   build, a reply that would not serialize) — [`ErrorKind::Registry`] being the one
+//!   kind reachable under two codes, because an unreadable registry is *also* why a
+//!   by-`run-id` client reports [`exit::CONTROL`] (103); and
 //! - it never merges two codes into one kind, so a consumer that branches on `kind`
 //!   alone loses nothing the exit code would have told it.
 //!
@@ -111,6 +115,15 @@ use crate::exit::{self, RunnerError};
 /// "durable artifact / read by a party that did not invoke this binary" test the
 /// JSONL `schema_version`, the registry `registry_version`, the control-plane
 /// `snapshot_version`, and the probe report's `probe_version` all meet.
+///
+/// Carrying a version does **not** make this a fourth compatibility surface. The
+/// crate's supported surface is still the three `AGENTS.md` fixes — CLI flags, the
+/// reserved exit-code band, the JSONL `schema_version` (see [`crate`]) — and this
+/// envelope rides on the first two: the global flag that turns it on, and the code
+/// it reports. `error_version` pins its *shape* inside the payload, exactly as
+/// `probe --json`'s `probe_version` and `inspect`'s `snapshot_version` pin theirs,
+/// which is why an adapter has three things to establish before launching and not
+/// four (`docs/compatibility.md`, "Machine-output schemas").
 ///
 /// Bumped only by a **breaking** change to the object (a stable field removed or
 /// re-typed, or an existing `kind` given a different meaning). Adding a field, or
@@ -262,13 +275,29 @@ pub enum ErrorKind {
     /// read perfectly well: "it does not conform" is the answer, not a failure to
     /// produce one.
     EventsInvalid,
-    /// A reserved-band code this build has no finer name for — the forward-compatible
-    /// fallback, so the envelope can always be produced and `kind` is never absent or
-    /// invented. Reachable in one narrow situation: a `run --detach` relays the exit
-    /// code of the copy it respawned from its own path, and that copy can be a
-    /// *different build* if the binary on disk was replaced in between — one that
-    /// mints a code from the reserved range this build does not assign. Read `code`,
-    /// not `kind`, when this appears.
+    /// A reserved-band code this build will not put a finer name to — the
+    /// forward-compatible fallback, so the envelope can always be produced and `kind`
+    /// is never absent or invented. Read `code`, not `kind`, when this appears.
+    ///
+    /// Reachable in one narrow situation — a `run --detach` relays the exit code of
+    /// the copy it respawned from its own path, and that copy can be a *different
+    /// build* if the binary on disk was replaced in between (`src/run/detach.rs`,
+    /// `detached_start_failure`) — which arrives in **two** shapes, both answered
+    /// here:
+    ///
+    /// - a code **no build assigns**: the retired `105`, or the still-reserved
+    ///   `115`-`119`. Naming a number whose meaning is unassigned would be worse than
+    ///   saying so (see [`Self::for_code`]);
+    /// - a code **this build assigns to a different subcommand**: `110`
+    ///   ([`Self::ProbeIncompatible`]), `112` ([`Self::WaitTimeout`]), `114`
+    ///   ([`Self::EventsInvalid`]) — minted only by `probe`, `wait`, and
+    ///   `events --validate`, and unreachable from `run`. Reading a foreign build's
+    ///   number through this build's table would state a verdict about a run that
+    ///   nothing established: a relayed `112` would claim `wait_timeout` — the one
+    ///   retryable kind, meaning "the run is still going, wait again" — for a run that
+    ///   never started, and would contradict `error.schema.json`'s own
+    ///   `wait_timeout ⇒ operation: "wait"` conditional. The relay therefore names
+    ///   only the codes `run` itself mints and leaves the rest here.
     Unknown,
 }
 
