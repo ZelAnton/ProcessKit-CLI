@@ -280,6 +280,603 @@ fn malformed_env_file_is_a_pre_run_setup_failure() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ---------------------------------------------------------------------------
+// `--run-id-env <KEY>` (T-304): publish the run's final id into the child
+// environment.
+//
+// These fixtures use their own throwaway registry (`PROCESSKIT_CLI_REGISTRY_DIR`)
+// for the same reason the detach ones below do: the registry answer is read while
+// the run is still live, so it must not have to be told apart from a developer's
+// real runs or a concurrently running test's.
+// ---------------------------------------------------------------------------
+
+/// The destination key these scenarios inject into. Deliberately *not* set in the
+/// runner's own environment by the identity scenarios: if the injection failed, the
+/// child would observe an unset variable rather than an inherited one, so a passing
+/// assertion cannot be an accident of inheritance.
+///
+/// The precedence scenarios further below are the deliberate exception — they *do*
+/// pre-set it (to [`RUN_ID_ENV_INHERITED`]) or fill it from an `--env-file` (with
+/// [`RUN_ID_ENV_FROM_FILE`]), because `--env-clear`/`--env-remove` need something
+/// real to act on. There the same guarantee is kept by a different means: those
+/// values are distinctive, and an assertion that the child observed the *run id*
+/// fails on either of them just as it fails on an unset variable.
+const RUN_ID_ENV_KEY: &str = "PROCESSKIT_TEST_RUN_ID";
+
+/// What the precedence scenarios give [`RUN_ID_ENV_KEY`] in the runner's own
+/// environment, so the child inherits it unless a flag says otherwise.
+const RUN_ID_ENV_INHERITED: &str = "inherited-value-the-run-id-replaces";
+
+/// What an `--env-file` entry gives [`RUN_ID_ENV_KEY`] in the precedence scenarios.
+const RUN_ID_ENV_FROM_FILE: &str = "env-file-value-the-run-id-replaces";
+
+/// How long a `--run-id-env` scenario waits for something the child or the run must
+/// do on its own. Generous: it bounds a failure, never a healthy path.
+const RUN_ID_ENV_OBSERVE_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Every independently-sourced answer to "which run is this?" for one scenario.
+/// The whole point of the flag is that these cannot disagree.
+struct RunIdEvidence {
+    /// What the child process actually read out of its own environment.
+    child_observed: String,
+    /// The child's own stdout line, echoed live by the runner — the "child prints
+    /// its environment" half, kept separate from the file handshake above so a
+    /// blocked echo path cannot pass as a successful injection.
+    child_echoed: String,
+    /// `run_started.run_id` from the run's `--jsonl` stream.
+    run_started: String,
+    /// The `run_id` of the run's per-user registry record, read while it was live.
+    registry: String,
+    /// The `run_id` a control-plane `inspect` reply carries, from the live runner.
+    control_plane: String,
+}
+
+/// A child that records the value it observes for [`RUN_ID_ENV_KEY`], echoes it,
+/// and then waits for a release marker instead of exiting — so the run is still
+/// live while the registry and the control plane are asked about it.
+fn write_run_id_observer_script(dir: &Path) -> PathBuf {
+    if cfg!(windows) {
+        let path = dir.join("observe-run-id.bat");
+        // Two deliberate details. The redirection is written *before* `echo`,
+        // because in `echo %VAR%>"%FILE%"` cmd would parse a value ending in a digit
+        // as a numbered handle redirection (`… 3>file`) — and a generated run id
+        // always ends in digits. And the value is written to a temporary name that
+        // is then renamed into place, so the waiting test can never read a file that
+        // exists but is not written yet (its poll is "non-empty", and a
+        // create-then-write would let that be briefly false).
+        let body = format!(
+            "@echo off\r\n\
+             echo run-id-env:%{key}%\r\n\
+             >\"%OBSERVED%.tmp\" echo %{key}%\r\n\
+             move /y \"%OBSERVED%.tmp\" \"%OBSERVED%\" >nul\r\n\
+             :wait\r\n\
+             if exist \"%RELEASE%\" goto done\r\n\
+             ping -n 2 127.0.0.1 >nul\r\n\
+             goto wait\r\n\
+             :done\r\n",
+            key = RUN_ID_ENV_KEY
+        );
+        std::fs::write(&path, body).expect("write observe-run-id.bat");
+        path
+    } else {
+        let path = dir.join("observe-run-id.sh");
+        // Same write-then-rename handshake as the Windows fixture above, for the
+        // same reason.
+        let body = format!(
+            "#!/bin/sh\n\
+             echo \"run-id-env:${key}\"\n\
+             printf '%s' \"${key}\" > \"$OBSERVED.tmp\"\n\
+             mv \"$OBSERVED.tmp\" \"$OBSERVED\"\n\
+             while [ ! -f \"$RELEASE\" ]; do sleep 1; done\n",
+            key = RUN_ID_ENV_KEY
+        );
+        std::fs::write(&path, body).expect("write observe-run-id.sh");
+        path
+    }
+}
+
+/// Drive one `--run-id-env` scenario end to end and collect every answer about the
+/// run's identity from a different source.
+///
+/// The child's file handshake is what makes this deterministic rather than timed:
+/// the registry and control-plane queries happen after the child has provably read
+/// its environment and before it is released, so all three observations are of the
+/// same live run.
+fn observe_run_id_env(tag: &str, explicit_run_id: Option<&str>) -> RunIdEvidence {
+    let dir = scratch(tag);
+    let registry = dir.join("registry");
+    let observed = dir.join("observed.txt");
+    let release = dir.join("release.marker");
+    let script = write_run_id_observer_script(&dir);
+
+    let mut flags = vec!["--run-id-env", RUN_ID_ENV_KEY];
+    if let Some(run_id) = explicit_run_id {
+        flags.extend(["--run-id", run_id]);
+    }
+    let runner = common::command_with_flags(
+        &dir,
+        &[
+            ("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path()),
+            ("OBSERVED", observed.as_path()),
+            ("RELEASE", release.as_path()),
+        ],
+        &flags,
+        script_program(&script),
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("spawn the runner binary");
+
+    wait_until(|| file_len(&observed) > 0, RUN_ID_ENV_OBSERVE_TIMEOUT);
+    let child_observed = std::fs::read_to_string(&observed)
+        .expect("read what the child observed")
+        .trim()
+        .to_string();
+
+    // Discovery, while the run is still live: exactly one record exists in this
+    // throwaway registry, so there is no ambiguity about whose id this is.
+    let listed = cli_against(&registry, &["list", "--json"]);
+    assert_eq!(listed.status.code(), Some(0), "list succeeds");
+    let listed_out = String::from_utf8_lossy(&listed.stdout).into_owned();
+    let entries: Vec<Value> = listed_out
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "the scenario's own registry holds exactly this run: {listed_out:?}"
+    );
+    assert_eq!(
+        entries[0]["health"], "live",
+        "the record is read while the run is live, not after it: {}",
+        entries[0]
+    );
+    let registry_run_id = entries[0]["run_id"]
+        .as_str()
+        .expect("a registry record names its run")
+        .to_string();
+
+    // The control plane's own answer, from the live runner rather than from a file.
+    let inspected = cli_against(
+        &registry,
+        &["inspect", "--run-id", &registry_run_id, "--json"],
+    );
+    assert_eq!(
+        inspected.status.code(),
+        Some(0),
+        "inspect reaches the live runner; stderr: {}",
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+    let snapshot: Value = serde_json::from_slice(&inspected.stdout).expect("inspect prints JSON");
+    let control_run_id = snapshot["run_id"]
+        .as_str()
+        .expect("a control snapshot names its run")
+        .to_string();
+
+    // Let the child finish and the run close its own stream.
+    std::fs::write(&release, b"go").expect("write the release marker");
+    let out = runner
+        .wait_with_output()
+        .expect("the runner finishes once the child is released");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the released child exits cleanly; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let child_echoed = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("run-id-env:").map(str::to_string))
+        .unwrap_or_else(|| panic!("the child echoed the variable it read: {stdout:?}"));
+
+    let events = read_run_events(&dir);
+    let run_started = events
+        .iter()
+        .find(|event| event["event"] == "run_started")
+        .unwrap_or_else(|| panic!("the run reported itself started: {events:?}"))["run_id"]
+        .as_str()
+        .expect("run_started names its run")
+        .to_string();
+
+    let _ = std::fs::remove_dir_all(&dir);
+    RunIdEvidence {
+        child_observed,
+        child_echoed,
+        run_started,
+        registry: registry_run_id,
+        control_plane: control_run_id,
+    }
+}
+
+/// The headline contract of `--run-id-env` (T-304): the child sees the run's
+/// **final** id, and every other account of that id agrees with it — for an
+/// explicit `--run-id` *and* for one the runner generated.
+///
+/// The generated case is the one that could not be expressed before this flag: a
+/// caller that wanted the child to know its run id had to mint the identity itself
+/// and pass it twice (`--run-id <id> --env KEY=<id>`), which foreclosed
+/// runner-generated ids entirely, because a generated id was not knowable outside
+/// the run until the run had already started.
+#[test]
+fn run_id_env_gives_the_child_the_final_run_id_explicit_or_generated() {
+    let explicit_id = "run-id-env-explicit";
+    let explicit = observe_run_id_env("run-id-env-explicit", Some(explicit_id));
+    assert_eq!(
+        explicit.child_observed, explicit_id,
+        "an explicit --run-id reaches the child verbatim"
+    );
+    assert_run_id_evidence_agrees(&explicit);
+
+    let generated = observe_run_id_env("run-id-env-generated", None);
+    assert_run_id_evidence_agrees(&generated);
+    assert_ne!(
+        generated.child_observed, explicit_id,
+        "the generated scenario must not be reading the other scenario's id"
+    );
+    assert!(
+        generated.child_observed.starts_with("run-"),
+        "the child observed the runner's own generated id ({}), not something it \
+         was given on the command line",
+        generated.child_observed
+    );
+}
+
+/// Every source of the run's identity agreed, and none of them was empty — an
+/// all-empty set would otherwise satisfy a naive equality chain.
+fn assert_run_id_evidence_agrees(evidence: &RunIdEvidence) {
+    assert!(
+        !evidence.child_observed.is_empty(),
+        "the child observed a value at all"
+    );
+    assert_eq!(
+        evidence.child_observed, evidence.child_echoed,
+        "the value the child recorded is the value it printed"
+    );
+    assert_eq!(
+        evidence.child_observed, evidence.run_started,
+        "the child's value is the one in run_started.run_id"
+    );
+    assert_eq!(
+        evidence.child_observed, evidence.registry,
+        "the child's value is the one in the registry record"
+    );
+    assert_eq!(
+        evidence.child_observed, evidence.control_plane,
+        "the child's value is the one the control plane reports"
+    );
+}
+
+/// The flag is strictly opt-in: a run that does not ask for it injects nothing, so
+/// no child inherits a run id it never had before. Differential rather than an
+/// absence-only assertion (K-059) — the same key is proven observable in the very
+/// same shape of run above.
+#[test]
+fn without_run_id_env_no_run_id_reaches_the_child_environment() {
+    let dir = scratch("run-id-env-absent");
+    let out = run(
+        &dir,
+        &[],
+        shell_inline(if cfg!(windows) {
+            "echo run-id-env:%PROCESSKIT_TEST_RUN_ID%"
+        } else {
+            "echo \"run-id-env:$PROCESSKIT_TEST_RUN_ID\""
+        }),
+    );
+    assert_eq!(out.status.code(), Some(0), "the child exits cleanly");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let events = read_run_events(&dir);
+    let run_id = events
+        .iter()
+        .find(|event| event["event"] == "run_started")
+        .expect("the run started")["run_id"]
+        .as_str()
+        .expect("run_started names its run")
+        .to_string();
+    assert!(
+        !stdout.contains(&run_id),
+        "no run id may reach a child that never asked for one: {stdout:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The collision decision, through the shipped binary: `--run-id-env KEY` together
+/// with an explicit `--env KEY=…` is refused as an ordinary `USAGE` (100) error
+/// before anything runs — no child, no events file — and the refusal names the key
+/// without ever repeating the value the caller typed beside it.
+#[test]
+fn run_id_env_colliding_with_an_explicit_env_is_refused_before_the_run_starts() {
+    let dir = scratch("run-id-env-collision");
+    let secret = "value-that-must-not-reach-diagnostics";
+    let entry = format!("{RUN_ID_ENV_KEY}={secret}");
+    let out = run_with_flags(
+        &dir,
+        &[],
+        &["--run-id-env", RUN_ID_ENV_KEY, "--env", &entry],
+        shell_inline("echo child-must-not-start"),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(100),
+        "a contradictory pair is a usage error, not a mid-run surprise; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty(), "no child output may be forwarded");
+    assert!(
+        !events_path(&dir).exists(),
+        "the refusal precedes even the events file"
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains(RUN_ID_ENV_KEY),
+        "the refusal names the key it is about: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains(secret),
+        "the refusal must not disclose the --env value: {stderr:?}"
+    );
+
+    // The same key is accepted the moment the contradiction is removed, so the
+    // refusal above is about the *pair*, not about the key or the flag.
+    let ok_dir = scratch("run-id-env-collision-resolved");
+    let out = run_with_flags(
+        &ok_dir,
+        &[],
+        &["--run-id-env", RUN_ID_ENV_KEY],
+        shell_inline("exit 0"),
+    );
+    assert_eq!(out.status.code(), Some(0), "the flag alone is legal");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&ok_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Applied order, end to end (T-304, R-02).
+//
+// The three "Also given → Result" rows README.md and `docs/running-commands.md`
+// publish — `--env-clear` → the key survives; `--env-remove KEY` → the key is
+// still set; an `--env-file` entry for `KEY` → the run id wins — are claims about
+// what the *child* observes, decided by where the injection sits in
+// `src/run/launch.rs`'s builder chain. A `src/cli/run.rs` unit test cannot reach
+// that: it sees which fields a command line populated, not which value survived to
+// the child. These scenarios drive the built binary and read the value out of the
+// child itself.
+//
+// Every scenario writes `--run-id-env` *before* the `--env-*` flag it is paired
+// with, and the two order-sensitive ones run both orders, so "the outcome does not
+// depend on argument order" is tested rather than declared. Each has a control run
+// (K-059) proving the flag it is competing with really does something on its own —
+// otherwise "the run id won" would also pass against a clear that cleared nothing
+// or a file entry that never reached the child.
+// ---------------------------------------------------------------------------
+
+/// A child that prints what it observes for [`RUN_ID_ENV_KEY`], prefixed so the
+/// value can be lifted out of the runner's live echo.
+///
+/// `cmd /c echo %VAR%` prints the literal `%VAR%` for an unset variable while `sh`
+/// prints nothing; neither rendering can be mistaken for a run id or for one of the
+/// sentinel values above, so no assertion here keys off how "unset" looks.
+fn echo_run_id_env_program() -> Vec<String> {
+    let script = if cfg!(windows) {
+        format!("echo run-id-env:%{RUN_ID_ENV_KEY}%")
+    } else {
+        format!("echo \"run-id-env:${RUN_ID_ENV_KEY}\"")
+    };
+    shell_inline(&script)
+}
+
+/// Run one precedence scenario to completion and return the two values the
+/// documented table is about: what the child observed for [`RUN_ID_ENV_KEY`], and
+/// this run's own `run_started.run_id`.
+///
+/// `runner_envs` is set on the runner process and therefore inherited by the child —
+/// that is how a scenario gives `--env-clear`/`--env-remove` something real to act
+/// on. No `--run-id` is passed, so every scenario also runs against a *generated*
+/// id: the value cannot have been read off the command line.
+fn observe_run_id_env_with(
+    tag: &str,
+    runner_envs: &[(&str, &Path)],
+    flags: &[&str],
+) -> (String, String) {
+    let dir = scratch(tag);
+    let out = run_with_flags(&dir, runner_envs, flags, echo_run_id_env_program());
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the child exits cleanly for {flags:?}; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let observed = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("run-id-env:").map(str::to_string))
+        .unwrap_or_else(|| panic!("the child echoed the variable it read: {stdout:?}"));
+
+    let events = read_run_events(&dir);
+    let run_id = events
+        .iter()
+        .find(|event| event["event"] == "run_started")
+        .unwrap_or_else(|| panic!("the run reported itself started: {events:?}"))["run_id"]
+        .as_str()
+        .expect("run_started names its run")
+        .to_string();
+
+    let _ = std::fs::remove_dir_all(&dir);
+    (observed, run_id)
+}
+
+/// Row 1: with `--env-clear`, the injection is applied *after* the clear, so the key
+/// is set on the emptied slate rather than wiped along with everything else.
+///
+/// What this scenario can and cannot catch, stated rather than implied: unlike the
+/// two rows below, this one does not depend on where the injection sits among the
+/// builder calls, because `processkit::Command::env_clear()` is an order-independent
+/// flag (it decides whether the *inherited* environment is carried over) while
+/// explicit sets are a separate ordered list. Moving the injection ahead of the
+/// `env_clear()` call therefore does not change what the child observes — verified
+/// by doing exactly that during this test's own self-check, where the two rows below
+/// failed and this one did not. Its job is the user-facing promise itself: that this
+/// key survives a cleared slate, which would break if the injection were dropped, or
+/// if that library property ever changed.
+#[test]
+fn run_id_env_is_set_on_a_slate_env_clear_emptied() {
+    let inherited: &[(&str, &Path)] = &[(RUN_ID_ENV_KEY, Path::new(RUN_ID_ENV_INHERITED))];
+
+    // Control: the clear really empties the slate this key was on.
+    let (cleared, _) =
+        observe_run_id_env_with("run-id-env-clear-control", inherited, &["--env-clear"]);
+    assert_ne!(
+        cleared, RUN_ID_ENV_INHERITED,
+        "control: --env-clear must actually wipe the inherited value, or the run below \
+         would pass without the injection having done anything"
+    );
+
+    let (observed, run_id) = observe_run_id_env_with(
+        "run-id-env-clear",
+        inherited,
+        &["--run-id-env", RUN_ID_ENV_KEY, "--env-clear"],
+    );
+    assert_eq!(
+        observed, run_id,
+        "the run id is injected after the clear, so the child observes it on the cleared slate"
+    );
+}
+
+/// Row 2: an `--env-remove` for the very key being injected does not win — removals
+/// are applied before every set, so the key is still set when the child starts.
+#[test]
+fn run_id_env_outlives_an_env_remove_for_the_same_key() {
+    let inherited: &[(&str, &Path)] = &[(RUN_ID_ENV_KEY, Path::new(RUN_ID_ENV_INHERITED))];
+
+    // Two controls: the value really is inherited by default, and the removal really
+    // removes it. Without both, "the child observed the run id" could pass against a
+    // removal that never happened.
+    let (baseline, _) = observe_run_id_env_with("run-id-env-remove-baseline", inherited, &[]);
+    assert_eq!(
+        baseline, RUN_ID_ENV_INHERITED,
+        "control: the runner's own environment reaches the child by default"
+    );
+    let (removed, _) = observe_run_id_env_with(
+        "run-id-env-remove-control",
+        inherited,
+        &["--env-remove", RUN_ID_ENV_KEY],
+    );
+    assert_ne!(
+        removed, RUN_ID_ENV_INHERITED,
+        "control: --env-remove must actually strip the inherited value"
+    );
+
+    let orders: [&[&str]; 2] = [
+        &[
+            "--run-id-env",
+            RUN_ID_ENV_KEY,
+            "--env-remove",
+            RUN_ID_ENV_KEY,
+        ],
+        &[
+            "--env-remove",
+            RUN_ID_ENV_KEY,
+            "--run-id-env",
+            RUN_ID_ENV_KEY,
+        ],
+    ];
+    for flags in orders {
+        let (observed, run_id) = observe_run_id_env_with("run-id-env-remove", inherited, flags);
+        assert_eq!(
+            observed, run_id,
+            "the injection lands after the removal, whichever order the flags were \
+             written: {flags:?}"
+        );
+    }
+}
+
+/// Row 3: an `--env-file` entry for the same key loses to the injection, which is
+/// applied last — the case the parser cannot decide, since a file's contents are
+/// read at run time rather than compared at parse time.
+#[test]
+fn run_id_env_wins_over_an_env_file_entry_for_the_same_key() {
+    let dir = scratch("run-id-env-file");
+    let env_file = dir.join("base.env");
+    std::fs::write(
+        &env_file,
+        format!("{RUN_ID_ENV_KEY}={RUN_ID_ENV_FROM_FILE}\n"),
+    )
+    .expect("write the env-file fixture");
+    let env_file = path_arg(&env_file);
+
+    // Control: the file entry does reach the child on its own, so losing to the
+    // injection below is a real precedence outcome and not an unread file.
+    let (from_file, _) =
+        observe_run_id_env_with("run-id-env-file-control", &[], &["--env-file", &env_file]);
+    assert_eq!(
+        from_file, RUN_ID_ENV_FROM_FILE,
+        "control: the file's own value reaches the child without --run-id-env"
+    );
+
+    let orders: [&[&str]; 2] = [
+        &["--run-id-env", RUN_ID_ENV_KEY, "--env-file", &env_file],
+        &["--env-file", &env_file, "--run-id-env", RUN_ID_ENV_KEY],
+    ];
+    for flags in orders {
+        let (observed, run_id) = observe_run_id_env_with("run-id-env-file-wins", &[], flags);
+        assert_eq!(
+            observed, run_id,
+            "the injection is applied last, so the run id replaces the file's value \
+             whichever order the flags were written: {flags:?}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The whole chain at once, with `--run-id-env` written first: a cleared slate, a
+/// removal of the very key, and a file entry that sets it to something else still
+/// end with the child observing this run's id. This is the applied-order claim
+/// (`clear → remove → env-file → env → run-id injection`) as one statement, and the
+/// end-to-end counterpart of the parse-level
+/// `run_id_env_composes_with_every_environment_flag_in_any_order` unit test.
+#[test]
+fn run_id_env_wins_over_every_other_environment_flag_at_once() {
+    let dir = scratch("run-id-env-chain");
+    let env_file = dir.join("base.env");
+    std::fs::write(
+        &env_file,
+        format!("{RUN_ID_ENV_KEY}={RUN_ID_ENV_FROM_FILE}\n"),
+    )
+    .expect("write the env-file fixture");
+    let env_file = path_arg(&env_file);
+    let inherited: &[(&str, &Path)] = &[(RUN_ID_ENV_KEY, Path::new(RUN_ID_ENV_INHERITED))];
+
+    let (observed, run_id) = observe_run_id_env_with(
+        "run-id-env-chain-run",
+        inherited,
+        &[
+            "--run-id-env",
+            RUN_ID_ENV_KEY,
+            "--env-clear",
+            "--env-remove",
+            RUN_ID_ENV_KEY,
+            "--env-file",
+            &env_file,
+            "--env",
+            "PROCESSKIT_TEST_OTHER=untouched",
+        ],
+    );
+    assert_eq!(
+        observed, run_id,
+        "the injection closes the chain, so nothing earlier in it decides this key"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A program that cannot be started is a runner-own failure, so the runner exits
 /// with the reserved `SPAWN` code (101) and reports the reason on stderr — never
 /// on stdout.
@@ -1515,7 +2112,8 @@ fn write_marker_after_work_script(dir: &Path) -> PathBuf {
     }
 }
 
-/// The platform invocation for one of the scripts above.
+/// The platform invocation for one of the fixture scripts this file writes (the
+/// detach marker script above, and the `--run-id-env` observer near the top).
 fn script_program(path: &Path) -> Vec<String> {
     if cfg!(windows) {
         vec!["cmd".into(), "/c".into(), path_arg(path)]

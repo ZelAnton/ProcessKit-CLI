@@ -39,7 +39,8 @@ mod prune;
 mod run;
 mod wait;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
 pub use attest::AttestArgs;
 pub use control::{InspectArgs, TargetArgs};
@@ -56,8 +57,8 @@ pub use wait::WaitArgs;
 /// they are defined, never how they are reached or what they accept.
 #[doc(hidden)]
 pub use parse::{
-    parse_cpu_quota, parse_duration, parse_env_kv, parse_exit_code_band, parse_max_processes,
-    parse_positive_duration, parse_run_id, parse_size,
+    parse_cpu_quota, parse_duration, parse_env_key, parse_env_kv, parse_exit_code_band,
+    parse_max_processes, parse_positive_duration, parse_run_id, parse_size,
 };
 
 /// Top-level parser: one required subcommand, plus the one global option every
@@ -90,6 +91,45 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Command,
+}
+
+impl Cli {
+    /// The cross-argument rules clap's declarative attributes cannot express,
+    /// checked in one place immediately after parsing.
+    ///
+    /// `conflicts_with`/`requires` compare whether two arguments are *present*;
+    /// what this checks is whether two arguments carry the **same value** (today:
+    /// `run --run-id-env <KEY>` against an explicit `run --env <KEY>=…`, see
+    /// [`RunArgs::validate`]). clap has no declarative form for that, so the
+    /// alternative would be discovering the contradiction mid-run — after a
+    /// registry entry, an events file, and possibly a child already exist.
+    ///
+    /// The refusal is deliberately shaped as an ordinary parse failure rather than
+    /// a runner error: the returned [`clap::Error`] renders with clap's own usage
+    /// text and reaches [`crate::exit::USAGE`] (100) through the same
+    /// `report_parse_error` path every malformed command line takes (`src/main.rs`).
+    /// From the caller's side it is indistinguishable from a `conflicts_with`
+    /// rejection — same code, same stream, no side effects — which is the point:
+    /// "rejected at parse time" must not depend on *how* the rule is spelled
+    /// internally.
+    ///
+    /// `Ok(())` for every subcommand that has no such rule (all of them but `run`,
+    /// today).
+    pub fn validate(&self) -> Result<(), clap::Error> {
+        let checked = match &self.command {
+            Command::Run(args) => args.validate(),
+            Command::Inspect(_)
+            | Command::Cancel(_)
+            | Command::Kill(_)
+            | Command::Attest(_)
+            | Command::Wait(_)
+            | Command::Events(_)
+            | Command::List(_)
+            | Command::Prune(_)
+            | Command::Probe(_) => Ok(()),
+        };
+        checked.map_err(|message| Self::command().error(ErrorKind::ArgumentConflict, message))
+    }
 }
 
 /// How a runner-own failure is rendered on stderr — the value of `--error-format`.
@@ -232,6 +272,71 @@ mod tests {
                 .is_err(),
                 "{sub} labels require --all"
             );
+        }
+    }
+
+    /// The cross-argument layer is wired to the same outcome as a declarative
+    /// `conflicts_with`: a `clap::Error` whose kind lands on `USAGE` (100) through
+    /// `src/main.rs`'s `report_parse_error`, not a bespoke runner error discovered
+    /// after a run has started.
+    #[test]
+    fn cross_argument_validation_reports_a_clap_argument_conflict() {
+        let cli = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--env",
+            "SHARED=mine",
+            "--run-id-env",
+            "SHARED",
+            "--",
+            "true",
+        ])
+        .expect("each flag is individually well-formed, so clap itself accepts them");
+        let error = cli
+            .validate()
+            .expect_err("the pair asks for two values of one child variable");
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+        assert!(
+            !matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ),
+            "a refusal must never be mapped onto the successful help/version exits"
+        );
+    }
+
+    /// Every subcommand without such a rule — that is, all of them but `run` — is
+    /// unaffected: validation is a no-op they cannot fail.
+    #[test]
+    fn cross_argument_validation_passes_for_ordinary_invocations() {
+        for argv in [
+            vec!["run", "--jsonl", "events.jsonl", "--", "true"],
+            vec![
+                "run",
+                "--jsonl",
+                "events.jsonl",
+                "--run-id-env",
+                "PROCESSKIT_RUN_ID",
+                "--env",
+                "MODE=ci",
+                "--",
+                "true",
+            ],
+            vec!["inspect", "--run-id", "r1"],
+            vec!["cancel", "--all"],
+            vec!["kill", "--run-id", "r1"],
+            vec!["wait", "--run-id", "r1"],
+            vec!["events", "--run-id", "r1"],
+            vec!["list"],
+            vec!["prune"],
+            vec!["probe", "--json"],
+        ] {
+            let mut full = vec!["processkit-cli"];
+            full.extend(argv.iter().copied());
+            let cli = Cli::try_parse_from(&full).unwrap_or_else(|err| panic!("{full:?}: {err}"));
+            assert!(cli.validate().is_ok(), "{full:?}");
         }
     }
 

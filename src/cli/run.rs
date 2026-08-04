@@ -11,8 +11,8 @@ use clap::{Args, ValueEnum};
 use crate::labels::OperatorLabel;
 
 use super::parse::{
-    parse_cpu_quota, parse_duration, parse_env_kv, parse_max_processes, parse_positive_duration,
-    parse_run_id, parse_size,
+    parse_cpu_quota, parse_duration, parse_env_key, parse_env_kv, parse_max_processes,
+    parse_positive_duration, parse_run_id, parse_size,
 };
 
 /// `run [--run-id <id>] [--cwd <dir>] --jsonl <events.jsonl> [--create-no-window]
@@ -23,7 +23,7 @@ use super::parse::{
 /// [--capture-dir <dir>] [--capture-max-bytes <size>]
 /// [--capture-overflow <truncate|cancel>] [--no-echo] [--detach]
 /// [--argv-raw] [--label <KEY=VALUE>] [--env-clear] [--env-remove <KEY>]
-/// [--env-file <file>] [--env <KEY=VALUE>]
+/// [--env-file <file>] [--env <KEY=VALUE>] [--run-id-env <KEY>]
 /// [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
 /// -- <program> <args...>`
 //
@@ -33,13 +33,20 @@ use super::parse::{
 // `members_snapshot` cadence (see `src/run/launch.rs`'s `snapshot_cadence`) —
 // `max_memory`, `max_processes`, `cpu_quota` — the
 // whole-tree ProcessKit resource caps (see `src/run/launch.rs`) — `command`, `jsonl`,
-// `run_id`, `argv_raw`, `capture_dir`/`capture_max_bytes` — bounded stdout/stderr
-// capture to files (see `src/capture.rs`) — `no_echo` — suppress the live echo
+// `run_id`, `argv_raw`, `capture_dir`/`capture_max_bytes`/`capture_overflow` —
+// bounded stdout/stderr
+// capture to files, and what happens at the ceiling (see `src/capture.rs`) —
+// `no_echo` — suppress the live echo
 // while capture/idle-timeout keep observing the same bytes (see `src/run/launch.rs`) —
 // `detach` — hand the whole run to a re-spawned, detached copy of this binary and
 // return as soon as it has provably started (see `src/run/detach.rs`) —
-// `labels`, `env_clear`, `env_remove`, `env_file`, `env`, and
+// `labels`, `env_clear`, `env_remove`, `env_file`, `env`, `run_id_env` — publish the
+// run's final id into the child's environment (see `src/run/launch.rs`) — and
 // `inherit_stdio`/`inherit_stdin`/`stdin_file`.
+//
+// This synopsis and the field list above it are **normative** and have silently
+// drifted apart before (K-006): re-derive both against the struct's full field
+// list — not just the flags a change happens to touch — whenever a field is added.
 #[derive(Debug, Args)]
 pub struct RunArgs {
     /// Identifier for this run; a value is generated when omitted. Explicit ids
@@ -318,11 +325,171 @@ pub struct RunArgs {
     #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env_kv)]
     pub env: Vec<(String, String)>,
 
+    /// Set `<KEY>` in the child's environment to this run's **final** id — the
+    /// explicit `--run-id` when one was given, otherwise the id the runner
+    /// generated. That is the same value `run_started.run_id`, the registry
+    /// record, and every control-plane reply carry, so a child (and its
+    /// descendants) can name the run it belongs to without the caller minting an
+    /// identity itself and passing it twice as `--run-id <id> --env KEY=<id>` —
+    /// two copies that can drift, and which foreclose a runner-generated id
+    /// entirely, since a generated id was previously not knowable until the run
+    /// had already started.
+    ///
+    /// **Strictly opt-in.** Omit it and the child's environment is exactly what it
+    /// has always been: there is no default key, and nothing is injected
+    /// unconditionally. `<KEY>` follows the same rules as an `--env` KEY (see
+    /// [`parse_env_key`]): non-empty, no whitespace or control characters, and no
+    /// `=` — the value comes from the runner, not the command line.
+    ///
+    /// **Applied last, after all four `--env-*` flags** (`--env-clear`,
+    /// `--env-remove`, `--env-file`, `--env`), so the injected id wins over an
+    /// `--env-file` entry or an `--env-remove` naming the same key no matter which
+    /// order those flags were written on the command line — see `README.md`,
+    /// "Environment". The one collision that is *refused* rather than resolved is
+    /// an explicit `--env <KEY>=…` for this very key: two flags asking for two
+    /// different values of one variable is a caller mistake, so it fails at parse
+    /// time as a `USAGE` (100) error instead of silently discarding the value the
+    /// caller typed (see [`RunArgs::validate`]). "The same key" means the same key
+    /// *to this platform*: byte-exact off Windows, and case-insensitive on Windows,
+    /// where `KEY` and `key` are one child variable rather than two.
+    ///
+    /// **The value is correlation data, not a credential.** It proves nothing
+    /// about who started the run, carries no authority, and is trivially forgeable
+    /// by anything that can set an environment variable; the child's own
+    /// environment is visible to the child and, on some platforms, to other
+    /// processes of the same user. Use it to *label* work, never to authorize it.
+    ///
+    /// Composes with `--detach`: the detached copy is re-spawned with an explicit
+    /// `--run-id` for the very id its caller reported, so the child of a detached
+    /// run observes the same value as the one in `--jsonl`.
+    #[arg(long = "run-id-env", value_name = "KEY", value_parser = parse_env_key)]
+    pub run_id_env: Option<String>,
+
     /// The program to run followed by its arguments. Everything after `--` is
     /// taken verbatim — there is no shell mode, so nothing here is expanded or
     /// re-interpreted. Kept as `OsString`s to preserve bytes exactly.
     #[arg(last = true, required = true, num_args = 1.., value_name = "program")]
     pub command: Vec<OsString>,
+}
+
+impl RunArgs {
+    /// The `run`-specific half of [`super::Cli::validate`]: the cross-argument
+    /// rules that compare two flags' **values** rather than their presence, which
+    /// clap's declarative `conflicts_with` cannot express.
+    ///
+    /// One rule today. `--run-id-env <KEY>` and an explicit `--env <KEY>=<value>`
+    /// for the same key are refused as a pair, because they ask for two different
+    /// values of one child variable and only one of them can survive. The
+    /// alternative — silently letting the injected run id win, which is what the
+    /// builder order in `src/run/launch.rs` would do — is deterministic but
+    /// discards, without a word, a value the caller explicitly typed. Refusing is
+    /// the more predictable contract for the calling side (an adapter learns it
+    /// asked for something impossible *before* a child runs, rather than
+    /// discovering a dropped variable in production), and it is the choice
+    /// `README.md` and `docs/running-commands.md` document.
+    ///
+    /// Whether two keys *are* the same key is decided the way the platform decides
+    /// it — [`names_one_child_variable`] — because that, not byte equality, is what
+    /// settles whether one child variable or two are at stake. Byte equality on
+    /// Windows would refuse `--env RID=mine --run-id-env RID` while accepting
+    /// `--env RID=mine --run-id-env rid`, and the accepted pair would then resolve
+    /// in exactly the way this refusal exists to prevent: one case-insensitive
+    /// child variable, the injected id landing last and winning, and `mine` gone
+    /// without a word.
+    ///
+    /// Deliberately **not** refused, because those are resolved rather than
+    /// contradictory (`README.md`, "Environment"):
+    ///
+    /// - `--env-remove <KEY>` with the same key: removals are applied before every
+    ///   set, so the injected id lands afterwards and wins — exactly as an explicit
+    ///   `--env` already wins over an `--env-remove` of its key.
+    /// - an `--env-file` entry for the same key: file contents are read at run
+    ///   time, not at parse time, so there is nothing to compare here; the fixed
+    ///   builder order settles it (the injection is applied last) regardless of
+    ///   argument order.
+    ///
+    /// Returns the message clap renders on failure; the KEY is escaped and no
+    /// environment **value** appears in it.
+    pub fn validate(&self) -> Result<(), String> {
+        let Some(key) = self.run_id_env.as_deref() else {
+            return Ok(());
+        };
+        let Some((env_key, _)) = self
+            .env
+            .iter()
+            .find(|(env_key, _)| names_one_child_variable(env_key, key))
+        else {
+            return Ok(());
+        };
+        // Each flag is quoted back with the spelling the caller actually typed, so
+        // the message never invents an `--env` entry they did not write. The two can
+        // only differ where the platform folds case (Windows today), and there the
+        // difference is precisely what needs explaining.
+        let case_note = if env_key == key {
+            ""
+        } else {
+            " (environment variable names are case-insensitive on Windows)"
+        };
+        Err(format!(
+            "`--run-id-env {}` and `--env {}=…` both set the same child variable{case_note}: \
+             the run id would always win, whichever order the two flags were given. \
+             Drop one of them — `--run-id-env` to keep your own value, or the `--env` \
+             entry to let the runner publish this run's id",
+            key.escape_debug(),
+            env_key.escape_debug()
+        ))
+    }
+}
+
+/// Whether two child-environment variable **names** address one and the same
+/// variable *on this platform* — the question [`RunArgs::validate`]'s refusal turns
+/// on, and the one place this crate decides it.
+///
+/// Windows environment blocks are case-insensitive: `PATH`, `Path`, and `path` name
+/// one variable there, and the environment map `std::process::Command` builds for a
+/// child folds them together the same way. So a pair differing only in case is the
+/// same contradiction as an identical spelling, and comparing bytes there would let
+/// the injected run id silently replace an explicit `--env` value for every
+/// spelling but one — the outcome the refusal exists to prevent.
+///
+/// Off Windows the comparison stays byte-exact, because names are genuinely
+/// case-sensitive there: `PATH` and `Path` are two variables, and refusing that pair
+/// would reject a legal invocation over a collision that does not exist.
+#[cfg(windows)]
+fn names_one_child_variable(left: &str, right: &str) -> bool {
+    // Compared per character rather than with `str::eq_ignore_ascii_case`, because
+    // the shared key grammar (`super::parse_env_key`) accepts non-ASCII names, and
+    // `é`/`É` is one Windows variable exactly as `a`/`A` is — an ASCII-only fold
+    // would leave that class of spellings in the silent-substitution hole this
+    // function closes.
+    left.chars()
+        .map(simple_uppercase)
+        .eq(right.chars().map(simple_uppercase))
+}
+
+/// The **simple** (one-to-one) uppercase form of `character`, matching how Windows
+/// folds an environment name per character, rather than Unicode's full mapping:
+/// where the full mapping produces more than one character (`ß` → `SS`), the
+/// platform's own table leaves the character alone, so this does too.
+///
+/// The two tables can still disagree on exotic code points; that residue is far
+/// narrower than the whole-case axis it replaces, and it cannot reach a name in the
+/// conventional `[A-Za-z0-9_]` shape.
+#[cfg(windows)]
+fn simple_uppercase(character: char) -> char {
+    let mut mapped = character.to_uppercase();
+    match (mapped.next(), mapped.next()) {
+        (Some(single), None) => single,
+        _ => character,
+    }
+}
+
+/// The byte-exact half of the same rule (see the Windows arm above): off Windows,
+/// environment variable names are case-sensitive, so `PATH` and `Path` are two
+/// child variables and only the identical spelling is a collision.
+#[cfg(not(windows))]
+fn names_one_child_variable(left: &str, right: &str) -> bool {
+    left == right
 }
 
 /// Policy applied when a bounded output transcript reaches its ceiling.
@@ -932,6 +1099,295 @@ mod tests {
             ])
             .is_err(),
             "invalid environment keys must fail at the CLI boundary"
+        );
+    }
+
+    /// Parse a `run` invocation built from the mandatory bits plus `flags`, and
+    /// hand back its arguments. Panics on a parse failure, so a test that is about
+    /// *accepted* command lines does not have to unwrap at every call.
+    fn run_args(flags: &[&str]) -> RunArgs {
+        let mut argv = vec!["processkit-cli", "run", "--jsonl", "events.jsonl"];
+        argv.extend_from_slice(flags);
+        argv.extend(["--", "true"]);
+        let cli = Cli::try_parse_from(&argv).unwrap_or_else(|err| panic!("{argv:?}: {err}"));
+        let Command::Run(args) = cli.command else {
+            panic!("expected the run subcommand");
+        };
+        *args
+    }
+
+    /// Whether the whole command line — parse **and** the cross-argument rules
+    /// `Cli::validate` applies right after it (`src/main.rs`) — is accepted. This is
+    /// what a caller actually observes: both refusals are the same `USAGE` (100)
+    /// exit with clap's own rendering, so the tests below assert on the pair rather
+    /// than on which of the two layers happened to catch the mistake.
+    fn run_is_accepted(flags: &[&str]) -> bool {
+        let mut argv = vec!["processkit-cli", "run", "--jsonl", "events.jsonl"];
+        argv.extend_from_slice(flags);
+        argv.extend(["--", "true"]);
+        Cli::try_parse_from(&argv).is_ok_and(|cli| cli.validate().is_ok())
+    }
+
+    #[test]
+    fn run_parses_run_id_env_and_defaults_to_absent() {
+        let args = run_args(&["--run-id-env", "PROCESSKIT_RUN_ID"]);
+        assert_eq!(args.run_id_env.as_deref(), Some("PROCESSKIT_RUN_ID"));
+        assert_eq!(args.validate(), Ok(()));
+
+        // Strictly opt-in: without the flag there is no key at all, so no run
+        // publishes its id into a child environment by default.
+        let args = run_args(&[]);
+        assert!(
+            args.run_id_env.is_none(),
+            "omitting --run-id-env injects nothing into the child environment"
+        );
+        assert_eq!(args.validate(), Ok(()));
+    }
+
+    #[test]
+    fn run_rejects_a_malformed_run_id_env_key() {
+        // The same KEY form `--env` demands (the shared `parse_env_key`/
+        // `validate_env_key`), plus the `KEY=VALUE` spelling a caller might reach
+        // for out of habit: the value is the runner's, so a pair is a
+        // misunderstanding rather than a harmless redundancy.
+        for bad in ["", "BAD KEY", "TAB\tKEY", "LINE\nKEY", "KEY=VALUE", "KEY="] {
+            assert!(
+                Cli::try_parse_from([
+                    "processkit-cli",
+                    "run",
+                    "--jsonl",
+                    "events.jsonl",
+                    "--run-id-env",
+                    bad,
+                    "--",
+                    "true",
+                ])
+                .is_err(),
+                "a malformed `--run-id-env {bad:?}` must fail at parse time"
+            );
+        }
+    }
+
+    /// `--run-id-env` is one more source feeding the same environment builder, not a
+    /// mode: it composes with all four `--env-*` flags, and — since the applied order
+    /// is fixed in `src/run/launch.rs` rather than read off the command line — the
+    /// parsed result cannot depend on where it was written among them.
+    ///
+    /// This pins the **parse** only: which fields a command line populates. What the
+    /// child ends up observing when those flags meet on one key is decided by the
+    /// builder chain in `src/run/launch.rs`, out of this module's reach, and is
+    /// proven through the built binary in `tests/run.rs` —
+    /// `run_id_env_is_set_on_a_slate_env_clear_emptied`,
+    /// `run_id_env_outlives_an_env_remove_for_the_same_key`,
+    /// `run_id_env_wins_over_an_env_file_entry_for_the_same_key`, and
+    /// `run_id_env_wins_over_every_other_environment_flag_at_once`.
+    #[test]
+    fn run_id_env_composes_with_every_environment_flag_in_any_order() {
+        let env_flags: [&[&str]; 2] = [
+            &[
+                "--env-clear",
+                "--env-remove",
+                "STALE",
+                "--env-file",
+                "base.env",
+                "--env",
+                "MODE=ci",
+                "--run-id-env",
+                "PROCESSKIT_RUN_ID",
+            ],
+            // The same invocation with the new flag written *first* instead of last.
+            &[
+                "--run-id-env",
+                "PROCESSKIT_RUN_ID",
+                "--env-clear",
+                "--env-remove",
+                "STALE",
+                "--env-file",
+                "base.env",
+                "--env",
+                "MODE=ci",
+            ],
+        ];
+        for flags in env_flags {
+            let args = run_args(flags);
+            assert_eq!(args.validate(), Ok(()), "{flags:?}");
+            assert!(args.env_clear);
+            assert_eq!(args.env_remove, vec!["STALE".to_string()]);
+            assert_eq!(args.env_file, vec![PathBuf::from("base.env")]);
+            assert_eq!(args.env, vec![("MODE".to_string(), "ci".to_string())]);
+            assert_eq!(args.run_id_env.as_deref(), Some("PROCESSKIT_RUN_ID"));
+        }
+    }
+
+    /// The collision decision (T-304): an explicit `--env KEY=…` for the very key
+    /// `--run-id-env` targets is **refused at parse time**, in either order, rather
+    /// than resolved by silently discarding the caller's value. A removal or a file
+    /// naming the same key is *not* refused — those have a documented applied order
+    /// that already settles them (the injection lands last and wins).
+    #[test]
+    fn run_id_env_refuses_a_duplicate_explicit_env_key_whatever_the_flag_order() {
+        assert!(
+            !run_is_accepted(&["--env", "SHARED=mine", "--run-id-env", "SHARED"]),
+            "an explicit --env for the injected key is a contradiction, not a default"
+        );
+        assert!(
+            !run_is_accepted(&["--run-id-env", "SHARED", "--env", "SHARED=mine"]),
+            "the refusal cannot depend on which flag was written first"
+        );
+
+        // A *different* key is no collision at all, in either order.
+        assert!(run_is_accepted(&[
+            "--env",
+            "OTHER=mine",
+            "--run-id-env",
+            "SHARED"
+        ]));
+        assert!(run_is_accepted(&[
+            "--run-id-env",
+            "SHARED",
+            "--env",
+            "OTHER=mine"
+        ]));
+
+        // Removals and files are resolved by the applied order, not refused.
+        assert!(run_is_accepted(&[
+            "--env-remove",
+            "SHARED",
+            "--run-id-env",
+            "SHARED"
+        ]));
+        assert!(run_is_accepted(&[
+            "--run-id-env",
+            "SHARED",
+            "--env-remove",
+            "SHARED"
+        ]));
+        assert!(run_is_accepted(&[
+            "--env-file",
+            "base.env",
+            "--run-id-env",
+            "SHARED"
+        ]));
+
+        // And with the flag absent, an `--env` for any key stays exactly as legal as
+        // it was before this flag existed.
+        assert!(run_is_accepted(&["--env", "SHARED=mine"]));
+    }
+
+    /// The refusal turns on what the *platform* calls one variable, not on byte
+    /// equality (T-304, R-01). Windows environment blocks are case-insensitive, so
+    /// `--env RID_TEST=mine --run-id-env rid_test` is the very contradiction the
+    /// rule is about: accepting it resolves the pair the one way the refusal exists
+    /// to prevent — one child variable, the injected id landing last, and the
+    /// caller's own `mine` discarded without a word.
+    #[cfg(windows)]
+    #[test]
+    fn run_id_env_refuses_a_case_variant_env_key_on_windows() {
+        for (entry, injected) in [
+            ("RID_TEST=mine", "rid_test"),
+            ("rid_test=mine", "RID_TEST"),
+            ("Rid_Test=mine", "rID_tEST"),
+            // The shared key grammar accepts non-ASCII names, and Windows folds
+            // their case too, so an ASCII-only comparison would leave this class of
+            // spellings in exactly the hole the rule closes.
+            ("RID_É=mine", "rid_é"),
+        ] {
+            assert!(
+                !run_is_accepted(&["--env", entry, "--run-id-env", injected]),
+                "`--env {entry}` and `--run-id-env {injected}` name one Windows variable"
+            );
+            assert!(
+                !run_is_accepted(&["--run-id-env", injected, "--env", entry]),
+                "the refusal cannot depend on which flag was written first"
+            );
+        }
+
+        // Folding case is not fuzzy matching: names differing by more than case stay
+        // two variables, and naming both remains as legal as it ever was.
+        assert!(run_is_accepted(&[
+            "--env",
+            "RID_TEST=mine",
+            "--run-id-env",
+            "rid_test_2"
+        ]));
+        assert!(run_is_accepted(&[
+            "--env",
+            "RID_TEST=mine",
+            "--run-id-env",
+            "other"
+        ]));
+
+        // The diagnostic quotes each flag with the spelling the caller actually
+        // typed — it must not render an `--env` entry they never wrote — and still
+        // never repeats the value beside it.
+        let args = run_args(&["--env", "RID_TEST=mine", "--run-id-env", "rid_test"]);
+        let error = args.validate().expect_err("the pair is refused");
+        assert!(
+            error.contains("`--run-id-env rid_test`") && error.contains("`--env RID_TEST=…`"),
+            "each flag is quoted as it was written: {error:?}"
+        );
+        assert!(
+            error.contains("case-insensitive on Windows"),
+            "two visibly different keys are one variable, and the message says why: {error:?}"
+        );
+        assert!(
+            !error.contains("mine"),
+            "the refusal must not disclose the --env value: {error:?}"
+        );
+    }
+
+    /// The mirror of the rule above off Windows, where environment names really are
+    /// case-sensitive: `RID_TEST` and `rid_test` are two child variables, so the
+    /// pair is not a collision at all and refusing it would reject a legal
+    /// invocation. The identical spelling is still refused.
+    #[cfg(not(windows))]
+    #[test]
+    fn run_id_env_treats_a_case_variant_env_key_as_a_second_variable_off_windows() {
+        assert!(run_is_accepted(&[
+            "--env",
+            "RID_TEST=mine",
+            "--run-id-env",
+            "rid_test"
+        ]));
+        assert!(run_is_accepted(&[
+            "--run-id-env",
+            "rid_test",
+            "--env",
+            "RID_TEST=mine"
+        ]));
+        assert!(!run_is_accepted(&[
+            "--env",
+            "RID_TEST=mine",
+            "--run-id-env",
+            "RID_TEST"
+        ]));
+    }
+
+    #[test]
+    fn run_id_env_collision_error_names_the_key_but_never_the_value() {
+        // The same secret-safety invariant the environment parsers hold
+        // (`parse_env_kv_errors_never_repeat_the_value`): a caller who collided a
+        // secret-bearing `--env` with `--run-id-env` must not see that secret echoed
+        // back into a terminal, a CI log, or a captured stderr transcript.
+        let secret = "do-not-print-this-secret";
+        let args = run_args(&[
+            "--env",
+            &format!("SHARED={secret}"),
+            "--run-id-env",
+            "SHARED",
+        ]);
+        let error = args.validate().expect_err("the pair is refused");
+        assert!(
+            !error.contains(secret),
+            "the refusal must not disclose the --env value: {error:?}"
+        );
+        assert!(
+            error.contains("SHARED"),
+            "the refusal names the key it is about: {error:?}"
+        );
+        assert!(
+            !error.chars().any(char::is_control),
+            "the refusal stays on one terminal line: {error:?}"
         );
     }
 

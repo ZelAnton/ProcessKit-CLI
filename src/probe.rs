@@ -392,6 +392,11 @@ mod tests {
             "run:--jsonl",
             "run:--label",
             "run:--env-file",
+            // `--run-id-env` (T-304) is the thirteenth consecutive confirmation of
+            // the subcommand-owned propagation path: declaring the flag in
+            // `src/cli/run.rs` was the whole change, and this module's production
+            // code was not touched at all — only this expected-token list.
+            "run:--run-id-env",
             "run:--capture-dir",
             // The `--capture-max-bytes` flag (T-181) appears in the surface
             // automatically too — same derivation as the resource-limit flags below.

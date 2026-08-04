@@ -1,6 +1,6 @@
 //! The hand-written value parsers the subcommand argument structs share:
 //! durations, byte sizes, process counts, CPU quotas, exit-code bands,
-//! `KEY=VALUE` environment entries, and run ids.
+//! `KEY=VALUE` environment entries, bare environment keys, and run ids.
 //!
 //! Each is deliberately strict and is the single source of truth for its flag's
 //! *form*, so a malformed value fails loudly at parse time as the documented
@@ -246,11 +246,58 @@ pub fn parse_exit_code_band(raw: &str) -> Result<(u8, u8), String> {
     Ok((start, end))
 }
 
+/// The **one** rule for the form of a child environment variable *name*, shared by
+/// every flag that names one: non-empty, and free of whitespace, control
+/// characters, and `=`.
+///
+/// The `=` clause states a rule `--env` has always had implicitly — [`parse_env_kv`]
+/// splits on the first `=`, so a KEY it produces can never contain one — and which
+/// a flag taking a *bare* name must therefore check explicitly to stay held to the
+/// same grammar rather than a laxer one.
+///
+/// Single source of truth in this module's own sense: `--env`'s `KEY=VALUE`
+/// grammar ([`parse_env_kv`] — which every `--env-file` line also goes through,
+/// see `run::parse_env_file_contents`) and `run --run-id-env <KEY>`
+/// ([`parse_env_key`]) both call this instead of each re-deriving what a key may
+/// look like, so the two can never drift into accepting different names.
+///
+/// `flag` is only ever the caller's own flag name, so the message points at what
+/// the operator actually typed; the rule itself is identical for every caller. The
+/// key is escaped rather than echoed raw — an invisible or terminal-reshaping
+/// character in the *name* must not reshape the diagnostic — and no environment
+/// **value** is ever part of a message here (see
+/// `parse_env_kv_errors_never_repeat_the_value`).
+fn validate_env_key(flag: &str, key: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err(format!("`{flag}` KEY is empty"));
+    }
+    if key
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(format!(
+            "`{flag}` KEY `{}` contains whitespace or a control character",
+            key.escape_debug()
+        ));
+    }
+    if key.contains('=') {
+        // Unreachable from `parse_env_kv` (it split the key off at the first `=`),
+        // but load-bearing for every caller that takes a bare name: `FOO=bar` is a
+        // caller reaching for the `--env` spelling, not a variable named `FOO=bar`.
+        return Err(format!(
+            "`{flag}` takes a bare KEY, not `KEY=VALUE`: `{}` contains `=`",
+            key.escape_debug()
+        ));
+    }
+    Ok(())
+}
+
 /// Parse a `--env` value: `KEY=VALUE`, split on the **first** `=` (so a value
 /// containing `=` is preserved verbatim rather than truncated). A missing `=` or
 /// an empty `KEY`, or one containing whitespace/control characters, is rejected
 /// at parse time — mapped to the `USAGE` exit — rather than silently accepted as
-/// a malformed environment variable name.
+/// a malformed environment variable name. The `KEY` half is held to the shared
+/// [`validate_env_key`] rule.
 ///
 /// `pub`/`#[doc(hidden)]` — see [`parse_duration`]'s note on why (fuzz target).
 #[doc(hidden)]
@@ -258,19 +305,24 @@ pub fn parse_env_kv(raw: &str) -> Result<(String, String), String> {
     let (key, value) = raw.split_once('=').ok_or_else(|| {
         "`--env` value must be `KEY=VALUE` (a literal `=` separating name and value)".to_string()
     })?;
-    if key.is_empty() {
-        return Err("`--env` value has an empty KEY before `=`".to_string());
-    }
-    if key
-        .chars()
-        .any(|character| character.is_whitespace() || character.is_control())
-    {
-        return Err(format!(
-            "`--env` KEY `{}` contains whitespace or a control character",
-            key.escape_debug()
-        ));
-    }
+    validate_env_key("--env", key)?;
     Ok((key.to_string(), value.to_string()))
+}
+
+/// Parse a `run --run-id-env` destination: a bare environment variable **name**,
+/// with no `=` and no value — the run id is the value, and it comes from the
+/// runner, not the command line.
+///
+/// The name is held to exactly the same form as an `--env` KEY, through the shared
+/// [`validate_env_key`] rather than a second, similar-looking check: a caller that
+/// can write `--env FOO=1` can write `--run-id-env FOO`, and neither flag accepts
+/// a name the other would reject.
+///
+/// `pub`/`#[doc(hidden)]` — see [`parse_duration`]'s note on why (fuzz target).
+#[doc(hidden)]
+pub fn parse_env_key(raw: &str) -> Result<String, String> {
+    validate_env_key("--run-id-env", raw)?;
+    Ok(raw.to_string())
 }
 
 /// Parse an explicit `--run-id`. Run ids become registry keys and appear in human
@@ -497,6 +549,75 @@ mod tests {
                 "expected `{bad}` to be rejected as a KEY=VALUE pair"
             );
         }
+    }
+
+    #[test]
+    fn parse_env_key_accepts_exactly_the_names_parse_env_kv_does() {
+        // Differential, not two independent lists: whatever `--env` accepts as the
+        // KEY half, `--run-id-env` accepts as a whole value, and whatever `--env`
+        // rejects there, `--run-id-env` rejects too. Both go through
+        // `validate_env_key`, and this is what would fail if one of them ever grew
+        // its own second rule.
+        for key in [
+            "FOO",
+            "PROCESSKIT_RUN_ID",
+            "lower_case",
+            "x",
+            "WITH.DOT",
+            "é",
+        ] {
+            let from_pair = parse_env_kv(&format!("{key}=value"))
+                .unwrap_or_else(|err| panic!("`--env {key}=value` must parse: {err}"))
+                .0;
+            let bare = parse_env_key(key)
+                .unwrap_or_else(|err| panic!("`--run-id-env {key}` must parse: {err}"));
+            assert_eq!(from_pair, bare);
+        }
+
+        for bad in ["", "BAD KEY", "TAB\tKEY", "LINE\nKEY", "NO\u{00a0}BREAK"] {
+            assert!(
+                parse_env_kv(&format!("{bad}=value")).is_err(),
+                "expected `--env {bad}=value` to be rejected"
+            );
+            assert!(
+                parse_env_key(bad).is_err(),
+                "expected `--run-id-env {bad}` to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_env_key_takes_a_bare_name_not_a_pair() {
+        // The value is the run id the runner resolves, so a `KEY=VALUE` spelling is
+        // a caller misunderstanding rather than a redundant-but-harmless form: `=`
+        // is not a legal name character here, and it fails loudly at parse time.
+        // This is the same grammar `--env` has always enforced implicitly by
+        // splitting on the first `=` — never a name that reached the child.
+        for pair in ["FOO=bar", "FOO=", "=bar", "FOO=a=b"] {
+            let error = parse_env_key(pair).expect_err("a pair is not a bare name");
+            assert!(
+                error.contains("bare KEY") || error.contains("is empty"),
+                "the message explains the shape mistake: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_env_key_errors_name_the_flag_and_escape_the_key() {
+        // The message points at the flag the operator actually typed (the shared
+        // validator is parameterized precisely so it can), and a key carrying a
+        // control character is escaped rather than replayed into the terminal.
+        let error = parse_env_key("BAD KEY").expect_err("whitespace is rejected");
+        assert!(error.contains("--run-id-env"), "{error:?}");
+
+        let error = parse_env_kv("BAD KEY=value").expect_err("whitespace is rejected");
+        assert!(error.contains("--env"), "{error:?}");
+
+        let error = parse_env_key("BEL\u{7}KEY").expect_err("a control character is rejected");
+        assert!(
+            !error.chars().any(char::is_control),
+            "diagnostics stay on one terminal line: {error:?}"
+        );
     }
 
     #[test]

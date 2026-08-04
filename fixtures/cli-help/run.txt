@@ -114,5 +114,16 @@ Options:
       --env <KEY=VALUE>
           Set an environment variable for the child as `KEY=VALUE` (repeatable). Applied last — after `--env-clear` and `--env-remove` — so it always wins on a duplicated key. Maps onto `processkit::Command::env()`
 
+      --run-id-env <KEY>
+          Set `<KEY>` in the child's environment to this run's **final** id — the explicit `--run-id` when one was given, otherwise the id the runner generated. That is the same value `run_started.run_id`, the registry record, and every control-plane reply carry, so a child (and its descendants) can name the run it belongs to without the caller minting an identity itself and passing it twice as `--run-id <id> --env KEY=<id>` — two copies that can drift, and which foreclose a runner-generated id entirely, since a generated id was previously not knowable until the run had already started.
+          
+          **Strictly opt-in.** Omit it and the child's environment is exactly what it has always been: there is no default key, and nothing is injected unconditionally. `<KEY>` follows the same rules as an `--env` KEY (see [`parse_env_key`]): non-empty, no whitespace or control characters, and no `=` — the value comes from the runner, not the command line.
+          
+          **Applied last, after all four `--env-*` flags** (`--env-clear`, `--env-remove`, `--env-file`, `--env`), so the injected id wins over an `--env-file` entry or an `--env-remove` naming the same key no matter which order those flags were written on the command line — see `README.md`, "Environment". The one collision that is *refused* rather than resolved is an explicit `--env <KEY>=…` for this very key: two flags asking for two different values of one variable is a caller mistake, so it fails at parse time as a `USAGE` (100) error instead of silently discarding the value the caller typed (see [`RunArgs::validate`]). "The same key" means the same key *to this platform*: byte-exact off Windows, and case-insensitive on Windows, where `KEY` and `key` are one child variable rather than two.
+          
+          **The value is correlation data, not a credential.** It proves nothing about who started the run, carries no authority, and is trivially forgeable by anything that can set an environment variable; the child's own environment is visible to the child and, on some platforms, to other processes of the same user. Use it to *label* work, never to authorize it.
+          
+          Composes with `--detach`: the detached copy is re-spawned with an explicit `--run-id` for the very id its caller reported, so the child of a detached run observes the same value as the one in `--jsonl`.
+
   -h, --help
           Print help (see a summary with '-h')

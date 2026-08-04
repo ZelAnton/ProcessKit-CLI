@@ -1891,8 +1891,9 @@ fn env_remove_removes_an_inherited_variable() {
 
 /// `--env-clear` wipes the child's entire inherited environment; an `--env` given
 /// on the same run still sets its own explicit variable on top of that cleared
-/// slate — the documented "clear, then remove, then set" applied order
-/// (README.md, "Environment").
+/// slate — the first and fourth steps of the documented "clear, remove, env-file,
+/// explicit set, run-id injection" applied order (README.md, "Environment"); the
+/// steps this scenario does not exercise are covered in `tests/run.rs`.
 #[test]
 fn env_clear_wipes_inherited_env_except_explicit_env() {
     let scenario = Scenario::new("e2e-env-clear");

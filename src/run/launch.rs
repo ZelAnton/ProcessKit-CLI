@@ -245,7 +245,8 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
         command = command.current_dir(cwd);
     }
     // Environment configuration maps onto ProcessKit's builder in the documented
-    // order: clear, remove, file entries, explicit sets. Later calls win for a
+    // order: clear, remove, file entries, explicit sets, then the opt-in run-id
+    // injection. Later calls win for a
     // duplicate key, so `--env` always overrides every file without exposing a
     // file's secret values in the runner's command line.
     if args.env_clear {
@@ -259,6 +260,27 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     }
     for (key, value) in &args.env {
         command = command.env(key, value);
+    }
+    // `--run-id-env <KEY>` (opt-in, T-304) closes the chain, and its position here is
+    // the whole contract: `env`/`env_remove` share one ordered push list where the
+    // *last* push for a key wins at spawn time, so injecting after every other
+    // environment source makes this value win over an `--env-file` entry or an
+    // `--env-remove` for the same key no matter which order those flags were typed
+    // on the command line (README.md, "Environment"). The one case a caller could
+    // reasonably have meant differently — an explicit `--env <KEY>=…` for this very
+    // key — never reaches here: `RunArgs::validate` refuses that pair at parse time
+    // rather than letting this line silently discard the caller's own value. That
+    // refusal compares the two keys the way the platform itself does (case-
+    // insensitively on Windows, byte-exact elsewhere), so no spelling of an
+    // explicit `--env` for this variable slips past it into this line.
+    //
+    // The value is `run_id` as resolved above — the single site that decides it, so
+    // the child sees exactly what `run_started`, the registry record, and every
+    // control-plane reply carry, whether the id came from `--run-id` or was
+    // generated here. Nothing else about the run changes when the flag is absent:
+    // no key is injected by default.
+    if let Some(key) = &args.run_id_env {
+        command = command.env(key, &run_id);
     }
     // `--create-no-window` maps straight onto `Command::create_no_window()`
     // (`CREATE_NO_WINDOW` on Windows, a no-op elsewhere). Default: OFF. A bare

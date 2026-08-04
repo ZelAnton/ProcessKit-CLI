@@ -28,6 +28,16 @@ fn main() -> ExitCode {
         Err(err) => return report_parse_error(err),
     };
 
+    // The cross-argument rules clap cannot express declaratively — they compare two
+    // flags' *values*, not their presence (see `Cli::validate`) — are checked here,
+    // between parsing and dispatch. They report through the very same path a
+    // malformed command line takes, so a violation is an ordinary `USAGE` (100)
+    // refusal with clap's own rendering, decided before any registry entry, events
+    // file, or child exists.
+    if let Err(err) = cli.validate() {
+        return report_parse_error(err);
+    }
+
     // How a failure is *rendered* is decided once, here, from the one global option
     // (`--error-format`, accepted before or after the subcommand), and carried into
     // every reporting path below. What failed, and with which code, is decided
