@@ -142,11 +142,13 @@ nothing to any run; **`cancel --all` / `kill --all` are the exception** — see
 "`cancel --all` / `kill --all` and a partial `103`" below before assuming
 nothing happened.
 
-**Diagnose.** stderr names which of three reasons applied — and if you are
-diagnosing this from a script rather than by eye, re-run the same command with
-`--error-format json`, which prints the reason as a machine-readable `kind`
-(`stale` / `unprobed` / `control_unreachable`, plus `not_found`,
-`ambiguous_run_id`, `ipc_deadline`, and `incompatible_contract`) instead of a
+**Diagnose.** stderr names which reason applied — three of them mean the runner
+itself was not reached, and the read-only verbs add refusals of their own below,
+where the target *was* reached and did answer. If you are diagnosing this from a
+script rather than by eye, re-run the same command with `--error-format json`,
+which prints the reason as a machine-readable `kind` (`stale` / `unprobed` /
+`control_unreachable`, plus `not_found`, `ambiguous_run_id`, `ipc_deadline`,
+`incompatible_contract`, and `peer_identity_unsupported`) instead of a
 sentence: a **stale registry
 entry** (the runner died abruptly, so the entry's record is left behind but
 its liveness lock has been released, detected *before* connecting), an
@@ -180,6 +182,25 @@ you tell two installed builds apart (no preflight can report a *runner's*
 snapshot version — that number only arrives in its reply). See
 [`docs/control-plane.md`](control-plane.md), "Snapshot version: a newer runner's
 reply is refused, an older one is read".
+
+**`attest` has a fifth reason of its own, and it is neither a lost runner nor a
+negative verdict.** If the message says the runner could not obtain a
+kernel-authenticated identity for this client from the control transport
+(`kind: "peer_identity_unsupported"`), the runner is reachable and healthy: the
+exchange completed, and it *declined to decide* membership because a transport
+that cannot name the caller leaves it nothing to decide on — reporting an
+unproven `member` is the one answer it will not give. This is a refusal, never a
+"no": a **decided** non-membership is not a `103` at all but `NOT_A_MEMBER`
+(115), `kind: "not_a_member"` (the attestation is printed on stdout either way).
+Retrying will not help, because the capability is a property of the runner's
+platform and build rather than of the moment; rule it out at preflight instead,
+with `processkit-cli probe --json --require-surface attest:peer-identity` run
+against the runner's own binary — meeting it at runtime means that check was
+skipped, or the runner is a different build. No other command can hit it:
+`inspect`/`cancel`/`kill`/`wait`/`list` never ask the question, and the run
+itself is untouched and still going, since `attest` is read-only. See
+[`docs/control-plane.md`](control-plane.md), "`attest`", and
+[`docs/integration.md`](integration.md) §6 ("A caller the runner cannot name").
 
 **`wait` does not share this code.** The registry-only `wait --run-id <id>`
 never connects to a run's control transport, so "died mid-conversation" is

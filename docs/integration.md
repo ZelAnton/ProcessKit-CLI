@@ -601,12 +601,15 @@ processkit-cli --error-format json inspect --run-id build-42
   `kind`, `operation`, `run_id`, and `retryable` are the contract; `message` is
   free text that may be reworded in any release.
 - **`kind` maps onto §6.** `stale`, `unprobed`, `ambiguous_run_id`,
-  `control_unreachable`, `ipc_deadline`, `incompatible_contract`, `not_found`,
-  plus `registry`/`setup`, `wait_timeout`, `events_invalid`, `probe_incompatible`,
-  and — for a failing `run` — the terminal `runner_exit` event's own `source`
-  spellings (`spawn_error`, `container_error`, `timeout`, `cancelled`,
-  `control_cancel`, `control_kill`, `output_overflow`). Unrecognized value? Fall
-  back to `code`; the vocabulary grows additively.
+  `control_unreachable`, `ipc_deadline`, `not_found`, and the two refusals
+  `incompatible_contract` and `peer_identity_unsupported` — those eight are the
+  ones that exist *to split* the single `CONTROL` (103) — plus `not_a_member`
+  (the decided verdict, `115`), `registry`/`setup`/`internal`, `wait_timeout`,
+  `events_invalid`, `probe_incompatible`, and — for a failing `run` — the
+  terminal `runner_exit` event's own `source` spellings (`spawn_error`,
+  `container_error`, `timeout`, `cancelled`, `control_cancel`, `control_kill`,
+  `output_overflow`). Unrecognized value? Fall back to `code`; the vocabulary
+  grows additively.
 - **stdout is untouched.** The envelope is on stderr, so an adapter can leave the
   flag on for every invocation without any risk to the JSON it parses from stdout —
   including for a command that prints a report *and then* fails, such as

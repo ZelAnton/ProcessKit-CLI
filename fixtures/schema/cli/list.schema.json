@@ -17,7 +17,7 @@
       "properties": {
         "run_id": {
           "type": "string",
-          "description": "The run's identifier — the value a caller passes as `--run-id` to `inspect`/`cancel`/`kill`/`wait`. Not unique: the registry does not enforce uniqueness (docs/registry.md, \"Run id resolution\")."
+          "description": "The run's identifier — the value a caller passes as `--run-id` to `inspect`/`cancel`/`kill`/`attest`/`wait`. Not unique: the registry does not enforce uniqueness (docs/registry.md, \"Run id resolution\")."
         },
         "health": {
           "type": "string",
