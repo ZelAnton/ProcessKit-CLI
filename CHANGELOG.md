@@ -146,13 +146,13 @@ to a dated version section.
 - `EVENTS_INVALID` (`114`), the reserved exit code `events --validate` returns when
   a checked stream does not conform to that schema — a verdict about a document,
   distinct from `SETUP` (111) for a stream that could not be read at all and from
-  `CONTROL` (103) for a `--run-id` that names no single stream. Codes `116`–`119`
-  remain reserved (`115` is now `NOT_A_MEMBER`, see `attest` above). The check adds
-  **no runtime dependency**: it interprets the
-  embedded schema document over the keyword subset that document uses, refuses to
-  run on anything it does not implement, and is held to a real JSON Schema engine's
-  verdict — line for line, over the golden fixture and a generated mutation corpus
-  — by the test tier.
+  `CONTROL` (103) for a `--run-id` that names no single stream. Codes `117`–`119`
+  remain reserved (`115` is now `NOT_A_MEMBER`, see `attest` above; `116` is now
+  `HOST_UNQUALIFIED`, see `doctor` above). The check adds **no runtime
+  dependency**: it interprets the embedded schema document over the keyword subset
+  that document uses, refuses to run on anything it does not implement, and is held
+  to a real JSON Schema engine's verdict — line for line, over the golden fixture
+  and a generated mutation corpus — by the test tier.
 - `run --snapshot-interval <duration>`, an opt-in cadence that re-emits the
   `members_snapshot` lifecycle event while the child runs, so a long, quiet, or
   detached run records how its process tree evolved instead of only its shape at

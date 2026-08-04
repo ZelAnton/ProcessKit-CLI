@@ -510,10 +510,10 @@ Two things, both deliberate and both stated here rather than left as silent gaps
   still gets the reserved `100`, and the supported way to establish that a flag
   exists *before* using it is the `probe` preflight
   (`--require-surface inspect:--error-format`, see
-  [`docs/integration.md`](integration.md#1-fail-closed-preflight-probe)). Note too
-  that an invocation whose own `--error-format` value failed to parse has no format
-  to honor. Should a future version cover these as well, that is an additive change
-  and will be announced in `CHANGELOG.md`.
+  [`docs/integration.md`](integration.md#1-fail-closed-preflight-probe-the-binary-then-doctor-the-host)).
+  Note too that an invocation whose own `--error-format` value failed to parse has
+  no format to honor. Should a future version cover these as well, that is an
+  additive change and will be announced in `CHANGELOG.md`.
 - **`processkit-cli: warning: …` lines.** These are not failures; the envelope is
   printed once, on the way out, for the failure that ends the process. They keep
   their prose in both modes.
