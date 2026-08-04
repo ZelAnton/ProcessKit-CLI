@@ -10,7 +10,7 @@ reading the cited code.
 
 ## Untrusted inputs
 
-Four input surfaces are treated as untrusted or semi-trusted and are handled
+Five input surfaces are treated as untrusted or semi-trusted and are handled
 accordingly (bounded parsing, validation before use, no blind trust in shape):
 
 - **Registry bytes.** Every record file under the per-user run registry
@@ -19,8 +19,21 @@ accordingly (bounded parsing, validation before use, no blind trust in shape):
   registry directory (see "Closed threats" below for the `lock_file` case).
 - **Control-plane wire strings.** The one request-verb line a client sends,
   and the one JSON reply line the server sends back, over the local
-  `inspect`/`cancel`/`kill` transport (`src/control/mod.rs`), are read as
+  `inspect`/`cancel`/`kill`/`attest` transport (`src/control/mod.rs`), are read as
   untrusted bytes from whichever local process holds the socket/pipe.
+- **A control-plane client's claimed identity — which is why there is none.** The
+  `attest` verb answers whether the connecting process is inside the run's container
+  (`docs/control-plane.md`, "`attest`"), and a caller's own account of who it is would
+  be the most obviously untrusted input on this list: any local process can hold any
+  string and name any pid. So none is accepted. The command exposes no `--pid` and the
+  verb carries no argument at all; the identity is read from the transport itself
+  (unix peer credentials, `GetNamedPipeClientProcessId` on Windows) while the
+  connection is open, and checked against the run's own live container membership. The
+  two facts that follow are the reason this is listed here rather than under "closed
+  threats": the *input* surface for this verb is empty by construction, and the answer
+  is therefore a property of the connection rather than of anything parsed. A platform
+  that cannot supply that identity is answered `peer_identity_unsupported` — a refusal
+  — rather than being allowed to fall back to what the caller says.
 - **The child's argv and output.** The command line passed to `run` is
   attacker-influenceable in the sense that it ends up in a diagnostic
   artifact (the JSONL stream) an operator or automated tooling later reads;
@@ -265,6 +278,23 @@ explicitly **out of scope** for this project's own security mechanisms:
   mechanism against it (no additional sandboxing, no cross-process
   capability restriction beyond the owner-only ACLs that already keep out
   *other* users).
+- **Authentication between mutually hostile peers — including through
+  `attest`.** The `attest` verb reports a *containment* fact (is the connecting
+  process in this run's container?) established from kernel-supplied peer
+  identity, and it is genuinely unforgeable in the sense that matters: a
+  process cannot make the runner name a pid other than its own. What it is
+  **not** is an authentication mechanism. It runs entirely inside the same-user
+  boundary above — a process able to reach the control plane at all is already
+  that user — so it neither adds a boundary nor is one. Two consequences worth
+  stating outright: a `member` answer says the caller is contained, not that it
+  is trustworthy (a compromised process inside the container attests
+  positively, correctly); and the answer is scoped to the connection it was
+  made on, so it is not a token, not transferable, and says nothing about any
+  later instant (hence `checked_at`). A consumer needing a boundary between
+  distrusting parties needs OS-level isolation — separate users, containers,
+  sandboxes — and `attest` is a check *within* one such boundary rather than a
+  substitute for it. See [`docs/control-plane.md`](control-plane.md), "The
+  boundary: containment, not authentication".
 - **Trust in the `dtolnay/rust-toolchain` action owner.** Both workflows
   deliberately leave that one action unpinned (a floating `@stable`/`@master`
   tag rather than a commit SHA) so CI and releases keep tracking the rolling

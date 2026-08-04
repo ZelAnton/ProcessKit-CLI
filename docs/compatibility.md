@@ -8,11 +8,15 @@ ProcessKit CLI has three public compatibility surfaces:
 
 **Three, and only three — a versioned payload is not a fourth surface.** Several
 machine-readable outputs carry a version field of their own: `probe --json`'s
-`probe_version`, `inspect`'s `snapshot_version`, and the `--error-format json`
-failure envelope's `error_version`. Each of those *rides on* the list above — on the
-command and flag that produce it (surface 1), and, for the failure envelope, on the
+`probe_version`, `inspect`'s `snapshot_version`, the `--error-format json`
+failure envelope's `error_version`, and `attest --json`'s `attestation_version`.
+Each of those *rides on* the list above — on the
+command and flag that produce it (surface 1), and, for the failure envelope and the
+attestation, on the
 reserved code it reports (surface 2) — and pins its own shape inside the payload
-rather than adding a fourth thing to pin before launching. The registry record's
+rather than adding a further thing to pin before launching. (Count them separately:
+"three compatibility surfaces" and "how many version fields this project publishes"
+are different questions with different answers.) The registry record's
 `registry_version` is not on the list either, for a different reason: the per-user
 registry is a private contract between this binary and itself, not something a caller
 reads off an invocation (see [`docs/registry.md`](registry.md)). Which outputs carry a
@@ -138,13 +142,20 @@ fixture under
 | `prune --json`, `prune --dry-run --json` | `fixtures/schema/cli/prune.schema.json` | `prune.jsonl` |
 | `wait --report-outcome`, `wait --all --report-outcome` | `fixtures/schema/cli/wait.schema.json` | `wait.jsonl` |
 | the `--error-format json` failure envelope (stderr, any subcommand) | `fixtures/schema/cli/error.schema.json` | `error.jsonl` |
+| `attest --json` | `fixtures/schema/cli/attest.schema.json` | `attest.jsonl` |
 
-The last row is the odd one out in two ways, both deliberate. It is printed on
+The failure-envelope row is the odd one out in two ways, both deliberate. It is
+printed on
 **stderr**, not stdout — that is what keeps stdout reserved for successful output,
 so a command that prints a report and then fails leaves its stdout untouched — and
-it describes a *failure* rather than a success, which is exactly why the six
-success shapes above could never have covered it. It is opt-in: without
+it describes a *failure* rather than a success, which is exactly why the seven
+success shapes beside it could never have covered it. It is opt-in: without
 `--error-format json`, a failure prints the same free-text prose it always did.
+
+`attest --json` is the one success-side row routinely printed *alongside* a
+non-zero exit: two of its three verdicts make the command fail, and the attestation
+is printed for all three, because the verdict is the answer while the exit code is
+what to do about it (see [`docs/control-plane.md`](control-plane.md), "`attest`").
 
 `events --json` is deliberately absent from that table: it passes the runner's own
 JSONL lines through byte for byte, so the document that describes it is the event
@@ -157,23 +168,29 @@ instead of reaching an adapter. A document whose family has more than one output
 form has a root `oneOf` over named `$defs`, so a consumer can validate against the
 exact form it invoked — for example `inspect.schema.json#/$defs/snapshot`.
 
-**Three rows of that table carry a version field; the other four deliberately do
+**Four rows of that table carry a version field; the other four deliberately do
 not.** `probe --json` carries `probe_version`, `inspect --json` carries
 `snapshot_version` — the same field the runner puts on the control-plane wire —
-and the failure envelope carries `error_version`.
-`probe.schema.json` and `error.schema.json` pin their value with `const`;
+the failure envelope carries `error_version`, and `attest --json` carries
+`attestation_version`.
+`probe.schema.json`, `error.schema.json` and `attest.schema.json` pin their value
+with `const`;
 `inspect.schema.json` admits the
 range of snapshot versions this build renders (see the `snapshot_version` bullet
 below), because that field reports the *runner's* contract, not the invoked
-binary's. Either way a bump is visible in the payload itself. **Pin those three on
+binary's. The shape follows the **reader's** tolerance rather than a sibling's
+precedent: `attest`'s value also comes off the wire, and is pinned anyway, because
+its client refuses any version but its own outright — a membership verdict read
+under unpromised semantics is worse than no verdict. Either way a bump is visible in
+the payload itself. **Pin those four on
 their own version field**, not on the CLI version alone: ignoring a
 `snapshot_version` bump across an upgrade is exactly the class of mistake this
-section exists to prevent. All three
+section exists to prevent. All four
 are versioned for the reason the project's other two versioned contracts (the
 durable JSONL stream's `schema_version` and the registry record's
 `registry_version`) are: each can be read by a party that did not invoke the
-binary — the snapshot crosses a process boundary to a runner that may be a
-different build, the probe report's whole job is to be read *before* the
+binary — the snapshot and the attestation cross a process boundary to a runner that
+may be a different build, the probe report's whole job is to be read *before* the
 binary's version is known, and a failure envelope is routinely read out of its
 invoking context altogether (captured stderr in a CI log, read back later by a
 different tool than the one that ran the binary).
@@ -197,8 +214,8 @@ Consequently:
   names and flags), not on a version integer of their own. A breaking change to
   any of them — removing a field, renaming it, changing its type or the meaning
   of a value — is a **major** release, announced in the changelog.
-- **`probe --json`, `inspect --json`, and the failure envelope additionally bump
-  their own field.** A
+- **`probe --json`, `inspect --json`, the failure envelope, and `attest --json`
+  additionally bump their own field.** A
   breaking change to either of the first two shapes bumps `probe_version` /
   `snapshot_version` respectively, and that field is what a consumer should check.
   The envelope's `error_version` works the same way: removing or re-typing one of
@@ -217,6 +234,12 @@ Consequently:
   *older* clients in a mixed deployment, not merely a signal to read; and the
   `snapshot_version` on stdout is the runner's number, so `inspect.schema.json`
   admits the range this build renders instead of pinning a single value.
+  `attest --json`'s `attestation_version` is checked too and is the strict case of
+  the same rule — any version but this build's own is refused, because a membership
+  verdict must never be read under semantics its sender did not promise, and because
+  that contract has had only one version so far, so strictness refuses nothing that
+  ever existed. Whether a wire-supplied version pin is a range or a single value
+  follows what its **reader** actually decodes, never what a sibling document does.
 - **Every document under `fixtures/schema/cli/` is updated in place.** There is no
   `vN/` directory there (unlike `fixtures/schema/v1/`, whose `v1` *is* the JSONL
   `schema_version`), because a version here, where there is one, lives in the

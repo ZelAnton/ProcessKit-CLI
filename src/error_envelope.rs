@@ -5,7 +5,7 @@
 //!
 //! Without this flag, a failed invocation gives a machine consumer exactly two
 //! things: a reserved-band exit code ([`crate::exit`]) and a line of free-text prose
-//! on stderr. The code is a coarse verdict — seven genuinely different situations all
+//! on stderr. The code is a coarse verdict — eight genuinely different situations all
 //! exit [`exit::CONTROL`] (103) — and the prose is not a contract, so an adapter
 //! that must tell a stale registry entry from an unprobeable one, or an ambiguous
 //! run id from a runner that died mid-conversation, has to parse English or
@@ -32,12 +32,14 @@
 //! `kind` is the finer name of what actually happened, and it is *never coarser*
 //! than the code:
 //!
-//! - it splits [`exit::CONTROL`] (103) **seven** ways — [`ErrorKind::NotFound`],
+//! - it splits [`exit::CONTROL`] (103) **eight** ways — [`ErrorKind::NotFound`],
 //!   [`ErrorKind::Stale`], [`ErrorKind::Unprobed`], [`ErrorKind::AmbiguousRunId`],
-//!   [`ErrorKind::ControlUnreachable`], [`ErrorKind::IpcDeadline`], and
-//!   [`ErrorKind::IncompatibleContract`] — which are exactly the distinctions
+//!   [`ErrorKind::ControlUnreachable`], [`ErrorKind::IpcDeadline`],
+//!   [`ErrorKind::IncompatibleContract`], and
+//!   [`ErrorKind::PeerIdentityUnsupported`] — which are exactly the distinctions
 //!   `docs/integration.md` §6 ("Typical errors") already draws in prose, and
-//!   [`crate::control`]'s `no_live_entry`/`ambiguous_run`/`refuse_snapshot_version`
+//!   [`crate::control`]'s
+//!   `no_live_entry`/`ambiguous_run`/`refuse_snapshot_version`/`attest_outcome`
 //!   already make in code (that count is the kinds that exist *to split* 103, which
 //!   is what `fixtures/schema/cli/error.schema.json` conditions on; the one further
 //!   kind that can arrive under 103 is [`ErrorKind::Registry`], below);
@@ -275,6 +277,33 @@ pub enum ErrorKind {
     /// read perfectly well: "it does not conform" is the answer, not a failure to
     /// produce one.
     EventsInvalid,
+    /// `attest` established that the calling process is **not** in the container of
+    /// the run it asked about ([`exit::NOT_A_MEMBER`], 115): the runner was reached,
+    /// it named the caller from the control transport itself, and that identity is
+    /// not one of its container's members.
+    ///
+    /// A *decided* answer, and the only kind here that reports one — every other
+    /// value on this list names something that went wrong. It is deliberately kept
+    /// apart from [`Self::ControlUnreachable`] and its siblings for that reason:
+    /// "the runner says no" and "no runner said anything" call for opposite
+    /// responses from an adapter gating work on membership. Not retryable: the
+    /// process asking is the process asked about, and it will not become a member by
+    /// asking again.
+    NotAMember,
+    /// `attest` could not be answered at all because the runner's platform cannot
+    /// obtain a kernel-authenticated identity for the connecting client
+    /// ([`exit::CONTROL`], 103, alongside every other "no answer you can act on").
+    ///
+    /// The fail-closed half of the same command: rather than degrade to an unproven
+    /// "ok" — or to the caller's own claim about who it is — the runner declines to
+    /// answer, and this names why. Emphatically **not** [`Self::NotAMember`]: nothing
+    /// was established about membership either way. A consumer establishes this
+    /// capability before it depends on it, with `probe --json --require-surface
+    /// attest:peer-identity` against the runner's own binary (`docs/integration.md`);
+    /// meeting it at runtime instead means that preflight was skipped or the runner
+    /// is a different build. Not retryable: it is a property of the platform, not a
+    /// transient condition.
+    PeerIdentityUnsupported,
     /// A reserved-band code this build will not put a finer name to — the
     /// forward-compatible fallback, so the envelope can always be produced and `kind`
     /// is never absent or invented. Read `code`, not `kind`, when this appears.
@@ -286,12 +315,13 @@ pub enum ErrorKind {
     /// here:
     ///
     /// - a code **no build assigns**: the retired `105`, or the still-reserved
-    ///   `115`-`119`. Naming a number whose meaning is unassigned would be worse than
+    ///   `116`-`119`. Naming a number whose meaning is unassigned would be worse than
     ///   saying so (see [`Self::for_code`]);
     /// - a code **this build assigns to a different subcommand**: `110`
     ///   ([`Self::ProbeIncompatible`]), `112` ([`Self::WaitTimeout`]), `114`
-    ///   ([`Self::EventsInvalid`]) — minted only by `probe`, `wait`, and
-    ///   `events --validate`, and unreachable from `run`. Reading a foreign build's
+    ///   ([`Self::EventsInvalid`]), `115` ([`Self::NotAMember`]) — minted only by
+    ///   `probe`, `wait`, `events --validate`, and `attest`, and unreachable from
+    ///   `run`. Reading a foreign build's
     ///   number through this build's table would state a verdict about a run that
     ///   nothing established: a relayed `112` would claim `wait_timeout` — the one
     ///   retryable kind, meaning "the run is still going, wait again" — for a run that
@@ -333,6 +363,8 @@ impl ErrorKind {
             Self::WaitTimeout => "wait_timeout",
             Self::OutputOverflow => "output_overflow",
             Self::EventsInvalid => "events_invalid",
+            Self::NotAMember => "not_a_member",
+            Self::PeerIdentityUnsupported => "peer_identity_unsupported",
             Self::Unknown => "unknown",
         }
     }
@@ -386,6 +418,8 @@ impl ErrorKind {
             | Self::Setup
             | Self::OutputOverflow
             | Self::EventsInvalid
+            | Self::NotAMember
+            | Self::PeerIdentityUnsupported
             | Self::Unknown => false,
         }
     }
@@ -415,7 +449,8 @@ impl ErrorKind {
             exit::WAIT_TIMEOUT => Self::WaitTimeout,
             exit::OUTPUT_OVERFLOW => Self::OutputOverflow,
             exit::EVENTS_INVALID => Self::EventsInvalid,
-            // `NOT_IMPLEMENTED` (105, retired) and the reserved `115`-`119`: no
+            exit::NOT_A_MEMBER => Self::NotAMember,
+            // `NOT_IMPLEMENTED` (105, retired) and the reserved `116`-`119`: no
             // active path mints them, and inventing a name for a number whose
             // meaning is not assigned would be worse than saying so.
             _ => Self::Unknown,
@@ -561,6 +596,8 @@ mod tests {
         ErrorKind::WaitTimeout,
         ErrorKind::OutputOverflow,
         ErrorKind::EventsInvalid,
+        ErrorKind::NotAMember,
+        ErrorKind::PeerIdentityUnsupported,
         ErrorKind::Unknown,
     ];
 
@@ -672,6 +709,7 @@ mod tests {
             exit::WAIT_TIMEOUT,
             exit::OUTPUT_OVERFLOW,
             exit::EVENTS_INVALID,
+            exit::NOT_A_MEMBER,
         ] {
             let kind = ErrorKind::for_code(code);
             assert_ne!(
@@ -697,6 +735,7 @@ mod tests {
             ErrorKind::AmbiguousRunId,
             ErrorKind::IpcDeadline,
             ErrorKind::IncompatibleContract,
+            ErrorKind::PeerIdentityUnsupported,
         ] {
             assert_ne!(
                 kind,
@@ -714,14 +753,14 @@ mod tests {
 
     #[test]
     fn an_unassigned_reserved_code_is_named_unknown_rather_than_guessed() {
-        // 105 is retired and 115-119 are reserved: no active path mints them, and a
+        // 105 is retired and 116-119 are reserved: no active path mints them, and a
         // relayed detached start failure is the one way a foreign build's code could
         // arrive here.
         assert_eq!(
             ErrorKind::for_code(exit::NOT_IMPLEMENTED),
             ErrorKind::Unknown
         );
-        for code in exit::EVENTS_INVALID + 1..=exit::RUNNER_RANGE_END {
+        for code in exit::NOT_A_MEMBER + 1..=exit::RUNNER_RANGE_END {
             assert_eq!(
                 ErrorKind::for_code(code),
                 ErrorKind::Unknown,

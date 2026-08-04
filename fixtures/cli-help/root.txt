@@ -7,6 +7,7 @@ Commands:
   inspect  Query a live run over local IPC
   cancel   Ask a live run to cancel (graceful where supported, then a hard kill), by `--run-id` or, in aggregate, `--all`
   kill     Hard-kill a live run's container immediately, by `--run-id` or, in aggregate, `--all`
+  attest   Ask a live run whether this very process is inside its container — a fact the runner checks against the kernel's own view of who connected, never a claim the caller makes about itself
   wait     Block until a run recorded in the per-user registry has finished
   events   Read back a run's JSONL lifecycle stream: render it, follow it, pass it through, or check it against the embedded event schema
   list     List every run recorded in the per-user registry, whatever its health (live/stale/unprobed)

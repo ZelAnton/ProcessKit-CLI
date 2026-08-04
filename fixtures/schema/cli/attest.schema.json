@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/ZelAnton/ProcessKit-CLI/main/fixtures/schema/cli/attest.schema.json",
+  "title": "processkit-cli `attest --json` containment attestation",
+  "description": "The single JSON line `attest --run-id <id> --json` prints to **stdout**: the live runner's verdict on whether the process that ran the command is inside that run's ProcessKit container. The identity behind the verdict is the kernel's — unix socket peer credentials, or `GetNamedPipeClientProcessId` on the Windows named pipe, read from the control connection while it is open — never anything the caller supplied, which is why the command accepts no `--pid` and why a positive answer is a containment fact rather than a repeated claim. The line is printed for every verdict, including the two that make the invocation fail: `not_a_member` exits NOT_A_MEMBER (115) and `peer_identity_unsupported` exits CONTROL (103), and under `--error-format json` the matching envelope goes to stderr (fixtures/schema/cli/error.schema.json) while this stays on stdout. The normative prose is docs/control-plane.md, \"`attest`\", and the boundary it draws is docs/threat-model.md; the in-code source of truth is src/control/mod.rs. Validated against fixtures/schema/cli/attest.jsonl, and against the real binary's output, by tests/machine_output.rs; the cross-process scenarios behind it are tests/attest.rs.",
+  "$ref": "#/$defs/attestation",
+  "$defs": {
+    "attestation": {
+      "type": "object",
+      "description": "One run's answer about one caller, at one instant. Bounded by construction: six fields, every one of them a scalar. Unlike `inspect`'s snapshot this carries no member list — a caller learns whether *it* is contained, never who else is, so a negative answer discloses nothing about the run.",
+      "properties": {
+        "attestation_version": {
+          "const": 1,
+          "description": "The attestation contract's own format version (src/control/mod.rs, ATTESTATION_VERSION) — an axis of its own, independent of `inspect`'s `snapshot_version`, the JSONL `schema_version`, the `registry_version`, and the probe report's `probe_version`. Pinned with `const` because the read side is strict: a client renders a reply only when the runner declares exactly this number, and refuses anything else with CONTROL (103) / `incompatible_contract` rather than reading a security verdict under semantics its sender never promised. That is deliberately unlike `inspect.schema.json`'s `snapshot_version`, which enumerates a range because its client genuinely decodes an older shape — pick the form per whether the reader is strict or range-tolerant."
+        },
+        "run_id": {
+          "type": "string",
+          "description": "The run the verdict is about — the id the client matched in the registry, echoed by the runner and checked by the client, so an answer from another run is refused rather than printed."
+        },
+        "verdict": {
+          "type": "string",
+          "enum": ["member", "not_a_member", "peer_identity_unsupported"],
+          "description": "`member` — the connecting process is in this run's container (exit 0). `not_a_member` — the runner named the caller and it is not (exit 115): a decided answer, not a failure to obtain one. `peer_identity_unsupported` — the runner could not obtain a kernel-authenticated identity for the caller at all and declined to answer either way (exit 103): fail-closed, never a silent degradation to an unproven `member`. A consumer establishes that third case cannot happen on its platform before it depends on attestation, with `probe --json --require-surface attest:peer-identity` (docs/integration.md)."
+        },
+        "peer_pid": {
+          "type": ["integer", "null"],
+          "description": "The pid the kernel reported for the connecting client, as the runner sees it, or null when the platform could not name it (`peer_identity_unsupported`). Reported for correlation only — it is an output of the transport, never an input a caller could choose. On a system where runner and client are in different pid namespaces this is the runner's view, which is the one the verdict was decided in."
+        },
+        "mechanism": {
+          "type": "string",
+          "enum": ["job_object", "cgroup_v2", "process_group", "unknown"],
+          "description": "The containment mechanism the verdict is about — the same vocabulary the JSONL `run_started` and the `inspect` snapshot use (docs/schema.md). It fixes the *scope* of the fact, which genuinely differs: a Job Object or a cgroup enumerates the whole contained tree, while the POSIX `process_group` fallback contains a tree but enumerates only its group leaders, so membership there is decided against the peer's own process group — the predicate that mechanism actually enforces. Read this to know how strong the containment behind a `member` answer is; see docs/control-plane.md, \"What `member` means, per mechanism\"."
+        },
+        "checked_at": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$",
+          "description": "When the runner decided this, RFC 3339 UTC with millisecond precision (the same formatter as the JSONL events and the registry record). An attestation is a point-in-time fact about a live connection, not a token to keep: it says the caller was contained when it asked, and nothing about any later instant."
+        }
+      },
+      "required": [
+        "attestation_version",
+        "run_id",
+        "verdict",
+        "peer_pid",
+        "mechanism",
+        "checked_at"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "verdict": { "enum": ["member", "not_a_member"] }
+            },
+            "required": ["verdict"]
+          },
+          "then": {
+            "properties": { "peer_pid": { "type": "integer", "minimum": 1 } },
+            "description": "Both decided verdicts rest on a peer the kernel actually named, so the pid is always present and positive there. A pid of 0 (or none) is precisely the case the runner refuses to decide on."
+          },
+          "else": {
+            "properties": { "peer_pid": { "type": "null" } },
+            "description": "`peer_identity_unsupported` fabricates no identity: the field is null rather than a placeholder number."
+          }
+        }
+      ]
+    }
+  }
+}

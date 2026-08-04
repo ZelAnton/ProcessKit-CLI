@@ -160,12 +160,33 @@ fn probe_reports_a_consistent_compatible_surface() {
         "list:--error-format",
         "prune:--error-format",
         "probe:--error-format",
+        // `attest` (T-306) is the third whole subcommand to enter the surface with
+        // no hand-maintained token list, flags and global included.
+        "attest",
+        "attest:--run-id",
+        "attest:--json",
+        "attest:--error-format",
     ] {
         assert!(
             surface.contains(&token),
             "the surface must expose `{token}`: {surface:?}"
         );
     }
+
+    // The one **capability** token (T-306), and the one entry here that is not a
+    // spelling the parser knows: `attest:peer-identity` says this build can obtain a
+    // kernel-authenticated peer identity on this platform, which is what makes
+    // `attest`'s verdict possible at all. It carries no `--` precisely so it is never
+    // mistaken for a flag. Every target this project releases for (Windows, Linux,
+    // macOS) has that facility, so through the real binary it must be advertised
+    // here; that a consumer can then *require* it, and that requiring it really is
+    // fail-closed, is asserted in
+    // `incompatible_band_and_surface_fail_closed_and_real_ones_pass` below.
+    assert!(
+        surface.contains(&"attest:peer-identity"),
+        "the platforms this project ships for all name their control-plane peers, so \
+         the capability must be advertised: {surface:?}"
+    );
 
     // No side effects: the probe spawned nothing and wrote nothing to its cwd.
     let leftovers: Vec<_> = std::fs::read_dir(&dir)
@@ -283,6 +304,34 @@ fn incompatible_band_and_surface_fail_closed_and_real_ones_pass() {
     );
     assert_eq!(surface_ok.status.code(), Some(0));
     assert_eq!(parse_report(&surface_ok)["compatible"], true);
+
+    // The capability token behaves exactly like every other requirement — which is
+    // the whole reason it is published as one (T-306). An adapter that will gate work
+    // on `attest` asks for it here, at preflight, and gets a real verdict rather than
+    // discovering mid-run that the runner cannot name its callers. On this platform
+    // the capability is present, so the check passes; on one where it is absent the
+    // very same invocation is `compatible: false` and exit 110, like the bogus token
+    // above — a missing capability can never read as a satisfied requirement.
+    let capability = probe(
+        &dir,
+        &[
+            "--require-surface",
+            "attest",
+            "--require-surface",
+            "attest:--run-id",
+            "--require-surface",
+            "attest:peer-identity",
+        ],
+    );
+    assert_eq!(capability.status.code(), Some(0));
+    assert_eq!(parse_report(&capability)["compatible"], true);
+
+    // A capability spelled like a flag is not a capability: the grammar is part of
+    // the contract, so `attest:--peer-identity` is simply an unknown token and fails
+    // closed.
+    let mistyped = probe(&dir, &["--require-surface", "attest:--peer-identity"]);
+    assert_eq!(mistyped.status.code(), Some(PROBE_INCOMPATIBLE));
+    assert_eq!(parse_report(&mistyped)["compatible"], false);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

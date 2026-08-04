@@ -109,6 +109,12 @@ pub struct ProbeReport {
     /// sorted. Derived from the live clap definition so it never drifts from the
     /// real parser. A consumer reads this to confirm the exact flags it will use
     /// exist.
+    ///
+    /// One entry is a **capability** rather than a spelling, and is distinguishable
+    /// by carrying no `--`: `attest:peer-identity` (see [`PEER_IDENTITY_TOKEN`]),
+    /// present only where this build can obtain a kernel-authenticated peer identity.
+    /// A consumer requires it exactly as it requires a flag, with
+    /// `--require-surface`, and gets the same fail-closed verdict when it is missing.
     pub surface: Vec<String>,
     /// Whether every `--require-*` expectation the consumer asked for is satisfied.
     /// `true` when no expectation was requested (a healthy self-report).
@@ -230,6 +236,20 @@ fn evaluate(args: &ProbeArgs) -> Vec<String> {
     mismatches
 }
 
+/// The one **capability** token in the surface list: this build obtains a
+/// kernel-authenticated peer identity on this platform, so `attest`
+/// (`docs/control-plane.md`) can return a real membership verdict here rather than
+/// failing closed with `peer_identity_unsupported`.
+///
+/// It is present exactly when [`crate::control::PEER_IDENTITY_SUPPORTED`] is, which
+/// is the whole point: a consumer that will gate work on attestation asks for it at
+/// preflight — `probe --json --require-surface attest:peer-identity` — and gets the
+/// same fail-closed `110` every other unmet expectation produces, instead of
+/// discovering mid-run that the answer it needs cannot be given. Absence is the
+/// withholding of a guarantee, not a prediction of failure; see that constant for the
+/// one target where the two differ, and why the claim is deliberately conservative.
+const PEER_IDENTITY_TOKEN: &str = "attest:peer-identity";
+
 /// The binary's CLI surface tokens, derived from the **live** clap definition so the
 /// report can never drift from the real parser: for each subcommand, its name, plus
 /// `<name>:--<long>` for each of its long flags — its own, and the top-level
@@ -246,6 +266,17 @@ fn evaluate(args: &ProbeArgs) -> Vec<String> {
 /// is what would otherwise propagate them), because building also injects clap's own
 /// `help` subcommand and would silently widen the published surface with tokens no
 /// task asked for.
+///
+/// **One token is not clap-derived, and cannot be**: [`PEER_IDENTITY_TOKEN`]
+/// (`attest:peer-identity`, no `--`, because it is not a flag). Every other token
+/// answers "does this binary accept this spelling", which the parser knows; that one
+/// answers "can this binary *do* the thing that spelling asks for on this platform",
+/// which the parser cannot know and which is genuinely platform-dependent. Publishing
+/// it here rather than inventing a second discovery channel keeps a consumer's
+/// preflight to one command and one mechanism (`--require-surface`), and the distinct
+/// grammar — no `--` — is what keeps the two categories from being confused for each
+/// other. A flag's presence is still never hand-maintained: only this capability is,
+/// and its condition is a single constant owned by the module that implements it.
 fn surface_tokens() -> Vec<String> {
     use clap::CommandFactory;
 
@@ -266,6 +297,9 @@ fn surface_tokens() -> Vec<String> {
                 tokens.push(format!("{name}:--{long}"));
             }
         }
+    }
+    if crate::control::PEER_IDENTITY_SUPPORTED {
+        tokens.push(PEER_IDENTITY_TOKEN.to_string());
     }
     tokens.sort();
     tokens.dedup();
@@ -382,6 +416,13 @@ mod tests {
             "inspect:--json",
             "inspect:--all",
             "inspect:--label",
+            // `attest` (T-306) is the third whole-subcommand confirmation that a new
+            // subcommand and its flags enter the surface with no edit to this
+            // module's derivation at all.
+            "attest",
+            "attest:--run-id",
+            "attest:--json",
+            "attest:--error-format",
             "cancel:--run-id",
             "cancel:--label",
             "kill:--label",
@@ -431,6 +472,23 @@ mod tests {
                 .iter()
                 .any(|t| t.ends_with(":--help") || t.ends_with(":--version")),
             "clap's help/version flags are not part of the compatibility surface: {surface:?}"
+        );
+        // The one deliberately non-clap-derived token: it tracks the platform
+        // capability constant exactly, in both directions, so it can never advertise
+        // a guarantee this build does not make (nor withhold one it does).
+        assert_eq!(
+            surface.iter().any(|t| t == PEER_IDENTITY_TOKEN),
+            crate::control::PEER_IDENTITY_SUPPORTED,
+            "`{PEER_IDENTITY_TOKEN}` is published exactly when this build can obtain a \
+             kernel-authenticated peer identity: {surface:?}"
+        );
+        assert!(
+            surface
+                .iter()
+                .filter(|t| t.starts_with("attest:"))
+                .all(|t| t.starts_with("attest:--") || t.as_str() == PEER_IDENTITY_TOKEN),
+            "a capability token is spelled without `--` so it is never mistaken for a flag: \
+             {surface:?}"
         );
         // Deterministic: sorted and free of duplicates.
         let mut sorted = surface.clone();

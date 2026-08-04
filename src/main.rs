@@ -44,7 +44,7 @@ fn main() -> ExitCode {
     // returns an ordinary `ExitCode` reporting whether the run *started* (see
     // `run::execute` and `docs/exit-codes.md`, "Detached runs"). Every
     // other subcommand either reaches a live runner over the control plane
-    // (`inspect`/`cancel`/`kill`), reads the per-user registry without contacting
+    // (`inspect`/`cancel`/`kill`/`attest`), reads the per-user registry without contacting
     // any runner (`wait`/`list`/`prune`, and `events`, which also reads back the
     // run's own JSONL file), or is entirely self-contained (`probe`) — and each
     // reports through the shared runner-error path below.
@@ -81,6 +81,9 @@ fn main() -> ExitCode {
                     .expect("clap requires --run-id when --all is absent"),
             )
         }),
+        // `--run-id` is not an `Option` here: `attest` has no aggregate form, so
+        // clap requires the single target outright (see `cli::AttestArgs`).
+        Command::Attest(args) => report(control::attest(&args.run_id, args.json)),
         Command::Wait(args) => report(if args.all {
             wait::run_all(args.timeout, &args.labels, args.report_outcome)
         } else {

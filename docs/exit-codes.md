@@ -38,7 +38,7 @@ failure is not mistaken for a child result.
 | 100  | `USAGE`           | Invalid command line: unknown flag, missing required option, malformed value (including a bad `--timeout`/`--grace` duration), or bad subcommand form. |
 | 101  | `SPAWN`           | The target program could not be started (not found, not executable, bad `--cwd`, permission denied). |
 | 102  | `BACKEND`         | ProcessKit backend/containment failure: kernel container, job object, IPC endpoint, or run registry could not be established — including a requested resource limit (`--max-memory` / `--max-processes` / `--cpu-quota`) the active mechanism could not apply (the machine-readable `limit_hit` event names which one; see "Resource limits" below). |
-| 103  | `CONTROL`         | A by-`run-id` command could not be resolved to **the** single live run it names. For `inspect` / `cancel` / `kill` that covers every way the target cannot be reached: no such run id, a stale/dead registry entry, an entry whose liveness could not be probed at all (reported as `unprobed` — a refusal, not a claim that the runner died), an ambiguous run id (more than one live run registered under it), or an IPC failure. `inspect` adds one reason of its own that is *not* an unreachable runner: the target answered, and its **answer** was rejected — a reply declaring a `snapshot_version` outside the range this client reads (newer than it implements, or older than it still decodes) is refused rather than rendered under semantics its sender never promised (see `docs/control-plane.md`, "Snapshot version: a newer runner's reply is refused, an older one is read"). Retrying does not clear it, but that is no way to tell it apart from the others: a confirmed-stale entry and an ambiguous run id are equally unaffected by a retry. The registry-only `wait` shares exactly one of those reasons — an **ambiguous** run id — and reports it with this same code even though it contacts no runner: there is no single run to wait for. `cancel --all` / `kill --all` reuse this same code for a different fact — one or more record-addressed targets in the confirmed-live snapshot remained potentially live but could not be reached safely or did not acknowledge the command. A target confirmed gone before dispatch is instead the successful `already_gone` report status. The per-target reason is in the JSON report on stdout, not just the stderr tally. See `docs/control-plane.md`, "`cancel --all` / `kill --all`". |
+| 103  | `CONTROL`         | A by-`run-id` command could not be resolved to **the** single live run it names. For `inspect` / `cancel` / `kill` / `attest` that covers every way the target cannot be reached: no such run id, a stale/dead registry entry, an entry whose liveness could not be probed at all (reported as `unprobed` — a refusal, not a claim that the runner died), an ambiguous run id (more than one live run registered under it), or an IPC failure. `inspect` adds one reason of its own that is *not* an unreachable runner: the target answered, and its **answer** was rejected — a reply declaring a `snapshot_version` outside the range this client reads (newer than it implements, or older than it still decodes) is refused rather than rendered under semantics its sender never promised (see `docs/control-plane.md`, "Snapshot version: a newer runner's reply is refused, an older one is read"). `attest` adds the second such reason: the target answered that it could not obtain a kernel-authenticated identity for the caller (`kind: peer_identity_unsupported`), so it declined to decide membership either way — again reached and healthy, again no answer to act on. Its *decided* negative is deliberately **not** this code but `NOT_A_MEMBER` (115). Retrying does not clear it, but that is no way to tell it apart from the others: a confirmed-stale entry and an ambiguous run id are equally unaffected by a retry. The registry-only `wait` shares exactly one of those reasons — an **ambiguous** run id — and reports it with this same code even though it contacts no runner: there is no single run to wait for. `cancel --all` / `kill --all` reuse this same code for a different fact — one or more record-addressed targets in the confirmed-live snapshot remained potentially live but could not be reached safely or did not acknowledge the command. A target confirmed gone before dispatch is instead the successful `already_gone` report status. The per-target reason is in the JSON report on stdout, not just the stderr tally. See `docs/control-plane.md`, "`cancel --all` / `kill --all`". |
 | 104  | `INTERNAL`        | Unexpected runner fault: the runner reached a state its own logic rules out, or lost a trustworthy view of the run (a `wait` on the child failed and its fate is unknown; the backend returned an outcome this build cannot render). Reported with this code instead of panicking. **A genuine runner bug** — an ordinary setup failure is `SETUP` (111), not this. |
 | 105  | `NOT_IMPLEMENTED` | **Retired.** Formerly minted for a defined-but-not-yet-built code path; every subcommand is now implemented, so no active path mints it. The number stays permanently reserved (see "Stability" below) — it is never reused for a different meaning. |
 | 106  | `TIMEOUT`         | The run exceeded a runner deadline — the whole-run `--timeout`, or the `--idle-timeout` (the child went silent past the idle window) — and the runner tore the process tree down. A runner-*imposed outcome*, not a child exit. The two are told apart by the `timeout` event's `reason` (`overall` / `idle`), not by the code; both reuse `106` (see "Timeout, cancel, and kill" below). |
@@ -50,11 +50,12 @@ failure is not mistaken for a child result.
 | 112  | `WAIT_TIMEOUT`    | The **`wait` subcommand's own** deadline (`wait --run-id <id> --timeout <duration>`) elapsed while the run it was waiting for was still live. *The waiter* gave up; the run was never touched — `wait` is read-only and reaches no runner — and is still going. Deliberately **not** `TIMEOUT` (106), which means the opposite (the *runner* enforced a deadline and tore the child's tree down), and not `CONTROL` (103), since the run was resolved unambiguously and found perfectly healthy. See "A waiter's deadline is not a run's deadline" below. |
 | 113  | `OUTPUT_OVERFLOW` | A capture stream exceeded `--capture-max-bytes` while `--capture-overflow cancel` was active. The runner ended the tree through its graceful-stop and escalation path. Distinct from a time deadline; `output_overflow` identifies the stream and limit. |
 | 114  | `EVENTS_INVALID`  | `events --validate` found at least one line of the JSONL stream it checked that does not conform to the event schema this binary embeds (the document `probe --print-schema` prints). A verdict about a **document**, not about any run — `events` spawns no child, contacts no runner, and mutates nothing. Deliberately not `PROBE_INCOMPATIBLE` (110), whose subject is the opposite direction (*this binary* failing a consumer's `--require-*` expectations), and not `SETUP` (111): the stream was found, opened, and read perfectly well, and "it does not conform" is the answer, not a failure to produce one. A stream that could not be read at all is still `SETUP` (111) and a `--run-id` naming no single readable stream is still `CONTROL` (103), so a CI job can tell "invalid" from "could not be checked". See "Checking a stream: `events --validate`" below. |
+| 115  | `NOT_A_MEMBER`    | `attest --run-id <id>` established that the **calling process is not inside that run's container**: the runner was reached, it named the caller from the control transport itself (unix peer credentials / `GetNamedPipeClientProcessId`), and that identity is not one of its container's members. A *decided verdict*, not a failure to obtain one — which is exactly why it is not `CONTROL` (103), whose every meaning is "no answer you can act on". `attest`'s other failing outcome, a runner that could not obtain a kernel-authenticated identity for the caller at all, **is** a `103` (`kind: peer_identity_unsupported`), because nothing was established either way. See "A membership verdict is not an unreachable target" below and [`docs/control-plane.md`](control-plane.md), "`attest`". |
 
-Codes `115`–`119` are **reserved** for future runner-own conditions. `--help`
+Codes `116`–`119` are **reserved** for future runner-own conditions. `--help`
 and `--version` are not failures: they print to stdout and exit `0`.
 
-A code is deliberately coarse — `CONTROL` (103) alone covers seven different
+A code is deliberately coarse — `CONTROL` (103) alone covers eight different
 situations. A consumer that needs the finer verdict without parsing the stderr
 prose asks for it with the global `--error-format json`, which prints one bounded
 JSON object naming this same code plus a more specific `kind`; see
@@ -164,6 +165,41 @@ could not check it":
 `--validate` never reports `0` for a stream it could not check, and never reports `114`
 for one it merely could not read: that separation is the whole point of the code.
 
+## A membership verdict is not an unreachable target
+
+`NOT_A_MEMBER` (115) is the third code that reports a *verdict* rather than an ending,
+and the distinction it draws is the reason it exists at all. It is minted only by
+`attest --run-id <id>` (see [`docs/control-plane.md`](control-plane.md), "`attest`"),
+and only for one situation: the runner was reached, it named the calling process from
+the control transport itself, and that process is not in the run's container.
+
+The pressure to fold this into `CONTROL` (103) is obvious — both are non-zero results
+from a control-plane client — and it is exactly what must not happen:
+
+- **`CONTROL` (103) means there is no answer to act on.** Every one of its situations
+  is a way the target could not be resolved, reached, or understood.
+- **`NOT_A_MEMBER` (115) means the answer arrived and it is "no".** The target was
+  resolved to one live run, the connection succeeded, the runner checked its own
+  container membership, and it says the caller is not in it.
+
+An adapter gating work on membership must respond to those differently — deny, versus
+investigate or retry — and it cannot, if a single code carries both. Nor is there an
+earlier, more specific signal to lean on the way `BACKEND` (102) leans on the
+`limit_hit` event or `TIMEOUT` (106) on the `timeout` event's `reason`: `attest` never
+touches a run's JSONL stream, so the code (and, under `--error-format json`, the
+`kind`) is all a caller has.
+
+`attest`'s three outcomes therefore land on three distinguishable results:
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | The caller is inside the run's container (`verdict: "member"` on stdout). |
+| `115` (`NOT_A_MEMBER`) | The runner named the caller and it is not a member. A decided verdict; the attestation is still printed on stdout. |
+| `103` (`CONTROL`) | No verdict: the run was unreachable/stale/unprobed/ambiguous as for any control client — or it was reached and could not obtain a kernel-authenticated identity for the caller (`kind: peer_identity_unsupported`), which is a refusal to answer, never a negative answer. |
+
+Like `WAIT_TIMEOUT` (112), this code says nothing about the run itself: `attest` is
+read-only, and the run it asked about is untouched and still going either way.
+
 ## Setup failures vs internal faults
 
 `SETUP` (111) and `INTERNAL` (104) are deliberately kept apart so the code alone tells a
@@ -235,7 +271,7 @@ run can fail before it begins — a program that is not there (`SPAWN` 101), a c
 that cannot be created or a limit that cannot be applied (`BACKEND` 102), an unwritable
 `--jsonl`/`--capture-dir` (`SETUP` 111) — and the detached copy exits with precisely
 that code, which the caller then relays unchanged. A caller therefore reads `run
---detach`'s failures with the same table as `run`'s, and the reserved range `115`–`119`
+--detach`'s failures with the same table as `run`'s, and the reserved range `116`–`119`
 stays free. Two failures belong to the detach wrapper itself rather than to the run, and
 both take `SETUP` (111): the detached copy could not be spawned at all (a support step
 failed; blaming `SPAWN` would point at the caller's program, which was never reached),
@@ -249,9 +285,10 @@ never relayed, because no run path can exit successfully without having written
 `--error-format json` (below), a relayed code that `run` itself mints reports the kind
 the foreground failure would have reported — `spawn_error`, `container_error`, `setup`,
 and so on. A reserved-band code `run` *cannot* mint reports `kind: "unknown"` instead:
-that is `PROBE_INCOMPATIBLE` (110), `WAIT_TIMEOUT` (112), and `EVENTS_INVALID` (114),
-which only `probe`, `wait`, and `events --validate` produce, plus any number no build
-assigns yet. The respawned copy can be a *different build* — the binary on disk may have
+that is `PROBE_INCOMPATIBLE` (110), `WAIT_TIMEOUT` (112), `EVENTS_INVALID` (114), and
+`NOT_A_MEMBER` (115),
+which only `probe`, `wait`, `events --validate`, and `attest` produce, plus any number
+no build assigns yet. The respawned copy can be a *different build* — the binary on disk may have
 been replaced between the spawn and the exec — so reading its number through this
 build's table would invent a verdict: a relayed `112` would say `wait_timeout`, the one
 kind that reports `retryable: true` and means "the run is still going, wait again",
@@ -291,13 +328,14 @@ number. A child's own code is never lost or aliased, because the runner's failur
 are additionally recorded out of band.
 
 There is a second way the band is not enough, and it applies to the commands that
-never start a run at all: a code is **coarse**. `CONTROL` (103) alone covers seven
+never start a run at all: a code is **coarse**. `CONTROL` (103) alone covers eight
 genuinely different situations — no such run id, a confirmed-stale entry, an
 unprobeable one, an ambiguous id, a runner that could not be reached, one that was
-reached but let a bounded window elapse, and a reply whose version this build
-refuses — and `inspect`/`cancel`/`kill`/`wait`/`events`
-have no event stream of their own to disambiguate them in. (Those seven are the ones
-that exist *to split* `103`, and the seven the `kind` table below lists against it.
+reached but let a bounded window elapse, a reply whose version this build
+refuses, and a runner that could not name the caller an `attest` asks about — and
+`inspect`/`cancel`/`kill`/`attest`/`wait`/`events`
+have no event stream of their own to disambiguate them in. (Those eight are the ones
+that exist *to split* `103`, and the eight the `kind` table below lists against it.
 An unreadable registry can arrive under the same code as well, reported as
 `registry` — the one kind published under two codes, since it is *why* a by-`run-id`
 client could not resolve its target.) Historically the only
@@ -334,7 +372,7 @@ and `tests/error_envelope.rs`. The in-code source of truth is
 | `error_version` | yes | The envelope's own format version, currently `1`. Pin it. A breaking change to the shape bumps it; a new field or a new `kind` value does not (both are additive). |
 | `code` | yes | The reserved-band code this invocation exits with — the same number `$?` reports, so the two can never disagree. |
 | `kind` | yes | What actually failed, finer than `code`. The vocabulary is below. |
-| `operation` | yes | The subcommand that failed: `run`, `inspect`, `cancel`, `kill`, `wait`, `events`, `list`, `prune`, `probe`. |
+| `operation` | yes | The subcommand that failed: `run`, `inspect`, `cancel`, `kill`, `attest`, `wait`, `events`, `list`, `prune`, `probe`. |
 | `run_id` | yes | The run id the invocation named, or `null` when it named none (an `--all` fan-out, `list`/`prune`/`probe`, or a `run` that let the runner generate one). Present-and-null, never omitted. |
 | `retryable` | yes | Whether repeating this exact invocation may succeed later. A pure function of `kind` — see below. |
 | **`message`** | **no** | The same free-text explanation the default prose prints. **Never branch on it**: it may be reworded in any release, and the golden fixture deliberately does not pin its text. |
@@ -354,12 +392,14 @@ either: every assigned code has at least one kind of its own, so branching on
 | `ambiguous_run_id` | 103 | More than one live run (or, for `events`, more than one stream) is registered under that id, so the command refuses to guess. |
 | `control_unreachable` | 103 | A single target was resolved but could not be reached or did not answer — no endpoint, a failed connect, a runner that died mid-conversation. Also the verdict of an `--all` fan-out where some targets could not be acted on. |
 | `ipc_deadline` | 103 | A bounded control-plane window (connect, or request/response) elapsed against a runner that was there. |
-| `incompatible_contract` | 103 | The other side declared a contract this build does not implement and the answer was refused rather than misread — today, an `inspect` reply whose `snapshot_version` is outside the range this client reads. Says nothing about the run's liveness. |
+| `incompatible_contract` | 103 | The other side declared a contract this build does not implement and the answer was refused rather than misread — an `inspect` reply whose `snapshot_version` is outside the range this client reads, or an `attest` reply whose `attestation_version` is not the one this client reads. Says nothing about the run's liveness. |
+| `peer_identity_unsupported` | 103 | `attest` reached the runner, and the runner could not obtain a kernel-authenticated identity for the calling process from the control transport, so it declined to decide membership either way. A refusal, never a negative answer — see "A membership verdict is not an unreachable target". Establish the capability at preflight with `probe --json --require-surface attest:peer-identity`. |
 | `probe_incompatible` | 110 | The preflight found this binary does not satisfy a `--require-*` expectation. The concrete reasons are in `probe --json`'s own `mismatches` array on stdout. |
 | `registry` | 111, or 103 | The per-user run registry itself could not be opened or scanned. The one kind reachable under two codes: `SETUP` (111) for a whole-registry command, `CONTROL` (103) when it is why a by-`run-id` client could not resolve its target. |
 | `setup` | 111 | Any other prerequisite: an unwritable output, an unreadable stream, a runtime that would not build, a reply that would not serialize. |
 | `wait_timeout` | 112 | `wait`'s own deadline elapsed; the run was never touched and is still going. |
 | `events_invalid` | 114 | `events --validate` checked a document and it does not conform. |
+| `not_a_member` | 115 | `attest` established that the calling process is **not** in the container of the run it asked about. The one kind here that reports a decided verdict rather than something that went wrong. |
 | `usage` | 100 | An invalid command line detected after parsing — in practice only a detached start relaying the code its respawned copy reported. clap's own parse-time errors are outside this envelope (below). |
 | `spawn_error` | 101 | The child could not be started. |
 | `container_error` | 102 | The container / job object / IPC endpoint / registry could not be established, including an unappliable resource limit. |
@@ -369,7 +409,7 @@ either: every assigned code has at least one kind of its own, so branching on
 | `control_cancel` | 108 | A control-plane `cancel` ended the run. |
 | `control_kill` | 109 | A control-plane `kill` ended the run. |
 | `output_overflow` | 113 | A capture stream exceeded `--capture-max-bytes` under `--capture-overflow cancel`. |
-| `unknown` | any | A reserved-band code this build will not name here. Read `code`. Reachable only when a `run --detach` relays the code of a respawned copy that turned out to be a different build, and covering both shapes of that: a code no build assigns yet (the retired `105`, the reserved `115`–`119`), and a code this build assigns to a *different* subcommand (`110`, `112`, `114` — minted only by `probe`, `wait`, and `events --validate`, never by `run`), which the relay refuses to read as a verdict about a run. |
+| `unknown` | any | A reserved-band code this build will not name here. Read `code`. Reachable only when a `run --detach` relays the code of a respawned copy that turned out to be a different build, and covering both shapes of that: a code no build assigns yet (the retired `105`, the reserved `116`–`119`), and a code this build assigns to a *different* subcommand (`110`, `112`, `114`, `115` — minted only by `probe`, `wait`, `events --validate`, and `attest`, never by `run`), which the relay refuses to read as a verdict about a run. |
 
 The nine `run`-family values in that table (`usage` is not one of them: a
 `run --detach` can relay it, but it names no run *ending*) are **not a second
@@ -450,13 +490,18 @@ Two things, both deliberate and both stated here rather than left as silent gaps
   do that yet" — but the number is not reassigned to a new meaning; it stays
   reserved and unused going forward.
 - New runner-own conditions take the **next free code** in the reserved range
-  rather than overloading an existing one. `EVENTS_INVALID` (114) is the most recent,
-  taking the next free slot after `OUTPUT_OVERFLOW` (113) rather than overloading
+  rather than overloading an existing one, and only when no existing code (or an
+  earlier, more specific event or field) already tells the new situation apart.
+  `NOT_A_MEMBER` (115) is the most recent, taking the next free slot after
+  `EVENTS_INVALID` (114) rather than overloading `CONTROL` (103), whose every meaning
+  is the absence of an answer rather than a decided one (see "A membership verdict is
+  not an unreachable target" above); `EVENTS_INVALID` (114) did the same before it,
+  taking the slot after `OUTPUT_OVERFLOW` (113) rather than overloading
   `PROBE_INCOMPATIBLE` (110), whose subject is this binary's own compatibility rather
-  than a document's (see "Checking a stream: `events --validate`" below); `WAIT_TIMEOUT`
-  (112) did the same before it, taking the slot after `SETUP` (111) rather than
+  than a document's (see "Checking a stream: `events --validate`" above); and `WAIT_TIMEOUT`
+  (112) before that, taking the slot after `SETUP` (111) rather than
   overloading `TIMEOUT` (106), whose meaning is the opposite one (see "A waiter's
-  deadline is not a run's deadline" above); codes `115`–`119` remain reserved.
+  deadline is not a run's deadline" above). Codes `116`–`119` remain reserved.
 - The **`--error-format json` envelope** versions on its own axis, `error_version`
   (currently `1`), independent of every code above: removing or re-typing a stable
   field, or changing what an existing `kind` means, is a breaking change and bumps

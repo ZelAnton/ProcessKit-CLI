@@ -12,21 +12,50 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- `attest --run-id <id> [--json]`: a read-only control-plane command that asks a live
+  run whether **the calling process** is inside its ProcessKit container. The runner
+  takes the caller's identity from the control transport itself — unix socket peer
+  credentials (`SO_PEERCRED` on Linux, `LOCAL_PEEREPID` on macOS, `LOCAL_PEEREID` on
+  NetBSD, `getpeerucred` on Solaris/illumos) or `GetNamedPipeClientProcessId` on the
+  Windows named pipe — reads it *while the connection is open* (so pid reuse cannot
+  turn a departed client into a false positive), and checks it against the run's own
+  live container membership through the same `members_info()` path `inspect` and the
+  JSONL `members_snapshot` already use. **There is deliberately no `--pid` and no
+  `--all`:** a caller-supplied pid would only prove that some chosen process is a
+  member, which says nothing about the asker. This turns an adapter's
+  environment-string convention ("the caller belongs to run X") into an invariant the
+  runner checks. Three outcomes: `member` (exit `0`), `not_a_member` (the **new**
+  reserved exit code `NOT_A_MEMBER` = `115`), and `peer_identity_unsupported` (the
+  existing `CONTROL` = `103`) — a platform that cannot obtain a kernel-authenticated
+  peer identity **fails closed** rather than degrading to an unproven "ok", and a
+  consumer rules that out at preflight with the new capability token
+  `probe --json --require-surface attest:peer-identity`. Two new `--error-format json`
+  kinds accompany them (`not_a_member`, `peer_identity_unsupported`). The attestation
+  is published as an eighth machine-output family
+  (`fixtures/schema/cli/attest.schema.json` + `attest.jsonl`) carrying its own
+  `attestation_version` (currently `1`), which the client checks strictly — a security
+  verdict is refused rather than read under semantics its sender never promised.
+  Scope, honestly stated: this is a **containment fact inside the existing
+  same-OS-user threat model, not authentication between hostile peers**, and what
+  `member` covers follows the run's containment mechanism (whole-tree for a Job
+  Object or cgroup; the process group for the POSIX fallback, which enumerates only
+  its leaders) — see `docs/control-plane.md`, "`attest`", and `docs/threat-model.md`.
 - `--error-format <human|json>`, the CLI's first **global** option: accepted before
   or after the subcommand, honored by every subcommand, and off by default. Under
   `--error-format json` a post-parse failure prints exactly one bounded, versioned
   JSON object on **stderr** instead of the `processkit-cli: <message>` prose —
   `error_version`, `code`, `kind`, `operation`, `run_id`, `retryable`, `message` —
   so an adapter branches on a published `kind` rather than on English. The point is
-  that an exit code is coarse: `CONTROL` (103) alone covers seven situations, and
+  that an exit code is coarse: `CONTROL` (103) alone covers eight situations, and
   `kind` splits it into `not_found` / `stale` / `unprobed` / `ambiguous_run_id` /
-  `control_unreachable` / `ipc_deadline` / `incompatible_contract` (and splits
+  `control_unreachable` / `ipc_deadline` / `incompatible_contract` /
+  `peer_identity_unsupported` (and splits
   `SETUP` 111 into `registry` versus `setup`). **No exit code was minted or
   changed**: the taxonomy is a finer axis over the existing band, and for a failing
   `run` its values are the terminal `runner_exit` event's own `source` spellings
   rather than a second vocabulary for the same endings. A `run --detach` still relays
   the reserved *code* of the copy it respawned, but not a meaning for it: a code
-  `run` itself never mints (`110`/`112`/`114`, or one no build assigns yet) reports
+  `run` itself never mints (`110`/`112`/`114`/`115`, or one no build assigns yet) reports
   `kind: "unknown"` rather than borrowing another subcommand's verdict, since that
   copy can be a different build. `message` is deliberately
   *not* part of the contract and may be reworded in any release. Invariants: stdout
@@ -34,8 +63,8 @@ to a dated version section.
   `probe --json` exiting 110, still prints exactly what it always did), the default
   stderr prose is byte-for-byte unchanged, and the exit code is unchanged. The
   shape is published as `fixtures/schema/cli/error.schema.json` with a golden
-  `error.jsonl` beside it and its own `error_version` (currently `1`) — the third
-  versioned family in that directory, for the reason the other two are versioned: a
+  `error.jsonl` beside it and its own `error_version` (currently `1`) — a
+  versioned family in that directory, for the reason the others are versioned: a
   captured stderr line is routinely read out of its invoking context. One
   documented gap: clap's *parse-time* usage errors (exit 100) stay human-readable
   in v1, since they happen before the binary knows what it was asked to do. See

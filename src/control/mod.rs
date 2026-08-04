@@ -208,6 +208,7 @@ use crate::registry::{self, Health};
 mod render;
 
 pub use imp::ControlServer;
+use render::attestation_output_lines;
 use render::inspect_all_output_lines;
 #[cfg(test)]
 use render::render_snapshot_human;
@@ -273,6 +274,37 @@ pub const SNAPSHOT_VERSION: u32 = 2;
 /// it.
 pub const MIN_READABLE_SNAPSHOT_VERSION: u32 = 1;
 
+/// Version of the `attest` reply's field set **and of what its verdicts mean** — an
+/// axis of its own, exactly as [`SNAPSHOT_VERSION`] is for `inspect` (the two verbs
+/// answer with different contracts and there is no reason a change to one should
+/// invalidate the other).
+///
+/// **The read side is strict, and that is a decision, not a copied shape.** A client
+/// renders a reply only when it declares exactly this number
+/// ([`AttestationReply::accept`]); anything else is refused with [`exit::CONTROL`]
+/// (103) and [`ErrorKind::IncompatibleContract`], never interpreted. `inspect`'s
+/// version check is deliberately *not* strict — it reads down to
+/// [`MIN_READABLE_SNAPSHOT_VERSION`], because refusing a version-1 snapshot would
+/// delete a capability every released binary still provides — and the difference
+/// between the two is the difference in what a misread costs and in what history
+/// each contract has:
+///
+/// - a misread **snapshot** is a diagnostic rendered under the wrong semantics; a
+///   misread **attestation** is a security verdict — an adapter gating a lease on it
+///   would grant or deny access on a sentence its sender never said. The honest
+///   answer to "I do not know this contract" is to decline to answer;
+/// - and there is nothing to lose by declining: this contract has had exactly one
+///   version, so strictness refuses no shape that has ever existed. `inspect`'s floor
+///   records a *checked* fact about a bump that really happened; asserting the same
+///   tolerance here in advance would be a claim about bumps not yet made — the
+///   premise that has to be verified rather than assumed (`fixtures/schema/cli/`'s
+///   own "pick `const` vs a range per whether the reader is strict", and why
+///   `error.schema.json` pins `error_version` with `const`).
+///
+/// A later additive bump can widen this to a range in the same change that makes the
+/// widening true, exactly as `inspect`'s floor was written when its bump landed.
+pub const ATTESTATION_VERSION: u32 = 1;
+
 /// The read-only request verb. An empty request line is treated as this too, so a
 /// bare connect-and-read probe still gets a snapshot.
 const INSPECT_REQUEST: &str = "inspect";
@@ -283,6 +315,12 @@ const CANCEL_REQUEST: &str = "cancel";
 
 /// The mutating verb that hard-kills a run's whole tree immediately (no grace).
 const KILL_REQUEST: &str = "kill";
+
+/// The read-only verb that asks the runner whether **the asking process itself** is
+/// inside this run's container. It carries no argument at all — deliberately: the
+/// identity it is answered about is the one the transport reports, never one the
+/// request could name (see [`Attestation`]).
+const ATTEST_REQUEST: &str = "attest";
 
 /// A mutating control-plane command, delivered from a `cancel`/`kill` client to the
 /// live run's own `select!` loop (which owns teardown — this module never tears a
@@ -322,6 +360,8 @@ pub enum RequestVerb {
     Cancel,
     /// The mutating immediate hard-kill request.
     Kill,
+    /// The read-only containment-membership request (see [`Attestation`]).
+    Attest,
 }
 
 /// Classify a request line's trimmed text into the [`RequestVerb`] it names, or
@@ -333,9 +373,65 @@ pub fn classify_request(line: &str) -> Option<RequestVerb> {
         INSPECT_REQUEST | "" => Some(RequestVerb::Inspect),
         CANCEL_REQUEST => Some(RequestVerb::Cancel),
         KILL_REQUEST => Some(RequestVerb::Kill),
+        ATTEST_REQUEST => Some(RequestVerb::Attest),
         _ => None,
     }
 }
+
+/// Who is on the other end of one accepted control connection, as the **kernel**
+/// reports it — the whole basis of [`Attestation`], and the reason `attest` takes no
+/// pid argument.
+///
+/// It is obtained from the transport itself (unix peer credentials, or
+/// `GetNamedPipeClientProcessId` on the Windows named pipe — see each platform
+/// module's `peer_identity`) at accept time, before the request line is even read,
+/// so:
+///
+/// - **the client cannot choose it.** Nothing a request could contain reaches this
+///   value. A pid a caller supplied would only ever prove that *some* process is a
+///   member, which is not the question an adapter gating on "the caller is inside
+///   run X" is actually asking;
+/// - **pid reuse cannot turn a departed client into a false positive.** The
+///   connection is open when this is read and stays open until the reply is written,
+///   and a process with an open socket/pipe has not exited, so the number cannot yet
+///   have been recycled onto a different process.
+///
+/// [`Self::Unavailable`] is a first-class outcome rather than an error to swallow:
+/// the platforms that cannot answer this question must **say so** (and are answered
+/// with [`AttestVerdict::PeerIdentityUnsupported`]), never fall back to an
+/// unauthenticated identity or to an unproven "ok".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerIdentity {
+    /// The kernel named the connecting process, and the number is one that can be
+    /// compared against this container's members.
+    Pid(u32),
+    /// No kernel-authenticated pid could be obtained for this connection — either
+    /// the platform has no such facility, or the call failed. Never a guess.
+    Unavailable,
+}
+
+/// Whether this build obtains a kernel-authenticated peer identity on **this**
+/// target, as a compile-time guarantee — the capability `attest` rests on, and the
+/// fact `probe --json` publishes as the surface token `attest:peer-identity` so a
+/// consumer can establish it at preflight instead of discovering it mid-run (see
+/// [`crate::probe`], `docs/integration.md`).
+///
+/// The per-target reasoning lives in each platform module's own
+/// `PEER_IDENTITY_SUPPORTED` (`src/control/platform/{unix,windows}.rs`), because
+/// that is where the system calls it describes are made.
+///
+/// **The claim is one-directional, on purpose.** `true` is a guarantee: this target
+/// always names the peer, so a `not_a_member` answer from it is a real verdict rather
+/// than a missing capability in disguise. `false` withholds that guarantee — it does
+/// **not** predict that `attest` will fail. One target (FreeBSD) supplies a peer pid
+/// on a new enough kernel and not on an older one, which no compile-time constant can
+/// tell apart, so it is excluded here rather than over-claimed; `attest` there still
+/// answers from whatever the kernel actually provides, and fails closed with
+/// [`AttestVerdict::PeerIdentityUnsupported`] when that is nothing. Under-claiming is
+/// the safe direction for a fail-closed preflight: a consumer that requires the token
+/// declines to rely on attestation, which is never worse than relying on one that
+/// might not be there.
+pub const PEER_IDENTITY_SUPPORTED: bool = imp::PEER_IDENTITY_SUPPORTED;
 
 /// The channel the control server pushes a mutating command into, handed to the
 /// run's main loop. An **unbounded** sender so the server's send is synchronous and
@@ -596,7 +692,16 @@ pub struct SnapshotSource<'a> {
     /// Produces the current enriched member list on demand. Kept as a borrowed
     /// closure so this module never has to depend on `processkit` directly — `run`
     /// supplies one that queries the owning `ProcessGroup`.
-    members: &'a (dyn Fn() -> Vec<Member> + 'a),
+    ///
+    /// `None` means the read itself **failed**, and it is deliberately not the same
+    /// value as `Some(vec![])`. The two consumers need that distinction differently:
+    /// a [`Snapshot`] degrades a failed read to an empty list exactly as it always
+    /// has (a diagnostic that reports nothing rather than not being produced), while
+    /// [`SnapshotSource::attest`] must not — "I could not read my members" is not
+    /// "you are not one of them", and reporting the second for the first would be a
+    /// verdict nothing established (the honest-degradation discipline the JSONL
+    /// `members_snapshot`'s own `read_error` flag follows).
+    members: &'a (dyn Fn() -> Option<Vec<Member>> + 'a),
 }
 
 impl<'a> SnapshotSource<'a> {
@@ -609,7 +714,7 @@ impl<'a> SnapshotSource<'a> {
         started: SystemTime,
         jsonl: &'a str,
         capture_dir: Option<&'a str>,
-        members: &'a (dyn Fn() -> Vec<Member> + 'a),
+        members: &'a (dyn Fn() -> Option<Vec<Member>> + 'a),
     ) -> Self {
         Self {
             run_id,
@@ -632,8 +737,59 @@ impl<'a> SnapshotSource<'a> {
             started_at: events::format_rfc3339_utc(self.started),
             jsonl: Some(self.jsonl.to_string()),
             capture_dir: self.capture_dir.map(str::to_string),
-            members: (self.members)(),
+            // A failed member read degrades to an empty list here, unchanged from
+            // before this closure could report the failure at all: an `inspect`
+            // snapshot is a diagnostic, and one that reports no members is still a
+            // snapshot. `attest` treats the same `None` quite differently — see
+            // [`SnapshotSource::members`].
+            members: (self.members)().unwrap_or_default(),
         }
+    }
+
+    /// Decide, right now, whether `peer` is inside this run's container, and build
+    /// the [`Attestation`] that says so.
+    ///
+    /// The member list is queried **live**, through the very same closure the
+    /// `inspect` snapshot uses — one `ProcessGroup::members_info()` enrichment path
+    /// for the whole binary, so what counts as "a container member" cannot mean one
+    /// thing here and another in the JSONL `members_snapshot` or an `inspect` reply.
+    /// It is queried *while the peer's connection is open*, which is what makes the
+    /// answer about the process that asked rather than about a pid that has since
+    /// been recycled.
+    fn attest(&self, peer: PeerIdentity) -> Result<Attestation, &'static str> {
+        let (verdict, peer_pid) = match peer {
+            // No member read is even attempted: without an identity there is
+            // nothing to look for, and the refusal is about the identity.
+            PeerIdentity::Unavailable => (AttestVerdict::PeerIdentityUnsupported, None),
+            PeerIdentity::Pid(pid) => {
+                let Some(members) = (self.members)() else {
+                    // The peer *was* named; the container's own membership could not
+                    // be read. There is no honest verdict here — `not_a_member`
+                    // would claim something nothing established — so no attestation
+                    // is produced at all and the client is told why (it reports the
+                    // established `CONTROL` "no answer you can act on", carrying this
+                    // text).
+                    return Err(
+                        "the runner could not read its own container membership, so it \
+                         refused to decide whether this client is a member",
+                    );
+                };
+                let verdict = if peer_is_member(pid, self.mechanism, &members) {
+                    AttestVerdict::Member
+                } else {
+                    AttestVerdict::NotAMember
+                };
+                (verdict, Some(pid))
+            }
+        };
+        Ok(Attestation {
+            attestation_version: ATTESTATION_VERSION,
+            run_id: self.run_id.to_string(),
+            verdict,
+            peer_pid,
+            mechanism: self.mechanism.to_string(),
+            checked_at: events::format_rfc3339_utc(SystemTime::now()),
+        })
     }
 
     /// The acknowledgement for a mutating verb: the runner accepted `action` for this
@@ -645,6 +801,87 @@ impl<'a> SnapshotSource<'a> {
             run_id: self.run_id.to_string(),
         }
     }
+}
+
+/// The [`events::mechanism_str`] spelling of the POSIX process-group fallback — the
+/// one mechanism whose member list is *not* the whole contained tree, which
+/// [`peer_is_member`] has to account for.
+///
+/// Compared as a string because this module deliberately does not depend on
+/// `processkit` directly (see [`SnapshotSource::members`]); that the string is the
+/// right one is not left to inspection either — `mechanism_names_stay_in_step` in
+/// this module's tests holds it against `events::mechanism_str`'s own output for that
+/// variant, so a rename there fails here rather than silently turning this branch
+/// off.
+const PROCESS_GROUP_MECHANISM: &str = "process_group";
+
+/// Whether `peer_pid` is inside a container that reports `members` under `mechanism`
+/// — the single membership predicate `attest` answers with.
+///
+/// **The identity-safe list is the whole basis.** `members` comes from the run's own
+/// live `members_info()` read ([`SnapshotSource::attest`]), never from a registry
+/// record, a file, or anything else on disk: the question is whether the kernel
+/// currently places this pid in *this* container, and only the container can answer
+/// that.
+///
+/// **Why the mechanism matters.** `members` is the whole contained tree on the
+/// mechanisms that enumerate one — a Windows Job Object lists every pid assigned to
+/// the job, a Linux cgroup lists every pid in `cgroup.procs`, a FreeBSD process
+/// reaper lists the whole descendant subtree — so a plain pid comparison is exact
+/// there, and this function does nothing else. The POSIX process-group fallback
+/// (macOS and the other non-FreeBSD BSDs, and Linux with no usable cgroup) is
+/// different in kind: it *contains* a whole tree but *enumerates* only the tracked
+/// group leaders. Comparing pids alone there would answer `not_a_member` for a
+/// genuinely contained grandchild — a wrong answer, not a conservative one, and it
+/// would make the command mean something different on macOS than on Linux and
+/// Windows for the same process tree.
+///
+/// So on that mechanism, and only there, membership is decided against the peer's
+/// **process group**: the leaders `members` reports are process-group leaders, and
+/// "is in the process group of a tracked leader" is precisely the predicate that
+/// mechanism enforces — it is what `killpg` reaches at teardown. This is not a
+/// loosening: a process that left the group (`setsid`) has genuinely escaped this
+/// mechanism's containment, and reads `not_a_member`, which is the honest answer.
+/// The extra step is deliberately *not* applied to the whole-tree mechanisms, where
+/// membership is already exact and sharing a process group with a member would not
+/// prove containment.
+///
+/// `getpgid` is asked about a pid the kernel just named on an open connection, so the
+/// process is alive and the number cannot have been recycled; a failure to answer (a
+/// target that refuses it across sessions, a process that vanished in the meantime)
+/// degrades to the plain comparison rather than to a guess.
+fn peer_is_member(peer_pid: u32, mechanism: &str, members: &[Member]) -> bool {
+    let listed = |pid: u32| members.iter().any(|member| member.pid == pid);
+    listed(peer_pid)
+        || (mechanism == PROCESS_GROUP_MECHANISM && process_group_of(peer_pid).is_some_and(listed))
+}
+
+/// The process-group id the kernel reports for `pid`, on the platforms that have
+/// process groups at all.
+///
+/// A pure query of kernel state — see [`peer_is_member`] for why the answer is only
+/// consulted on the process-group mechanism. `None` for every way there is no answer
+/// to trust: a pid that does not fit `pid_t`, a process that has already gone, or a
+/// call the platform refused.
+#[cfg(unix)]
+fn process_group_of(pid: u32) -> Option<u32> {
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    // SAFETY: `getpgid` takes a pid by value and returns a pid — no pointers, no
+    // allocation, no shared state; it is a read of kernel state that cannot fail
+    // other than by returning `-1`.
+    let group = unsafe { libc::getpgid(pid) };
+    u32::try_from(group).ok()
+}
+
+/// The Windows counterpart: there are no POSIX process groups here, and none are
+/// needed — the Job Object mechanism enumerates the whole contained tree, so
+/// [`peer_is_member`] never consults this (it is reached only for the
+/// [`PROCESS_GROUP_MECHANISM`], which this platform never reports). A separate
+/// top-level function rather than a `cfg`-gated arm inside the caller, matching how
+/// the rest of the crate splits platform behavior.
+#[cfg(not(unix))]
+fn process_group_of(_pid: u32) -> Option<u32> {
+    None
 }
 
 /// Stand up the local control transport for a run. Not tied to the registry
@@ -692,11 +929,27 @@ pub async fn serve(
 /// exact, platform-dependent threshold at which a queued client fails outright with
 /// [`exit::CONTROL`] before ever being serviced — it differs between unix and
 /// Windows and which deadline fires differs too).
-async fn handle_connection<S>(stream: S, source: &SnapshotSource<'_>, commands: &ControlCommandSink)
-where
+///
+/// `peer` is the identity the platform read off this very connection *before* calling
+/// this (each `serve` loop's own `peer_identity`), which is why it arrives as a
+/// parameter rather than being looked up here: it belongs to the concrete transport
+/// type the accept loop still holds, and it must be taken while the connection is
+/// unquestionably open (see [`PeerIdentity`]). This function is generic over the
+/// stream precisely so both platforms share one protocol implementation, and the
+/// identity is the one thing that cannot be generic.
+async fn handle_connection<S>(
+    stream: S,
+    peer: PeerIdentity,
+    source: &SnapshotSource<'_>,
+    commands: &ControlCommandSink,
+) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let _ = tokio::time::timeout(CONNECTION_DEADLINE, serve_one(stream, source, commands)).await;
+    let _ = tokio::time::timeout(
+        CONNECTION_DEADLINE,
+        serve_one(stream, peer, source, commands),
+    )
+    .await;
 }
 
 /// Read one `\n`-terminated line from `reader`, capped at [`MAX_LINE_BYTES`] total —
@@ -746,6 +999,7 @@ where
 /// end the run.
 async fn serve_one<S>(
     stream: S,
+    peer: PeerIdentity,
     source: &SnapshotSource<'_>,
     commands: &ControlCommandSink,
 ) -> io::Result<()>
@@ -771,6 +1025,21 @@ where
             Some(RequestVerb::Kill) => {
                 write_response(&mut write_half, &serialize_ack(&source.ack(KILL_REQUEST))).await?;
                 let _ = commands.send(ControlCommand::Kill);
+            }
+            // Read-only, like `inspect`: it answers about the connection it arrived
+            // on and changes nothing. The verdict is decided here, with the client
+            // still attached, rather than being derived from anything the request
+            // carried — the request carries nothing.
+            Some(RequestVerb::Attest) => {
+                // An attestation, or — when the container's membership could not be
+                // read at all — the same structured-error closing path an
+                // unrecognized verb gets, which the client surfaces verbatim rather
+                // than turning into a verdict.
+                let response = match source.attest(peer) {
+                    Ok(attestation) => serialize_attestation(&attestation),
+                    Err(reason) => serialize_error(reason),
+                };
+                write_response(&mut write_half, &response).await?;
             }
             None => {
                 let error =
@@ -809,6 +1078,16 @@ where
 fn serialize_snapshot(snapshot: &Snapshot) -> String {
     serde_json::to_string(snapshot)
         .unwrap_or_else(|_| String::from(r#"{"error":"could not render the snapshot"}"#))
+}
+
+/// Serialize an attestation for the wire. A struct of owned strings, a unit enum and
+/// an optional number cannot fail to serialize; the fallback is defensive only, and
+/// it is deliberately *not* a fabricated verdict — an unserializable answer becomes
+/// the same structured error an unknown verb gets, which the client surfaces as a
+/// `CONTROL` failure rather than reading as `member` or `not_a_member`.
+fn serialize_attestation(attestation: &Attestation) -> String {
+    serde_json::to_string(attestation)
+        .unwrap_or_else(|_| String::from(r#"{"error":"could not render the attestation"}"#))
 }
 
 /// Serialize an error response for an unrecognized request.
@@ -1068,6 +1347,249 @@ fn verify_snapshot_identity(snapshot: &Snapshot, expected_run_id: &str) -> Resul
         expected_run_id,
         "the runner returned a snapshot for a different run".to_string(),
     ))
+}
+
+/// The runner's answer to `attest`: whether the process that opened **this
+/// connection** is inside this run's ProcessKit container, decided by the runner
+/// itself while that connection is open.
+///
+/// This is what turns a convention into a checkable fact. An adapter that gates work
+/// on "the caller belongs to run X" can otherwise only inspect an environment string
+/// the caller carries, which proves nothing about containment — any process can hold
+/// any string. Here the identity is the kernel's ([`PeerIdentity`]) and the
+/// membership list is the container's own ([`SnapshotSource::members`], the same
+/// `members_info()` read `inspect` and the JSONL `members_snapshot` use), so a
+/// positive answer is a statement the runner is in a position to make.
+///
+/// **What it is not.** It is not authentication between mutually hostile parties.
+/// Everything here lives inside this project's existing same-OS-user trust boundary
+/// (`docs/threat-model.md`): the transport is owner-only, and a process running as
+/// that same user is already inside the boundary. What this closes is the *forgeable
+/// correlation* — a non-member claiming membership through a string it copied — not
+/// an attack by a principal who could already reach the run's control plane by
+/// definition.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Attestation {
+    /// Attestation format version — [`ATTESTATION_VERSION`] when this build is the
+    /// runner. Like [`Snapshot::snapshot_version`], its value genuinely originates on
+    /// the far side of the wire, and the client acts on it before reading anything
+    /// else (see [`AttestationReply`]).
+    pub attestation_version: u32,
+    /// The run that answered — the id the client matched in the registry, echoed so a
+    /// reply describing some other run is refused rather than believed.
+    pub run_id: String,
+    /// The verdict itself. See [`AttestVerdict`] for why the three outcomes are kept
+    /// apart rather than collapsed into a boolean.
+    pub verdict: AttestVerdict,
+    /// The pid the kernel gave for the connecting client, or `null` when the platform
+    /// could not name it (the [`AttestVerdict::PeerIdentityUnsupported`] case).
+    ///
+    /// Reported for correlation, never as an input: the client did not send it and
+    /// cannot influence it. On a system where the runner and the client see different
+    /// pid namespaces this is the runner's view, which is the one the verdict was
+    /// decided in.
+    pub peer_pid: Option<u32>,
+    /// The containment mechanism the verdict is *about* — `job_object` | `cgroup_v2` |
+    /// `process_group` (the same vocabulary as the JSONL `run_started` and the
+    /// `inspect` snapshot, [`events::mechanism_str`]).
+    ///
+    /// Present because it is what fixes the **scope** of the fact, and that scope
+    /// genuinely differs by mechanism: a Job Object or a cgroup enumerates the whole
+    /// tree, while the POSIX process-group fallback contains a tree but enumerates
+    /// only the group leaders — which is exactly why membership is decided against
+    /// the process group there rather than against the leader list alone (see
+    /// [`peer_is_member`]). A consumer that needs to know how strong the containment
+    /// behind a `member` answer is reads this rather than guessing from the platform.
+    pub mechanism: String,
+    /// When the runner decided this, RFC 3339 UTC with millisecond precision (the
+    /// same formatter as the JSONL events and the registry record).
+    ///
+    /// An attestation is a *point-in-time* fact, not a token: it says the peer was a
+    /// member when asked, and it says nothing about any later moment. Carrying the
+    /// instant makes that explicit instead of implied.
+    pub checked_at: String,
+}
+
+/// The three outcomes of an attestation — deliberately three, not a boolean.
+///
+/// "Not a member" and "this platform cannot tell you" are different facts with
+/// different consequences for a caller: the first is a decided, stable verdict a
+/// retry cannot change; the second is a missing capability, and treating it as a
+/// negative would understate it just as treating it as a positive would be the
+/// unproven "ok" the whole design exists to prevent. Each maps onto its own exit code
+/// and [`ErrorKind`] (see [`attest_outcome`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttestVerdict {
+    /// The connecting process is inside this run's container.
+    Member,
+    /// The connecting process was named by the kernel and is **not** inside this
+    /// run's container. A positive negative: the runner knows who asked and knows the
+    /// answer is no.
+    NotAMember,
+    /// The runner could not obtain a kernel-authenticated identity for the connecting
+    /// process at all, so it refuses to answer either way (see [`PeerIdentity`] and
+    /// [`PEER_IDENTITY_SUPPORTED`]).
+    PeerIdentityUnsupported,
+}
+
+/// An `attest` reply as it comes off the wire, decoded in the order its contract is
+/// decided in: the declared `attestation_version` first, the payload's shape second —
+/// the same construction (and for the same reason) as [`SnapshotReply`], so a runner
+/// whose shape this build cannot even deserialize still gets the *version*
+/// diagnostic, which is the actionable one.
+///
+/// `#[doc(hidden)] pub` so the `control_wire` fuzz target can drive the exact type
+/// this verb's client parses a reply into, alongside the ones it already drives.
+#[derive(Debug)]
+#[doc(hidden)]
+pub enum AttestationReply {
+    /// A reply declaring exactly [`ATTESTATION_VERSION`], parsed into the shape this
+    /// build implements.
+    Readable(Attestation),
+    /// A reply declaring any other version, carrying only the number the runner
+    /// declared — the payload was deliberately *not* interpreted.
+    Unreadable(u64),
+}
+
+impl<'de> Deserialize<'de> for AttestationReply {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if let Some(declared) = value
+            .get("attestation_version")
+            .and_then(serde_json::Value::as_u64)
+            && declared != u64::from(ATTESTATION_VERSION)
+        {
+            return Ok(Self::Unreadable(declared));
+        }
+        serde_json::from_value(value)
+            .map(Self::Readable)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl AttestationReply {
+    /// Everything a client must establish before it may act on an attestation: the
+    /// runner's declared contract is the one this build implements, and the answer
+    /// describes the run that was addressed. **The** acceptance test for an `attest`
+    /// reply, consuming `self` so an unaccepted reply has no path to the renderer or
+    /// to the exit-code decision — the same structural guarantee
+    /// [`SnapshotReply::accept`] gives the read-only snapshot.
+    fn accept(self, expected_run_id: &str) -> Result<Attestation, RunnerError> {
+        match self {
+            Self::Unreadable(declared) => Err(unreachable_run(
+                ATTEST_REQUEST,
+                expected_run_id,
+                format!(
+                    "the runner answered with control-plane attestation version {declared}, and \
+                     this client reads version {ATTESTATION_VERSION}; the reply was refused rather \
+                     than read as a membership verdict its sender never promised — attest this \
+                     run with a processkit-cli build that implements its attestation version"
+                ),
+            )
+            .with_kind(ErrorKind::IncompatibleContract)),
+            Self::Readable(attestation) => {
+                if attestation.run_id != expected_run_id {
+                    return Err(unreachable_run(
+                        ATTEST_REQUEST,
+                        expected_run_id,
+                        "the runner returned an attestation for a different run".to_string(),
+                    ));
+                }
+                Ok(attestation)
+            }
+        }
+    }
+}
+
+/// Client entry for `attest --run-id <id> [--json]`: ask the live runner named
+/// `run_id` whether **this very process** is inside its container, print the answer,
+/// and turn it into an exit code (see [`attest_outcome`]).
+///
+/// There is deliberately no way to ask about a different process: the identity comes
+/// from the connection this client itself opens, so the only question the command can
+/// pose is "am I in it?". Runs on the same small current-thread runtime every other
+/// control client uses.
+pub fn attest(run_id: &str, json: bool) -> Result<(), RunnerError> {
+    let runtime = current_thread_runtime()?;
+    runtime.block_on(attest_async(run_id, json))
+}
+
+/// The async body of [`attest`]: registry lookup, the exchange itself, print, then
+/// the verdict's own outcome.
+///
+/// The report is printed **before** the verdict is turned into a failure, matching
+/// every other command here that reports and then fails (`probe --json` with an unmet
+/// `--require-*`, `inspect --all --json` with an unreachable target): a caller reading
+/// stdout gets the machine-readable answer in every case where the runner produced
+/// one, and the exit code says what to do about it.
+async fn attest_async(run_id: &str, json: bool) -> Result<(), RunnerError> {
+    let endpoint = resolve_live_endpoint(ATTEST_REQUEST, run_id).await?;
+    let attestation = attest_endpoint(&endpoint, run_id).await?;
+
+    for line in attestation_output_lines(&attestation, json)? {
+        println!("{line}");
+    }
+    attest_outcome(&attestation, run_id)
+}
+
+/// The `attest` exchange with one already-resolved endpoint: connect, converse, and
+/// accept the reply only if [`AttestationReply::accept`] does. Split out of
+/// [`attest_async`] for the same reason [`inspect_endpoint`] is: the whole path from
+/// the wire to the accept/refuse decision stays drivable against a *specific*
+/// endpoint in a test, without the process-wide env-resolved registry.
+async fn attest_endpoint(endpoint: &str, run_id: &str) -> Result<Attestation, RunnerError> {
+    let stream = connect_live(endpoint, ATTEST_REQUEST, run_id).await?;
+    let reply: AttestationReply =
+        converse_under_deadline(stream, ATTEST_REQUEST, ATTEST_REQUEST, run_id).await?;
+    reply.accept(run_id)
+}
+
+/// Turn an accepted attestation into this invocation's outcome — the one place the
+/// three verdicts become exit codes, so the CLI and the wire cannot drift.
+///
+/// - [`AttestVerdict::Member`] is the only success.
+/// - [`AttestVerdict::NotAMember`] takes the reserved [`exit::NOT_A_MEMBER`] (115) it
+///   was minted for: a *decided* negative, which no existing code could carry without
+///   claiming something else happened (see that code's own documentation).
+/// - [`AttestVerdict::PeerIdentityUnsupported`] fails closed on the established
+///   [`exit::CONTROL`] (103) — the runner was reached and answered, but no answer this
+///   client may act on came back, the same shape a refused `snapshot_version` takes —
+///   and is told apart from every other 103 by its [`ErrorKind`].
+fn attest_outcome(attestation: &Attestation, run_id: &str) -> Result<(), RunnerError> {
+    match attestation.verdict {
+        AttestVerdict::Member => Ok(()),
+        AttestVerdict::NotAMember => Err(RunnerError::new(
+            exit::NOT_A_MEMBER,
+            format!(
+                "this process is not a member of run `{run_id}`: the runner named the connecting \
+                 process (pid {}) from the control transport and it is not in that run's {} \
+                 container",
+                attestation
+                    .peer_pid
+                    .map_or_else(|| "unknown".to_string(), |pid| pid.to_string()),
+                // The one peer-supplied string spliced into this diagnostic, so it
+                // crosses the terminal barrier bounded — the same treatment the
+                // human renderer gives it, and the same reason a peer's own error
+                // text is normalized before being surfaced.
+                crate::text::terminal_safe_bounded(&attestation.mechanism)
+            ),
+        )
+        .with_kind(ErrorKind::NotAMember)),
+        AttestVerdict::PeerIdentityUnsupported => Err(unreachable_run(
+            ATTEST_REQUEST,
+            run_id,
+            "the runner could not obtain a kernel-authenticated identity for this client from \
+             the control transport, so it refused to answer either way rather than report an \
+             unproven membership; check `probe --json --require-surface attest:peer-identity` \
+             against the runner's own binary before relying on attestation on this platform"
+                .to_string(),
+        )
+        .with_kind(ErrorKind::PeerIdentityUnsupported)),
+    }
 }
 
 /// Client entry for `cancel --run-id <id>`: reach the live runner through the

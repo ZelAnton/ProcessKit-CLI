@@ -65,7 +65,7 @@ path = "src/lib.rs"
 # ---------------------------------------------------------------------------
 [dependencies]
 # Command-line parsing. The `derive` API expresses the normative CLI surface —
-# the nine subcommands (run/inspect/cancel/kill/wait/events/list/prune/probe),
+# the ten subcommands (run/inspect/cancel/kill/attest/wait/events/list/prune/probe),
 # their flags, the one global option every subcommand shares (`--error-format`),
 # and the verbatim `-- <program> <args...>` tail — that AGENTS.md
 # counts as part of the compatibility surface.
@@ -178,6 +178,11 @@ libc = "0.2"
 # library proper — `run --detach`, which reads `GetStdHandle` to stop this process's
 # standard handles from being inherited by the detached runner (src/run/detach.rs,
 # `disinherit_std_handles`).
+#
+# `Win32_System_Pipes` backs the control plane's peer identity on this platform
+# (src/control/platform/windows.rs): `GetNamedPipeClientProcessId` asks the kernel
+# which process opened a connected pipe instance, which is what lets `attest` answer
+# about the caller itself rather than about a pid the caller named.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
@@ -187,6 +192,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Console",
     "Win32_System_IO",
     "Win32_System_JobObjects",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
 

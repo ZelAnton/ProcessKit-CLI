@@ -799,7 +799,7 @@ fn snapshot_source_queries_members_live() {
     let calls = Cell::new(0u32);
     let members = || {
         calls.set(calls.get() + 1);
-        vec![Member::from_pid(7)]
+        Some(vec![Member::from_pid(7)])
     };
     let started = SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_123);
     let source = SnapshotSource::new(
@@ -872,11 +872,20 @@ fn command_verbs_are_the_on_the_wire_spelling() {
 /// Drive one server-side exchange for `verb` over an in-memory duplex stream, and
 /// return the response line the client read plus the command (if any) the server
 /// routed to the run's main loop. The shared harness for the routing tests below.
+///
+/// The peer is the container's own sole member, so a verb that consults the
+/// connection's identity sees a member; [`serve_verb_as`] varies that.
 async fn serve_verb(verb: &str) -> (String, Option<ControlCommand>) {
+    serve_verb_as(verb, PeerIdentity::Pid(1)).await
+}
+
+/// [`serve_verb`] with an explicit peer identity — the harness for `attest`, whose
+/// whole answer is a function of *who* connected rather than of what was sent.
+async fn serve_verb_as(verb: &str, peer: PeerIdentity) -> (String, Option<ControlCommand>) {
     let (mut client, server) = tokio::io::duplex(1024);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-    let members = || vec![Member::from_pid(1)];
+    let members = || Some(vec![Member::from_pid(1)]);
     let source = SnapshotSource::new(
         "run-t",
         "job_object",
@@ -891,7 +900,7 @@ async fn serve_verb(verb: &str) -> (String, Option<ControlCommand>) {
         .write_all(format!("{verb}\n").as_bytes())
         .await
         .expect("write the request verb");
-    serve_one(server, &source, &tx)
+    serve_one(server, peer, &source, &tx)
         .await
         .expect("serve one connection");
 
@@ -965,6 +974,366 @@ async fn unknown_verb_errors_and_routes_no_command() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// `attest` — kernel-backed containment membership (T-306).
+// ---------------------------------------------------------------------------
+
+/// The mechanism string [`peer_is_member`] switches on is the very one
+/// [`events::mechanism_str`] emits, not a hand-copied lookalike: this is the
+/// indirection that keeps the process-group branch from silently turning itself off
+/// if that vocabulary is ever respelled (the spelling is `processkit`'s own stable
+/// identifier, so it is checked against the source, not against a second copy).
+#[test]
+fn mechanism_names_stay_in_step() {
+    assert_eq!(
+        PROCESS_GROUP_MECHANISM,
+        events::mechanism_str(processkit::Mechanism::ProcessGroup),
+        "the process-group fallback's name must match the one the rest of the binary emits"
+    );
+}
+
+/// On the mechanisms that enumerate the **whole** contained tree, membership is the
+/// plain pid comparison and nothing else — a pid outside the list is not a member,
+/// and no process-group reasoning may soften that (sharing a process group with a
+/// member does not prove a process is inside a Job Object or a cgroup).
+#[test]
+fn whole_tree_mechanisms_decide_membership_by_pid_alone() {
+    let members = [Member::from_pid(101), Member::from_pid(202)];
+    for mechanism in ["job_object", "cgroup_v2"] {
+        assert!(peer_is_member(101, mechanism, &members));
+        assert!(peer_is_member(202, mechanism, &members));
+        assert!(
+            !peer_is_member(303, mechanism, &members),
+            "{mechanism} enumerates the whole tree, so an absent pid is a real negative"
+        );
+    }
+    assert!(
+        !peer_is_member(101, "job_object", &[]),
+        "an empty member list can never make anyone a member"
+    );
+}
+
+/// The POSIX process-group fallback enumerates only the tracked group **leaders**,
+/// so the leader itself must still attest positively by the plain comparison — the
+/// half of that mechanism this test can assert without a live process tree. The
+/// group-based half (a contained grandchild the list does not name) needs a real
+/// process group and is covered by `tests/attest.rs`'s in-run scenario on the
+/// platforms that actually use this mechanism.
+#[test]
+fn the_process_group_fallback_still_matches_its_tracked_leaders() {
+    let members = [Member::from_pid(101)];
+    assert!(peer_is_member(101, PROCESS_GROUP_MECHANISM, &members));
+    // `getpgid` is consulted for a non-listed pid, and a pid that is not in any
+    // tracked group (or does not exist at all) is still not a member — the fallback
+    // widens the predicate to the mechanism's real containment, it does not weaken
+    // it into "anything the kernel will answer about".
+    assert!(!peer_is_member(101, PROCESS_GROUP_MECHANISM, &[]));
+}
+
+/// The `attest` verb answers with a verdict about the *connection's* identity and
+/// routes no teardown command — read-only, exactly like `inspect`.
+#[tokio::test]
+async fn attest_verb_answers_about_the_connecting_peer_and_routes_no_command() {
+    // The harness's container has exactly one member, pid 1.
+    let (response, command) = serve_verb_as("attest", PeerIdentity::Pid(1)).await;
+    let attestation: Attestation =
+        serde_json::from_str(&response).expect("the reply is an attestation");
+    assert_eq!(attestation.attestation_version, ATTESTATION_VERSION);
+    assert_eq!(attestation.run_id, "run-t");
+    assert_eq!(attestation.verdict, AttestVerdict::Member);
+    assert_eq!(attestation.peer_pid, Some(1));
+    assert_eq!(attestation.mechanism, "job_object");
+    assert!(
+        command.is_none(),
+        "attest must never signal a teardown command"
+    );
+
+    // A different, kernel-named peer is a decided negative — same run, same wire,
+    // different answer, and the difference is *only* who connected.
+    let (response, command) = serve_verb_as("attest", PeerIdentity::Pid(9999)).await;
+    let attestation: Attestation =
+        serde_json::from_str(&response).expect("the reply is an attestation");
+    assert_eq!(attestation.verdict, AttestVerdict::NotAMember);
+    assert_eq!(attestation.peer_pid, Some(9999));
+    assert!(command.is_none());
+}
+
+/// A transport that cannot name the caller fails **closed**: the runner says so
+/// rather than answering `member` (which would be an unproven positive) or
+/// `not_a_member` (which would be an unproven negative dressed as a verdict).
+#[tokio::test]
+async fn attest_fails_closed_when_the_peer_cannot_be_identified() {
+    let (response, command) = serve_verb_as("attest", PeerIdentity::Unavailable).await;
+    let attestation: Attestation =
+        serde_json::from_str(&response).expect("the reply is an attestation");
+    assert_eq!(
+        attestation.verdict,
+        AttestVerdict::PeerIdentityUnsupported,
+        "an unidentifiable peer is its own outcome: {response}"
+    );
+    assert_eq!(
+        attestation.peer_pid, None,
+        "no pid is invented for a peer the kernel did not name"
+    );
+    assert!(command.is_none());
+}
+
+/// A container whose membership could not be read produces **no verdict at all**,
+/// not a negative one.
+///
+/// This is the honest-degradation half of the same design: the peer was named
+/// perfectly well, so the refusal is not `peer_identity_unsupported` either — the
+/// runner simply has nothing to decide with, and says so through the structured-error
+/// path an unrecognized verb already uses. Answering `not_a_member` here would report
+/// a decided verdict (and, through `attest`'s exit code, deny access) on the strength
+/// of a failed query.
+#[tokio::test]
+async fn a_membership_read_failure_is_not_a_negative_verdict() {
+    let (mut client, server) = tokio::io::duplex(1024);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    // `None` is exactly what `run`'s provider reports when `members_info()` errors.
+    let members = || None;
+    let source = SnapshotSource::new(
+        "run-t",
+        "job_object",
+        Some(1),
+        SystemTime::UNIX_EPOCH,
+        "/runs/run-t.jsonl",
+        None,
+        &members,
+    );
+
+    client
+        .write_all(b"attest\n")
+        .await
+        .expect("write the request verb");
+    serve_one(server, PeerIdentity::Pid(1), &source, &tx)
+        .await
+        .expect("serve one connection");
+
+    let mut reader = BufReader::new(&mut client);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .await
+        .expect("read the response");
+    let value: serde_json::Value = serde_json::from_str(line.trim()).expect("valid JSON");
+    let error = value
+        .get("error")
+        .and_then(|value| value.as_str())
+        .unwrap_or_else(|| panic!("an unreadable membership yields an error object: {line}"));
+    assert!(
+        error.contains("refused to decide"),
+        "the refusal says what it could not do: {error}"
+    );
+    assert!(
+        !line.contains("verdict"),
+        "no attestation — and so no verdict — is produced at all: {line}"
+    );
+    assert!(rx.try_recv().is_err(), "attest still routes no command");
+
+    // And the client end of that exchange: a `CONTROL` failure carrying the runner's
+    // own words, never a parsed attestation.
+    let reply = serde_json::from_str::<AttestationReply>(line.trim());
+    assert!(
+        reply.is_err(),
+        "an error object must not deserialize as an attestation: {line}"
+    );
+}
+
+/// An attestation round-trips through JSON: the client parses back exactly what the
+/// server serialized, verdict spelling included (the wire spelling is the contract
+/// `fixtures/schema/cli/attest.schema.json` publishes).
+#[test]
+fn attestation_round_trips_through_json() {
+    for (verdict, spelling, peer_pid) in [
+        (AttestVerdict::Member, "member", Some(4242u32)),
+        (AttestVerdict::NotAMember, "not_a_member", Some(4242)),
+        (
+            AttestVerdict::PeerIdentityUnsupported,
+            "peer_identity_unsupported",
+            None,
+        ),
+    ] {
+        let line = serialize_attestation(&Attestation {
+            attestation_version: ATTESTATION_VERSION,
+            run_id: "run-a".to_string(),
+            verdict,
+            peer_pid,
+            mechanism: "job_object".to_string(),
+            checked_at: "2026-07-21T00:00:00.000Z".to_string(),
+        });
+        let value: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
+        assert_eq!(value["verdict"], serde_json::json!(spelling));
+        assert_eq!(value["peer_pid"], serde_json::json!(peer_pid));
+
+        let parsed: Attestation = serde_json::from_str(&line).expect("an attestation parses back");
+        assert_eq!(parsed.verdict, verdict);
+        assert_eq!(parsed.run_id, "run-a");
+    }
+}
+
+/// The read side is strict about the contract it was answered under, and about the
+/// run the answer describes — a security verdict is never read under semantics its
+/// sender did not promise, and never accepted from the wrong run.
+#[test]
+fn an_attestation_is_accepted_only_for_the_declared_version_and_the_addressed_run() {
+    let readable: AttestationReply = serde_json::from_str(
+        r#"{"attestation_version":1,"run_id":"run-a","verdict":"member","peer_pid":7,
+            "mechanism":"job_object","checked_at":"2026-07-21T00:00:00.000Z"}"#,
+    )
+    .expect("a current-version reply parses");
+    let attestation = readable
+        .accept("run-a")
+        .expect("the declared version is this build's own");
+    assert_eq!(attestation.verdict, AttestVerdict::Member);
+
+    for line in [
+        r#"{"attestation_version":2,"run_id":"run-a","verdict":"member","peer_pid":7,
+            "mechanism":"job_object","checked_at":"2026-07-21T00:00:00.000Z"}"#,
+        // Older, too: this contract has had exactly one version, so there is no
+        // shape below it that ever existed to be tolerant of.
+        r#"{"attestation_version":0,"run_id":"run-a","verdict":"member"}"#,
+        // A newer runner whose *shape* this build cannot even parse still gets the
+        // version diagnostic rather than a serde field complaint.
+        r#"{"attestation_version":9,"verdict":"whatever-comes-next"}"#,
+    ] {
+        let reply: AttestationReply = serde_json::from_str(line).expect("the reply parses");
+        let err = reply
+            .accept("run-a")
+            .expect_err("a foreign attestation contract is refused, never interpreted");
+        assert_eq!(err.code(), exit::CONTROL);
+        assert_eq!(err.kind(), ErrorKind::IncompatibleContract);
+        assert!(
+            err.to_string().contains("attestation version"),
+            "the refusal names the contract that arrived: {err}"
+        );
+    }
+
+    let other_run: AttestationReply = serde_json::from_str(
+        r#"{"attestation_version":1,"run_id":"run-b","verdict":"member","peer_pid":7,
+            "mechanism":"job_object","checked_at":"2026-07-21T00:00:00.000Z"}"#,
+    )
+    .expect("the reply parses");
+    let err = other_run
+        .accept("run-a")
+        .expect_err("an attestation for another run proves nothing about this one");
+    assert_eq!(err.code(), exit::CONTROL);
+}
+
+/// The three verdicts become three distinguishable process outcomes — the whole
+/// point of minting `NOT_A_MEMBER` (115) instead of reusing `CONTROL` (103).
+#[test]
+fn each_verdict_maps_onto_its_own_outcome() {
+    let attestation = |verdict, peer_pid| Attestation {
+        attestation_version: ATTESTATION_VERSION,
+        run_id: "run-a".to_string(),
+        verdict,
+        peer_pid,
+        mechanism: "job_object".to_string(),
+        checked_at: "2026-07-21T00:00:00.000Z".to_string(),
+    };
+
+    attest_outcome(&attestation(AttestVerdict::Member, Some(7)), "run-a")
+        .expect("membership is the one success");
+
+    let err = attest_outcome(&attestation(AttestVerdict::NotAMember, Some(7)), "run-a")
+        .expect_err("a decided negative is a failure for the caller");
+    assert_eq!(err.code(), exit::NOT_A_MEMBER);
+    assert_eq!(err.kind(), ErrorKind::NotAMember);
+    assert!(
+        err.to_string().contains("not a member of run `run-a`"),
+        "the message names the run the verdict is about: {err}"
+    );
+
+    let err = attest_outcome(
+        &attestation(AttestVerdict::PeerIdentityUnsupported, None),
+        "run-a",
+    )
+    .expect_err("an unanswerable attestation fails closed");
+    assert_eq!(
+        err.code(),
+        exit::CONTROL,
+        "nothing was established, so it joins every other `no answer you can act on`"
+    );
+    assert_eq!(err.kind(), ErrorKind::PeerIdentityUnsupported);
+    assert!(
+        !err.kind().retryable(),
+        "a platform capability is not a transient condition"
+    );
+}
+
+/// The real transport, end to end: this test process connects to a live control
+/// server over the actual unix socket / named pipe and the runner names it from the
+/// **kernel's** own record of who connected — not from anything the request carried.
+///
+/// This is the platform peer-identity primitive's own proof, exercised through the
+/// production path rather than by poking at it: the pid the runner reports back must
+/// be this process's, which no in-memory duplex-stream test could establish, and
+/// which is exactly the property `attest` rests on. The verdict is then a pure
+/// function of the member list, so the same connection yields both answers.
+#[tokio::test]
+async fn the_transport_names_this_process_to_the_runner() {
+    let expected = std::process::id();
+
+    for (members, verdict) in [
+        (vec![Member::from_pid(expected)], AttestVerdict::Member),
+        // A container this process is genuinely not in — the kernel still names it,
+        // and the answer flips.
+        (vec![Member::from_pid(1)], AttestVerdict::NotAMember),
+    ] {
+        let server = imp::ControlServer::bind().expect("bind a real control transport");
+        let endpoint = server.endpoint().to_string();
+        let provider = || Some(members.iter().map(|m| Member::from_pid(m.pid)).collect());
+        let source = SnapshotSource::new(
+            "run-peer",
+            "job_object",
+            Some(expected),
+            SystemTime::UNIX_EPOCH,
+            "/runs/run-peer.jsonl",
+            None,
+            &provider,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let client = async {
+            let stream = imp::connect(&endpoint)
+                .await
+                .expect("connect to the live control transport");
+            converse::<_, AttestationReply>(stream, ATTEST_REQUEST)
+                .await
+                .expect("the runner answers the attest verb")
+        };
+
+        // `serve` never resolves, so `select!` returns when the client is done —
+        // the same shape `run`'s own loop uses to host the server alongside its
+        // real work.
+        let reply = tokio::select! {
+            never = server.serve(&source, &tx) => match never {},
+            reply = client => reply,
+        };
+
+        let attestation = reply.accept("run-peer").expect("the reply is acceptable");
+        assert_eq!(
+            attestation.peer_pid,
+            Some(expected),
+            "the runner reports the pid the kernel gave it for this connection, \
+             which is this test process's own"
+        );
+        assert_eq!(attestation.verdict, verdict);
+        // What was just observed and what `probe` advertises must be the same fact:
+        // this transport named its peer, so the build has to say it can — and a
+        // build that could not would have to withhold the claim. The advertisement
+        // is what a consumer's preflight rests on, so it is checked against
+        // demonstrated behavior rather than trusted.
+        assert_eq!(
+            attestation.peer_pid.is_some(),
+            crate::control::PEER_IDENTITY_SUPPORTED,
+            "the advertised capability must match what this transport actually did"
+        );
+    }
+}
+
 /// (T-173) A request line over [`MAX_LINE_BYTES`] with no terminating `\n` — a
 /// broken or hostile owner-local client — must not make `serve_one` buffer it
 /// without bound. `read_bounded_line`'s `take`-based cap returns deterministically
@@ -977,7 +1346,7 @@ async fn unknown_verb_errors_and_routes_no_command() {
 async fn server_rejects_an_oversized_request_line_without_unbounded_buffering() {
     let (mut client, server) = tokio::io::duplex(MAX_LINE_BYTES + 4096);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let members = || vec![Member::from_pid(1)];
+    let members = || Some(vec![Member::from_pid(1)]);
     let source = SnapshotSource::new(
         "run-t",
         "job_object",
@@ -996,10 +1365,12 @@ async fn server_rejects_an_oversized_request_line_without_unbounded_buffering() 
         .await
         .expect("write past the byte ceiling into the duplex buffer");
 
-    serve_one(server, &source, &tx).await.expect(
-        "an oversized request still closes normally through the structured-error path, \
+    serve_one(server, PeerIdentity::Pid(1), &source, &tx)
+        .await
+        .expect(
+            "an oversized request still closes normally through the structured-error path, \
              not a hard connection error",
-    );
+        );
 
     let mut reader = BufReader::new(&mut client);
     let mut line = String::new();
@@ -1475,7 +1846,7 @@ async fn racing_duplicate_after_reconfirm_does_not_misdirect_the_dispatched_verb
         .register_plain("dup-post-race", Some("endpoint-b"), SystemTime::now())
         .expect("register the racing duplicate after the re-check passed");
 
-    let members = || vec![Member::from_pid(1)];
+    let members = || Some(vec![Member::from_pid(1)]);
     let source = SnapshotSource::new(
         "dup-post-race",
         "job_object",
@@ -1490,7 +1861,7 @@ async fn racing_duplicate_after_reconfirm_does_not_misdirect_the_dispatched_verb
     // Drive both sides of the already-open connection concurrently, exactly as
     // `mutate_async` does after `reconfirm_target` returns.
     let (serve_result, ack) = tokio::join!(
-        serve_one(server_stream, &source, &tx),
+        serve_one(server_stream, PeerIdentity::Pid(1), &source, &tx),
         converse::<_, ControlAck>(client_stream, ControlCommand::Cancel.verb()),
     );
     serve_result.expect("run A answers the one connection it actually received");

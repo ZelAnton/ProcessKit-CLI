@@ -54,6 +54,16 @@ The report (one line, shown reformatted here):
   `<subcommand>:--<long-flag>`) — this is how an adapter confirms a flag it
   depends on (for example `run:--capture-dir`) actually exists on this build
   before passing it.
+- Pin **`attest:peer-identity`** if the adapter will gate anything on
+  containment membership (§4). It is the one token in `surface` that is a
+  *capability* rather than a spelling — note the missing `--` — and it says this
+  build can obtain a kernel-authenticated identity for a control-plane client on
+  this platform, which is what makes `attest` able to answer at all. Requiring it
+  turns "this platform cannot prove membership" into an ordinary fail-closed
+  `PROBE_INCOMPATIBLE` (110) here, instead of a `peer_identity_unsupported`
+  refusal in the middle of a job. Its presence is a guarantee; its absence
+  withholds one rather than predicting failure, so an adapter that requires it is
+  choosing not to depend on an unguaranteed capability.
 - An unmet expectation makes `probe` exit **`PROBE_INCOMPATIBLE` (110)** with
   `compatible: false` and the concrete `mismatches`; a malformed `--require-*`
   argument (not an incompatibility, a bad flag) is the ordinary `USAGE` (100).
@@ -71,9 +81,10 @@ validate what it parsed instead of re-deriving the shape by hand. Every
 machine-readable output in this guide has such a pair; see
 [`fixtures/schema/cli/README.md`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/fixtures/schema/cli/README.md)
 for the full table, and `docs/compatibility.md`, "Machine-output schemas", for
-why most of these outputs carry no version field of their own (the `probe`
-report's `probe_version`, the `inspect` snapshot's `snapshot_version`, and the
-failure envelope's `error_version` — §7 — are the three that do).
+why half of these outputs carry no version field of their own (the `probe`
+report's `probe_version`, the `inspect` snapshot's `snapshot_version`, the
+failure envelope's `error_version` — §7 — and the attestation's
+`attestation_version` — §4 — are the four that do).
 
 `probe --print-schema` is a separate, simpler mode on the same subcommand: it
 prints this binary's embedded JSONL event-schema document instead of the
@@ -288,7 +299,7 @@ source means the child's own exit code was never produced or is not what
 [`docs/schema.md`](schema.md#runner_exit) and the exit-code contract in
 [`docs/exit-codes.md`](exit-codes.md).
 
-## 4. Supervising a live run: `inspect` / `cancel` / `kill` / `wait`
+## 4. Supervising a live run: `inspect` / `cancel` / `kill` / `attest` / `wait`
 
 Once a run has started (its `run_id` is known — supplied at launch, per §2),
 an adapter can query, steer, and wait for it while it is still live. Every
@@ -303,10 +314,11 @@ at all:
 processkit-cli inspect --run-id build-42 --json
 processkit-cli cancel  --run-id build-42
 processkit-cli kill    --run-id build-42
+processkit-cli attest  --run-id build-42 --json
 processkit-cli wait    --run-id build-42 --timeout 10m
 ```
 
-The first three reach the live runner over the local control plane described
+The first four reach the live runner over the local control plane described
 normatively in [`docs/control-plane.md`](control-plane.md); `wait` does not
 contact the runner at all and is described in [`docs/registry.md`](registry.md),
 "Waiting — `wait`".
@@ -320,6 +332,20 @@ contact the runner at all and is described in [`docs/registry.md`](registry.md),
   `CONTROL_CANCELLED` (`108`).
 - **`kill`** hard-kills the whole tree **immediately** — no soft stop, no
   grace — exiting the run with `CONTROL_KILLED` (`109`).
+- **`attest`** answers one question about the *calling process*: is it inside
+  this run's container? The runner decides it from the kernel's own record of who
+  opened the control connection — there is no `--pid` and no way to ask about any
+  other process — so a `member` answer is a containment fact rather than a string
+  the caller carried. This is what turns an adapter's "the caller belongs to run
+  X" convention into a runner-checked invariant: `verdict` `member` exits `0`,
+  `not_a_member` exits `NOT_A_MEMBER` (115) — a *decided* answer, deliberately not
+  a `CONTROL` (103) — and `peer_identity_unsupported` exits `103`, the fail-closed
+  refusal a platform that cannot name its callers gives instead of an unproven
+  "ok" (pin `attest:peer-identity` at preflight, §1, to rule that out up front).
+  The attestation is printed on stdout for every verdict, including the failing
+  ones. Read `mechanism` if you need to know how strong the containment behind a
+  `member` answer is; nested runs and the per-mechanism scope are covered in
+  [`docs/control-plane.md`](control-plane.md), "`attest`".
 - **`wait`** blocks until the run is no longer live and exits `0`. It is the
   answer for an adapter that is **not** the runner's parent — one that
   restarted, or that supervises runs another process launched — and so has no
@@ -336,8 +362,8 @@ contact the runner at all and is described in [`docs/registry.md`](registry.md),
 Each of these outputs has a published JSON Schema and golden fixture under
 `fixtures/schema/cli/`: `inspect.schema.json` (the single snapshot and the
 `--all` array), `control-ack.schema.json` (the `cancel`/`kill` ack and the
-`--all` report array), and `wait.schema.json` (`--report-outcome` in either
-single-run or aggregate form).
+`--all` report array), `attest.schema.json` (the attestation), and
+`wait.schema.json` (`--report-outcome` in either single-run or aggregate form).
 
 Both mutating verbs' outcomes are also written to the *target run's own*
 `--jsonl` stream (a `cancelled`/`killed` event with `source`
@@ -388,14 +414,17 @@ esac
 - Without `--timeout`, `wait` blocks indefinitely. Prefer an explicit deadline
   in an adapter, so a supervisor never inherits an unbounded wait.
 
-**`CONTROL` (103)** is the one exit code all four of these clients' by-`run_id`
-form can return, and for all four the usual reason is the same: the command could
-not be resolved to *the* single target run. `inspect` has one further reason of its
-own, where the target *was* resolved and reached and did answer — its reply declared
-a control-plane snapshot version this client does not read, so the answer was
-refused rather than rendered (see `docs/control-plane.md`, "Snapshot version: a
-newer runner's reply is refused, an older one is read"). See §6 for the concrete
-situations that produce a `103`, that one included. `cancel --all` / `kill --all`
+**`CONTROL` (103)** is the one exit code all five of these clients' by-`run_id`
+form can return, and for all five the usual reason is the same: the command could
+not be resolved to *the* single target run. Two further reasons belong to the
+read-only verbs, where the target *was* resolved and reached and did answer:
+`inspect`'s reply declared a control-plane snapshot version this client does not
+read, so the answer was refused rather than rendered (see `docs/control-plane.md`,
+"Snapshot version: a newer runner's reply is refused, an older one is read"), and
+`attest` was answered `peer_identity_unsupported` — the runner could not name the
+caller, so it declined to decide. `attest`'s *decided* negative is not a `103` at
+all but `NOT_A_MEMBER` (115). See §6 for the concrete
+situations that produce a `103`, those included. `cancel --all` / `kill --all`
 reuse the same code for a different reason — one or more snapshot targets failed,
 not "no single target run" — see the `--all` paragraph above and
 `docs/control-plane.md`.
@@ -458,8 +487,8 @@ The `kind` column is noted per bullet; §7 has the full contract.
 
 - **Stale registry entry.** (`kind: "stale"`) The runner behind a `run_id` died abruptly
   (crash, `SIGKILL`, a parent's Job Object terminate); its record is left
-  behind but its liveness lock is released. `inspect`/`cancel`/`kill` detect
-  this *before* connecting and report it as a `CONTROL` (103) failure with an
+  behind but its liveness lock is released. `inspect`/`cancel`/`kill`/`attest`
+  detect this *before* connecting and report it as a `CONTROL` (103) failure with an
   explanatory message on stderr — never a hang, and never silently treated as
   live. `list` still shows the entry (marked `stale`); `prune` is what removes
   it. An ordinary Unix `SIGTERM`/`SIGHUP`, or a Windows `Ctrl-Break`/console
@@ -471,8 +500,8 @@ The `kind` column is noted per bullet; §7 has the full contract.
 - **Unprobeable registry entry.** (`kind: "unprobed"`) The entry's liveness lock could not be probed
   at all (permission denied, a rejected symlink/reparse point, a non-regular
   file in its place), so nothing about the run is confirmed either way. This is
-  the same `CONTROL` (103) refusal — `inspect`/`cancel`/`kill` act only on a
-  **confirmed-live** entry — but it is reported honestly as `unprobed`, not as
+  the same `CONTROL` (103) refusal — `inspect`/`cancel`/`kill`/`attest` act only on
+  a **confirmed-live** entry — but it is reported honestly as `unprobed`, not as
   a gone runner; `list` shows the same entry as `unprobed` and `prune` leaves
   it in place. Investigate the registry directory rather than deleting the
   record by hand (see [`docs/troubleshooting.md`](troubleshooting.md)).
@@ -483,7 +512,7 @@ The `kind` column is noted per bullet; §7 has the full contract.
   plane (connecting, and the request/response exchange) is deadline-bounded.
 - **Ambiguous `run_id`.** (`kind: "ambiguous_run_id"`) The registry does not enforce `run_id` uniqueness;
   if more than one **live** entry matches, every by-`run-id` command — the
-  read-only `inspect` and `wait` included — fails closed with `CONTROL` (103)
+  read-only `inspect`, `attest`, and `wait` included — fails closed with `CONTROL` (103)
   rather than guessing which entry the scan happened to return first. Keep
   `run_id`s unique among an adapter's own concurrently-live runs (§2) to avoid
   this entirely.
@@ -501,10 +530,28 @@ The `kind` column is noted per bullet; §7 has the full contract.
   [`docs/control-plane.md`](control-plane.md), "Snapshot version: a newer runner's
   reply is refused, an older one is read", and
   [`docs/compatibility.md`](compatibility.md), "Machine-output schemas".
+- **A caller the runner cannot name (`attest` only).** (`kind:
+  "peer_identity_unsupported"`) The runner was reached and refused to decide
+  membership, because its transport could not supply a kernel-authenticated
+  identity for the connecting process. Also a `CONTROL` (103), and for the same
+  reason as the bullet above: an answer that cannot be trusted is withheld rather
+  than guessed — here in the safe direction, since the alternative would be
+  reporting an unproven `member`. It says nothing about the run's liveness or
+  about membership. Rule it out at preflight by requiring
+  `attest:peer-identity` (§1); meeting it at runtime means that check was skipped
+  or the runner is a different build.
+- **A decided non-membership is *not* in this class.** (`kind: "not_a_member"`,
+  exit `NOT_A_MEMBER` 115) When `attest` reports that the caller is not in the
+  run's container, nothing failed: the target was resolved, reached, and answered.
+  It has a code of its own precisely so an adapter can tell "the runner says no"
+  (deny the request) from "no runner said anything" (investigate, or retry). Never
+  fold it into the `103` handling above.
 - **`CONTROL`-class exit codes are not run outcomes.** A `103` from the
-  by-`run_id` form of `inspect`/`cancel`/`kill`/`wait` describes a failure on the
+  by-`run_id` form of `inspect`/`cancel`/`kill`/`attest`/`wait` describes a failure
+  on the
   *client's* side of the exchange — it could not resolve or reach a single target,
-  or (the `inspect`-only case above) could not read the answer it got — and says
+  or (the two read-only cases above) could not read or obtain the answer it asked
+  for — and says
   nothing about how the target run itself ended (or is still running). Do not
   conflate it with
   the run-outcome codes in §3's table (`106`–`109`, or the child's own code);
@@ -534,7 +581,7 @@ The `kind` column is noted per bullet; §7 has the full contract.
 
 Everything in §6 is a real distinction the CLI already makes — but by default an
 adapter can only read it as English on stderr, because the exit code is coarse: one
-`CONTROL` (103) covers five of those bullets at once — seven `kind` values in all,
+`CONTROL` (103) covers six of those bullets at once — eight `kind` values in all,
 since the "died mid-conversation" bullet is two of them (`control_unreachable` and
 `ipc_deadline`) and `not_found`, a run id the registry names nowhere, gets no bullet
 of its own above. The global, opt-in

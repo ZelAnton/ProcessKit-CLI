@@ -1,5 +1,5 @@
 //! Arguments for the `run` subcommand — the runner's own surface, and by far the
-//! largest and fastest-growing of the nine subcommands' argument sets (the
+//! largest and fastest-growing of the ten subcommands' argument sets (the
 //! subcommand itself lives in [`crate::run`]).
 
 use std::ffi::OsString;

@@ -14,7 +14,7 @@
 
 use crate::exit::{self, RunnerError};
 
-use super::{InspectAllOutcome, InspectAllStatus, Snapshot};
+use super::{AttestVerdict, Attestation, InspectAllOutcome, InspectAllStatus, Snapshot};
 
 /// Choose `inspect`'s output form: exact JSON when requested, otherwise the
 /// bounded terminal-safe human rendering.
@@ -124,6 +124,88 @@ pub(super) fn render_snapshot_human(snapshot: &Snapshot) -> Vec<String> {
         .collect();
     lines.extend(crate::text::aligned_table(HEADERS, &cells, "  ", "  "));
     lines
+}
+
+/// Choose `attest`'s output form: exact JSON when requested, otherwise the bounded
+/// terminal-safe human rendering.
+///
+/// Every [`Attestation`] that reaches here came out of
+/// [`super::AttestationReply::accept`], so it declares a contract this build
+/// implements and describes the run that was addressed. Rendering never decides
+/// anything: the verdict printed here and the exit code the caller gets come from the
+/// same one field, mapped in [`super::attest_outcome`], so a human reading stdout and
+/// a script reading `$?` can never be told different things.
+pub(super) fn attestation_output_lines(
+    attestation: &Attestation,
+    json: bool,
+) -> Result<Vec<String>, RunnerError> {
+    if json {
+        let line = serde_json::to_string(attestation).map_err(|err| {
+            RunnerError::new(
+                exit::SETUP,
+                format!("could not render the attestation: {err}"),
+            )
+        })?;
+        Ok(vec![line])
+    } else {
+        Ok(render_attestation_human(attestation))
+    }
+}
+
+/// Render every [`Attestation`] field. Destructuring without `..` makes an additive
+/// field fail compilation until the human view is updated too — the same discipline
+/// [`render_snapshot_human`] uses.
+fn render_attestation_human(attestation: &Attestation) -> Vec<String> {
+    let Attestation {
+        attestation_version,
+        run_id,
+        verdict,
+        peer_pid,
+        mechanism,
+        checked_at,
+    } = attestation;
+
+    const LABEL_WIDTH: usize = 22;
+    vec![
+        format!(
+            "{:<LABEL_WIDTH$}{attestation_version}",
+            "attestation_version:"
+        ),
+        format!(
+            "{:<LABEL_WIDTH$}{}",
+            "run_id:",
+            crate::text::terminal_safe_bounded(run_id)
+        ),
+        format!("{:<LABEL_WIDTH$}{}", "verdict:", verdict_str(*verdict)),
+        format!(
+            "{:<LABEL_WIDTH$}{}",
+            "peer_pid:",
+            peer_pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        ),
+        format!(
+            "{:<LABEL_WIDTH$}{}",
+            "mechanism:",
+            crate::text::terminal_safe_bounded(mechanism)
+        ),
+        format!(
+            "{:<LABEL_WIDTH$}{}",
+            "checked_at:",
+            crate::text::terminal_safe_bounded(checked_at)
+        ),
+    ]
+}
+
+/// The verdict's human spelling, identical to its wire spelling on purpose: an
+/// operator reading a terminal and an adapter reading `--json` should be able to
+/// quote the same word to each other.
+fn verdict_str(verdict: AttestVerdict) -> &'static str {
+    match verdict {
+        AttestVerdict::Member => "member",
+        AttestVerdict::NotAMember => "not_a_member",
+        AttestVerdict::PeerIdentityUnsupported => "peer_identity_unsupported",
+    }
 }
 
 /// Choose `inspect --all`'s output form. JSON is the original single-array wire

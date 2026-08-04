@@ -35,7 +35,13 @@
 //! confirmed-stale leftovers of runners that died abruptly while never touching a
 //! live entry; and [`wait`] is the *lifetime* counterpart, blocking on the same
 //! registry until a run is no longer live, for a supervisor that is not the
-//! runner's parent and so cannot wait on it as a child process. [`events_cmd`]
+//! runner's parent and so cannot wait on it as a child process. [`control`] also
+//! carries the fourth control-plane client, `attest`: it asks a live runner whether
+//! the *calling* process is inside that run's container, answering from the
+//! kernel-supplied identity of whoever opened the control connection rather than
+//! from anything the caller said, so an adapter's "the caller belongs to run X"
+//! convention becomes a runner-checked fact (a decided negative is its own reserved
+//! code, [`exit::NOT_A_MEMBER`]). [`events_cmd`]
 //! closes the loop by reading a run's JSONL stream back — rendering, following,
 //! passing through, or schema-checking the very events [`events`] wrote — resolving
 //! the stream through the same registry, and mutating nothing. [`error_envelope`]
@@ -45,9 +51,11 @@
 //! published `kind` instead of on prose. It adds no fourth compatibility surface:
 //! like every other machine-readable output it rides on the flag that turns it on
 //! and on the reserved code it carries, and pins its own shape in the payload with
-//! `error_version` — the same relationship `probe --json`'s `probe_version` and
-//! `inspect`'s `snapshot_version` have to that surface (see `docs/compatibility.md`,
-//! "Machine-output schemas"). The compatibility
+//! `error_version` — the same relationship `probe --json`'s `probe_version`,
+//! `inspect`'s `snapshot_version`, and `attest --json`'s `attestation_version` have
+//! to that surface (see `docs/compatibility.md`,
+//! "Machine-output schemas"). Those version fields are an independent axis *layered
+//! on* the three surfaces, never a count of them. The compatibility
 //! surface itself — CLI flags (see [`cli`]), the exit-code
 //! contract (see [`exit`] and `docs/exit-codes.md`), and the JSONL `schema_version`
 //! (see [`events`] and `docs/schema.md`) — is fixed, and is the same three-item list

@@ -1,18 +1,20 @@
 //! Windows transport: a named pipe with an owner-only protected DACL.
 
 use core::ffi::c_void;
+use std::os::windows::io::AsRawHandle;
 
 use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
 };
 use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
 
 use crate::win_security::SecurityDescriptor;
 
 use super::{
-    ControlCommandSink, Infallible, PIPE_ENDPOINT_PREFIX, SnapshotSource, handle_connection, io,
-    unique_token,
+    ControlCommandSink, Infallible, PIPE_ENDPOINT_PREFIX, PeerIdentity, SnapshotSource,
+    handle_connection, io, unique_token,
 };
 
 /// The connected client stream type on this platform — a named-pipe client. Named
@@ -77,12 +79,19 @@ impl ControlServer {
                 // Cannot stand up the next instance: serve this last client, then
                 // park forever (no more can be accepted, but the run is fine).
                 Err(_) => {
-                    handle_connection(server, source, commands).await;
+                    let peer = peer_identity(&server);
+                    handle_connection(server, peer, source, commands).await;
                     park_forever().await
                 }
             };
             let connected = std::mem::replace(&mut server, next);
-            handle_connection(connected, source, commands).await;
+            // Read the peer's identity off the connected instance *before* it is
+            // served, while the client is unquestionably still attached: that is
+            // what makes the answer about the process on the other end of *this*
+            // pipe instance rather than about whoever holds that pid later (see
+            // [`peer_identity`]).
+            let peer = peer_identity(&connected);
+            handle_connection(connected, peer, source, commands).await;
         }
     }
 }
@@ -93,6 +102,48 @@ impl ControlServer {
 /// without appearing to reuse it on the next iteration.
 async fn park_forever() -> ! {
     match std::future::pending::<Infallible>().await {}
+}
+
+/// Windows always names a connected named pipe's client — the counterpart of the
+/// per-target unix list in `platform/unix.rs`, and unconditional here:
+/// `GetNamedPipeClientProcessId` has shipped in every supported Windows version and
+/// needs no capability probing, so `attest` is never degraded on this platform (see
+/// [`super::PEER_IDENTITY_SUPPORTED`]).
+pub const PEER_IDENTITY_SUPPORTED: bool = true;
+
+/// The kernel's answer to "which process opened this pipe instance?", read from
+/// the connected instance itself.
+///
+/// Nothing the client sent is involved: `GetNamedPipeClientProcessId` answers from
+/// the object manager's own record of the handle that opened this instance, so a
+/// client cannot name a process other than the one that connected. It is read while
+/// the instance is still connected, which is what keeps pid reuse out of the answer
+/// — a process holding an open pipe handle has not exited, so its pid cannot yet
+/// have been recycled onto another process.
+///
+/// **What the pid identifies, exactly.** It is the process that *opened* the client
+/// end. Windows lets a handle be duplicated or inherited into another process
+/// afterwards, so a peer that hands its open handle to a third process makes this
+/// pid name the opener rather than the current writer. That is the same identity
+/// every `GetNamedPipeClient*` API reports, it is a deliberate act by a process
+/// already inside this project's trust boundary (`docs/threat-model.md`, "Trusted
+/// principal and boundary" — the same OS user), and it is exactly what
+/// `docs/control-plane.md` states the attestation covers.
+///
+/// A failed call or a `0` pid is [`PeerIdentity::Unavailable`] — never a fabricated
+/// identity. `0` is the Windows System Idle Process and never a real peer, so it can
+/// only mean the API filled in nothing.
+pub fn peer_identity(server: &NamedPipeServer) -> PeerIdentity {
+    let mut pid: u32 = 0;
+    // SAFETY: `server` is a live, connected pipe instance this loop owns, so its
+    // raw handle is valid for the duration of the call, and `pid` is a
+    // stack-allocated `u32` the API only writes on success.
+    let named = unsafe { GetNamedPipeClientProcessId(server.as_raw_handle(), &raw mut pid) };
+    if named != 0 && pid != 0 {
+        PeerIdentity::Pid(pid)
+    } else {
+        PeerIdentity::Unavailable
+    }
 }
 
 /// Create one pipe instance guarded by the owner-only security descriptor.

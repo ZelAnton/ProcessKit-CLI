@@ -252,6 +252,7 @@ processkit-cli run     [--run-id <id>] [--label <KEY=VALUE>]... [--cwd <dir>]
 processkit-cli inspect (--run-id <id> | --all [--label <KEY=VALUE>]...) [--json]
 processkit-cli cancel  (--run-id <id> | --all [--label <KEY=VALUE>]...)
 processkit-cli kill    (--run-id <id> | --all [--label <KEY=VALUE>]...)
+processkit-cli attest  --run-id <id> [--json]
 processkit-cli wait    --run-id <id> [--timeout <duration>] [--report-outcome]
 processkit-cli wait    --all [--label <KEY=VALUE>]... [--timeout <duration>] [--report-outcome]
 processkit-cli events  (--run-id <id> | --file <events.jsonl>)
@@ -283,7 +284,7 @@ subcommand and every subcommand honors it. `--error-format json` replaces the
 bounded, versioned JSON object — `{"error_version":1,"code":103,"kind":"stale",
 "operation":"inspect","run_id":"build-42","retryable":false,"message":"…"}` — so an
 adapter can branch on a stable `kind` instead of parsing English (a single `103`
-covers seven different situations). It is opt-in and stdout-safe: without it stderr
+covers eight different situations). It is opt-in and stdout-safe: without it stderr
 is byte-for-byte what it always was, and with it stdout is untouched, so it can be
 left on for every invocation. clap's own parse-time usage errors stay
 human-readable in v1. See [the exit-code contract](docs/exit-codes.md), and
@@ -350,7 +351,8 @@ exit. In every case the runner restores the original foreground group and tears
 down its ProcessKit container before returning. Callers that require a deterministic
 runner-owned cancellation outcome should use the control-plane `cancel` command.
 
-`inspect`, `cancel`, and `kill` all communicate with a live `run` process over the
+`inspect`, `cancel`, `kill`, and `attest` all communicate with a live `run` process
+over the
 same local IPC control plane, addressing it by `run_id` through the per-user registry
 — never by PID. `inspect` is read-only and, like `list`/`prune`, has an optional
 `--json`: without it, `inspect` prints a human-readable rendering of the snapshot
@@ -370,6 +372,24 @@ cancel/kill against it is a bounded `CONTROL` (103) failure — never a hang. Cl
 after an abrupt runner
 death follows the platform-specific `abrupt_cleanup` guarantee above; only Windows
 currently guarantees the whole tree.
+
+`attest --run-id <id>` is the fourth, read-only client, and the one whose answer is
+about **the caller** rather than about the run: it asks the live runner whether the
+process running the command is inside that run's ProcessKit container. The runner
+takes the caller's identity from the control connection itself — unix socket peer
+credentials, `GetNamedPipeClientProcessId` on the Windows named pipe — while the
+connection is open, so PID reuse cannot turn a departed client into a false positive
+and, crucially, the caller cannot name a process: there is no `--pid`, because
+proving that *some chosen* pid is a member proves nothing about the asker. That is
+the difference between this and an environment variable carrying a run id, which any
+process can hold and which nothing checks. The verdict is `member` (exit `0`),
+`not_a_member` (the reserved `115`, a *decided* answer rather than an unreachable
+target), or `peer_identity_unsupported` (a `103` refusal from a platform that cannot
+name its callers — never a silent degradation to an unproven "ok"; a consumer rules
+it out at preflight with `probe --json --require-surface attest:peer-identity`). It
+is a containment fact inside the existing same-OS-user threat model, **not**
+authentication between hostile peers — see
+[the control plane](docs/control-plane.md) and [the threat model](docs/threat-model.md).
 
 `inspect --all` snapshots the confirmed-live registry entries once, then inspects
 those exact record paths and endpoints. Repeated `--label KEY=VALUE` filters are
@@ -650,7 +670,12 @@ from the run's own `TIMEOUT` (`106`). `events --validate` adds `EVENTS_INVALID`
 (`114`) in the same spirit — a verdict about a *document*, not about any run: the
 stream it checked does not conform to this binary's event schema.
 
-A code is necessarily coarse — `CONTROL` (`103`) alone covers seven different
+`attest` adds `NOT_A_MEMBER` (`115`) in that same spirit, and for the opposite
+reason: it is a *decided verdict* — the runner was reached, it named the caller from
+the control transport, and the caller is not in its container — which is exactly why
+it is not folded into the `CONTROL` (`103`) that means "no answer to act on".
+
+A code is necessarily coarse — `CONTROL` (`103`) alone covers eight different
 situations, from a stale registry entry to an ambiguous run id. A consumer that
 needs the finer verdict without parsing prose adds the global `--error-format json`,
 which prints one bounded JSON object on stderr naming that same code plus a more
@@ -1023,10 +1048,13 @@ and `--argv-raw` are consumed by that stream, `--snapshot-interval` adds a recor
 cadence of `members_snapshot` events to it while the child runs, and
 `--capture-dir` records a bounded
 stdout/stderr transcript with per-stream byte counts, hashes, and truncation flags
-(see "Bounded output capture"). `inspect`, `cancel`, and `kill` all reach live runs
+(see "Bounded output capture"). `inspect`, `cancel`, `kill`, and `attest` all reach live runs
 through the local control plane: `inspect` prints a snapshot, `cancel` ends a run
-gracefully (its shared soft-stop → grace → hard-kill teardown, exit `108`), and `kill`
-force-kills the whole tree immediately (exit `109`) — each a distinguishable outcome in
+gracefully (its shared soft-stop → grace → hard-kill teardown, exit `108`), `kill`
+force-kills the whole tree immediately (exit `109`), and `attest` answers whether the
+calling process is inside the run's container — a kernel-checked containment fact,
+with its own reserved code for a decided negative (`NOT_A_MEMBER`, 115) — each a
+distinguishable outcome in
 the JSONL stream and by exit code, and each a bounded `CONTROL` (103) failure when the
 run cannot be reached. `list` scans the same registry read-only and prints every
 entry, whatever its health (`live`/`stale`/`unprobed`), as a table or (with

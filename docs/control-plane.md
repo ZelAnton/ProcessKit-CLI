@@ -9,8 +9,9 @@ run becomes **detectably gone** — never a dangling handle a client could act o
 mistake.
 
 This document is the normative description of the **local transport**, the **wire
-protocol**, and the three clients — **`inspect`** (read-only) and the mutating
-**`cancel`** / **`kill`** — including their behavior when the runner cannot be reached.
+protocol**, and the four clients — the read-only **`inspect`** and **`attest`**, and
+the mutating **`cancel`** / **`kill`** — including their behavior when the runner
+cannot be reached.
 Discovery — how a client *finds* a live runner — is the run registry, described in
 [`docs/registry.md`](registry.md). The in-code source of truth is `src/control/`.
 
@@ -93,8 +94,8 @@ nothing to reap: the pipe simply vanishes with the process.
 Line-oriented and deliberately tiny. Over an accepted connection:
 
 1. The client writes one **request verb** line, UTF-8, terminated by `\n`. The verbs
-   are `inspect`, `cancel`, and `kill`. (An empty line is also treated as `inspect`,
-   so a bare connect-and-read probe still works.)
+   are `inspect`, `cancel`, `kill`, and `attest`. (An empty line is also treated as
+   `inspect`, so a bare connect-and-read probe still works.)
 2. The server writes back **one JSON line** — the response — and closes the
    connection.
 
@@ -105,6 +106,13 @@ The responses per verb:
 | `inspect` | a [snapshot](#the-inspect-snapshot)          | none (read-only).                                                        |
 | `cancel`  | an [ack](#cancel-and-kill) `{"accepted":true,"action":"cancel","run_id":"…"}` | the run runs its shared soft-stop → grace → hard-kill teardown and exits with `CONTROL_CANCELLED` (108). |
 | `kill`    | an [ack](#cancel-and-kill) `{"accepted":true,"action":"kill","run_id":"…"}`   | the run hard-kills the whole tree immediately (no soft stop, no grace) and exits with `CONTROL_KILLED` (109). |
+| `attest`  | an [attestation](#attest)                    | none (read-only).                                                        |
+
+**No verb carries an argument, and for `attest` that is load-bearing.** The request
+line is the verb and nothing else, so everything a response depends on is either the
+run's own state or a property of the connection itself. `attest` answers about the
+process on the other end of *this* connection, which the runner reads from the
+transport rather than from the request — see below.
 
 An unrecognized verb yields a JSON error object (`{"error":"..."}`) instead, and
 changes nothing about the run — a foreign client cannot end a run by sending garbage.
@@ -239,6 +247,196 @@ moves with it is part of making the bump, and both are announced in `CHANGELOG.m
 `cancel`/`kill` are unaffected (their ack carries no version and is verified by
 `accepted`/`action`/`run_id` instead), as are `list`, `wait`, and `prune`, which never
 read a snapshot.
+
+## `attest`
+
+```
+processkit-cli attest --run-id <id> [--json]
+```
+
+Asks the live run named `<id>` one question: **is the process running this command
+inside your container?** The runner answers from the kernel's own record of who
+opened the connection, so a positive answer is a containment fact rather than a claim
+the caller repeated.
+
+This is what an environment variable cannot be. An adapter that gates work on "the
+caller belongs to run X" can otherwise only check the *shape* of a string the caller
+carries — a convention enforced by instructions, not a checkable fact, since any
+process can hold any string (and a string is inherited by processes that later leave
+the container). `attest` turns that convention into an invariant the runner itself
+verifies.
+
+**The caller cannot name a process, and that is the whole design.** There is no
+`--pid` and no equivalent. A caller-supplied pid would prove that *some chosen*
+process is a member, which says nothing about the caller and would let any process
+launder a membership claim about a pid it picked. The identity comes from the
+transport:
+
+- **Unix** — the socket's peer credentials. On Linux (and Android/OpenBSD) that is
+  `getsockopt(SOL_SOCKET, SO_PEERCRED)`, whose `ucred` carries the peer's pid. On
+  **macOS** `SO_PEERCRED` does not exist and the portable `getpeereid(3)` reports only
+  the effective uid/gid — not an identity a membership check can use — so the pid
+  comes from the Darwin-specific `getsockopt(SOL_LOCAL, LOCAL_PEEREPID)` instead;
+  NetBSD uses `LOCAL_PEEREID`, and Solaris/illumos `getpeerucred(3C)`. The mechanism
+  differs per platform; the guarantee — a pid the kernel attributes to the peer, not
+  one the peer asserted — does not.
+- **Windows** — `GetNamedPipeClientProcessId` on the connected pipe instance, which
+  the object manager answers from its own record of the handle that opened it.
+
+**PID reuse cannot produce a false positive.** The identity is read from the
+connection while it is open, and the membership check runs on that same open
+connection: a process holding an open socket or pipe handle has not exited, so its pid
+cannot yet have been recycled onto a different process. An attestation is therefore a
+statement about a peer that is demonstrably still there, which is also why it carries
+`checked_at` — it is a point-in-time fact about a live connection, not a token to keep
+and present later.
+
+The pid is checked against the run's **own container membership**, through the very
+same `members_info()` read that produces the `inspect` snapshot and the JSONL
+`members_snapshot` (`docs/schema.md`, "Enriched member fields") — one notion of "a
+container member" for the whole binary, never a second list assembled for this
+command, and never a pid read back from the registry or any other file on disk.
+
+The reply (`--json`; the default is the same fields rendered for a terminal):
+
+```json
+{"attestation_version":1,"run_id":"build-42","verdict":"member","peer_pid":4242,
+ "mechanism":"job_object","checked_at":"2026-07-20T21:00:05.000Z"}
+```
+
+| Field | Meaning |
+|---|---|
+| `attestation_version` | The attestation contract's own version, currently `1`. Its own axis, independent of `snapshot_version` (see "Attestation version" below). |
+| `run_id` | The run that answered, echoed and checked by the client, so a reply describing another run is refused rather than printed. |
+| `verdict` | `member` \| `not_a_member` \| `peer_identity_unsupported` — see below. |
+| `peer_pid` | The pid the kernel reported for the caller, as the runner sees it; `null` only for `peer_identity_unsupported`. Output, never input. |
+| `mechanism` | The containment the verdict is about (`job_object` \| `cgroup_v2` \| `process_group`), which fixes its scope — see "What `member` means, per mechanism". |
+| `checked_at` | When the runner decided, RFC 3339 UTC with millisecond precision. |
+
+The three verdicts are three outcomes, deliberately not a boolean:
+
+| Verdict | Exit code | `--error-format json` `kind` | Meaning |
+|---|---|---|---|
+| `member` | `0` | — | The caller is inside this run's container. |
+| `not_a_member` | `NOT_A_MEMBER` (115) | `not_a_member` | The runner named the caller and it is **not** in the container. A decided answer. |
+| `peer_identity_unsupported` | `CONTROL` (103) | `peer_identity_unsupported` | The runner could not obtain a kernel-authenticated identity for the caller, so it declined to answer either way. |
+
+There is a fourth outcome, and it is deliberately **not** a verdict: if the runner
+cannot read its *own* container membership at that moment (the `members_info()` query
+itself fails), it produces no attestation at all. The client gets the same structured
+error an unrecognized verb does, surfaces the runner's own words, and reports
+`CONTROL` (103) — "the runner could not read its own container membership, so it
+refused to decide". Answering `not_a_member` there would state a decided verdict, and
+deny access through exit `115`, on the strength of a failed query; answering
+`peer_identity_unsupported` would blame the wrong thing, since the caller *was* named.
+This is the same honest-degradation discipline the JSONL `members_snapshot` event's
+`read_error` flag follows — an `inspect` snapshot still degrades that failure to an
+empty `members` array, because a diagnostic that reports nothing is still a
+diagnostic, while a verdict that decides on nothing is not a verdict.
+
+The attestation is printed on **stdout for every verdict**, including the two that
+make the command exit non-zero — the same shape `probe --json` and `inspect --all
+--json` already use when they report and then fail. The verdict is the answer the
+caller asked for; the exit code says what to do about it, and under
+`--error-format json` the matching envelope goes to stderr while stdout stays exactly
+as it is (`fixtures/schema/cli/attest.schema.json`).
+
+**Why a negative gets its own code.** Every `CONTROL` (103) result means *no answer
+you can act on* — the target is missing, stale, unprobeable, ambiguous, unreachable,
+too slow, or speaking a contract this build refuses. A `not_a_member` is the opposite:
+the target was resolved, reached, and answered. An adapter that gated a lease on
+membership must be able to tell "the runner says no" from "no runner said anything",
+because the correct response differs (deny versus investigate or retry), so the two
+never share a code. See [`docs/exit-codes.md`](exit-codes.md).
+
+**Fail-closed on a platform that cannot answer.** A runner whose transport cannot name
+its peer reports `peer_identity_unsupported` rather than degrading to an unproven
+`member`. A consumer establishes that this cannot happen *before* it depends on
+attestation, at preflight, with the capability token in `probe --json`'s `surface`:
+
+```sh
+processkit-cli probe --json --require-surface attest --require-surface attest:peer-identity
+```
+
+That token carries no `--` precisely because it is not a flag: it says this build can
+obtain a kernel-authenticated peer identity **on this platform**, and it is absent
+where the build cannot promise that. A missing capability is then the ordinary
+fail-closed `PROBE_INCOMPATIBLE` (110) every other unmet `--require-*` produces, at
+preflight, rather than a surprise in the middle of a job. The claim is deliberately
+one-directional: its presence is a guarantee, its absence withholds one rather than
+predicting failure (FreeBSD, for instance, supplies a peer pid on a new enough kernel
+and not on an older one, which no compile-time claim can distinguish — so it is
+excluded rather than over-claimed, and `attest` there still answers from whatever the
+kernel really provides).
+
+### What `member` means, per mechanism
+
+`member` means exactly this: **the run's own container reports the caller as one of
+its members.** Since that is the same enumeration `inspect` and `members_snapshot`
+publish, what a `member` answer covers follows the mechanism the run obtained
+(`run_started.mechanism`, and the `mechanism` field of the attestation itself):
+
+- **`job_object` (Windows) and `cgroup_v2` (Linux)** enumerate the *whole contained
+  tree*, so any process in the tree — a grandchild, a great-grandchild — attests as a
+  member.
+- **`process_group`** (the POSIX fallback: macOS and the non-FreeBSD BSDs, and Linux
+  with no usable cgroup) *contains* a whole tree but *enumerates* only the tracked
+  group leaders. Membership there is therefore decided against the caller's own
+  **process group** — the predicate that mechanism actually enforces, and the one its
+  teardown (`killpg`) reaches — so a contained grandchild attests as a member on this
+  mechanism too, and a process that escaped the group with `setsid` (and so escaped
+  this mechanism's containment) correctly does not.
+
+**Nested runs.** A run started *inside* another run is an ordinary run: a client
+inside it attests against it exactly as a client inside a top-level run does, on every
+platform. Whether that client is *also* a member of the **outer** run is
+mechanism-dependent, and the honest answer differs: Windows Job Objects nest, so the
+inner run's processes are in the outer job as well and attest as members of it; a
+Linux cgroup leaf is created inside the outer run's own cgroup, and a process moved
+into that leaf is no longer listed in the outer cgroup's `cgroup.procs`, so it attests
+as a non-member of the outer run even though the outer run's recursive teardown would
+still reach it. Neither is a bug — each is a faithful report of what that mechanism
+enumerates — so **ask about the run you actually mean**, and read `mechanism` if you
+need to reason about the containment behind the answer.
+
+### Attestation version
+
+`attestation_version` is the contract's own axis, exactly as `snapshot_version` is
+`inspect`'s, and the client **acts** on it: a reply declaring any other version is
+refused with `CONTROL` (103) / `incompatible_contract` rather than rendered.
+
+That is stricter than `inspect`'s range, on purpose rather than by omission. A misread
+snapshot is a diagnostic shown under the wrong semantics; a misread attestation is a
+security verdict, and an adapter would grant or deny access on a sentence its sender
+never said. And strictness costs nothing here: this contract has had exactly one
+version, so there is no older shape being refused — unlike `snapshot_version`, whose
+floor records a checked fact about a bump that really happened (see "Snapshot version:
+a newer runner's reply is refused, an older one is read"). If an additive bump ever
+makes an older attestation genuinely readable, the range widens in the same change
+that makes the widening true.
+
+### The boundary: containment, not authentication
+
+`attest` reports a **containment fact inside the existing same-OS-user threat model**
+([`docs/threat-model.md`](threat-model.md)). It is **not** authentication between
+mutually hostile peers, and must not be used as one:
+
+- the control transport is owner-only, so every party to this exchange is already the
+  same OS user, and that user's processes are inside the trust boundary this project
+  draws — a same-user process that wanted to interfere with a run never needed to
+  forge an attestation, since it can reach the control plane directly;
+- what `attest` closes is the **forgeable correlation**: a process that is not
+  contained claiming it is, by carrying a string. That is a real and common failure
+  mode (a stale environment variable, a copied id, a process that outlived the run it
+  was started for), and it is closed by asking the kernel instead of the caller;
+- what it does **not** close is a same-user process that is genuinely inside the
+  container behaving badly, nor anything about a *different* user (that is the
+  transport's owner-only permissions, not this verb), nor any claim that survives the
+  connection — the fact is scoped to the moment it was checked.
+
+A consumer that needs a security boundary between mutually distrusting parties needs
+OS-level isolation (separate users, containers, sandboxes); `attest` is a containment
+invariant *within* one such boundary, not a replacement for one.
 
 ## `cancel` and `kill`
 
@@ -379,8 +577,9 @@ rule over a snapshot, it never widens or narrows it.
 
 ### When the runner cannot be reached: a distinguishable result, never a hang
 
-Every client — `inspect`, `cancel`, and `kill` — can lose the runner the same three
-ways (this applies per target under `--all` too, one snapshot entry at a time). All
+Every client — `inspect`, `cancel`, `kill`, and `attest` — can lose the runner the
+same three ways (this applies per target under `--all` too, one snapshot entry at a
+time). All
 of them are reported as the reserved **`CONTROL` exit code (103)** — "could
 not reach the target run" (see [`docs/exit-codes.md`](exit-codes.md)) — with an
 explanatory message on **stderr** (naming the action and the run) and nothing on
@@ -416,17 +615,27 @@ is already gone is the *same* bounded `CONTROL` (103) result — it never blocks
 for a teardown that will not happen, and it does not mistake a dead run for a
 successful cancel.
 
-**One `inspect`-only refusal shares this code without being a lost runner.** A runner
+**Two refusals share this code without being a lost runner**, and both belong to the
+read-only verbs. A runner
 that answers with a snapshot declaring a `snapshot_version` outside the range this
 client reads is reachable and perfectly healthy — the exchange completed and the reply
 arrived — but that reply cannot be interpreted, so `inspect` refuses it with the same
 `103` instead of rendering it (see "Snapshot version: a newer runner's reply is
-refused, an older one is read"). That is what sets it apart from the reasons above:
+refused, an older one is read"). `attest` has the same refusal for its own
+`attestation_version`, plus one more of its own: a runner that could not obtain a
+kernel-authenticated identity for the caller answers `peer_identity_unsupported`,
+which is again `103` — reached, healthy, and unable to give an answer this client may
+act on. That is what sets these apart from the reasons above:
 they are all ways the *target* could not be resolved or reached, while here the target
-answered and its **answer** was rejected. (Determinism is not the distinguishing
-property — a confirmed-stale entry and an ambiguous `run_id` are just as unaffected by
-a retry; only "died mid-conversation" is genuinely transient.) `cancel`/`kill` cannot
-hit it — their ack carries no version.
+answered and its **answer** was rejected or withheld. (Determinism is not the
+distinguishing property — a confirmed-stale entry and an ambiguous `run_id` are just
+as unaffected by a retry; only "died mid-conversation" is genuinely transient.)
+`cancel`/`kill` cannot hit any of them — their ack carries no version and no identity.
+
+**`attest`'s `not_a_member` is emphatically not in this family**, even though it is
+also a non-zero exit from a control client: nothing was lost or unreachable, the
+runner answered, and the answer is the point. It carries `NOT_A_MEMBER` (115) for
+exactly that reason (see "`attest`").
 
 This is the exit-code half of the contract: a caller distinguishes "here is the run's
 state" / "the command was accepted" (exit `0`, JSON on stdout) from "that run is not
@@ -436,6 +645,7 @@ Telling the reasons *within* that `103` apart is the one thing the code cannot d
 which is what the global `--error-format json` is for: under it the same failure
 prints a bounded JSON object on stderr whose `kind` is exactly the distinction this
 section draws (`stale`, `unprobed`, `control_unreachable`, `ipc_deadline`,
-`ambiguous_run_id`, `not_found`, and — for the refusal above —
-`incompatible_contract`). Still no free text parsed, and stdout is untouched. See
+`ambiguous_run_id`, `not_found`, and — for the two refusals above —
+`incompatible_contract` and `peer_identity_unsupported`). Still no free text parsed,
+and stdout is untouched. See
 [`docs/exit-codes.md`](exit-codes.md#machine-readable-failures---error-format-json).

@@ -10,14 +10,18 @@
 //! [`Cli`]/[`Command`] shapes live here, each subcommand family's argument
 //! struct lives in the file named after the module that implements that
 //! subcommand — `run.rs` ([`RunArgs`]), `control.rs` ([`InspectArgs`] and the
-//! shared [`TargetArgs`] behind `cancel`/`kill`), `wait.rs` ([`WaitArgs`]),
+//! shared [`TargetArgs`] behind `cancel`/`kill`), `attest.rs` ([`AttestArgs`]),
+//! `wait.rs` ([`WaitArgs`]),
 //! `list.rs` ([`ListArgs`]), `prune.rs` ([`PruneArgs`]), `probe.rs`
 //! ([`ProbeArgs`]), and `events.rs` ([`EventsArgs`]) — and the hand-written value
 //! parsers those arguments share live in `parse.rs`. Each file carries the unit
-//! tests for the shapes it defines. The one file whose name does not match its
-//! implementing module is `events.rs`: the `events` subcommand is implemented by
-//! [`crate::events_cmd`], because the plain `events` module name already belongs to
-//! the JSONL emitter that command reads back.
+//! tests for the shapes it defines. Two files' names do not match their
+//! implementing module: `events.rs`, because the `events` subcommand is implemented
+//! by [`crate::events_cmd`] (the plain `events` module name already belongs to the
+//! JSONL emitter that command reads back), and `attest.rs`, whose client lives in
+//! [`crate::control`] alongside the other control-plane verbs — it has a file of its
+//! own because its argument shape is the opposite of `control.rs`'s shared
+//! `--run-id`/`--all` target form, and deliberately so (see [`AttestArgs`]).
 //!
 //! The submodules are private and everything they define is re-exported here, so
 //! `crate::cli::<Item>` stays the single path to every CLI type and parser —
@@ -25,6 +29,7 @@
 //! (`fuzz/fuzz_targets/cli_parsers.rs`), and `build.rs`, which loads this very
 //! file to generate completions and man pages from the live parser.
 
+mod attest;
 mod control;
 mod events;
 mod list;
@@ -36,6 +41,7 @@ mod wait;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+pub use attest::AttestArgs;
 pub use control::{InspectArgs, TargetArgs};
 pub use events::EventsArgs;
 pub use list::{ListArgs, ListHealth};
@@ -110,6 +116,10 @@ pub enum Command {
     /// Hard-kill a live run's container immediately, by `--run-id` or, in
     /// aggregate, `--all`.
     Kill(TargetArgs),
+    /// Ask a live run whether this very process is inside its container — a fact the
+    /// runner checks against the kernel's own view of who connected, never a claim
+    /// the caller makes about itself.
+    Attest(AttestArgs),
     /// Block until a run recorded in the per-user registry has finished.
     Wait(WaitArgs),
     /// Read back a run's JSONL lifecycle stream: render it, follow it, pass it
@@ -140,6 +150,7 @@ impl Command {
             Self::Inspect(_) => "inspect",
             Self::Cancel(_) => "cancel",
             Self::Kill(_) => "kill",
+            Self::Attest(_) => "attest",
             Self::Wait(_) => "wait",
             Self::Events(_) => "events",
             Self::List(_) => "list",
@@ -161,6 +172,9 @@ impl Command {
             Self::Run(args) => args.run_id.as_deref(),
             Self::Inspect(args) => args.run_id.as_deref(),
             Self::Cancel(args) | Self::Kill(args) => args.run_id.as_deref(),
+            // The one by-id command whose target is not optional: `attest` has no
+            // aggregate form to be absent for (see `AttestArgs`).
+            Self::Attest(args) => Some(&args.run_id),
             Self::Wait(args) => args.run_id.as_deref(),
             Self::Events(args) => args.run_id.as_deref(),
             Self::List(_) | Self::Prune(_) | Self::Probe(_) => None,
@@ -286,6 +300,7 @@ mod tests {
             vec!["inspect", "--error-format", "json", "--run-id", "r1"],
             vec!["cancel", "--error-format", "json", "--run-id", "r1"],
             vec!["kill", "--error-format", "json", "--run-id", "r1"],
+            vec!["attest", "--error-format", "json", "--run-id", "r1"],
             vec!["wait", "--error-format", "json", "--run-id", "r1"],
             vec!["events", "--error-format", "json", "--run-id", "r1"],
             vec!["list", "--error-format", "json"],
@@ -324,6 +339,7 @@ mod tests {
             (vec!["probe", "--json"], "probe", None),
             (vec!["cancel", "--all"], "cancel", None),
             (vec!["kill", "--run-id", "r1"], "kill", Some("r1")),
+            (vec!["attest", "--run-id", "r1"], "attest", Some("r1")),
             (vec!["wait", "--all"], "wait", None),
             (vec!["wait", "--run-id", "r2"], "wait", Some("r2")),
             (vec!["events", "--run-id", "r3"], "events", Some("r3")),
@@ -372,6 +388,7 @@ mod tests {
                 vec!["processkit-cli", "inspect", "--run-id", bad],
                 vec!["processkit-cli", "cancel", "--run-id", bad],
                 vec!["processkit-cli", "kill", "--run-id", bad],
+                vec!["processkit-cli", "attest", "--run-id", bad],
                 vec!["processkit-cli", "wait", "--run-id", bad],
                 vec!["processkit-cli", "events", "--run-id", bad],
             ];

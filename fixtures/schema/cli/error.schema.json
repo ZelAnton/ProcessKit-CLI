@@ -43,9 +43,11 @@
             "wait_timeout",
             "output_overflow",
             "events_invalid",
+            "not_a_member",
+            "peer_identity_unsupported",
             "unknown"
           ],
-          "description": "What actually failed — a finer axis over `code`, never a competing one, and never coarser than it: `control_unreachable`/`not_found`/`stale`/`unprobed`/`ambiguous_run_id`/`ipc_deadline`/`incompatible_contract` all split CONTROL (103), and `registry` splits SETUP (111) away from every other prerequisite failure. The `run` family's values (`spawn_error`, `container_error`, `timeout`, `cancelled`, `control_cancel`, `control_kill`, `output_overflow`, `setup`, `internal`) are the terminal `runner_exit` event's `source` values, spelled identically: fixtures/schema/v1/schema.json's `runnerExit.source` remains their single source of truth and this envelope mirrors rather than forks that vocabulary. The list grows additively (a new value is a minor change); a reader that meets one it does not know falls back to `code`, which is always present. `unknown` is that fallback from this binary's own side — a reserved-band code this build will not name here, either because no build assigns it yet (the retired 105, the reserved 115-119) or because this build assigns it to a different subcommand than the one reporting (110/112/114 are minted only by probe/wait/events --validate, so a `run --detach` relaying one from a respawned copy that turned out to be a different build reports `unknown` rather than borrowing that meaning; src/run/detach.rs, `relayed_kind`)."
+          "description": "What actually failed — a finer axis over `code`, never a competing one, and never coarser than it: `control_unreachable`/`not_found`/`stale`/`unprobed`/`ambiguous_run_id`/`ipc_deadline`/`incompatible_contract`/`peer_identity_unsupported` all split CONTROL (103), and `registry` splits SETUP (111) away from every other prerequisite failure. `not_a_member` is the one value here that reports a *decided verdict* rather than something that went wrong — `attest` reached the runner, the runner named the caller from the control transport, and the caller is not in that run's container — which is why it carries a code of its own (115) instead of joining the CONTROL family; its sibling `peer_identity_unsupported` is the opposite case (nothing was established at all, so it fails closed under 103). The `run` family's values (`spawn_error`, `container_error`, `timeout`, `cancelled`, `control_cancel`, `control_kill`, `output_overflow`, `setup`, `internal`) are the terminal `runner_exit` event's `source` values, spelled identically: fixtures/schema/v1/schema.json's `runnerExit.source` remains their single source of truth and this envelope mirrors rather than forks that vocabulary. The list grows additively (a new value is a minor change); a reader that meets one it does not know falls back to `code`, which is always present. `unknown` is that fallback from this binary's own side — a reserved-band code this build will not name here, either because no build assigns it yet (the retired 105, the reserved 116-119) or because this build assigns it to a different subcommand than the one reporting (110/112/114/115 are minted only by probe/wait/events --validate/attest, so a `run --detach` relaying one from a respawned copy that turned out to be a different build reports `unknown` rather than borrowing that meaning; src/run/detach.rs, `relayed_kind`)."
         },
         "operation": {
           "type": "string",
@@ -54,6 +56,7 @@
             "inspect",
             "cancel",
             "kill",
+            "attest",
             "wait",
             "events",
             "list",
@@ -115,7 +118,8 @@
                   "ambiguous_run_id",
                   "control_unreachable",
                   "ipc_deadline",
-                  "incompatible_contract"
+                  "incompatible_contract",
+                  "peer_identity_unsupported"
                 ]
               }
             },
@@ -124,6 +128,33 @@
           "then": {
             "properties": { "code": { "const": 103 } },
             "description": "The kinds that exist to split CONTROL (103) always carry that code. `registry` is deliberately absent from this list — it is the one kind reachable under two codes, CONTROL (103) when a by-`run-id` control client cannot resolve its target because the registry itself is unreadable, and SETUP (111) when a whole-registry command hits the same condition."
+          }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "const": "not_a_member" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "code": { "const": 115 },
+              "operation": { "const": "attest" },
+              "run_id": { "type": "string" }
+            },
+            "description": "A decided containment verdict, produced only by `attest`, which always names the run it asked about — see docs/exit-codes.md, \"A membership verdict is not an unreachable target\"."
+          }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "const": "peer_identity_unsupported" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "operation": { "const": "attest" },
+              "run_id": { "type": "string" }
+            },
+            "description": "The fail-closed half of the same command: the runner was reached but could not name the caller, so no verdict was reached. Its code is the shared CONTROL (103) above, because nothing about membership was established."
           }
         },
         {

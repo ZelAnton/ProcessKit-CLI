@@ -17,7 +17,11 @@
 //! shape) or a [`ControlAck`] (a real client picks the type by which verb it
 //! sent, information a byte-string input does not carry), and, since T-191, the
 //! owned [`ErrorReply`] `converse` falls back to when neither `T` parses — the
-//! shape `serve_one`'s structured `{"error": "..."}` reply takes. [`Snapshot`]
+//! shape `serve_one`'s structured `{"error": "..."}` reply takes. Since T-306 the
+//! [`AttestationReply`] the `attest` client parses joins them, decided the same
+//! way (its declared `attestation_version` before the payload's shape) and, being
+//! the reply a *security verdict* arrives in, the one where a parse that accepted
+//! more than it should is worth the fuzz budget. [`Snapshot`]
 //! is fuzzed alongside them because it remains the *server's* serialized shape
 //! and the inner type `SnapshotReply` parses into. Never expected to panic — a
 //! malformed line/reply is exactly what both real parsers already treat as a
@@ -26,7 +30,9 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use processkit_cli::control::{ControlAck, ErrorReply, Snapshot, SnapshotReply, classify_request};
+use processkit_cli::control::{
+    AttestationReply, ControlAck, ErrorReply, Snapshot, SnapshotReply, classify_request,
+};
 
 fuzz_target!(|data: &[u8]| {
     let Ok(text) = std::str::from_utf8(data) else {
@@ -40,5 +46,6 @@ fuzz_target!(|data: &[u8]| {
     let _ = serde_json::from_str::<SnapshotReply>(response.trim());
     let _ = serde_json::from_str::<Snapshot>(response.trim());
     let _ = serde_json::from_str::<ControlAck>(response.trim());
+    let _ = serde_json::from_str::<AttestationReply>(response.trim());
     let _ = serde_json::from_str::<ErrorReply>(response.trim());
 });

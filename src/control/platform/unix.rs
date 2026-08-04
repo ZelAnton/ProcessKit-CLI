@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use tokio::net::{UnixListener, UnixStream};
 
 use super::{
-    ControlCommandSink, Infallible, SOCKET_DIR_PREFIX, SOCKET_FILE_NAME, SnapshotSource,
-    handle_connection, io, socket_base_dirs, unique_token,
+    ControlCommandSink, Infallible, PeerIdentity, SOCKET_DIR_PREFIX, SOCKET_FILE_NAME,
+    SnapshotSource, handle_connection, io, socket_base_dirs, unique_token,
 };
 
 /// The connected client stream type on this platform — a unix domain socket
@@ -74,7 +74,16 @@ impl ControlServer {
     ) -> Infallible {
         loop {
             match self.listener.accept().await {
-                Ok((stream, _addr)) => handle_connection(stream, source, commands).await,
+                Ok((stream, _addr)) => {
+                    // Read the peer's identity off the accepted socket *before*
+                    // the connection is served, while it is unquestionably still
+                    // open: this is what makes the answer about the process on
+                    // the other end of *this* socket rather than about whoever
+                    // happens to hold that pid number later (see
+                    // [`peer_identity`]).
+                    let peer = peer_identity(&stream);
+                    handle_connection(stream, peer, source, commands).await
+                }
                 // A transient accept error (e.g. a fd limit) must not spin the
                 // loop; pause briefly, then keep serving.
                 Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
@@ -93,6 +102,85 @@ impl Drop for ControlServer {
         // leftover does not accumulate.
         let _ = std::fs::remove_file(&self.path);
         let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+
+/// Whether *this target* is one where a unix domain socket is guaranteed to name
+/// the connecting client's process — the compile-time half of the capability
+/// [`super::PEER_IDENTITY_SUPPORTED`] advertises through `probe`.
+///
+/// The list is the set of targets whose `SO_PEERCRED`-equivalent **unconditionally**
+/// carries a pid, verified against `tokio`'s own per-target implementations
+/// (`tokio::net::unix::ucred`, 1.53), not assumed from the Linux spelling:
+///
+/// - **Linux / Android / OpenBSD** — `getsockopt(SOL_SOCKET, SO_PEERCRED)` filling a
+///   `ucred` (`sockpeercred` on OpenBSD), whose `pid` field the kernel sets.
+/// - **macOS / iOS** — `SO_PEERCRED` does **not** exist here, and the portable
+///   `getpeereid(3)` this platform does have returns only the effective uid/gid,
+///   which is not an identity a membership check can use. The pid comes from a
+///   second, Darwin-specific call: `getsockopt(SOL_LOCAL, LOCAL_PEEREPID)`, which
+///   answers with the peer's **effective** pid. `tokio` issues both (`LOCAL_PEEREPID`
+///   for the pid, `getpeereid` for uid/gid), so `UCred::pid()` is `Some` here exactly
+///   as it is on Linux — the mechanism differs, the guarantee does not.
+/// - **NetBSD** — `getsockopt(SOL_SOCKET, LOCAL_PEEREID)` filling a `unpcbid`
+///   (`unp_pid`).
+/// - **Solaris / illumos** — `getpeerucred(3C)` plus `ucred_getpid`.
+///
+/// Deliberately **absent**, and each for a checked reason rather than an oversight:
+///
+/// - **FreeBSD** — `LOCAL_PEERCRED` yields an `xucred` whose `cr_pid` is populated
+///   only since FreeBSD 13, so whether a pid arrives is a property of the *running
+///   kernel*, not of the target this was compiled for. A compile-time claim would
+///   therefore be an over-claim on an older kernel, and this constant is a
+///   guarantee: it under-claims instead. `attest` still works there whenever the
+///   kernel does supply one — see [`super::PEER_IDENTITY_SUPPORTED`] for why the
+///   advertisement and the runtime path are deliberately allowed to differ in that
+///   direction and never the other.
+/// - **DragonFly BSD / AIX / QNX Neutrino** — only `getpeereid(3)`: uid and gid, no
+///   pid at all.
+/// - Every other unix target — no pid path in `tokio` at all (`UCred::pid()` is
+///   hard-wired `None`), or one this project has not verified.
+pub const PEER_IDENTITY_SUPPORTED: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "openbsd",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "netbsd",
+    target_os = "solaris",
+    target_os = "illumos",
+));
+
+/// The kernel's answer to "which process is on the other end of this socket?",
+/// read from the connected socket itself.
+///
+/// Nothing the client sent is involved: the pid comes from the kernel's own
+/// record of who connected (see [`PEER_IDENTITY_SUPPORTED`] for the per-target
+/// system call), so a client cannot name a process other than itself. It is read
+/// while the connection is open, which is what keeps pid reuse out of the answer:
+/// a process that owns an open socket has not exited, so its pid cannot yet have
+/// been recycled onto some other process.
+///
+/// Anything short of a positive pid is [`PeerIdentity::Unavailable`] — never a
+/// fabricated or guessed identity:
+///
+/// - the call failed (a target whose `getpeereid`-only path errors, an unusual
+///   socket state);
+/// - the target has no pid path at all, so `tokio` reports `None`;
+/// - the pid is `0` or negative. On Linux `SO_PEERCRED` translates the peer's pid
+///   into the *reader's* pid namespace and reports `0` when it has no
+///   representation there — precisely the case where a number would be meaningless
+///   to compare against this container's members — and no real userland peer is
+///   pid `0` on any of these targets anyway.
+pub fn peer_identity(stream: &UnixStream) -> PeerIdentity {
+    let Ok(credentials) = stream.peer_cred() else {
+        return PeerIdentity::Unavailable;
+    };
+    match credentials.pid() {
+        Some(pid) if pid > 0 => u32::try_from(pid)
+            .map(PeerIdentity::Pid)
+            .unwrap_or(PeerIdentity::Unavailable),
+        _ => PeerIdentity::Unavailable,
     }
 }
 

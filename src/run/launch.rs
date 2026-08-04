@@ -450,16 +450,25 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     });
     emit_members_snapshot(&mut emitter, &group, SnapshotReason::Spawn);
 
-    // What the control server answers an `inspect` with. `members` is a live query of
+    // What the control server answers an `inspect` — and an `attest` — with.
+    // `members` is a live query of
     // the owning container, so a snapshot reflects the tree's composition *when
     // inspected* — the same enriched view the `members_snapshot` event carries
     // (both read through `members_info()`, so `inspect` and the JSONL stream never
     // drift on what a "container member" looks like).
+    //
+    // A failed read is reported as `None` rather than swallowed into an empty list:
+    // `inspect` still degrades it to an empty `members` array exactly as before (its
+    // own `unwrap_or_default`, in `SnapshotSource::snapshot`), but `attest` must be
+    // able to tell "no members" from "could not read the members" — answering
+    // `not_a_member` because a query failed would be a verdict nothing established.
+    // Same honest-degradation discipline as the `members_snapshot` event's
+    // `read_error` flag, which this very call's sibling emits.
     let members_provider = || {
         group
             .members_info()
             .map(|infos| infos.into_iter().map(Member::from_info).collect())
-            .unwrap_or_default()
+            .ok()
     };
     let snapshot_source = SnapshotSource::new(
         &run_id,

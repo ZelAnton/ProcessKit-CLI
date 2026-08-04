@@ -61,7 +61,7 @@ end the run.
 When a command *fails*, add the global `--error-format json` (it parses before or
 after the subcommand) instead of reading the stderr prose: the failure prints one
 JSON object on stderr with a stable `code`, `kind`, `operation`, `run_id`, and
-`retryable`. This is how to tell the seven situations behind a single `CONTROL (103)`
+`retryable`. This is how to tell the eight situations behind a single `CONTROL (103)`
 apart — `stale` (the runner is gone) from `unprobed` (nothing established, worth one
 retry) from `ambiguous_run_id` (fix the id) from `not_found`. It never touches
 stdout, so it is safe to leave on for every invocation; `message` is free text and
@@ -94,6 +94,16 @@ terminal `runner_exit`, or when the run is over and the stream stopped growing.
 `--json` passes the runner's own lines through byte for byte; `--validate` checks a
 stream against the embedded event schema and exits `EVENTS_INVALID (114)` if any
 line does not conform.
+
+To make "this process belongs to run X" a checked fact rather than an inherited
+string, have the process itself run `attest --run-id build-42` (add `--json` for the
+machine form). The runner answers from the kernel's own record of who opened the
+control connection, so there is no `--pid` and no way to ask about anyone else:
+exit `0` means the caller is inside that run's container, `115` (`NOT_A_MEMBER`)
+means it is definitely not, and `103` means no verdict was reached — never a silent
+"ok". If you will gate work on it, require the capability at preflight with
+`probe --json --require-surface attest:peer-identity`. It is a containment check
+inside the same-OS-user boundary, not authentication.
 
 Use `cancel --run-id build-42` for graceful teardown and `kill --run-id build-42`
 only for an immediate hard kill. Never clean up by process name or PID. For fleets,

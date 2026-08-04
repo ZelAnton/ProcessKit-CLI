@@ -16,9 +16,10 @@
 //! that cannot read the event stream.
 //!
 //! A shell has one byte to read, so these codes are necessarily coarse: [`CONTROL`]
-//! alone covers seven genuinely different situations — a target that is missing,
+//! alone covers eight genuinely different situations — a target that is missing,
 //! confirmed stale, unprobeable, ambiguous, unreachable, too slow within a bounded
-//! window, or speaking a version this build refuses. A caller that wants the finer
+//! window, speaking a version this build refuses, or unable to name the caller an
+//! `attest` asks about. A caller that wants the finer
 //! verdict without parsing prose asks for it explicitly with `--error-format json`,
 //! which prints one bounded JSON object naming both this code and an
 //! [`ErrorKind`](crate::error_envelope::ErrorKind) — a *finer axis over these very
@@ -45,9 +46,9 @@ pub const SPAWN: u8 = 101;
 /// endpoint, or run registry could not be established.
 pub const BACKEND: u8 = 102;
 /// A by-`run-id` command could not be resolved to **the** single live run it
-/// names. For the control-plane clients (`inspect`/`cancel`/`kill`) that covers
-/// every way the target cannot be reached: no such run id, a stale/dead registry
-/// entry, or an IPC failure. The registry-only [`crate::wait`] shares just one of
+/// names. For the control-plane clients (`inspect`/`cancel`/`kill`/`attest`) that
+/// covers every way the target cannot be reached: no such run id, a stale/dead
+/// registry entry, or an IPC failure. The registry-only [`crate::wait`] shares just one of
 /// those reasons — an **ambiguous** run id, more than one live run registered under
 /// it — and reports it with this same code even though it speaks to no runner,
 /// because it is the same verdict: there is no single target run to act on (see
@@ -60,6 +61,12 @@ pub const BACKEND: u8 = 102;
 /// and acted on"). The run itself is live and controllable — `cancel`/`kill` against
 /// it are unaffected, their ack carrying no version — so a consumer must not read that
 /// `103` as "the runner is gone".
+///
+/// `attest` adds the second such reason, and the same caveat applies to it: the
+/// runner was reached and declined to answer because it could not obtain a
+/// kernel-authenticated identity for the caller (`peer_identity_unsupported`). A
+/// *decided* "you are not a member" is deliberately **not** this code — that is
+/// [`NOT_A_MEMBER`] (115), because it is an answer rather than the absence of one.
 ///
 /// `cancel --all` / `kill --all` reuse this
 /// same code for a different fact — one or more targets in the confirmed-live
@@ -139,7 +146,7 @@ pub const PROBE_INCOMPATIBLE: u8 = 110;
 /// stays [`INTERNAL`]. Splitting them out keeps `INTERNAL` (104) honestly meaning
 /// "a runner bug", so a consumer is never misled into reading a setup error as one.
 /// Takes the next free code after [`PROBE_INCOMPATIBLE`] so no existing assignment
-/// shifts; `113`/`114` are assigned below and `115`–`119` remain reserved.
+/// shifts; `113`–`115` are assigned below and `116`–`119` remain reserved.
 pub const SETUP: u8 = 111;
 /// The **`wait` subcommand's own** deadline elapsed while its target(s) were still
 /// live: `wait --timeout <duration>`, either the single-run form (`--run-id <id>`) or
@@ -184,8 +191,41 @@ pub const OUTPUT_OVERFLOW: u8 = 113;
 /// names no single readable stream is still [`CONTROL`] — this code means the check
 /// ran and failed, so a CI job can gate a fixture on it and tell "invalid" apart from
 /// "could not check". Takes the next free code after [`OUTPUT_OVERFLOW`] so no
-/// existing assignment shifts; `115`–`119` remain reserved.
+/// existing assignment shifts; `116`–`119` remain reserved.
 pub const EVENTS_INVALID: u8 = 114;
+/// `attest` established that the calling process is **not** a member of the run it
+/// asked about: the runner was reached, it named the caller from the control
+/// transport itself, and the caller is not in that run's container
+/// (`docs/control-plane.md`, "`attest`").
+///
+/// **Why this is minted rather than folded into an existing code**, since reuse is
+/// the default this project applies (`docs/exit-codes.md`, "Stability"): every
+/// candidate would have to say something that did not happen.
+///
+/// - [`CONTROL`] (103) is the code for *not having an answer* — the target is
+///   missing, stale, unprobeable, ambiguous, unreachable, too slow, or speaking a
+///   contract this build refuses. This is the opposite situation: the target was
+///   resolved, reached, and answered, and the answer is a decided "no". Folding them
+///   together would make a *verdict* indistinguishable from a *failure to obtain
+///   one*, which is precisely the distinction an adapter gating work on membership
+///   needs — and unlike the reuse cases this project has accepted before
+///   ([`BACKEND`] for a resource limit, [`TIMEOUT`] for an idle deadline), there is
+///   no earlier, more specific event or field that disambiguates it: `attest` never
+///   touches a run's JSONL stream, so the code and the `--error-format json` `kind`
+///   are all a caller has.
+/// - [`USAGE`] (100) would blame the command line for a fact about the process tree.
+/// - No run-ending code applies: `attest` is read-only, spawns nothing, and ends no
+///   run — the run it asked about is unaffected and still going, exactly as it is
+///   after a [`WAIT_TIMEOUT`], which is itself the precedent for giving a read-only
+///   command's own verdict its own number.
+///
+/// The one further outcome `attest` has — the runner could not obtain a
+/// kernel-authenticated identity for the caller at all — deliberately does **not**
+/// take this code: nothing was established, so it reports [`CONTROL`] (103) with the
+/// `peer_identity_unsupported` kind, alongside every other "no answer you can act
+/// on". Takes the next free code after [`EVENTS_INVALID`] so no existing assignment
+/// shifts; `116`–`119` remain reserved.
+pub const NOT_A_MEMBER: u8 = 115;
 
 /// A runner-own failure carrying the exit code it should surface and a
 /// human-readable message. Distinct from a child's exit — a child's code is
@@ -217,8 +257,9 @@ impl RunnerError {
     ///
     /// Only meaningful for the two codes that genuinely carry several situations —
     /// [`CONTROL`] (a target that is missing / confirmed stale / unprobeable /
-    /// ambiguous / unreachable / too slow / speaking a version this build refuses)
-    /// and [`SETUP`] (the run registry itself, versus every other prerequisite). It
+    /// ambiguous / unreachable / too slow / speaking a version this build refuses /
+    /// unable to name an `attest` caller) and [`SETUP`] (the run registry itself,
+    /// versus every other prerequisite). It
     /// changes **only** what `--error-format json` prints; the exit code and the
     /// human-readable message are untouched, so no caller of the default prose path
     /// can observe it. See [`crate::error_envelope`].
@@ -270,6 +311,7 @@ mod tests {
             WAIT_TIMEOUT,
             OUTPUT_OVERFLOW,
             EVENTS_INVALID,
+            NOT_A_MEMBER,
         ] {
             assert!(
                 (RUNNER_RANGE_START..=RUNNER_RANGE_END).contains(&code),
@@ -298,6 +340,7 @@ mod tests {
             WAIT_TIMEOUT,
             OUTPUT_OVERFLOW,
             EVENTS_INVALID,
+            NOT_A_MEMBER,
         ];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {
@@ -341,5 +384,27 @@ mod tests {
             WAIT_TIMEOUT, CONTROL,
             "a waiter giving up must not read as an unreachable/ambiguous run"
         );
+    }
+
+    #[test]
+    fn a_decided_non_membership_is_not_an_unanswered_target() {
+        // `attest`'s two failing outcomes are different in kind, and the codes are
+        // where that difference survives into a shell: `NOT_A_MEMBER` means the
+        // runner answered and the answer is no, while every "no answer you can act
+        // on" — including the platform that cannot name the caller at all — stays
+        // `CONTROL`. Collapsing them would make a verdict indistinguishable from a
+        // failure to obtain one, which is the whole reason this code exists.
+        assert_ne!(
+            NOT_A_MEMBER, CONTROL,
+            "a decided `not a member` must not read as an unreachable/ambiguous run"
+        );
+        // Nor is it a runner-imposed ending: the attested run is untouched and still
+        // running, exactly as it is after a waiter's own timeout.
+        for ending in [TIMEOUT, CANCELLED, CONTROL_CANCELLED, CONTROL_KILLED] {
+            assert_ne!(
+                NOT_A_MEMBER, ending,
+                "attesting never ends a run, so its verdict must not read as one ending"
+            );
+        }
     }
 }

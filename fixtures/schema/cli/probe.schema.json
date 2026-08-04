@@ -44,10 +44,10 @@
         },
         "surface": {
           "type": "array",
-          "description": "The CLI surface tokens this binary exposes: every subcommand name plus `<subcommand>:--<long-flag>` for each of its long flags, sorted and deduplicated. Derived from the live clap definition, so it cannot drift from the real parser; clap's own `--help`/`--version` are excluded.",
+          "description": "The CLI surface tokens this binary exposes: every subcommand name plus `<subcommand>:--<long-flag>` for each of its long flags, sorted and deduplicated. Derived from the live clap definition, so it cannot drift from the real parser; clap's own `--help`/`--version` are excluded. A third, deliberately distinct form — `<subcommand>:<capability>`, with **no** `--` — names a platform capability rather than a spelling the parser accepts: `attest:peer-identity` is present exactly where this build can obtain a kernel-authenticated identity for a control-plane client, which is what makes `attest` able to return a verdict at all (docs/integration.md §1; src/probe.rs, PEER_IDENTITY_TOKEN). A consumer requires it with the same `--require-surface` as any flag and gets the same fail-closed 110 when it is absent; the missing `--` is what keeps the two categories from being read as one another.",
           "items": {
             "type": "string",
-            "pattern": "^[a-z][a-z0-9-]*(?::--[a-z0-9][a-z0-9-]*)?$"
+            "pattern": "^[a-z][a-z0-9-]*(?::(?:--)?[a-z0-9][a-z0-9-]*)?$"
           },
           "minItems": 1,
           "uniqueItems": true

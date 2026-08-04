@@ -128,6 +128,7 @@ agent policy and complete foreground, recovery, and escalation examples.
 | `inspect` | Snapshot a live run and its current members. |
 | `cancel` | Request soft stop, wait through the grace window, then hard-kill survivors. |
 | `kill` | Hard-kill the run's whole container immediately. |
+| `attest` | Ask a live run whether the calling process is inside its container — a kernel-checked containment fact. |
 | `wait` | Wait for one run, or a snapshot of all live runs, to finish. |
 | `events` | Read a run's JSONL lifecycle stream back: render, follow, pass through, or validate it. |
 | `list` | Discover live, stale, and unprobed registry entries. |
@@ -168,7 +169,7 @@ cleanup path. See the [architecture](architecture.md) and
 | [Running in containers](containers.md) | musl/glibc images, PID 1, signals, writable paths, cgroup delegation, outer limits. |
 | [Integration guide](integration.md) | Probe, launch, event consumption, supervision, and housekeeping for adapters. |
 | [Compatibility and upgrades](compatibility.md) | Surface tokens, schema/exit-band pinning, rolling upgrades, and acceptance policy. |
-| [Live-run control plane](control-plane.md) | IPC transport, inspect/cancel/kill semantics, and safe targeting. |
+| [Live-run control plane](control-plane.md) | IPC transport, inspect/cancel/kill/attest semantics, and safe targeting. |
 | [Run registry](registry.md) | Per-user records, liveness probing, ambiguity, waiting, and pruning. |
 | [JSONL event schema](schema.md) | The normative `schema_version = 1` contract and golden fixtures. |
 | [Exit-code contract](exit-codes.md) | Child-code fidelity, the reserved runner failure band, and the `--error-format json` machine-error envelope built over it. |

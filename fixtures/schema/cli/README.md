@@ -13,15 +13,22 @@ same three-part contract discipline the JSONL lifecycle-event stream already has
 | `prune --json` (tally and `--dry-run`) | `prune.schema.json` | `prune.jsonl` | [`docs/registry.md`](../../../docs/registry.md), "Reaping — `prune`" |
 | `wait --report-outcome` (single outcome and the `--all` array) | `wait.schema.json` | `wait.jsonl` | [`docs/registry.md`](../../../docs/registry.md), "Waiting — `wait`" |
 | `--error-format json` failure envelope (**stderr**, every subcommand) | `error.schema.json` | `error.jsonl` | [`docs/exit-codes.md`](../../../docs/exit-codes.md), "Machine-readable failures: `--error-format json`"; [`docs/integration.md`](../../../docs/integration.md) §7 |
+| `attest --json` containment attestation | `attest.schema.json` | `attest.jsonl` | [`docs/control-plane.md`](../../../docs/control-plane.md), "`attest`" |
 
 **The error envelope is the one family on stderr, and that is the point.** Every
 other row above is a *successful* command's stdout. The envelope is what a
 **failed** invocation prints, and it goes to stderr precisely so that stdout stays
 reserved for success — a command that prints a report and *then* fails
-(`probe --json` exiting 110, `inspect --all --json` exiting 103) leaves its stdout
-byte-for-byte unchanged and adds the envelope beside it. It is not a seventh
-*success* shape; it is the failure-side counterpart to all six, which is also why
-success-output fixtures could never have covered it.
+(`probe --json` exiting 110, `inspect --all --json` exiting 103, `attest --json`
+exiting 115) leaves its stdout byte-for-byte unchanged and adds the envelope beside
+it. It is not another *success* shape; it is the failure-side counterpart to all
+seven, which is also why success-output fixtures could never have covered it.
+
+**`attest --json` is the one success-side family whose stdout accompanies a
+non-zero exit as a matter of course.** Two of its three verdicts make the invocation
+fail, and the attestation is printed for all three: the verdict is the answer the
+caller asked for, and the exit code says what to do about it — so both channels
+carry the same fact, in the same invocation, without either replacing the other.
 
 **Why `events --json` is not a family here.** It is not a *non-event* output:
 `events --json` passes the runner's own JSONL lines through byte for byte, so the
@@ -47,14 +54,16 @@ validates both the golden fixture *and* the real binary's live output against
 every document. On a disagreement between a schema and the prose, trust the prose
 and treat the schema as needing a fix.
 
-## Versioning: three of these seven are versioned, four deliberately are not
+## Versioning: four of these eight are versioned, four deliberately are not
 
 `probe --json` carries `probe_version`, `inspect --json` carries
-`snapshot_version`, and the failure envelope carries `error_version`, so a bump is
-visible in the payload itself. `probe.schema.json` and `error.schema.json` pin
-their value with `const`; `inspect.schema.json` enumerates a *range* instead,
-because that field is the only value published here that the far side of a wire
-supplies — see "The `snapshot_version` range" below. The other four families here
+`snapshot_version`, the failure envelope carries `error_version`, and
+`attest --json` carries `attestation_version`, so a bump is
+visible in the payload itself. `probe.schema.json`, `error.schema.json` and
+`attest.schema.json` pin their value with `const`; `inspect.schema.json`
+enumerates a *range* instead — the shape follows the **reader's** tolerance, not a
+sibling's precedent, and `inspect` is the one whose client genuinely decodes an
+older form (see "The `snapshot_version` range" below). The other four families here
 carry no version field, and that was an explicit decision, not an oversight (see
 `docs/compatibility.md`, "Machine-output schemas", for the consumer-facing
 statement of it).
@@ -72,8 +81,19 @@ binary**:
 - the probe report exists precisely to be read by a consumer that does *not yet
   know* the binary's version — it bootstraps the whole compatibility check.
 
-**The failure envelope meets that same test**, which is why it is the third
-versioned family rather than a fourth unversioned one. It is the only shape here
+**`attest --json` meets it on the second of those three counts**, which is why it
+arrived versioned: like the `inspect` snapshot, its content is a *cross-process wire
+reply* — the verdict originates in the runner, which can be a different build than
+the client that prints it. Its pin is `const` rather than a range because the
+**reader** is strict: a client refuses any version but its own with `CONTROL` (103)
+rather than reading a membership verdict under semantics its sender never promised,
+and, unlike `snapshot_version`, this contract has had exactly one version, so
+strictness refuses no shape that ever existed. The two version pins that cross a
+wire therefore have deliberately different shapes, for a reason that is about their
+readers rather than about their senders.
+
+**The failure envelope meets that same test too**, which is why it is versioned
+rather than unversioned. It is the only shape here
 that a consumer reads *when things went wrong*, and that is exactly when the
 invoking context is least likely to be intact: captured stderr sitting in a CI log,
 read back hours later by a different tool than the one that ran the binary; a
@@ -180,11 +200,18 @@ own line:
 | `control-ack.jsonl` | a `cancel` ack; a `kill` ack; the `cancel --all` report array |
 | `prune.jsonl` | the plain tally; the `--dry-run` report with both candidate kinds |
 | `wait.jsonl` | a `reported` outcome; an `unknown` one; the `wait --all` report array |
-| `error.jsonl` | the variants of the one envelope shape: a named run id versus a `null` one, a retryable verdict versus a final one, three different reserved codes — `not_found`, `stale`, `unprobed`, `probe_incompatible`, `events_invalid` |
+| `error.jsonl` | the variants of the one envelope shape: a named run id versus a `null` one, a retryable verdict versus a final one, four different reserved codes — `not_found`, `stale`, `unprobed`, `probe_incompatible`, `events_invalid`, `not_a_member` |
+| `attest.jsonl` | the two verdicts a platform that can name its peers produces: `member` (from a client inside the run) and `not_a_member` (from one outside it) |
 
 `docs/*` and the schema documents remain the complete list — the `already_gone`
 and `failed` arms of the `inspect --all` and `cancel`/`kill --all` reports, for
 instance, are documented and validated there without a line of their own here.
+`attest.jsonl` has one further reason for an unpinned variant: its third verdict,
+`peer_identity_unsupported`, can only be produced on a platform whose transport
+cannot name a peer, and these lines are generated by the real binary on the platform
+running the tests — so pinning it would mean publishing an example no binary here
+ever printed. The document describes it and `src/control/mod.rs`'s unit tests drive
+it directly.
 (The third aggregate array, `wait --all --report-outcome`, has no such extra
 arms: its entries are the very `waitOutcome` objects the single-run form prints,
 and both of that form's arms already have a line above.) A fixture line is a
@@ -255,7 +282,13 @@ representative example an adapter can build and test a reader against.
   reads both documents off disk and fails if they ever drift apart. The rest of the
   `kind` vocabulary (the CONTROL/SETUP refinements, `wait_timeout`,
   `events_invalid`, `probe_incompatible`, `usage`, `unknown`) belongs to the
-  envelope alone and appears nowhere else.
+  envelope alone and appears nowhere else — with one deliberate exception in the
+  other direction: `not_a_member` and `peer_identity_unsupported` are spelled exactly
+  like two of `attest.schema.json`'s own `verdict` values, because they name the same
+  two facts. The envelope reports the *consequence* of a verdict the attestation
+  itself already stated, so a second spelling for it would be the same parallel
+  contract in miniature. The third verdict, `member`, has no envelope counterpart at
+  all: it is a success, and successes have no failure to describe.
 
 ## What the tests guarantee
 
