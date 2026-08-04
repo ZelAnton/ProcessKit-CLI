@@ -655,6 +655,29 @@ mod tests {
             .expect("the envelope is valid JSON")
     }
 
+    /// The kinds this build gives a reserved code **no other kind carries**, each
+    /// therefore minted by exactly one subcommand, as `(code, kind)` pairs.
+    ///
+    /// **Derived** from this build's own code-to-kind table rather than listed, so a
+    /// newly minted verdict code cannot slip past the checks that consume this: what
+    /// is excluded is only what genuinely has no single command — `usage` (any
+    /// subcommand, in practice a relayed detached start), the two codes several kinds
+    /// refine (`CONTROL`, `SETUP`), and the [`RUN_FAMILY`] above, which `run` mints as
+    /// a whole rather than one verdict per code. Named once because two tests need the
+    /// same set: one holds it against the published schema's conditionals, the other
+    /// against the golden fixture's lines.
+    fn kinds_with_a_code_of_their_own() -> Vec<(u8, ErrorKind)> {
+        (exit::RUNNER_RANGE_START..=exit::RUNNER_RANGE_END)
+            .filter_map(|code| {
+                let kind = ErrorKind::for_code(code);
+                let has_one_command = kind != ErrorKind::Unknown
+                    && !matches!(code, exit::USAGE | exit::CONTROL | exit::SETUP)
+                    && !RUN_FAMILY.contains(&kind);
+                has_one_command.then_some((code, kind))
+            })
+            .collect()
+    }
+
     /// The published schema document itself, read off disk — the consumer-facing half
     /// of this vocabulary, and the only honest thing to check this build against.
     fn published_schema() -> Value {
@@ -663,6 +686,35 @@ mod tests {
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
         serde_json::from_str(&text).expect("the schema document is valid JSON")
+    }
+
+    /// The `(code, kind)` of every line in the published golden fixture, read off
+    /// disk — the *generated* half of this family's published contract, beside
+    /// [`published_schema`]'s hand-written one. The lines themselves are written by
+    /// `tests/machine_output.rs` from the real binary's stderr and are never
+    /// hand-edited; this only reads back which verdicts they cover.
+    fn published_fixture_lines() -> Vec<(u8, String)> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/schema/cli/error.jsonl");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let value: Value = serde_json::from_str(line).unwrap_or_else(|err| {
+                    panic!("every fixture line is valid JSON: {line}: {err}")
+                });
+                let code = value["code"]
+                    .as_u64()
+                    .and_then(|code| u8::try_from(code).ok())
+                    .unwrap_or_else(|| panic!("every fixture line carries a band code: {line}"));
+                let kind = value["kind"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("every fixture line carries a kind: {line}"))
+                    .to_owned();
+                (code, kind)
+            })
+            .collect()
     }
 
     #[test]
@@ -696,12 +748,10 @@ mod tests {
         //
         // A missing conditional is invisible to a review that reads one task's diff
         // (it can only be seen by comparing the edit against a sibling kind's shape),
-        // so it is asserted here instead. The set is **derived** from this build's own
-        // code-to-kind table rather than listed, so the next kind given a code of its
-        // own cannot land without its conditional: what is excluded is only what
-        // genuinely has no single command — `usage` (any subcommand, in practice a
-        // relayed detached start), the two codes several kinds refine (`CONTROL`,
-        // `SETUP`), and the `run` family above.
+        // so it is asserted here instead. The set comes from
+        // `kinds_with_a_code_of_their_own`, derived from this build's own code-to-kind
+        // table rather than listed, so the next kind given a code of its own cannot
+        // land without its conditional.
         let schema = published_schema();
         let envelope = &schema["$defs"]["errorEnvelope"];
         let branches = envelope["allOf"]
@@ -715,14 +765,7 @@ mod tests {
             .collect();
 
         let mut pinned = Vec::new();
-        for code in exit::RUNNER_RANGE_START..=exit::RUNNER_RANGE_END {
-            let kind = ErrorKind::for_code(code);
-            if kind == ErrorKind::Unknown
-                || matches!(code, exit::USAGE | exit::CONTROL | exit::SETUP)
-                || RUN_FAMILY.contains(&kind)
-            {
-                continue;
-            }
+        for (code, kind) in kinds_with_a_code_of_their_own() {
             let branch = branches
                 .iter()
                 .find(|branch| branch["if"]["properties"]["kind"]["const"] == json!(kind.as_str()))
@@ -757,8 +800,9 @@ mod tests {
             );
             pinned.push(kind.as_str());
         }
-        // A guard on the derivation itself: if the exclusions above ever swallowed
-        // everything, the loop would pass by checking nothing at all.
+        // A guard on the derivation itself: if `kinds_with_a_code_of_their_own`'s
+        // exclusions ever swallowed everything, the loop would pass by checking
+        // nothing at all.
         assert_eq!(
             pinned,
             vec![
@@ -770,6 +814,55 @@ mod tests {
             ],
             "the verdict kinds this build gives a code of their own"
         );
+    }
+
+    #[test]
+    fn every_kind_with_a_code_of_its_own_has_a_line_in_the_golden_fixture() {
+        // `fixtures/schema/cli/error.jsonl` is this family's published **index of
+        // coverage**: the schema document says which envelopes are legal, the fixture
+        // says which ones a real binary has actually printed here — the third part of
+        // this directory's convention (a named schema branch, a golden line generated
+        // by the binary, a live scenario in `tests/machine_output.rs`). The fixture's
+        // own README states that it carries every reserved code a single subcommand's
+        // own verdict carries, and that sentence was maintained by hand until it went
+        // false in silence: `wait_timeout` (112) had no line while the prose said
+        // "every", and nothing failed, because the golden comparison checks the
+        // fixture's *bytes*, never its claimed completeness.
+        //
+        // So the claim is asserted here instead of proofread, in both directions,
+        // against the same derived set the conditionals above are held to.
+        let pinned = published_fixture_lines();
+        let own_code = kinds_with_a_code_of_their_own();
+
+        for (code, kind) in &own_code {
+            assert!(
+                pinned
+                    .iter()
+                    .any(|(line_code, line_kind)| line_code == code && line_kind == kind.as_str()),
+                "fixtures/schema/cli/error.jsonl must carry a line the real binary printed for \
+                 `{}` ({code}): a kind whose reserved code no other kind carries is exactly what \
+                 this fixture indexes, and its README publishes that as coverage. Add a scenario \
+                 to tests/machine_output.rs and regenerate with UPDATE_MACHINE_SCHEMA_GOLDEN=1. \
+                 Pinned today: {pinned:?}",
+                kind.as_str()
+            );
+        }
+
+        // The converse, so the fixture cannot quietly grow a line the published claim
+        // does not describe: apart from `usage` and the two codes several kinds refine
+        // (`CONTROL`, `SETUP`), every line here is one of the verdict kinds above.
+        for (code, kind) in &pinned {
+            if matches!(*code, exit::USAGE | exit::CONTROL | exit::SETUP) {
+                continue;
+            }
+            assert!(
+                own_code.iter().any(|(_, own)| own.as_str() == kind),
+                "`{kind}` ({code}) has a line in fixtures/schema/cli/error.jsonl but is not one \
+                 of the verdict kinds this build gives a code of its own ({own_code:?}); if that \
+                 line is deliberate, the coverage sentence in fixtures/schema/cli/README.md's \
+                 fixture table has to move with it"
+            );
+        }
     }
 
     #[test]

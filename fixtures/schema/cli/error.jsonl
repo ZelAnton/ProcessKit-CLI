@@ -2,6 +2,7 @@
 {"code":103,"error_version":1,"kind":"stale","message":"<free-text explanation, not part of the contract>","operation":"inspect","retryable":false,"run_id":"build-43"}
 {"code":103,"error_version":1,"kind":"unprobed","message":"<free-text explanation, not part of the contract>","operation":"inspect","retryable":true,"run_id":"build-44"}
 {"code":110,"error_version":1,"kind":"probe_incompatible","message":"<free-text explanation, not part of the contract>","operation":"probe","retryable":false,"run_id":null}
+{"code":112,"error_version":1,"kind":"wait_timeout","message":"<free-text explanation, not part of the contract>","operation":"wait","retryable":true,"run_id":"build-44"}
 {"code":114,"error_version":1,"kind":"events_invalid","message":"<free-text explanation, not part of the contract>","operation":"events","retryable":false,"run_id":null}
 {"code":115,"error_version":1,"kind":"not_a_member","message":"<free-text explanation, not part of the contract>","operation":"attest","retryable":false,"run_id":"build-42"}
 {"code":116,"error_version":1,"kind":"host_unqualified","message":"<free-text explanation, not part of the contract>","operation":"doctor","retryable":false,"run_id":null}

@@ -178,6 +178,11 @@ fn a_waiter_that_gives_up_is_its_own_kind_and_is_retryable() {
     // its own deadline — the cheapest honest way to reach WAIT_TIMEOUT (112) without
     // a live runner. The kind must not be the run's `timeout`: the run was not
     // touched, which is exactly the confusion this taxonomy exists to prevent.
+    //
+    // `fixtures/schema/cli/error.jsonl` pins this envelope's *shape* from the same
+    // scenario (`tests/machine_output.rs`); what is asserted here is the reading —
+    // which kind, and why a retry is the intended response — which a golden line
+    // cannot state.
     let registry = registry_with_unprobeable_entry("envelope-wait");
 
     let out = cli(

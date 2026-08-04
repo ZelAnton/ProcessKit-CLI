@@ -842,17 +842,26 @@ fn prune_reports_match_their_schema_and_fixture() {
 /// `--error-format json`: the bounded failure envelope, in the variants worth
 /// pinning — a run id that is named versus one that cannot be (`null`), a retryable
 /// verdict versus a final one, and every reserved code that belongs to a single
-/// subcommand's own verdict (110, 114, 115, 116) alongside the shared `CONTROL` (103).
+/// subcommand's own verdict (110, 112, 114, 115, 116) alongside the shared
+/// `CONTROL` (103).
+///
+/// That set is not maintained by hand: `src/error_envelope.rs`'s
+/// `every_kind_with_a_code_of_its_own_has_a_line_in_the_golden_fixture` derives it
+/// from this build's own code-to-kind table and fails if one of those kinds has no
+/// line in `error.jsonl`, so minting a verdict code without adding a scenario here
+/// is a test failure rather than a quiet gap in what this fixture publishes.
 ///
 /// The scenarios are deliberately the cheap, deterministic ones wherever a fact
-/// allows it (no live run is needed to fail a lookup), and several of them also pin
-/// the invariant that gives this family its own channel: `probe --json` prints its
-/// full report to stdout *and* exits 110, `events --validate` prints its human
-/// summary to stdout *and* exits 114, `attest --json` prints its attestation *and*
-/// exits 115, and `doctor --json` prints its qualification report *and* exits 116 —
-/// in every case the envelope is on stderr and stdout is exactly what it always was.
-/// The kinds not pinned here are covered by `tests/error_envelope.rs`, which drives
-/// the remaining taxonomy against the live binary without re-pinning the shape.
+/// allows it — no live run is needed to fail a lookup, and `wait`'s own deadline
+/// runs out in 150ms against the very entry whose liveness nothing can establish —
+/// and several of them also pin the invariant that gives this family its own
+/// channel: `probe --json` prints its full report to stdout *and* exits 110,
+/// `events --validate` prints its human summary to stdout *and* exits 114,
+/// `attest --json` prints its attestation *and* exits 115, and `doctor --json`
+/// prints its qualification report *and* exits 116 — in every case the envelope is
+/// on stderr and stdout is exactly what it always was. The kinds not pinned here are
+/// covered by `tests/error_envelope.rs`, which drives the remaining taxonomy against
+/// the live binary without re-pinning the shape.
 #[test]
 fn error_envelopes_match_their_schema_and_fixture() {
     let dir = scratch("machine-error");
@@ -938,6 +947,41 @@ fn error_envelopes_match_their_schema_and_fixture() {
         "stdout still carries the probe's own report, unchanged: {report}"
     );
     lines.extend(probe_lines);
+
+    // A deadline of the *caller's* own, against the same entry `inspect` just refused
+    // to act on: nothing can establish that run's liveness, so `wait` never reads it
+    // as finished and runs out its own window. The verdict is emphatically not the
+    // run's `timeout` (106) — the run was never touched — and it is the second
+    // retryable line here for a different reason than `unprobed`'s: waiting again is
+    // the intended response, not a hope that a probe settles.
+    let gave_up = cli(
+        &registry,
+        &[
+            "wait",
+            "--run-id",
+            "build-44",
+            "--timeout",
+            "150ms",
+            "--error-format",
+            "json",
+        ],
+    );
+    let gave_up_lines = machine_stderr(&gave_up, 112, "`wait` giving up on an unprobeable entry");
+    assert_eq!(gave_up_lines[0]["kind"], json!("wait_timeout"));
+    assert_eq!(gave_up_lines[0]["operation"], json!("wait"));
+    assert_eq!(gave_up_lines[0]["run_id"], json!("build-44"));
+    assert_eq!(
+        gave_up_lines[0]["retryable"],
+        json!(true),
+        "the waiter gave up without touching anything, so waiting again is the intended response"
+    );
+    assert!(
+        gave_up.stdout.is_empty(),
+        "a plain `wait` prints nothing at all on stdout — its machine-readable form is \
+         `--report-outcome`, a different family entirely: {}",
+        String::from_utf8_lossy(&gave_up.stdout)
+    );
+    lines.extend(gave_up_lines);
 
     // A verdict about a document rather than a run: `events` never contacts a runner.
     let bad_stream = dir.join("not-conforming.jsonl");

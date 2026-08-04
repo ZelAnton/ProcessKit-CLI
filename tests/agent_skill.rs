@@ -1,11 +1,13 @@
-//! Drift checks for the prose that restates this binary's built surface: the
-//! installable `using-processkit-cli` agent skill, and the documents that publish
-//! the subcommand inventory itself.
+//! Drift checks for the prose that restates what this binary produces: the
+//! installable `using-processkit-cli` agent skill, the documents that publish the
+//! subcommand inventory itself, and the one row of `fixtures/schema/cli/README.md`
+//! that enumerates which failure verdicts the golden `error.jsonl` pins.
 //!
-//! Both tiers read markdown (and, for one of them, source and schema) off disk and
-//! assert it against the surface the *built binary* reports, never against a list
-//! maintained here — a hand-maintained expectation would drift in exactly the way
-//! these checks exist to catch.
+//! Each tier reads markdown (and, depending on the tier, source, schema, or a golden
+//! fixture) off disk and asserts it against the surface the *built binary* reports or
+//! the artifact that binary generated, never against a list maintained here — a
+//! hand-maintained expectation would drift in exactly the way these checks exist to
+//! catch.
 
 mod common;
 
@@ -19,6 +21,8 @@ const ARCHITECTURE: &str = include_str!("../docs/architecture.md");
 const EXIT_CODES: &str = include_str!("../docs/exit-codes.md");
 const ERROR_ENVELOPE: &str = include_str!("../src/error_envelope.rs");
 const ERROR_SCHEMA: &str = include_str!("../fixtures/schema/cli/error.schema.json");
+const SCHEMA_README: &str = include_str!("../fixtures/schema/cli/README.md");
+const ERROR_FIXTURE: &str = include_str!("../fixtures/schema/cli/error.jsonl");
 
 #[test]
 fn skill_facts_match_the_built_compatibility_surface() {
@@ -272,5 +276,68 @@ fn the_documents_that_publish_the_subcommand_inventory_match_the_binary() {
         published, names,
         "fixtures/schema/cli/error.schema.json's `operation` enum and the binary's \
          subcommands disagree"
+    );
+}
+
+/// The one row of `fixtures/schema/cli/README.md`'s fixture table that publishes a
+/// **vocabulary** rather than a description: `error.jsonl`'s row names the envelope
+/// kinds the fixture carries a line for, and adapters read it as an index of what
+/// this family has actually pinned.
+///
+/// It is prose enumerating a set that is generated elsewhere, which is precisely the
+/// shape of claim that goes stale without a single test failing — this one already
+/// did, promising "every reserved code a single subcommand's own verdict carries"
+/// while `wait_timeout` (112) had no line in the file. `src/error_envelope.rs`
+/// guards the other end of that chain (the build's own code-to-kind table against
+/// the fixture's lines); this holds the sentence itself against them, so a kind can
+/// no longer be named here without a line, or pinned by a line without being named.
+///
+/// The row is read against the schema's published `kind` enum rather than a list
+/// kept here, so the vocabulary this test recognizes cannot drift from the one the
+/// document defines.
+#[test]
+fn the_error_fixtures_documented_coverage_names_exactly_the_kinds_it_pins() {
+    let schema: serde_json::Value = serde_json::from_str(ERROR_SCHEMA).expect("error schema JSON");
+    let vocabulary: Vec<&str> = schema["$defs"]["errorEnvelope"]["properties"]["kind"]["enum"]
+        .as_array()
+        .expect("the schema publishes `kind` as a closed enum")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+
+    let mut carried: Vec<&str> = ERROR_FIXTURE
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let value: serde_json::Value =
+                serde_json::from_str(line).expect("every error.jsonl line is valid JSON");
+            let kind = value["kind"]
+                .as_str()
+                .expect("every error.jsonl line carries a kind")
+                .to_owned();
+            *vocabulary
+                .iter()
+                .find(|published| **published == kind)
+                .unwrap_or_else(|| {
+                    panic!("error.jsonl pins `{kind}`, which the schema never publishes")
+                })
+        })
+        .collect();
+    carried.sort_unstable();
+    carried.dedup();
+
+    let row = table_row(SCHEMA_README, "| `error.jsonl` |");
+    let mut named: Vec<&str> = vocabulary
+        .iter()
+        .copied()
+        .filter(|kind| row.contains(&format!("`{kind}`")))
+        .collect();
+    named.sort_unstable();
+
+    assert_eq!(
+        named, carried,
+        "fixtures/schema/cli/README.md's `error.jsonl` row and the fixture itself must name the \
+         same kinds — the row is read as this family's index of coverage, so a name it lists \
+         without a line (or a line it never lists) publishes a completeness that does not exist"
     );
 }

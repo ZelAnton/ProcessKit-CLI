@@ -240,7 +240,7 @@ own line:
 | `control-ack.jsonl` | a `cancel` ack; a `kill` ack; the `cancel --all` report array |
 | `prune.jsonl` | the plain tally; the `--dry-run` report with both candidate kinds |
 | `wait.jsonl` | a `reported` outcome; an `unknown` one; the `wait --all` report array |
-| `error.jsonl` | the variants of the one envelope shape: a named run id versus a `null` one, a retryable verdict versus a final one, and every reserved code a single subcommand's own verdict carries beside the shared `CONTROL` (103) — `not_found`, `stale`, `unprobed`, `probe_incompatible`, `events_invalid`, `not_a_member`, `host_unqualified` |
+| `error.jsonl` | the variants of the one envelope shape: a named run id versus a `null` one, a retryable verdict versus a final one, and every reserved code a single subcommand's own verdict carries beside the shared `CONTROL` (103) — `not_found`, `stale`, `unprobed`, `probe_incompatible`, `wait_timeout`, `events_invalid`, `not_a_member`, `host_unqualified` |
 | `attest.jsonl` | the two verdicts a platform that can name its peers produces: `member` (from a client inside the run) and `not_a_member` (from one outside it) |
 | `doctor.jsonl` | the qualified report a healthy host produces, and the unqualified one an unmeetable `--require-*` expectation produces — the same shape either way, which is the point of printing it either way |
 
@@ -377,3 +377,15 @@ code without being published here; another asserts that every kind carrying a
 reserved code of its own is pinned by an `allOf` conditional to that code and to the
 single subcommand that mints it, so a new verdict kind cannot be published without
 the conditional that stops this contract from accepting it under any other command.
+
+**The `error.jsonl` row of the fixture table above is a claim about coverage, so it
+is a checked one rather than a proofread one.** Both halves of it are derived, not
+maintained by hand: a third unit test in `src/error_envelope.rs` asserts that every
+kind this build gives a reserved code of its own — the same set the conditional test
+derives from the code-to-kind table — has a line in `error.jsonl`, and that no other
+line hides there under a code the row does not describe; and `tests/agent_skill.rs`
+reads that row and the fixture off disk and fails if either names a kind the other
+does not. The golden comparison itself cannot catch this: it checks the fixture's
+**bytes** against the binary, never the completeness its own documentation claims,
+which is exactly how the row once came to say "every" while `wait_timeout` (112) had
+no line at all.
