@@ -136,10 +136,12 @@ pub const CONTROL_KILLED: u8 = 109;
 pub const PROBE_INCOMPATIBLE: u8 = 110;
 /// A **setup / support failure**: a prerequisite the runner needs to run — or to
 /// report a result — could not be established or produced for an ordinary reason.
-/// The runner's async runtime could not be built (`run`/`inspect`/`cancel`/`kill`),
+/// The runner's async runtime could not be built
+/// (`run`/`inspect`/`cancel`/`kill`/`attest`),
 /// a required output the operator asked for could not be created (the `--jsonl`
 /// events file, the `--capture-dir`), or a report/reply the runner must emit could
-/// not be serialized (the `probe` report, an `inspect` snapshot, a control ack).
+/// not be serialized (the `probe` report, an `inspect` snapshot, a control ack, an
+/// `attest` attestation).
 /// These are peripheral support steps failing on an environment/resource condition
 /// the *caller* can usually act on — a bad path, missing permissions, exhausted OS
 /// resources — **not** the runner's own run-tracking logic being violated, which

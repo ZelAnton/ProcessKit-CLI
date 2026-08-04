@@ -18,8 +18,9 @@
 //! [`crate::prune`]'s cleanup, and like both it opens the registry through
 //! [`registry::Registry::open_read_only`] — never the mutating
 //! [`registry::Registry::open`] `run` uses — so waiting on a run cannot itself create
-//! the registry directory or touch its permissions. Unlike `inspect`/`cancel`/`kill`
-//! it never connects to the run's control transport and never asks the runner for
+//! the registry directory or touch its permissions. Unlike
+//! `inspect`/`cancel`/`kill`/`attest` it never connects to the run's control
+//! transport and never asks the runner for
 //! anything: the run is not disturbed, not ended, and not even aware it is being
 //! waited on. It follows that a run whose control endpoint never came up (best-effort
 //! transport degradation, see [`registry::Record::endpoint`]) is still perfectly

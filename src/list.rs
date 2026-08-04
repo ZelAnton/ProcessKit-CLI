@@ -1,12 +1,13 @@
 //! `list`: enumerate every run recorded in the per-user registry.
 //!
-//! The by-`run_id` commands (`inspect`/`cancel`/`kill`) all require an operator or
-//! orchestrator to already know which run to target; `list` is the discovery
-//! counterpart — it scans the registry ([`registry::Registry::entries`]) and prints
-//! every entry it finds, whatever its health, so a caller that lost (or never had) a
-//! `run_id` can find one. It is read-only: it never connects to a runner's control
+//! The by-`run_id` commands (`inspect`/`cancel`/`kill`/`attest`) all require an
+//! operator or orchestrator to already know which run to target; `list` is the
+//! discovery counterpart — it scans the registry ([`registry::Registry::entries`])
+//! and prints every entry it finds, whatever its health, so a caller that lost (or
+//! never had) a `run_id` can find one. It is read-only: it never connects to a
+//! runner's control
 //! transport and never mutates the registry, so it carries none of the
-//! reach-a-live-runner failure modes `inspect`/`cancel`/`kill` do (see
+//! reach-a-live-runner failure modes `inspect`/`cancel`/`kill`/`attest` do (see
 //! `src/control/mod.rs`) — the only way it can fail is the registry directory itself
 //! being unreadable, which is a [`exit::SETUP`] condition (a support/prerequisite
 //! failure), not a [`exit::CONTROL`] one (which is reserved for "could not reach
@@ -62,7 +63,7 @@ use crate::registry::{self, Health};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct ListEntry {
     /// The run's identifier — the value a caller passes as `--run-id` to
-    /// `inspect`/`cancel`/`kill`.
+    /// `inspect`/`cancel`/`kill`/`attest`.
     run_id: String,
     /// `"live"`, `"stale"`, or `"unprobed"` — the same three-value vocabulary
     /// [`registry::Health`] documents, and the one `prune --json`'s tallies and

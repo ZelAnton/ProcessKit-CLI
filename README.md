@@ -540,7 +540,7 @@ is exactly the point. An entry whose liveness lock could not even be *probed*
 (permission denied, a rejected symlink/reparse point) prints as `unprobed`, never
 the confirmed-dead `stale`, so an operator never mistakes "could not tell" for "the
 runner is gone" — the same distinction `prune --json`'s `unprobed` tally, `wait`, and
-an `inspect`/`cancel`/`kill` refusal against such an entry all make. See
+an `inspect`/`cancel`/`kill`/`attest` refusal against such an entry all make. See
 [`docs/registry.md`](docs/registry.md), "Discovery — `list`".
 
 `list` shows those stale leftovers; `prune` removes them. By default it reaps every

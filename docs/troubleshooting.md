@@ -110,7 +110,7 @@ distinct, conservative verdict — "could not confirm liveness" is not the same
 claim as "confirmed dead" — and `prune` (and its non-destructive
 `prune --dry-run` preview) never reap an entry in this state, on every
 repeated run, until the probe itself can succeed. A control client
-(`inspect`/`cancel`/`kill`) aimed at such an entry refuses with `CONTROL`
+(`inspect`/`cancel`/`kill`/`attest`) aimed at such an entry refuses with `CONTROL`
 (103), since it acts only on a **confirmed-live** entry — but its message,
 too, reports that liveness could not be probed rather than that the runner is
 gone (see the `CONTROL` (103) entry below).
@@ -136,7 +136,7 @@ issue or a path collision) rather than deleting registry files by hand.
 
 ## `CONTROL` (103): the runner could not be reached
 
-**Symptom.** `inspect` / `cancel` / `kill` exits `103` and prints an
+**Symptom.** `inspect` / `cancel` / `kill` / `attest` exits `103` and prints an
 explanatory line on stderr. For the by-`run_id` form this means the command did
 nothing to any run; **`cancel --all` / `kill --all` are the exception** — see
 "`cancel --all` / `kill --all` and a partial `103`" below before assuming
@@ -231,15 +231,15 @@ by-`run_id` sections above and below cover).
 
 ## An ambiguous `run_id`
 
-**Symptom.** `inspect` / `cancel` / `kill` / `wait --run-id <id>` exits
-`CONTROL` (`103`) with an "ambiguous run id" message, even though you believe
-exactly one run with that id is alive.
+**Symptom.** `inspect` / `cancel` / `kill` / `attest` / `wait --run-id <id>`
+exits `CONTROL` (`103`) with an "ambiguous run id" message, even though you
+believe exactly one run with that id is alive.
 
 **Diagnose.** The registry does **not** enforce `run_id` uniqueness at
 `register` time: two runs started concurrently with the same explicit
 `--run-id` are both written as independent, live entries. Every by-`run-id`
-client — including the read-only `inspect` and the registry-only `wait` —
-fails closed with `CONTROL` (`103`) the moment more than one **live** entry
+client — including the read-only `inspect` and `attest`, and the registry-only
+`wait` — fails closed with `CONTROL` (`103`) the moment more than one **live** entry
 matches, rather than silently acting on whichever entry a directory scan
 happens to return first; run `list --json` and filter by `run_id` to see the
 duplicates directly. See [`docs/registry.md`](registry.md), "Run id
@@ -285,6 +285,6 @@ platform.
 - [`docs/registry.md`](registry.md) — the normative registry location,
   staleness signal, and reaping rules.
 - [`docs/control-plane.md`](control-plane.md) — the normative local
-  transport, wire protocol, and `inspect`/`cancel`/`kill` behavior.
+  transport, wire protocol, and `inspect`/`cancel`/`kill`/`attest` behavior.
 - [`docs/integration.md`](integration.md) — the consumer/adapter walkthrough,
   organized by call sequence rather than by symptom.

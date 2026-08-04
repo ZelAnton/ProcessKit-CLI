@@ -313,7 +313,7 @@ overview only sketches how they connect:
 - [`docs/registry.md`](registry.md) — the per-user run registry: location,
   record format, staleness signal.
 - [`docs/control-plane.md`](control-plane.md) — the local transport, the wire
-  protocol, and the `inspect`/`cancel`/`kill` clients.
+  protocol, and the `inspect`/`cancel`/`kill`/`attest` clients.
 - [`docs/exit-codes.md`](exit-codes.md) — the reserved runner-own exit-code
   band and the child-fidelity rule.
 - [`docs/schema.md`](schema.md) — the versioned JSONL lifecycle-event schema.

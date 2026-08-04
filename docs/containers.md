@@ -114,8 +114,8 @@ termination.
 ## Registry location and container users
 
 The run registry is per-user and created with owner-only permissions. Keep the
-same user identity for `run` and its `inspect` / `cancel` / `kill` / `wait`
-clients. A sidecar running under a different UID should not expect access.
+same user identity for `run` and its `inspect` / `cancel` / `kill` / `attest` /
+`wait` clients. A sidecar running under a different UID should not expect access.
 
 For detached runs, ensure the registry and JSONL locations survive for as long
 as the detached runner. An ephemeral container that exits immediately after

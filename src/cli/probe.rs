@@ -41,10 +41,12 @@ pub struct ProbeArgs {
     #[arg(long, value_name = "start-end", value_parser = parse_exit_code_band)]
     pub require_exit_code_band: Option<(u8, u8)>,
 
-    /// Require a CLI **surface token** to be present (repeatable). A token is either
-    /// a subcommand name (`run`, `probe`) or a subcommand long flag
-    /// (`run:--capture-dir`, `inspect:--json`). An absent token is a fail-closed
-    /// incompatibility, so a consumer can assert the exact flags it will use exist.
+    /// Require a CLI **surface token** to be present (repeatable). A token is a
+    /// subcommand name (`run`, `probe`), a subcommand long flag
+    /// (`run:--capture-dir`, `inspect:--json`), or a platform capability, told apart
+    /// by carrying no `--` (`attest:peer-identity`). An absent token is a
+    /// fail-closed incompatibility, so a consumer can assert that the exact flags —
+    /// and capabilities — it will use exist.
     #[arg(long = "require-surface", value_name = "token")]
     pub require_surface: Vec<String>,
 

@@ -154,6 +154,14 @@ bench = []
 # via std, but the per-run liveness lock — a BSD `flock` whose OS-released-on-death
 # semantics make an orphaned entry detectably stale — has no std wrapper, so it
 # calls `flock`/`LOCK_EX`/`EWOULDBLOCK` through libc directly.
+#
+# `getpgid` backs the control plane's membership predicate on this platform
+# (src/control/mod.rs, `process_group_of`): where the obtained mechanism is the POSIX
+# process-group fallback, the container enumerates only tracked group leaders, so
+# "shares the process group of a leader" — the very predicate `killpg` enforces at
+# teardown — is what lets `attest` answer about a contained grandchild instead of
+# reporting it a non-member. A second, independent reason this dependency exists:
+# retiring the `flock` above would not retire libc.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

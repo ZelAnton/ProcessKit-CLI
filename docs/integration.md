@@ -116,8 +116,8 @@ processkit-cli run \
 - **`--jsonl <file>`** is the only place lifecycle events are written — never
   stdout, so the child's own stdout/stderr stay pristine. Give every run a
   distinct path; the file is created or truncated at the start of the run.
-- **`--run-id <id>`** is the identifier `inspect`/`cancel`/`kill` later match
-  on — supply one you control (rather than the generated default) so the
+- **`--run-id <id>`** is the identifier `inspect`/`cancel`/`kill`/`attest` later
+  match on — supply one you control (rather than the generated default) so the
   supervision step (§4) has a stable handle. Two live runs sharing one
   `--run-id` is legal but makes every supervision command against it fail
   closed as *ambiguous* (§4, §6) — keep run ids unique across an adapter's own
@@ -633,15 +633,16 @@ are in [`docs/exit-codes.md`](exit-codes.md#machine-readable-failures---error-fo
 - [`fixtures/schema/cli/README.md`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/fixtures/schema/cli/README.md)
   — the JSON Schema documents and golden fixtures for every machine-readable
   output in this guide (`probe`, `list`, `inspect`, the `cancel`/`kill` acks,
-  `prune`, `wait --report-outcome`, and the `--error-format json` failure
-  envelope), and the versioning decision behind them (`probe`, `inspect`, and the
-  envelope carry their own version field; the other four deliberately carry none).
+  `prune`, `wait --report-outcome`, `attest`, and the `--error-format json` failure
+  envelope), and the versioning decision behind them (`probe`, `inspect`, `attest`,
+  and the envelope carry their own version field; the other four deliberately carry
+  none).
 - [`docs/compatibility.md`](compatibility.md) — the compatibility surfaces, the
   pinning procedure, and the upgrade/downgrade checklists.
 - [`docs/exit-codes.md`](exit-codes.md) — the normative reserved exit-code
   band and the child-fidelity rule.
 - [`docs/control-plane.md`](control-plane.md) — the normative local transport,
-  wire protocol, and `inspect`/`cancel`/`kill` behavior.
+  wire protocol, and `inspect`/`cancel`/`kill`/`attest` behavior.
 - [`docs/registry.md`](registry.md) — the normative registry location, record
   format, and staleness/reaping rules.
 - [`docs/architecture.md`](architecture.md) — the map of this repository's own

@@ -97,7 +97,8 @@ processkit-cli run \
 
 When omitted, the runner generates an id and writes it in `run_started`. A
 caller that needs to address the live run immediately should provide an id or
-read the first event before calling `inspect`, `cancel`, `kill`, or `wait`.
+read the first event before calling `inspect`, `cancel`, `kill`, `attest`, or
+`wait`.
 Explicit ids must contain 1-256 Unicode characters and cannot contain terminal
 control or invisible formatting characters. The same validation applies to
 every by-id command, so an unsafe id is rejected before registry access.
@@ -281,4 +282,5 @@ Parse-time conflicts are usage failures (`100`); no child is spawned.
 - [Cookbook](cookbook.md) for complete command shapes.
 - [Detached runs](detached-runs.md) for out-of-band supervision.
 - [JSONL event schema](schema.md) for the machine-readable lifecycle.
-- [Live-run control plane](control-plane.md) for `inspect`, `cancel`, and `kill`.
+- [Live-run control plane](control-plane.md) for `inspect`, `cancel`, `kill`, and
+  `attest`.

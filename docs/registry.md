@@ -4,7 +4,7 @@ The **run registry** is the first brick of processkit-cli's control plane. The
 control plane lives in the live `run` process, not in named kernel objects
 (`AGENTS.md`, "The control plane lives in the live runner process"): a runner must
 stay alive to hold its kill-on-drop container, so the live process is exactly where
-`inspect` / `cancel` / `kill` reach it. The registry is how those
+`inspect` / `cancel` / `kill` / `attest` reach it. The registry is how those
 clients *find* a live runner — a per-user directory holding one record per in-flight
 run.
 
@@ -258,12 +258,14 @@ reaches the same verdict from its own scan — and it is deliberately conservati
 - **More than one** live match → also a `CONTROL` (103) failure, "ambiguous run
   id", instead of silently acting on whichever entry the directory scan happens
   to return first. This applies to **every** by-`run-id` client the same way — the
-  destructive `cancel`/`kill` verbs, the read-only `inspect`, and the registry-only
-  `wait` — rather than a softer fallback for the read-only ones: guessing wrong on a
-  mutating verb ends the *other* run instead of the intended one, a snapshot of the
-  wrong run under `inspect` is exactly as misleading as acting on it, and a `wait`
-  that silently tracked one of two duplicates would report "your run finished" on the
-  strength of the wrong run's ending. A caller that hits this is expected to pick a
+  destructive `cancel`/`kill` verbs, the read-only `inspect` and `attest`, and the
+  registry-only `wait` — rather than a softer fallback for the read-only ones:
+  guessing wrong on a mutating verb ends the *other* run instead of the intended
+  one, a snapshot of the wrong run under `inspect` is exactly as misleading as
+  acting on it, an `attest` verdict attributed to the wrong run would answer a
+  containment question nobody asked, and a `wait` that silently tracked one of two
+  duplicates would report "your run finished" on the strength of the wrong run's
+  ending. A caller that hits this is expected to pick a
   `--run-id` that is unique among currently live runs.
 - **Exactly one** live match → only now does its endpoint matter: resolved
   normally if it published one, or a distinguishable `CONTROL` (103) failure
@@ -312,7 +314,7 @@ scan every other client shares, printing every entry it finds, whatever its heal
 `labels`, `jsonl`, `capture_dir`, and `endpoint`. It is
 deliberately **read-only** and never connects to any runner's control transport, so
 it carries none of the "could not reach the target run" failure modes
-`inspect`/`cancel`/`kill` do — it has no single target to fail to reach.
+`inspect`/`cancel`/`kill`/`attest` do — it has no single target to fail to reach.
 
 - **No `--json`** prints a human-readable table (or `no runs registered` for an
   empty registry). Because record files are untrusted input, control characters in
@@ -328,8 +330,9 @@ it carries none of the "could not reach the target run" failure modes
   `no runs registered` notice) and exits `0`, exactly like scanning any other
   registry state.
 - A **stale (or unprobed) entry is listed, not hidden** — unlike
-  `inspect`/`cancel`/`kill`, which treat anything other than a confirmed-live match
-  as an unreachable-run failure, `list`'s whole purpose is discovery, so a stale
+  `inspect`/`cancel`/`kill`/`attest`, which treat anything other than a
+  confirmed-live match as an unreachable-run failure, `list`'s whole purpose is
+  discovery, so a stale
   leftover (evidence of a runner that died abruptly without cleaning up) is exactly
   the kind of thing an operator wants to see, e.g. before reaping it.
 - **`unprobed` is a distinct value, never folded into `stale` (T-206).** A record
@@ -501,8 +504,8 @@ kept strictly apart — and this is the load-bearing distinction:
   same case `Registry::entries` reports as [`Health::Unprobed`] (T-206) — never
   folded into `Stale` — so the read path `list`/`inspect` share already keeps it
   apart from a confirmed-dead entry too, at the `Health` level; `inspect`/`cancel`/
-  `kill` still *act* on it exactly as they do on `Stale` (they refuse, because they
-  act only on [`Health::Live`], and a probe-failed record is not that whichever of
+  `kill`/`attest` still *act* on it exactly as they do on `Stale` (they refuse,
+  because they act only on [`Health::Live`], and a probe-failed record is not that whichever of
   the two non-live values it carries) — but they no longer *word* the refusal the
   same way: an unprobeable entry is reported as `unprobed`, liveness unknown, not as
   a runner confirmed gone (see [`docs/control-plane.md`](control-plane.md), "When
@@ -627,8 +630,8 @@ only a `run_id` (or nothing but "I want every run gone") — and therefore has n
 process to wait on. Like `list` and `prune` it
 opens the registry through `Registry::open_read_only` (`src/registry/mod.rs`), so waiting
 never creates the registry directory or touches its permissions, and unlike
-`inspect`/`cancel`/`kill` it never connects to the run's control transport: the run is
-not disturbed, not ended, and not even aware of the waiter. A run whose transport never
+`inspect`/`cancel`/`kill`/`attest` it never connects to the run's control transport:
+the run is not disturbed, not ended, and not even aware of the waiter. A run whose transport never
 came up (a `null` `endpoint`, see "Record format" above) is still perfectly waitable —
 `wait` needs no endpoint.
 
@@ -721,9 +724,9 @@ the same "probe failed" case "The reaping safety invariant" above keeps apart fr
 "confirmed stale"). `Registry::entries` reports that case as its own
 [`Health::Unprobed`] value (T-206), never folded into `Stale` — right for `list`,
 whose whole purpose is showing the operator exactly what was and was not confirmed,
-and behaviorally unchanged for `inspect`/`cancel`/`kill`, which act only on
-[`Health::Live`] and so refuse on `Unprobed` exactly as they refused on the old
-collapsed `Stale` (their *message* now tells the two apart, so no client asserts a
+and behaviorally unchanged for the control clients `inspect`/`cancel`/`kill`/`attest`,
+which act only on [`Health::Live`] and so refuse on `Unprobed` exactly as they refuse
+on `Stale` (their *message* now tells the two apart, so no client asserts a
 death this case never established). Minting a *positive* "finished" from that same
 unconfirmed case would still be wrong for `wait --run-id`, whose `0` is a positive claim
 about a run's lifetime — so on this path `wait` probes through [`Registry::probe_run`]

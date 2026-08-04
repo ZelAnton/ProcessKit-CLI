@@ -68,12 +68,14 @@
 //! once. [`resolve_live_endpoint`] (via [`resolve_in_registry`]) detects that (more
 //! than one *live* entry matches the requested `run_id`, counted regardless of
 //! whether each one has published an endpoint yet) and refuses to pick one: every
-//! by-`run-id` verb — `inspect`, `cancel`, and `kill` alike — reports the same reserved
-//! [`exit::CONTROL`] (103) "ambiguous run id" failure rather than acting on whichever
+//! by-`run-id` verb — `inspect`, `attest`, `cancel`, and `kill` alike — reports the
+//! same reserved [`exit::CONTROL`] (103) "ambiguous run id" failure rather than
+//! acting on whichever
 //! entry the directory scan happens to return first. For the mutating verbs this is
 //! load-bearing (a wrong guess cancels or kills the *other* run); the read-only
-//! `inspect` gets the identical hard failure rather than a softer fallback, because a
-//! snapshot of the wrong run is exactly as misleading as acting on it. See
+//! `inspect` and `attest` get the identical hard failure rather than a softer
+//! fallback, because a snapshot — or a membership verdict — that names the wrong run
+//! is exactly as misleading as acting on it. See
 //! `docs/registry.md`, "Run id resolution — ambiguity is a hard failure".
 //!
 //! That initial check alone is a TOCTOU race for `cancel`/`kill`: a duplicate can
@@ -1104,9 +1106,9 @@ fn serialize_ack(ack: &ControlAck) -> String {
 }
 
 /// Build the small current-thread tokio runtime every client entry point (`run`,
-/// `inspect`, `cancel`, `kill`) drives its async body on, mapping a build failure to
-/// the shared [`exit::SETUP`] shape. `enable_all` arms the I/O, time, and signal
-/// drivers each caller's body needs (Cargo unifies every caller's feature set into
+/// `inspect`, `attest`, `cancel`, `kill`) drives its async body on, mapping a build
+/// failure to the shared [`exit::SETUP`] shape. `enable_all` arms the I/O, time, and
+/// signal drivers each caller's body needs (Cargo unifies every caller's feature set into
 /// the one tokio build), so one small runtime is enough for each — a run is one
 /// child plus its output pumps, a deadline timer, and the stop-signal listeners
 /// (`Ctrl-C`, plus `SIGTERM`/`SIGHUP` on Unix, plus `Ctrl-Break`/console
@@ -2028,8 +2030,8 @@ fn snapshot_target_state(
 
 /// Find the endpoint of the *live* run named `run_id`, or a distinguishable
 /// [`exit::CONTROL`] failure that says *why* it cannot be reached. Shared by every
-/// client (`inspect`/`cancel`/`kill`); `action` names the verb in the message. Opens
-/// the env/platform-resolved registry and delegates the scan to
+/// client (`inspect`/`cancel`/`kill`/`attest`); `action` names the verb in the
+/// message. Opens the env/platform-resolved registry and delegates the scan to
 /// [`resolve_in_registry`], which the mutating verbs' pre-dispatch re-check
 /// ([`reconfirm_target`]) also drives, against the same open [`registry::Registry`].
 async fn resolve_live_endpoint(action: &str, run_id: &str) -> Result<String, RunnerError> {
@@ -2094,14 +2096,15 @@ fn resolve_in_registry(
     // (yet, or ever) have published an endpoint (disconnected/failed transport).
     // Counting only endpoint-having entries would let such a duplicate evade
     // detection and have the sole endpoint-having entry acted on as if it were
-    // unambiguous. Every verb (`inspect`/`cancel`/`kill`) shares this resolver and
-    // treats *any* live duplicate as a hard, documented failure rather than
-    // silently acting on whichever entry the directory scan happens to return
+    // unambiguous. Every verb (`inspect`/`cancel`/`kill`/`attest`) shares this
+    // resolver and treats *any* live duplicate as a hard, documented failure rather
+    // than silently acting on whichever entry the directory scan happens to return
     // first: for the mutating verbs, guessing wrong means cancelling or killing
-    // the *other* run instead of the intended one; `inspect` gets the same
-    // treatment rather than a softer fallback because a snapshot of the wrong run
-    // is just as misleading as acting on it (see `docs/registry.md`, "Run id
-    // resolution — ambiguity is a hard failure").
+    // the *other* run instead of the intended one; the read-only `inspect` and
+    // `attest` get the same treatment rather than a softer fallback because a
+    // snapshot — or a membership verdict — that names the wrong run is just as
+    // misleading as acting on it (see `docs/registry.md`, "Run id resolution —
+    // ambiguity is a hard failure").
     let live: Vec<&registry::Entry> = matches
         .iter()
         .filter(|entry| entry.health == Health::Live)
@@ -2271,8 +2274,8 @@ where
 }
 
 /// A "cannot reach the target run" error carrying the reserved [`exit::CONTROL`] code
-/// and a message naming the `action` (`inspect`/`cancel`/`kill`), the run, and the
-/// reason.
+/// and a message naming the `action` (`inspect`/`cancel`/`kill`/`attest`), the run,
+/// and the reason.
 fn unreachable_run(action: &str, run_id: &str, detail: String) -> RunnerError {
     RunnerError::new(
         exit::CONTROL,

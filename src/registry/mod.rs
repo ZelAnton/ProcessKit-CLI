@@ -184,7 +184,7 @@ pub struct Record {
     pub run_id: String,
     /// The run's local control-transport connection address — a unix socket path, or
     /// a Windows named-pipe name (see [`crate::control`]). A live runner publishes it
-    /// so `inspect`/`cancel`/`kill` clients can reach it; `None` only when the
+    /// so `inspect`/`cancel`/`kill`/`attest` clients can reach it; `None` only when the
     /// transport could not be stood up (best-effort degradation).
     ///
     /// Untrusted deserialized data on the read side, exactly like
@@ -282,9 +282,9 @@ pub enum Health {
     /// [`Registry::probe_run`]'s own [`probe_health`] call already keep apart from a
     /// confirmed-dead entry (see [K-024]) — [`Registry::entries`] now keeps it apart
     /// too, instead of folding it into [`Health::Stale`]. Every control client
-    /// (`inspect`/`cancel`/`kill`) that matches only on [`Health::Live`] *acts* on
-    /// this exactly as it does on `Stale` — refusing — so their behavior is
-    /// unchanged; what they no longer share is the *wording* of that refusal, which
+    /// (`inspect`/`cancel`/`kill`/`attest`) that matches only on [`Health::Live`]
+    /// *acts* on this exactly as it does on `Stale` — refusing — so their behavior
+    /// is unchanged; what they no longer share is the *wording* of that refusal, which
     /// names an unprobeable entry `unprobed` instead of claiming the runner is gone
     /// (see [`crate::control`], "Dead runner / unreachable entry"). Neither the
     /// discovery surface `list` nor a refusing control client makes the misleadingly
@@ -465,7 +465,7 @@ impl Registry {
     /// permissions do not already match) because a run is about to write a record
     /// into it. A caller that only wants to *read* the registry —
     /// `list`/`prune`/`wait`/`events`, and the control clients
-    /// `inspect`/`cancel`/`kill` —
+    /// `inspect`/`cancel`/`kill`/`attest` —
     /// must use [`Registry::open_read_only`] instead, so a read-only scan cannot
     /// itself create registry state or touch its permissions.
     pub fn open() -> io::Result<Self> {
@@ -483,7 +483,7 @@ impl Registry {
     /// Open the per-user registry **without** creating its directory or touching its
     /// permissions — the read-only counterpart of [`Registry::open`], for callers
     /// (`list`/`prune`/`wait`/`events`, and the control clients
-    /// `inspect`/`cancel`/`kill`)
+    /// `inspect`/`cancel`/`kill`/`attest`)
     /// that must never mutate registry state just to look at it. The
     /// location is resolved exactly as [`Registry::open`] resolves it
     /// ([`REGISTRY_DIR_ENV`] if set, else the platform default); a directory that
@@ -671,8 +671,8 @@ impl Registry {
             // dropping the entry, aborting the scan, or fabricating a confirmed
             // `Stale` verdict the probe never actually reached — this keeps the entry
             // visible for the `prune` reaper (T-164) and preserves the misrouting fix
-            // this method exists for: `inspect`/`cancel`/`kill` act only on `Live`
-            // entries, so a record whose probe failed can no longer fail the whole
+            // this method exists for: `inspect`/`cancel`/`kill`/`attest` act only on
+            // `Live` entries, so a record whose probe failed can no longer fail the whole
             // scan and take down an operation on an unrelated, healthy run_id.
             // **Prune must not reuse this value** — it needs the acquired lock held
             // across its deletions, which a pure liveness query like this one already

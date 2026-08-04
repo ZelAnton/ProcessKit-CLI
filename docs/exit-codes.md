@@ -211,7 +211,8 @@ caller which one happened:
   build; a required `--jsonl` events file, `--capture-dir`, or `--stdin-file` the
   operator asked for but that cannot be opened or created (an unwritable path, a missing
   parent, denied permissions); and a
-  `probe` / `inspect` / control (`cancel`/`kill`) reply that cannot be serialized. It also
+  `probe` / `inspect` / `attest` / control (`cancel`/`kill`) reply that cannot be
+  serialized. It also
   covers the two failures that belong to `--detach`'s wrapper rather than to the run — the
   detached runner could not be spawned, or it never reported a started run before the
   startup budget elapsed (see "Detached runs" below). In every

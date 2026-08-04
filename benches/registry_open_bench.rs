@@ -1,7 +1,7 @@
 //! Phase-attribution benchmark for the *mutating* registry open — the one
 //! per-invocation cost `run` still pays and no read-only client
-//! (`list`/`prune`/`wait`/`events`, and the `inspect`/`cancel`/`kill` control
-//! clients) pays at all: T-174 routed the ones that existed then through
+//! (`list`/`prune`/`wait`/`events`, and the `inspect`/`cancel`/`kill`/`attest`
+//! control clients) pays at all: T-174 routed the ones that existed then through
 //! `Registry::open_read_only`, and every read-only client added since has been
 //! born on that path.
 //!

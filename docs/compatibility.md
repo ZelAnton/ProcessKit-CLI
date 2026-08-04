@@ -53,7 +53,8 @@ does not touch the registry. A missing requirement exits
 
 ## Surface tokens
 
-A surface token is either a subcommand or `subcommand:--long-flag`:
+A surface token takes one of three forms — a subcommand, `subcommand:--long-flag`,
+or `subcommand:capability`:
 
 ```text
 run
@@ -62,11 +63,38 @@ run:--idle-timeout
 inspect
 inspect:--json
 cancel:--all
+attest:peer-identity
 ```
+
+The first two forms name a **spelling** the parser accepts, and are derived from the
+live clap definition so they cannot drift from the real one. The third names a
+platform **capability** instead — "can this binary *do* the thing that spelling asks
+for here", which no parser can answer — and is told apart by carrying **no `--`**:
+`attest:peer-identity` is today the only one. It is published exactly where this
+build can obtain a kernel-authenticated identity for a control-plane client, which is
+what makes `attest` able to return a membership verdict at all (see
+[`docs/control-plane.md`](control-plane.md) and [`docs/integration.md`](integration.md),
+§1). The missing `--` is what keeps the two categories from being read as one
+another, so an adapter that validates this array with a pattern of its own must
+admit the `--`-less form; the published grammar is the `surface` pattern in
+`fixtures/schema/cli/probe.schema.json`.
+
+A capability token's **presence is a guarantee**: this target names the peer, so a
+negative membership answer from it is a real verdict rather than a missing capability
+in disguise. Its **absence withholds that guarantee rather than predicting failure** —
+`attest` on a build without the token still answers from whatever the kernel actually
+provides, and fails closed with `peer_identity_unsupported` when that is nothing.
+Requiring it therefore turns "this platform cannot prove membership" into an ordinary
+`PROBE_INCOMPATIBLE` (110) at preflight, instead of a refusal in the middle of a job.
 
 Require only the features the adapter will actually use. This permits additive
 CLI releases while preventing an invocation from reaching a binary that lacks
-a needed flag.
+a needed flag. That is why the preflight example above pins no capability token: it
+shows an adapter that uses `run`, `inspect`, and `cancel` and nothing else. An
+adapter that will gate work on containment membership adds
+`--require-surface attest:peer-identity` to its own invocation — an adapter that will
+not must leave it out, since requiring an unused capability would fail preflight on a
+platform whose missing capability could not have affected it.
 
 ## Schema pinning
 

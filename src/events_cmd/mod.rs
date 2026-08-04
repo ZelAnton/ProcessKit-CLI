@@ -41,8 +41,8 @@
 //! - no record names the id at all (a clean exit deletes its own record — this is
 //!   where `--file` earns its keep),
 //! - the records that do publish a locator publish **different** ones (ambiguity is
-//!   a hard failure here exactly as it is for `inspect`/`cancel`/`kill`/`wait`, see
-//!   `docs/registry.md`),
+//!   a hard failure here exactly as it is for
+//!   `inspect`/`cancel`/`kill`/`attest`/`wait`, see `docs/registry.md`),
 //! - every matching record publishes none, because the run was started without
 //!   `--jsonl` and so has no stream to read.
 //!
