@@ -2,14 +2,10 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/ZelAnton/ProcessKit-CLI/main/fixtures/schema/cli/wait.schema.json",
   "title": "processkit-cli `wait --report-outcome` report",
-  "description": "The `wait --run-id <id> --report-outcome` form prints one outcome object; `wait --all --report-outcome` prints one array of those objects after its snapshot barrier clears. A plain `wait` prints nothing at all. The report never changes `wait`'s exit code — a reported non-zero `code` is still exit 0 for the waiter, and the run's own outcome codes are never forwarded as the waiting process's status. The normative prose is docs/registry.md, \"Waiting — `wait`\"; the in-code source of truth is src/wait.rs. Validated against fixtures/schema/cli/wait.jsonl, and against the real binary's output, by tests/machine_output.rs.",
+  "description": "The `wait --run-id <id> --report-outcome` form prints one outcome object; `wait --all --report-outcome` prints one array of those objects after its snapshot barrier clears. A plain `wait` prints nothing at all. Validate against `#/$defs/waitOutcome` or `#/$defs/waitAllReport` directly when the invocation is known. The report never changes `wait`'s exit code — a reported non-zero `code` is still exit 0 for the waiter, and the run's own outcome codes are never forwarded as the waiting process's status. The normative prose is docs/registry.md, \"Waiting — `wait`\"; the in-code source of truth is src/wait.rs. Validated against fixtures/schema/cli/wait.jsonl, and against the real binary's output, by tests/machine_output.rs.",
   "oneOf": [
     { "$ref": "#/$defs/waitOutcome" },
-    {
-      "type": "array",
-      "description": "The aggregate report: one entry per target in stable snapshot order.",
-      "items": { "$ref": "#/$defs/waitOutcome" }
-    }
+    { "$ref": "#/$defs/waitAllReport" }
   ],
   "$defs": {
     "waitOutcome": {
@@ -63,6 +59,11 @@
           }
         }
       ]
+    },
+    "waitAllReport": {
+      "type": "array",
+      "description": "`wait --all --report-outcome`'s report, printed once the aggregate barrier clears: exactly one entry per target in the snapshot fixed when the invocation started (the entries confirmed live at that instant, narrowed by any `--label` filter) — no target is ever skipped silently, and one whose outcome could not be established reports `status` `unknown` rather than dropping out of the report. The order is stable and content-derived — by `run_id`, then by the target's registry-record path — never filesystem order. An empty snapshot prints `[]` and exits 0. The entries are the very objects the single-run form prints, and, unlike `inspect --all --json` or `cancel --all` / `kill --all`, no entry here can change the exit code: an `unknown` outcome is honest data, not a partial failure. A barrier that times out instead prints no report at all — it exits WAIT_TIMEOUT (112).",
+      "items": { "$ref": "#/$defs/waitOutcome" }
     }
   }
 }

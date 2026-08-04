@@ -1,7 +1,7 @@
 //! Golden schema tests for the CLI's **non-event** machine-readable outputs:
 //! `probe --json`, `list --json`, `inspect --json` (single and `--all`), the
 //! `cancel`/`kill` ack and its `--all` report array, `prune --json` (with and
-//! without `--dry-run`), and `wait --report-outcome`.
+//! without `--dry-run`), and `wait --report-outcome` (single and `--all`).
 //!
 //! These are the counterpart of what `tests/events.rs` does for the JSONL
 //! lifecycle stream and `tests/cli_help.rs` does for the help surface: every case
@@ -656,7 +656,13 @@ fn prune_reports_match_their_schema_and_fixture() {
 }
 
 /// `wait --report-outcome`: the reported outcome of a run the waiter watched to
-/// completion, and the honest `unknown` outcome for a run it never observed live.
+/// completion, the honest `unknown` outcome for a run it never observed live, and
+/// then the aggregate `wait --all --report-outcome` array the barrier prints once
+/// its snapshot clears.
+///
+/// All three forms belong to one test because [`check_family`] rewrites (and
+/// compares) the whole `wait.jsonl` fixture in one go — the same reason
+/// `inspect`'s and `control-ack`'s single and `--all` forms share a test each.
 #[test]
 fn wait_outcomes_match_their_schema_and_fixture() {
     let dir = scratch("machine-wait");
@@ -704,6 +710,52 @@ fn wait_outcomes_match_their_schema_and_fixture() {
     assert_eq!(unknown_lines[0]["status"], json!("unknown"));
     lines.extend(unknown_lines);
 
+    // The aggregate form, in its own scratch registry: `wait --all` fixes its
+    // target set to the runs *confirmed live* when it starts, so giving it a fresh
+    // registry (and a fresh `--jsonl` path) keeps the two scenarios above out of
+    // the snapshot it reports on. Fixture order follows the schema's root `oneOf`:
+    // the single-run outcomes, then the aggregate array.
+    let all_dir = scratch("machine-wait-all");
+    let all_registry = registry_dir(&all_dir);
+    let mut all_child = command_with_flags(
+        &all_dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", all_registry.as_path())],
+        &["--run-id", "build-42"],
+        brief_child(),
+    )
+    .spawn()
+    .expect("spawn the runner for the aggregate barrier");
+    wait_until(
+        || record_is_published(&all_registry, "build-42"),
+        Duration::from_secs(20),
+        "the record for the aggregate `build-42`",
+    );
+
+    // Blocking here is the point: the barrier must still see the run live when it
+    // takes its snapshot, or it would honestly report the empty `[]` of a snapshot
+    // with no targets — which the assertion below, and the fixture, both reject.
+    let aggregate = cli(&all_registry, &["wait", "--all", "--report-outcome"]);
+    let aggregate_lines = machine_output(&aggregate, 0, "`wait --all --report-outcome`");
+    assert_eq!(
+        aggregate_lines.len(),
+        1,
+        "the report is one JSON array line"
+    );
+    assert_eq!(
+        aggregate_lines[0],
+        json!([{
+            "run_id": "build-42",
+            "status": "reported",
+            "code": 0,
+            "source": "child_exit",
+            "child_code": 0
+        }]),
+        "the barrier reports the terminal event of the one run its snapshot fixed"
+    );
+    lines.extend(aggregate_lines);
+    let _ = all_child.wait();
+
     check_family("wait", &lines);
+    let _ = fs::remove_dir_all(&all_dir);
     let _ = fs::remove_dir_all(&dir);
 }

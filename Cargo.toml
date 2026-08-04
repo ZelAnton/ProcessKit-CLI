@@ -88,7 +88,15 @@ serde_json = "1"
 # implies the crate's `stats` feature). Without a limit flag `run` still creates
 # the group through the plain `ProcessGroup::new()`, so a default run pulls none
 # of this at runtime.
-processkit = { version = "3", features = ["limits"] }
+#
+# The requirement names 3.2, not a bare `3`: `src/run/teardown.rs` calls
+# `ProcessGroup::limit_evidence()` and matches on `LimitVerdict`, neither of which
+# exists before 3.2.0, so `^3` would let a resolver legitimately pick 3.1.x and
+# fail at compile time instead of at resolution. It also keeps the repository's
+# *second* committed lockfile (`fuzz/Cargo.lock`, for the deliberately
+# out-of-workspace fuzz crate — see `fuzz/Cargo.toml`) from silently holding an
+# older pin that satisfies the manifest but not the code.
+processkit = { version = "3.2", features = ["limits"] }
 # Async runtime that drives the tokio-based `processkit` API. A small
 # current-thread runtime hosts the run; `io-std` provides the async stdout/stderr
 # sinks the child's output is teed to. `time` arms the `--timeout` deadline timer

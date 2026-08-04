@@ -123,7 +123,7 @@ fixture under
 | `inspect --json`, `inspect --all --json` | `fixtures/schema/cli/inspect.schema.json` | `inspect.jsonl` |
 | `cancel`/`kill` ack, `cancel --all`/`kill --all` report | `fixtures/schema/cli/control-ack.schema.json` | `control-ack.jsonl` |
 | `prune --json`, `prune --dry-run --json` | `fixtures/schema/cli/prune.schema.json` | `prune.jsonl` |
-| `wait --report-outcome` | `fixtures/schema/cli/wait.schema.json` | `wait.jsonl` |
+| `wait --report-outcome`, `wait --all --report-outcome` | `fixtures/schema/cli/wait.schema.json` | `wait.jsonl` |
 
 `events --json` is deliberately absent from that table: it passes the runner's own
 JSONL lines through byte for byte, so the document that describes it is the event
@@ -154,11 +154,11 @@ different build, and the probe report's whole job is to be read *before* the
 binary's version is known.
 
 **The remaining four — `list --json`, the `cancel`/`kill` ack and `--all` report,
-`prune --json`, and `wait --report-outcome` — carry no version field,
-deliberately.** Each is a synchronous stdout rendering read by the caller that
-just invoked this exact binary. That includes the printed ack, whose content does
-arrive over the wire but is re-serialized by the client from the three fields it
-parsed and verified, so its field set is the client's own (see
+`prune --json`, and `wait --report-outcome` in both its forms — carry no version
+field, deliberately.** Each is a synchronous stdout rendering read by the caller
+that just invoked this exact binary. That includes the printed ack, whose content
+does arrive over the wire but is re-serialized by the client from the three
+fields it parsed and verified, so its field set is the client's own (see
 [`fixtures/schema/cli/README.md`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/fixtures/schema/cli/README.md),
 "Versioning"). Such a caller already knows the version and can pin the shape
 through the `probe` preflight above — the reported `version`, plus one

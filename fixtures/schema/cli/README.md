@@ -11,7 +11,7 @@ same three-part contract discipline the JSONL lifecycle-event stream already has
 | `inspect --json` (single snapshot and the `--all` array) | `inspect.schema.json` | `inspect.jsonl` | [`docs/control-plane.md`](../../../docs/control-plane.md), "`inspect`" |
 | `cancel`/`kill` ack (single) and the `--all` report array | `control-ack.schema.json` | `control-ack.jsonl` | [`docs/control-plane.md`](../../../docs/control-plane.md), "The ack", "`cancel --all` / `kill --all`" |
 | `prune --json` (tally and `--dry-run`) | `prune.schema.json` | `prune.jsonl` | [`docs/registry.md`](../../../docs/registry.md), "Reaping — `prune`" |
-| `wait --report-outcome` | `wait.schema.json` | `wait.jsonl` | [`docs/registry.md`](../../../docs/registry.md), "Waiting — `wait`" |
+| `wait --report-outcome` (single outcome and the `--all` array) | `wait.schema.json` | `wait.jsonl` | [`docs/registry.md`](../../../docs/registry.md), "Waiting — `wait`" |
 
 **Why `events --json` is not a seventh family.** It is not a *non-event* output:
 `events --json` passes the runner's own JSONL lines through byte for byte, so the
@@ -156,11 +156,14 @@ own line:
 | `inspect.jsonl` | the single-run snapshot; the `--all` array with that snapshot inline |
 | `control-ack.jsonl` | a `cancel` ack; a `kill` ack; the `cancel --all` report array |
 | `prune.jsonl` | the plain tally; the `--dry-run` report with both candidate kinds |
-| `wait.jsonl` | a `reported` outcome; an `unknown` one |
+| `wait.jsonl` | a `reported` outcome; an `unknown` one; the `wait --all` report array |
 
 `docs/*` and the schema documents remain the complete list — the `already_gone`
-and `failed` arms of the two aggregate reports, for instance, are documented and
-validated there without a line of their own here. A fixture line is a
+and `failed` arms of the `inspect --all` and `cancel`/`kill --all` reports, for
+instance, are documented and validated there without a line of their own here.
+(The third aggregate array, `wait --all --report-outcome`, has no such extra
+arms: its entries are the very `waitOutcome` objects the single-run form prints,
+and both of that form's arms already have a line above.) A fixture line is a
 representative example an adapter can build and test a reader against.
 
 - **Do not hand-edit these lines.** They are generated from the **real binary's
