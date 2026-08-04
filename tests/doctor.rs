@@ -365,6 +365,20 @@ fn a_requirement_gates_the_exit_code_and_nothing_else() {
     // by field over everything that is not a per-run value (a pid, an endpoint, a
     // path, a duration), because those legitimately differ between two runs of the
     // same command on the same host.
+    //
+    // The per-run values that exclusion leaves out are `containment.root_pid`,
+    // `control.endpoint`, `cleanup.remaining_pids`, and every `elapsed_ms`.
+    // `cleanup.remaining_pids` is the least obvious of them, so it is named here: on
+    // the POSIX `process_group` fallback the post-kill snapshot is a `kill(pid, 0)`
+    // probe that a just-exited, unreaped child still answers (`docs/schema.md`,
+    // "cleanup_finished"), so every invocation contributes its own freshly assigned pid
+    // to it. What a requirement flag could actually change about that field is its
+    // *size*, and that is compared below as `cleanup.remaining` — the count of exactly
+    // those pids (`src/run/teardown.rs`'s `emit_cleanup_finished`).
+    //
+    // `registry.dir` is compared despite being a path because this test pins it through
+    // the environment: it is the same configured directory every time, not a per-run
+    // one the command chose.
     for other in [&satisfied, &refused] {
         assert_eq!(
             other["registry"]["owner_only"], baseline["registry"]["owner_only"],
@@ -407,7 +421,6 @@ fn a_requirement_gates_the_exit_code_and_nothing_else() {
             "endpoint_released",
             "scratch_removed",
             "remaining",
-            "remaining_pids",
         ] {
             assert_eq!(
                 other["cleanup"][field], baseline["cleanup"][field],
