@@ -147,11 +147,26 @@ processkit-cli run \
   child: the detached runner has no console to lend it, so the OS gives the
   child one of its own. See [`docs/exit-codes.md`](exit-codes.md), "Detached
   runs".
-- **`--env-clear` / `--env-remove <KEY>` / `--env <KEY=VALUE>`** give the
+- **`--env-clear` / `--env-remove <KEY>` / `--env-file <file>` / `--env
+  <KEY=VALUE>`** give the
   adapter control over the child's environment, applied in that fixed order —
-  clear, then remove, then set — regardless of flag order on the command line,
-  so an explicit `--env` always wins on a duplicated key. See `README.md`,
-  "Environment", for the full precedence rule.
+  clear, then remove, then files, then explicit sets — regardless of flag order on
+  the command line, so an explicit `--env` always wins on a duplicated key. See
+  `README.md`, "Environment", for the full precedence rule.
+- **`--run-id-env <KEY>`** hands the child the run's *final* id — the `--run-id`
+  above, or the generated one when the adapter did not supply an id — in the named
+  environment variable, applied after every flag in the previous bullet. This is
+  the alternative to minting an identity adapter-side and passing it twice
+  (`--run-id <id> --env KEY=<id>`): one value, no second copy to drift, and it is
+  the *only* way to give the child a runner-generated id, which is otherwise not
+  knowable until the run has already started. It is opt-in (no key is injected by
+  default) and it composes with `--detach` — the detached copy is re-spawned with
+  an explicit `--run-id` for the id its caller already reported, so the child sees
+  the same value the caller has. An explicit `--env <KEY>=…` for the same key is
+  refused as a `USAGE` (100) parse error rather than silently overridden. Treat the
+  value as **correlation data only**: it identifies a run, it does not
+  authenticate one, and any process able to set an environment variable can forge
+  it.
 - **`--max-memory <size>` / `--max-processes <n>` / `--cpu-quota <cores>`** cap
   the run's whole process tree. Enforcement needs a real container (Windows Job
   Object or Linux cgroup v2 at the real hierarchy root); where the platform or

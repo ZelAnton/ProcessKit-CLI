@@ -12,6 +12,28 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- `run --run-id-env <KEY>`, an opt-in flag that sets one child environment variable
+  to the run's **final** id — the explicit `--run-id` when one was given, otherwise
+  the id the runner generated — so a child and its descendants can name the run
+  they belong to. The value is the same one `run_started.run_id`, the registry
+  record, and every control-plane reply carry. It replaces the "mint an id yourself
+  and pass it twice" plumbing (`--run-id <id> --env KEY=<id>`) every supervising
+  adapter carried: one value instead of two copies that can drift, and the only way
+  to hand the child a *generated* id, which was previously not knowable outside the
+  run until the run had already started. Strictly opt-in — no key is injected by
+  default, so a run without the flag has exactly the child environment it always
+  had. The injection is applied **after** all four `--env-*` flags (`--env-clear`,
+  `--env-remove`, `--env-file`, `--env`), so it wins over a file entry or a removal
+  of the same key whichever order the flags were written; the one combination that
+  is *refused* rather than resolved is an explicit `--env <KEY>=…` for the same key,
+  which fails at parse time as a `USAGE` (100) error before anything runs (asking
+  for two values of one variable is a caller mistake, and the outcome must not
+  depend on argument order either way). `<KEY>` is held to the same rule as an
+  `--env` KEY, through the same validator. The value is **correlation data, not a
+  credential**: it identifies a run, proves nothing about who started it, and is
+  forgeable by anything that can set an environment variable. New probe surface
+  token `run:--run-id-env`. See `README.md`, "Environment", and
+  `docs/running-commands.md`, "Publishing the run id to the child".
 - `--error-format <human|json>`, the CLI's first **global** option: accepted before
   or after the subcommand, honored by every subcommand, and off by default. Under
   `--error-format json` a post-parse failure prints exactly one bounded, versioned

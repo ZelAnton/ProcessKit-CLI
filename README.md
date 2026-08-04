@@ -247,7 +247,7 @@ processkit-cli run     [--run-id <id>] [--label <KEY=VALUE>]... [--cwd <dir>]
                        [--no-echo] [--detach] [--argv-raw]
                        [--inherit-stdio | --inherit-stdin | --stdin-file <file>]
                        [--env-clear] [--env-remove <KEY>]... [--env-file <file>]...
-                       [--env <KEY=VALUE>]...
+                       [--env <KEY=VALUE>]... [--run-id-env <KEY>]
                        -- <program> <args...>
 processkit-cli inspect (--run-id <id> | --all [--label <KEY=VALUE>]...) [--json]
 processkit-cli cancel  (--run-id <id> | --all [--label <KEY=VALUE>]...)
@@ -796,7 +796,7 @@ inherit one and Windows gives it a fresh console of its own — visible unless
 ## Environment
 
 By default the child inherits the runner's own environment unchanged, exactly as
-launching it directly would. Four flags give control over that, mapping straight
+launching it directly would. Five flags give control over that, mapping straight
 onto `processkit::Command`'s own environment builder (`env`/`env_remove`/
 `env_clear`) — the runner never reimplements this logic itself:
 
@@ -808,18 +808,23 @@ onto `processkit::Command`'s own environment builder (`env`/`env_remove`/
   unreadable, non-UTF-8, or malformed file is a pre-spawn `SETUP` (111) failure.
 - `--env <KEY=VALUE>` (repeatable) sets one variable for the child, splitting on
   the *first* `=` (so a value that itself contains `=` is preserved verbatim).
+- `--run-id-env <KEY>` sets `KEY` to **this run's final id** — see
+  [Publishing the run id to the child](#publishing-the-run-id-to-the-child) below.
 
-For both entry sources, `KEY` must be non-empty and contain no whitespace or
-control characters. Invalid command-line entries are usage errors; invalid file
+For every entry source, `KEY` must be non-empty and contain no whitespace or
+control characters (one shared rule, so no flag accepts a name another rejects).
+Invalid command-line entries are usage errors; invalid file
 entries fail setup before the child starts. Parser diagnostics never repeat the
 value, so a malformed secret-bearing entry does not disclose its secret.
 
-**Applied order: clear, then remove, then env-file, then explicit set** — regardless of the order the
+**Applied order: clear, then remove, then env-file, then explicit set, then
+`--run-id-env`** — regardless of the order the
 flags are given on the command line. Concretely: `--env-clear` first empties the
 slate (or is skipped if absent), `--env-remove` then strips any of the remaining
-inherited variables it names, each `--env-file` is applied in argument order, and
-`--env` is applied last, so an explicit `--env`
-always wins over an `--env-remove` of the same key. This is the intuitive "what I
+inherited variables it names, each `--env-file` is applied in argument order,
+`--env` is applied after those, so an explicit `--env`
+always wins over an `--env-remove` of the same key, and the `--run-id-env`
+injection closes the chain. This is the intuitive "what I
 set is what I get" outcome: combining `--env-clear` with an `--env` for the same
 key still leaves that key set (`--env` fills the slate back in after the clear),
 and combining `--env-remove KEY` with `--env KEY=VALUE` always sets `KEY=VALUE`
@@ -827,6 +832,41 @@ regardless of which flag was written first on the command line.
 
 `--env-file` is the secret-safe path: values live in the file rather than the
 runner's argv (and are never copied into lifecycle events or registry records).
+
+### Publishing the run id to the child
+
+`--run-id-env <KEY>` sets one child variable to this run's **final** id: the
+explicit `--run-id` when one was given, otherwise the id the runner generated.
+It is the same value `run_started.run_id`, the registry record, and every
+control-plane reply carry, so a child — and everything it spawns — can name the
+run it belongs to:
+
+```sh
+processkit-cli run \
+  --run-id-env PROCESSKIT_RUN_ID \
+  --jsonl build.jsonl \
+  -- ./build.sh
+```
+
+Without it, a supervising adapter that needs the child to know its run has to
+mint the identity itself and pass it twice (`--run-id <id> --env KEY=<id>`) —
+two copies that can drift, and which rule out a runner-generated id entirely,
+since a generated id is not knowable outside the run until the run has started.
+
+- **Strictly opt-in.** Omit the flag and nothing is injected; there is no default
+  key and no unconditional `PROCESSKIT_RUN_ID`.
+- **It is applied last** (see the order above), so it wins over an `--env-file`
+  entry or an `--env-remove` for the same key whichever order those flags were
+  written.
+- **An explicit `--env KEY=…` for that same key is refused**, not silently
+  overridden: two flags asking for two different values of one variable is a
+  caller mistake, and it fails at parse time as a `USAGE` (100) error before
+  anything runs. The outcome never depends on the order the two flags were
+  written — that is the reason it is a refusal rather than a precedence rule.
+- **The value is correlation data, not a credential or a security proof.** It
+  identifies which run some work belongs to; it proves nothing about who started
+  that run, grants no authority, and is trivially forgeable by anything that can
+  set an environment variable. Use it to label work, never to authorize it.
 
 Operator labels are separate, non-secret metadata: repeat `run --label KEY=VALUE`
 to group runs for discovery and aggregate operations. Keys are 1-64 ASCII bytes,

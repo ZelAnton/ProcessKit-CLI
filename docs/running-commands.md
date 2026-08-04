@@ -53,7 +53,7 @@ before the child starts.
 
 ## Environment
 
-Without environment flags, the child inherits the runner's environment. Four
+Without environment flags, the child inherits the runner's environment. Five
 options make the result explicit:
 
 | Flag | Effect |
@@ -62,13 +62,15 @@ options make the result explicit:
 | `--env-remove KEY` | Remove one inherited key. |
 | `--env-file FILE` | Read UTF-8 `KEY=VALUE` lines without placing their values in argv; blank lines and `#` comments are ignored. |
 | `--env KEY=VALUE` | Set or replace one key. The value may contain `=`. |
+| `--run-id-env KEY` | Set one key to this run's final id (see [Publishing the run id to the child](#publishing-the-run-id-to-the-child)). |
 
 Application order is fixed, regardless of flag order: **clear, remove, env-file,
-explicit set**. Repeated files are applied in argument order, and an explicit
-`--env` therefore wins over every file or removal for the same key. A file read,
+explicit set, run-id injection**. Repeated files are applied in argument order, an
+explicit `--env` therefore wins over every file or removal for the same key, and
+`--run-id-env` — applied last — wins over all of them. A file read,
 UTF-8, or syntax failure is `SETUP` (111) before the child starts.
-For either `--env` or a file entry, the key must be non-empty and contain no
-whitespace or control characters. Diagnostics for malformed entries do not
+Every flag that names a key holds it to one rule: non-empty, and no whitespace or
+control characters. Diagnostics for malformed entries do not
 repeat their values.
 
 ```sh
@@ -84,6 +86,49 @@ Environment values are not copied into lifecycle events or registry records.
 They can still reach child output, so capture files and echoed output require
 the same secret-handling discipline as any other process log.
 
+### Publishing the run id to the child
+
+`--run-id-env KEY` sets `KEY` in the child's environment to this run's **final**
+id — the explicit `--run-id` when one was given, otherwise the id the runner
+generated:
+
+```sh
+processkit-cli run \
+  --run-id-env PROCESSKIT_RUN_ID \
+  --jsonl build.jsonl \
+  -- ./build.sh
+```
+
+The injected value is the same one `run_started.run_id`, the registry record,
+and every control-plane reply carry, so the child (and anything it spawns) can
+correlate its own work with the run without the caller minting an id itself and
+passing it twice as `--run-id <id> --env KEY=<id>` — which duplicates an identity
+that can then drift, and rules out a generated id, since a generated id is not
+knowable outside the run until the run has started.
+
+The flag is strictly opt-in: omit it and nothing is injected. No key is set by
+default.
+
+Collisions are settled without reference to flag order:
+
+| Also given | Result |
+| --- | --- |
+| `--env-clear` | The injection is applied after the clear, so the key survives. |
+| `--env-remove KEY` | The injection is applied after removals, so the key is set. |
+| `--env-file` entry for `KEY` | The injection is applied last, so the run id wins. |
+| `--env KEY=VALUE` | **Refused** at parse time as `USAGE` (100), before anything runs. |
+
+The last row is the deliberate choice: an explicit `--env` for the same key asks
+for a different value of one variable, and silently discarding what the caller
+typed would be worse than refusing the pair. The refusal names the key and never
+repeats the value beside it.
+
+The value is **correlation data, not a credential or a security proof**. It says
+which run some work belongs to; it does not establish who started that run,
+carries no authority, and can be set by anything able to write an environment
+variable. Do not use it to authorize anything — see
+[Threat model](threat-model.md).
+
 ## Run identity
 
 `--run-id` gives the run a stable application-level name:
@@ -98,6 +143,9 @@ processkit-cli run \
 When omitted, the runner generates an id and writes it in `run_started`. A
 caller that needs to address the live run immediately should provide an id or
 read the first event before calling `inspect`, `cancel`, `kill`, or `wait`.
+Whichever way the id was decided, `--run-id-env KEY` publishes that final value
+into the child's environment (see [Publishing the run id to the
+child](#publishing-the-run-id-to-the-child)).
 Explicit ids must contain 1-256 Unicode characters and cannot contain terminal
 control or invisible formatting characters. The same validation applies to
 every by-id command, so an unsafe id is rejected before registry access.

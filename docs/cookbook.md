@@ -42,7 +42,7 @@ processkit-cli run \
 ```
 
 Use absolute program paths when clearing `PATH` entirely. Applied order is
-clear → remove → set.
+clear → remove → env-file → set → `--run-id-env`.
 
 ## Remove one inherited secret
 
@@ -55,6 +55,20 @@ processkit-cli run \
 ```
 
 Environment values are not placed in JSONL, but the child can still echo them.
+
+## Let the child know which run it is in
+
+```sh
+processkit-cli run \
+  --run-id-env PROCESSKIT_RUN_ID \
+  --jsonl correlated.jsonl \
+  -- ./build.sh
+```
+
+The child reads the run's final id — the explicit `--run-id` when given, the
+generated one otherwise — from `PROCESSKIT_RUN_ID`, matching `run_started.run_id`
+and the registry record. Correlation only: the value authorizes nothing and
+anything that can set an environment variable can forge it.
 
 ## Capture output without echoing it live
 

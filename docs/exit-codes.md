@@ -35,7 +35,7 @@ failure is not mistaken for a child result.
 
 | Code | Name              | Meaning                                                                                     |
 |------|-------------------|---------------------------------------------------------------------------------------------|
-| 100  | `USAGE`           | Invalid command line: unknown flag, missing required option, malformed value (including a bad `--timeout`/`--grace` duration), or bad subcommand form. |
+| 100  | `USAGE`           | Invalid command line: unknown flag, missing required option, malformed value (including a bad `--timeout`/`--grace` duration), a contradictory pair of flags (declared conflicts, and the value-level ones checked right after parsing — see `run --run-id-env`), or bad subcommand form. |
 | 101  | `SPAWN`           | The target program could not be started (not found, not executable, bad `--cwd`, permission denied). |
 | 102  | `BACKEND`         | ProcessKit backend/containment failure: kernel container, job object, IPC endpoint, or run registry could not be established — including a requested resource limit (`--max-memory` / `--max-processes` / `--cpu-quota`) the active mechanism could not apply (the machine-readable `limit_hit` event names which one; see "Resource limits" below). |
 | 103  | `CONTROL`         | A by-`run-id` command could not be resolved to **the** single live run it names. For `inspect` / `cancel` / `kill` that covers every way the target cannot be reached: no such run id, a stale/dead registry entry, an entry whose liveness could not be probed at all (reported as `unprobed` — a refusal, not a claim that the runner died), an ambiguous run id (more than one live run registered under it), or an IPC failure. `inspect` adds one reason of its own that is *not* an unreachable runner: the target answered, and its **answer** was rejected — a reply declaring a `snapshot_version` outside the range this client reads (newer than it implements, or older than it still decodes) is refused rather than rendered under semantics its sender never promised (see `docs/control-plane.md`, "Snapshot version: a newer runner's reply is refused, an older one is read"). Retrying does not clear it, but that is no way to tell it apart from the others: a confirmed-stale entry and an ambiguous run id are equally unaffected by a retry. The registry-only `wait` shares exactly one of those reasons — an **ambiguous** run id — and reports it with this same code even though it contacts no runner: there is no single run to wait for. `cancel --all` / `kill --all` reuse this same code for a different fact — one or more record-addressed targets in the confirmed-live snapshot remained potentially live but could not be reached safely or did not acknowledge the command. A target confirmed gone before dispatch is instead the successful `already_gone` report status. The per-target reason is in the JSON report on stdout, not just the stderr tally. See `docs/control-plane.md`, "`cancel --all` / `kill --all`". |
@@ -410,7 +410,10 @@ Two things, both deliberate and both stated here rather than left as silent gaps
 - **clap's parse-time usage errors.** An unknown flag, a malformed `--timeout`, a
   missing subcommand — everything that exits `USAGE` (100) *before* the binary has
   decided what it was asked to do — keeps clap's own human-readable
-  usage/suggestion text even under `--error-format json`. There is no `operation`
+  usage/suggestion text even under `--error-format json`. The cross-argument
+  refusals checked immediately after parsing (today: `run --run-id-env <KEY>`
+  against an explicit `run --env <KEY>=…`) are part of this group and behave
+  identically: same reserved `100`, same clap rendering, no side effects. There is no `operation`
   to name and no run to point at, and clap's text is a rendering for a human, not
   a verdict about a run; forcing it into an envelope would distort both. A machine
   still gets the reserved `100`, and the supported way to establish that a flag
