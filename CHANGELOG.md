@@ -12,6 +12,45 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- `doctor [--json]`: a **runtime qualification of the host**, and the side-effecting
+  counterpart to `probe`. `probe` proves *this binary* exposes the surface a consumer
+  needs — it reads compile-time constants and the in-memory CLI tree, spawns nothing,
+  and touches no registry, container, or transport, which is exactly what makes it
+  safe as a per-launch preflight and exactly why a passing probe is not evidence that
+  a *run* will work here. A binary can satisfy every `--require-*` check and still
+  fail its first real run on a registry directory it cannot create, a containment
+  mechanism the kernel will not hand out, or a local IPC endpoint that will not bind.
+  `doctor` closes that gap by doing the thing: it performs a bounded scratch `run` of
+  this binary's own harmless child (the new report-replacing
+  `doctor --scratch-child <duration>`, which sleeps and does nothing else — published
+  rather than hidden, so the claim that a qualification contains only this binary's
+  own code can be checked, and refused by clap in combination with any other flag so
+  a requested qualification can never be silently replaced by a sleep), drives that
+  run as an ordinary control-plane client, and reports the facts it observed: the
+  registry directory and its owner-only protection (re-read from the filesystem, by
+  the same predicate the registry's own tests use), the containment `mechanism` and
+  `abrupt_cleanup` level this machine really gives a run, an `inspect`/`cancel`/
+  terminal-wait round-trip over the local transport, a **confirmed**-empty teardown
+  (`read_error` and the remaining members, not one boolean), optionally the
+  whole-tree resource controller (`--check-resource-controller`), and per-phase
+  `elapsed_ms` so a slow host is diagnosable rather than a generic hang. It
+  reimplements none of it — every phase drives the same production code a caller's
+  own `run` and control clients take — which is what makes a pass evidence about
+  *this* containment path on *this* host. On success every scratch artifact is gone
+  and the report says so, having checked each; on a failed phase a **named**
+  diagnostics directory is kept (`diagnostics_dir`) holding the scratch run's JSONL
+  stream, the runner's stdout/stderr, and a copy of the report. The requirement flags
+  (`--require-mechanism`, `--require-abrupt-cleanup`, `--require-resource-controller`)
+  gate the **exit code only** — the new reserved `HOST_UNQUALIFIED` = `116`, the
+  host-side twin of `PROBE_INCOMPATIBLE` (`110`) — while the report carries the
+  observed facts either way; a matching `--error-format json` kind
+  (`host_unqualified`) accompanies it. The report is published as a ninth
+  machine-output family (`fixtures/schema/cli/doctor.schema.json` + `doctor.jsonl`)
+  carrying its own `doctor_version` (currently `1`), versioned because a
+  qualification report is *kept*: the failure path writes it into the diagnostics
+  directory precisely so it can be read later, elsewhere, by whoever debugs the host
+  rather than by whoever ran the command. See `docs/troubleshooting.md`, "Qualifying
+  a host: `doctor`", `docs/integration.md` §1, and `docs/exit-codes.md`.
 - `attest --run-id <id> [--json]`: a read-only control-plane command that asks a live
   run whether **the calling process** is inside its ProcessKit container. The runner
   takes the caller's identity from the control transport itself — unix socket peer

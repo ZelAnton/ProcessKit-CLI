@@ -262,6 +262,12 @@ processkit-cli prune   [--json] [--dry-run] [--label <KEY=VALUE>]...
 processkit-cli probe   --json [--require-schema-version <N>]
                        [--require-exit-code-band <start>-<end>]
                        [--require-surface <token>]...
+processkit-cli doctor  [--json] [--timeout <duration>]
+                       [--check-resource-controller]
+                       [--require-mechanism <name>]
+                       [--require-abrupt-cleanup <level>]
+                       [--require-resource-controller]
+processkit-cli doctor  --scratch-child <duration>
 
 # accepted by every subcommand above, before or after it:
                        [--error-format <human|json>]
@@ -277,6 +283,22 @@ surface (version, `schema_version`, exit-code band, and CLI surface tokens) as o
 JSON line and — with `--require-*` — verifies it, so a consumer can confirm a
 runner is usable **before** launching a payload. It spawns no child and touches no
 registry or container.
+
+`doctor` is its side-effecting counterpart, and the pair is deliberate: `probe`
+qualifies the **binary**, `doctor` qualifies the **host**. A binary can pass every
+`--require-*` check and still fail its first real run on a registry directory it
+cannot create, a containment mechanism the kernel will not hand out, or a local IPC
+endpoint that will not bind — so `doctor` runs a bounded scratch containment of this
+binary's own harmless child (`--scratch-child`, which sleeps briefly and does nothing
+else), drives it through the real control plane (`inspect`, `cancel`, terminal wait),
+and reports what it observed: the registry path and its owner-only protection, the
+containment mechanism and abrupt-cleanup level, the transport round-trip, a
+**confirmed**-empty teardown, optionally the resource controller, and per-phase
+timings. It cleans up everything it created on success and keeps a named diagnostics
+directory on failure. `--require-*` here gates only the exit code
+(`HOST_UNQUALIFIED`, 116); the report carries the observed facts either way. Run it
+once per host at setup time — see [Troubleshooting](docs/troubleshooting.md) and
+[the integration guide](docs/integration.md).
 
 `--error-format` is the CLI's one **global** option: it parses before or after the
 subcommand and every subcommand honors it. `--error-format json` replaces the
@@ -674,6 +696,13 @@ stream it checked does not conform to this binary's event schema.
 reason: it is a *decided verdict* — the runner was reached, it named the caller from
 the control transport, and the caller is not in its container — which is exactly why
 it is not folded into the `CONTROL` (`103`) that means "no answer to act on".
+
+`doctor` adds the last one, `HOST_UNQUALIFIED` (`116`), and it is the host-side twin
+of `PROBE_INCOMPATIBLE` (`110`): `110` says *this binary* does not expose the surface
+you need, `116` says *this machine* did not complete the qualification — or completed
+it and is not the machine you required. The two call for opposite responses (install a
+different build, versus fix or avoid the host), which is why they are different
+numbers.
 
 A code is necessarily coarse — `CONTROL` (`103`) alone covers eight different
 situations, from a stale registry entry to an ambiguous run id. A consumer that

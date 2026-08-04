@@ -111,7 +111,7 @@ use crate::exit::{self, RunnerError};
 /// Version of the envelope's field set and of the [`ErrorKind`] vocabulary's
 /// meanings — the pin a consumer reads before trusting the object's shape.
 ///
-/// **Why this contract carries a version when four of the seven *other* families
+/// **Why this contract carries a version when four of the eight *other* families
 /// under `fixtures/schema/cli/` do not.** Those are synchronous stdout
 /// renderings consumed by whoever just invoked this exact binary, so the caller
 /// already knows which version produced them and can pin it with `probe`
@@ -121,7 +121,8 @@ use crate::exit::{self, RunnerError};
 /// incident triage that has the stderr but not the invocation. That is the same
 /// "durable artifact / read by a party that did not invoke this binary" test the
 /// JSONL `schema_version`, the registry `registry_version`, the control-plane
-/// `snapshot_version`, the attestation's `attestation_version`, and the probe
+/// `snapshot_version`, the attestation's `attestation_version`, the qualification
+/// report's `doctor_version`, and the probe
 /// report's `probe_version` all meet.
 ///
 /// Carrying a version does **not** make this a fourth compatibility surface. The
@@ -315,6 +316,19 @@ pub enum ErrorKind {
     /// is a different build. Not retryable: it is a property of the platform, not a
     /// transient condition.
     PeerIdentityUnsupported,
+    /// `doctor` finished qualifying this host and the verdict is no
+    /// ([`exit::HOST_UNQUALIFIED`], 116): a phase of the qualification failed, or a
+    /// `--require-*` expectation about the host was not met.
+    ///
+    /// A verdict about the **machine**, and the exact counterpart of
+    /// [`Self::ProbeIncompatible`], which is a verdict about the **binary**: one says
+    /// the installed file does not expose the surface you need, the other that this
+    /// environment did not successfully create a registry, contain a process,
+    /// round-trip its control plane, and clean up. Which of `doctor`'s phases failed,
+    /// and which requirement went unmet, is in the report on stdout — printed for a
+    /// negative verdict exactly as it is for a positive one. Not retryable: a host
+    /// that cannot contain a process does not become able to by being asked twice.
+    HostUnqualified,
     /// A reserved-band code this build will not put a finer name to — the
     /// forward-compatible fallback, so the envelope can always be produced and `kind`
     /// is never absent or invented. Read `code`, not `kind`, when this appears.
@@ -326,13 +340,14 @@ pub enum ErrorKind {
     /// here:
     ///
     /// - a code **no build assigns**: the retired `105`, or the still-reserved
-    ///   `116`-`119`. Naming a number whose meaning is unassigned would be worse than
+    ///   `117`-`119`. Naming a number whose meaning is unassigned would be worse than
     ///   saying so (see [`Self::for_code`]);
     /// - a code **this build assigns to a different subcommand**: `110`
     ///   ([`Self::ProbeIncompatible`]), `112` ([`Self::WaitTimeout`]), `114`
-    ///   ([`Self::EventsInvalid`]), `115` ([`Self::NotAMember`]) — minted only by
-    ///   `probe`, `wait`, `events --validate`, and `attest`, and unreachable from
-    ///   `run`. Reading a foreign build's
+    ///   ([`Self::EventsInvalid`]), `115` ([`Self::NotAMember`]), `116`
+    ///   ([`Self::HostUnqualified`]) — minted only by
+    ///   `probe`, `wait`, `events --validate`, `attest`, and `doctor`, and unreachable
+    ///   from `run`. Reading a foreign build's
     ///   number through this build's table would state a verdict about a run that
     ///   nothing established: a relayed `112` would claim `wait_timeout` — the one
     ///   retryable kind, meaning "the run is still going, wait again" — for a run that
@@ -376,6 +391,7 @@ impl ErrorKind {
             Self::EventsInvalid => "events_invalid",
             Self::NotAMember => "not_a_member",
             Self::PeerIdentityUnsupported => "peer_identity_unsupported",
+            Self::HostUnqualified => "host_unqualified",
             Self::Unknown => "unknown",
         }
     }
@@ -431,6 +447,7 @@ impl ErrorKind {
             | Self::EventsInvalid
             | Self::NotAMember
             | Self::PeerIdentityUnsupported
+            | Self::HostUnqualified
             | Self::Unknown => false,
         }
     }
@@ -461,7 +478,8 @@ impl ErrorKind {
             exit::OUTPUT_OVERFLOW => Self::OutputOverflow,
             exit::EVENTS_INVALID => Self::EventsInvalid,
             exit::NOT_A_MEMBER => Self::NotAMember,
-            // `NOT_IMPLEMENTED` (105, retired) and the reserved `116`-`119`: no
+            exit::HOST_UNQUALIFIED => Self::HostUnqualified,
+            // `NOT_IMPLEMENTED` (105, retired) and the reserved `117`-`119`: no
             // active path mints them, and inventing a name for a number whose
             // meaning is not assigned would be worse than saying so.
             _ => Self::Unknown,
@@ -490,12 +508,13 @@ pub struct ErrorEnvelope<'a> {
     /// The finer name of what failed. See [`ErrorKind`].
     pub kind: ErrorKind,
     /// The subcommand that failed (`run`, `inspect`, `cancel`, `kill`, `attest`,
-    /// `wait`, `events`, `list`, `prune`, `probe`) — always a `&'static str` from the
-    /// CLI's own definition, never caller-supplied text.
+    /// `wait`, `events`, `list`, `prune`, `probe`, `doctor`) — always a `&'static str`
+    /// from the CLI's own definition, never caller-supplied text.
     pub operation: &'static str,
     /// The run id the invocation named, or `null` when it named none: an `--all`
     /// fan-out, a whole-registry command (`list`/`prune`), a self-contained `probe`,
-    /// or a `run` that let the runner generate its id. Present rather than omitted
+    /// a `doctor` (whose only run is the scratch one it mints for itself), or a `run`
+    /// that let the runner generate its id. Present rather than omitted
     /// when null, so a consumer never distinguishes absent from unknown — the same
     /// convention the other published shapes use.
     pub run_id: Option<&'a str>,
@@ -609,6 +628,7 @@ mod tests {
         ErrorKind::EventsInvalid,
         ErrorKind::NotAMember,
         ErrorKind::PeerIdentityUnsupported,
+        ErrorKind::HostUnqualified,
         ErrorKind::Unknown,
     ];
 
@@ -721,6 +741,7 @@ mod tests {
             exit::OUTPUT_OVERFLOW,
             exit::EVENTS_INVALID,
             exit::NOT_A_MEMBER,
+            exit::HOST_UNQUALIFIED,
         ] {
             let kind = ErrorKind::for_code(code);
             assert_ne!(
@@ -764,14 +785,16 @@ mod tests {
 
     #[test]
     fn an_unassigned_reserved_code_is_named_unknown_rather_than_guessed() {
-        // 105 is retired and 116-119 are reserved: no active path mints them, and a
+        // 105 is retired and 117-119 are reserved: no active path mints them, and a
         // relayed detached start failure is the one way a foreign build's code could
-        // arrive here.
+        // arrive here. The lower bound walks up from the *last assigned* code rather
+        // than naming a number, so minting one moves this range instead of leaving a
+        // stale assertion that the new code means nothing.
         assert_eq!(
             ErrorKind::for_code(exit::NOT_IMPLEMENTED),
             ErrorKind::Unknown
         );
-        for code in exit::NOT_A_MEMBER + 1..=exit::RUNNER_RANGE_END {
+        for code in exit::HOST_UNQUALIFIED + 1..=exit::RUNNER_RANGE_END {
             assert_eq!(
                 ErrorKind::for_code(code),
                 ErrorKind::Unknown,

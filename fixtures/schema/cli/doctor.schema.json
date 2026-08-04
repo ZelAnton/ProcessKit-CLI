@@ -1,0 +1,325 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/ZelAnton/ProcessKit-CLI/main/fixtures/schema/cli/doctor.schema.json",
+  "title": "processkit-cli `doctor --json` runtime-qualification report",
+  "description": "The single JSON line `processkit-cli doctor --json` prints to stdout — the side-effecting counterpart of `probe --json`. Where the probe report says what this *binary* is, this one says what this *host* did: it is written after a bounded scratch run of the binary's own harmless child, and carries the facts observed doing it (registry creation and owner-only protection, containment mechanism and abrupt-cleanup level, a local control-transport inspect/cancel/terminal round-trip, a confirmed-empty teardown, optionally the resource controller, and per-phase timings). Printed in both the qualified and the unqualified case (a failed phase or an unmet `--require-*` expectation exits HOST_UNQUALIFIED (116) with `qualified: false`), so the caller always has a parseable result. The normative prose is docs/troubleshooting.md, \"Qualifying a host: `doctor`\", and docs/integration.md §1; the in-code source of truth is src/doctor.rs. Validated against fixtures/schema/cli/doctor.jsonl, and against the real binary's output, by tests/machine_output.rs.",
+  "$ref": "#/$defs/doctorReport",
+  "$defs": {
+    "doctorReport": {
+      "type": "object",
+      "description": "One `doctor --json` report line.",
+      "properties": {
+        "doctor_version": {
+          "const": 1,
+          "description": "The report's own format version (src/doctor.rs, DOCTOR_VERSION) — an axis of its own, independent of the JSONL `schema_version`, `probe_version`, `snapshot_version`, `attestation_version`, `error_version`, and `registry_version`. Versioned because this report is meant to be kept: a failed qualification writes it into the diagnostics directory it leaves behind, where it is read later, out of context, by someone who did not run it (fixtures/schema/cli/README.md, \"Versioning\"). Pinned here: a bump is a breaking change to this shape and updates this document with it."
+        },
+        "binary": {
+          "const": "processkit-cli",
+          "description": "The binary's package name, so a report read out of context still names what produced it."
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.+-]+)?$",
+          "description": "The binary's semantic version (CARGO_PKG_VERSION) — which build performed this qualification."
+        },
+        "os": {
+          "type": "string",
+          "description": "The host's operating system as this build names it (`std::env::consts::OS`: `windows`, `linux`, `macos`, …). The coarsest fact about *which* host was qualified, and the first thing a reader of a kept report needs. Open-ended on purpose: it is Rust's target vocabulary, not one this project defines."
+        },
+        "qualified": {
+          "type": "boolean",
+          "description": "Whether every phase succeeded **and** every `--require-*` expectation was met. The one-line verdict; `failures` and `mismatches` are the two independent reasons it can be false, and everything else here is the evidence behind it. `false` exits HOST_UNQUALIFIED (116)."
+        },
+        "registry": {
+          "description": "The per-user run registry as observed, or `null` if that phase never ran.",
+          "oneOf": [{ "$ref": "#/$defs/registryFacts" }, { "type": "null" }]
+        },
+        "containment": {
+          "description": "The containment mechanism as observed, or `null` if no scratch run ever reported one.",
+          "oneOf": [{ "$ref": "#/$defs/containmentFacts" }, { "type": "null" }]
+        },
+        "control": {
+          "description": "The local control-transport round-trip as observed, or `null` if it never got far enough to report anything.",
+          "oneOf": [{ "$ref": "#/$defs/controlFacts" }, { "type": "null" }]
+        },
+        "cleanup": {
+          "description": "Teardown and artifact cleanup as observed, or `null` if the scratch run never reached teardown.",
+          "oneOf": [{ "$ref": "#/$defs/cleanupFacts" }, { "type": "null" }]
+        },
+        "resource_controller": {
+          "description": "The optional resource-controller check, or `null` when `--check-resource-controller` was not asked for. **Null means \"not checked\", never \"not available\"** — an absent fact and a negative one are different answers, and only the flag decides which of the two this field carries.",
+          "oneOf": [{ "$ref": "#/$defs/resourceControllerFacts" }, { "type": "null" }]
+        },
+        "phases": {
+          "type": "array",
+          "description": "Each phase this invocation ran, in the order it ran them. A failed phase is the last one present — except `resource_controller`, which is isolated by design and runs after every mandatory phase has already finished.",
+          "items": { "$ref": "#/$defs/phaseReport" },
+          "minItems": 1
+        },
+        "elapsed_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Wall-clock milliseconds for the whole qualification."
+        },
+        "failures": {
+          "type": "array",
+          "description": "One human-readable reason per **failed phase** — what this host could not do. Always present; empty when every phase succeeded.",
+          "items": { "type": "string" }
+        },
+        "mismatches": {
+          "type": "array",
+          "description": "One human-readable reason per unmet `--require-*` expectation — what this host does, that the caller needed to be otherwise. Always present; empty when none was requested or all were met. Deliberately a separate array from `failures`: \"this host is broken\" and \"this host is not the one you asked for\" are different verdicts, even though both make `qualified` false and both exit 116.",
+          "items": { "type": "string" }
+        },
+        "diagnostics_dir": {
+          "type": ["string", "null"],
+          "description": "The directory holding this run's scratch artifacts — the scratch run's JSONL stream, its stdout/stderr, and a copy of this report — kept **only** when a phase failed, and named here so the next step is a path rather than a guess. `null` on a host that completed every phase, which leaves nothing behind at all (including when a `--require-*` expectation was the only thing unmet: nothing failed, so there is nothing to keep)."
+        }
+      },
+      "required": [
+        "doctor_version",
+        "binary",
+        "version",
+        "os",
+        "qualified",
+        "registry",
+        "containment",
+        "control",
+        "cleanup",
+        "resource_controller",
+        "phases",
+        "elapsed_ms",
+        "failures",
+        "mismatches",
+        "diagnostics_dir"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": { "qualified": { "const": true } },
+            "required": ["qualified"]
+          },
+          "then": {
+            "properties": {
+              "failures": { "maxItems": 0 },
+              "mismatches": { "maxItems": 0 },
+              "diagnostics_dir": { "type": "null" }
+            },
+            "description": "A qualified host carries neither reason and leaves nothing behind: `qualified` is exactly `failures.is_empty() && mismatches.is_empty()` (src/doctor.rs), and the scratch directory is kept only for a failure."
+          },
+          "else": {
+            "anyOf": [
+              { "properties": { "failures": { "minItems": 1 } } },
+              { "properties": { "mismatches": { "minItems": 1 } } }
+            ],
+            "description": "An unqualified report always names at least one concrete reason, in one array or the other — never a bare negative verdict."
+          }
+        },
+        {
+          "if": {
+            "properties": { "failures": { "minItems": 1 } },
+            "required": ["failures"]
+          },
+          "then": {
+            "properties": { "diagnostics_dir": { "type": "string" } },
+            "description": "A failed phase always leaves the named diagnostics directory behind (src/doctor.rs, `into_report`), so the evidence and the verdict can be read together."
+          }
+        }
+      ]
+    },
+    "registryFacts": {
+      "type": "object",
+      "description": "The per-user run registry this host resolved, and whether it really is protected to its owner alone.",
+      "properties": {
+        "dir": {
+          "type": "string",
+          "description": "The registry directory this host resolves to (`PROCESSKIT_CLI_REGISTRY_DIR` if set, else the platform default — docs/registry.md). Named explicitly because \"which directory\" is the first question a permissions problem raises."
+        },
+        "owner_only": {
+          "type": "boolean",
+          "description": "Whether the directory grants access to its owner alone, **re-read from the filesystem** after the create rather than inferred from the create succeeding. The check is the very predicate the registry's own tests use (src/registry/platform/{unix,windows}.rs, `is_owner_only`): a `0700` mode compare on unix, a binary-SID ACE compare against a protected DACL on Windows. `false` fails the phase — another account on this host could read or alter the records."
+        },
+        "protection": {
+          "type": "string",
+          "enum": ["posix_0700", "windows_owner_only_dacl"],
+          "description": "How that protection is expressed on this platform, so `owner_only` names a mechanism rather than an opinion (src/registry/mod.rs, OWNER_ONLY_PROTECTION)."
+        }
+      },
+      "required": ["dir", "owner_only", "protection"],
+      "additionalProperties": false
+    },
+    "containmentFacts": {
+      "type": "object",
+      "description": "What this host actually gave the scratch run, read from that run's own `run_started` event.",
+      "properties": {
+        "mechanism": {
+          "type": "string",
+          "enum": ["job_object", "cgroup_v2", "process_group", "unknown"],
+          "description": "The containment mechanism this host selected — the same vocabulary the JSONL `run_started` event publishes (docs/schema.md; `unknown` is that event's own forward-compatible fallback for a mechanism this build predates). `--require-mechanism` compares against this value exactly."
+        },
+        "abrupt_cleanup": {
+          "type": "string",
+          "enum": ["whole_tree", "direct_child_only", "none"],
+          "description": "What still reaps the tree if the runner is killed without running destructors — an OS-derived property of the mechanism, not a setting (docs/platform-support.md), and the same vocabulary `run_started` publishes. `--require-abrupt-cleanup` compares against this value exactly; the three values are platform facts and this project publishes no ordering between them, so it is not an \"at least this strong\" comparison."
+        },
+        "root_pid": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "The scratch child's PID as the run reported it, or `null` if the backend exposed none. Evidence that a real process was really contained, rather than that a container was merely created."
+        }
+      },
+      "required": ["mechanism", "abrupt_cleanup", "root_pid"],
+      "additionalProperties": false
+    },
+    "controlFacts": {
+      "type": "object",
+      "description": "The local control transport, driven as an ordinary client against the scratch run — the same client code `inspect` and `cancel` use, not a parallel one written to pass.",
+      "properties": {
+        "endpoint": {
+          "type": "string",
+          "description": "The endpoint the scratch run published and this qualification connected to: a unix socket path, or a Windows named pipe name."
+        },
+        "transport": {
+          "type": "string",
+          "enum": ["unix_socket", "windows_named_pipe"],
+          "description": "Which local transport this build binds (src/control/mod.rs, TRANSPORT)."
+        },
+        "inspected_members": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How many container members the `inspect` round-trip came back with — the round-trip's *content*, not merely its success. At least one on a healthy host (the scratch child itself); the exact number is a property of the platform's member enumeration."
+        },
+        "cancel_acknowledged": {
+          "type": "boolean",
+          "description": "Whether the runner acknowledged the `cancel` verb — the mutating half of the round-trip, which a read-only `inspect` cannot establish on its own."
+        },
+        "terminal_exit_code": {
+          "type": ["integer", "null"],
+          "description": "The exit code the scratch runner ended with, or `null` if it was ended by a signal rather than an exit. `108` (CONTROL_CANCELLED) on a healthy host: the cancel this qualification sent is what ended it."
+        },
+        "terminal_source": {
+          "type": ["string", "null"],
+          "description": "The terminal `runner_exit` event's `source` — `control_cancel` on a healthy host — read from the run's own stream, so the run's account and this report cannot disagree. `null` when the stream carried no terminal event. Its vocabulary is fixtures/schema/v1/schema.json's `runnerExit.source`, which stays its single source of truth and is deliberately not duplicated here."
+        }
+      },
+      "required": [
+        "endpoint",
+        "transport",
+        "inspected_members",
+        "cancel_acknowledged",
+        "terminal_exit_code",
+        "terminal_source"
+      ],
+      "additionalProperties": false
+    },
+    "cleanupFacts": {
+      "type": "object",
+      "description": "Teardown and artifact cleanup — the half of containment a host can fail *after* everything else worked.",
+      "properties": {
+        "members_before": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "The container's size as teardown began (`cleanup_started.members_before`), or `null` if the run reported no teardown at all."
+        },
+        "remaining": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Members still in the post-kill snapshot (`cleanup_finished.remaining`), or `null` if the run reported no teardown. On the `process_group` mechanism a non-zero value is **not** on its own a failed teardown: that snapshot is a `kill(pid, 0)` probe, which a just-exited child nobody has reaped yet still answers (docs/schema.md, \"cleanup_finished\"), so it is reported as an observed fact and noted on the phase rather than treated as a survivor. On every other mechanism it is conclusive and fails the phase."
+        },
+        "remaining_pids": {
+          "type": "array",
+          "description": "The PIDs behind `remaining`, when there were any. Always present; empty when there were none.",
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "read_error": {
+          "type": "boolean",
+          "description": "Whether **either** member read failed during teardown (`cleanup_started.read_error` or `cleanup_finished.read_error`). This is what makes a `remaining: 0` mean something: a zero from a failed read is a gap, not a confirmed-empty container. `true` fails the phase on every mechanism."
+        },
+        "confirmed_empty": {
+          "type": "boolean",
+          "description": "The reads succeeded **and** nothing remained. The conjunction is the point — either half alone would be an unearned claim. Reported independently of the phase verdict, which is mechanism-aware (see `remaining` and `teardown_snapshot_conclusive`)."
+        },
+        "teardown_snapshot_conclusive": {
+          "type": "boolean",
+          "description": "Whether a **non-empty** post-teardown snapshot would have been conclusive evidence that something survived: `true` on every mechanism whose teardown is atomic over the whole tree, `false` on the POSIX `process_group` fallback alone. It is what distinguishes the two readings of the same `remaining` count — on that one mechanism a `confirmed_empty: false` is the honest limit of what the platform can report rather than proof of a survivor, and does not fail the qualification. Published as a field rather than left to prose because a consumer deciding what to do about a non-zero `remaining` needs it."
+        },
+        "registry_record_removed": {
+          "type": "boolean",
+          "description": "Whether the scratch run's registry record is gone. Established by polling the registry until it disappears, not assumed from the runner having exited: a runner that exits without removing its record leaves exactly the stale entry `prune` exists to reap, and a caller qualifying a host wants to know that here rather than in production."
+        },
+        "endpoint_released": {
+          "type": "boolean",
+          "description": "Whether the control endpoint was released: nothing answers a connection to it any more, and — on unix, where the transport creates a private socket directory on disk — that directory is gone too. On Windows a named pipe is a kernel object that cannot outlive its runner, so only the first half is a filesystem question there."
+        },
+        "scratch_removed": {
+          "type": "boolean",
+          "description": "Whether the scratch directory (the run's JSONL stream and the runner's stdout/stderr) was deleted. `false` exactly when it was deliberately kept as `diagnostics_dir`."
+        }
+      },
+      "required": [
+        "members_before",
+        "remaining",
+        "remaining_pids",
+        "read_error",
+        "confirmed_empty",
+        "teardown_snapshot_conclusive",
+        "registry_record_removed",
+        "endpoint_released",
+        "scratch_removed"
+      ],
+      "additionalProperties": false
+    },
+    "resourceControllerFacts": {
+      "type": "object",
+      "description": "The optional whole-tree resource-controller check, present only when `--check-resource-controller` asked for it **and** the check reached a verdict. It runs as a second, separate scratch run *after* every mandatory phase has finished, so a host without a controller still gets a complete report about everything else. Every way the check could not be *performed* — no budget left, a scratch run that would not spawn, a wait that could not complete — fails the `resource_controller` phase and leaves this object `null` rather than writing a negative nobody established.",
+      "properties": {
+        "requested": {
+          "type": "string",
+          "description": "The cap this check asked for, spelled as the `run` flag that asks for it — so the report names a reproducible invocation rather than an abstraction."
+        },
+        "available": {
+          "type": "boolean",
+          "description": "Whether the container could be created with that cap installed. `false` means this host's containment mechanism cannot enforce whole-tree resource limits (docs/resource-limits.md), which is a property of the platform rather than a fault — it fails nothing by itself, and only `--require-resource-controller` turns it into a verdict."
+        },
+        "detail": {
+          "type": ["string", "null"],
+          "description": "What the scratch run said when the cap could not be installed, taken from its own `limit_hit` event where there was one. `null` when the cap installed cleanly. Free text: a diagnostic, not a contract."
+        }
+      },
+      "required": ["requested", "available", "detail"],
+      "additionalProperties": false
+    },
+    "phaseReport": {
+      "type": "object",
+      "description": "One phase of the qualification, and what it cost.",
+      "properties": {
+        "phase": {
+          "type": "string",
+          "enum": [
+            "registry",
+            "launch",
+            "inspect",
+            "cancel",
+            "terminal_wait",
+            "cleanup",
+            "resource_controller"
+          ],
+          "description": "The phase's name. The six mandatory phases run in the order listed; `resource_controller` is the optional seventh and runs last."
+        },
+        "ok": { "type": "boolean", "description": "Whether the phase succeeded." },
+        "elapsed_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Wall-clock milliseconds this phase took. The reason a slow host is diagnosable rather than a generic failure: the per-phase totals say *where* the time went."
+        },
+        "detail": {
+          "type": ["string", "null"],
+          "description": "Why it failed — or, on a phase that succeeded, a qualifying note about what it could and could not establish (today: a post-teardown member count on the one mechanism where such a count is inconclusive). `null` when there is neither. Free text: a diagnostic, not a contract."
+        }
+      },
+      "required": ["phase", "ok", "elapsed_ms", "detail"],
+      "additionalProperties": false
+    }
+  }
+}

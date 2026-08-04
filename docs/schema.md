@@ -44,7 +44,7 @@ alternatives avoid that:
   rejected at parse time as an ordinary usage error (exit `100`), not silently
   accepted with the requested checks skipped — a `probe` invocation that asks
   for expectations to be verified must never exit `0` without verifying them
-  (see `docs/integration.md`, "Fail-closed preflight: `probe`"). `--print-schema`
+  (see `docs/integration.md`, "Fail-closed preflight"). `--print-schema`
   itself is an ordinary, additive CLI surface token
   (`probe:--print-schema`) like any other `probe` flag.
 - Every release archive (`.github/workflows/release.yml`) bundles a `schema/`

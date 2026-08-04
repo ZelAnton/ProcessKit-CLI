@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/ZelAnton/ProcessKit-CLI/main/fixtures/schema/cli/probe.schema.json",
   "title": "processkit-cli `probe --json` compatibility report",
-  "description": "The single JSON line `processkit-cli probe --json` prints to stdout — the fail-closed launcher preflight a consumer runs on a candidate binary before launching anything through it. Printed in both the compatible and the incompatible case (an unmet `--require-*` expectation exits PROBE_INCOMPATIBLE (110) with `compatible: false`), so the consumer always has a parseable result. The normative prose is docs/compatibility.md and docs/integration.md, \"Fail-closed preflight: `probe`\"; the in-code source of truth is src/probe.rs. Validated against fixtures/schema/cli/probe.jsonl, and against the real binary's output, by tests/machine_output.rs.",
+  "description": "The single JSON line `processkit-cli probe --json` prints to stdout — the fail-closed launcher preflight a consumer runs on a candidate binary before launching anything through it. Printed in both the compatible and the incompatible case (an unmet `--require-*` expectation exits PROBE_INCOMPATIBLE (110) with `compatible: false`), so the consumer always has a parseable result. The normative prose is docs/compatibility.md and docs/integration.md, \"Fail-closed preflight\"; the in-code source of truth is src/probe.rs. Validated against fixtures/schema/cli/probe.jsonl, and against the real binary's output, by tests/machine_output.rs.",
   "$ref": "#/$defs/probeReport",
   "$defs": {
     "u8": {

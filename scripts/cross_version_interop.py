@@ -95,18 +95,20 @@ SCHEMA_LIST_VALUED = ("oneOf", "anyOf", "allOf", "prefixItems")
 SCHEMA_MAP_VALUED = ("properties", "patternProperties", "$defs", "definitions",
                      "dependentSchemas")
 
-# `docs/compatibility.md`, "Machine-output schemas": of the eight published
-# `fixtures/schema/cli/` families, FOUR carry a version field of their own —
+# `docs/compatibility.md`, "Machine-output schemas": of the nine published
+# `fixtures/schema/cli/` families, FIVE carry a version field of their own —
 # `probe --json` (`probe_version`), `inspect --json` (`snapshot_version`),
-# `attest --json` (`attestation_version`), and the `--error-format json` failure
+# `attest --json` (`attestation_version`), `doctor --json` (`doctor_version`), and
+# the `--error-format json` failure
 # envelope (`error_version`). The other four (`list`, `control-ack`, `prune`,
 # `wait`) deliberately do not and ride on the CLI surface instead. This lane
 # compares a *released* binary against the current documents, so it checks the two
-# of those four a released binary can actually be compared on: the envelope and
-# `attest` are both new in the current release and no published binary emits
-# either yet, leaving nothing on the other side of the comparison. Add each here
-# the first time a release ships it (`--error-format`, `attest`). Keep that scope
-# explicit either way: it must not be generalised in either direction.
+# of those five a released binary can actually be compared on: the envelope,
+# `attest`, and `doctor` are all new in the current release and no published binary
+# emits any of them yet, leaving nothing on the other side of the comparison. Add
+# each here
+# the first time a release ships it (`--error-format`, `attest`, `doctor`). Keep that
+# scope explicit either way: it must not be generalised in either direction.
 #
 # Each entry addresses the version field's own schema NODE, not one pinning
 # keyword inside it, because the published documents pin in two deliberately

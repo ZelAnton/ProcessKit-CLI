@@ -13,7 +13,7 @@ normative text — every concrete claim below is a pointer to, and a minimal
 worked example of, the contract those documents define; **on any disagreement,
 the linked document is the source of truth.**
 
-## 1. Fail-closed preflight: `probe`
+## 1. Fail-closed preflight: `probe` (the binary), then `doctor` (the host)
 
 Before launching anything through a candidate `processkit-cli` binary, verify
 it is compatible. `probe` is side-effect-free — it spawns no child and touches
@@ -81,10 +81,11 @@ validate what it parsed instead of re-deriving the shape by hand. Every
 machine-readable output in this guide has such a pair; see
 [`fixtures/schema/cli/README.md`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/fixtures/schema/cli/README.md)
 for the full table, and `docs/compatibility.md`, "Machine-output schemas", for
-why half of these outputs carry no version field of their own (the `probe`
+why some of these outputs carry no version field of their own (the `probe`
 report's `probe_version`, the `inspect` snapshot's `snapshot_version`, the
-failure envelope's `error_version` — §7 — and the attestation's
-`attestation_version` — §4 — are the four that do).
+failure envelope's `error_version` — §7 — the attestation's
+`attestation_version` — §4 — and the qualification report's `doctor_version`
+— below — are the five that do).
 
 `probe --print-schema` is a separate, simpler mode on the same subcommand: it
 prints this binary's embedded JSONL event-schema document instead of the
@@ -95,6 +96,54 @@ that combination is rejected as an ordinary `USAGE` (100) parse error, never a
 silent skip of the requested checks, so it can never produce a false "ok" on
 an invocation that also asked `probe` to verify expectations. See
 [`docs/schema.md`](schema.md), "Getting the schema without a git checkout".
+
+### Qualifying the host: `doctor`
+
+A passing `probe` says the binary you found is the one you need. It does not say this
+*machine* can run a contained process — by construction, since proving that would mean
+running one, and a preflight that spawned a child would not be a preflight. The two
+claims come apart in practice: a registry directory that cannot be created or is not
+owner-only, a containment mechanism the kernel will not hand out, a local IPC endpoint
+that will not bind. Each of those passes every `--require-*` check above and fails the
+first production run.
+
+`doctor` closes that gap by doing the thing:
+
+```sh
+processkit-cli doctor --json   --require-abrupt-cleanup whole_tree   --check-resource-controller --require-resource-controller
+```
+
+It performs a bounded scratch run of this binary's own harmless child
+(`doctor --scratch-child`), drives that run through the ordinary control plane
+(`inspect`, `cancel`, terminal wait), confirms teardown left nothing, and reports the
+facts it observed — the registry directory and its owner-only protection, the
+containment mechanism and abrupt-cleanup level this host really gives a run, the
+transport round-trip, a confirmed-empty cleanup, and per-phase timings. On success it
+leaves nothing behind; on a failed phase it keeps a diagnostics directory and names it
+in the report (`diagnostics_dir`).
+
+Where it belongs in an adapter's flow: **once per host, at setup or install time**, not
+before every run. It is the counterpart of the `probe` above, on the other axis —
+
+| | `probe` | `doctor` |
+| --- | --- | --- |
+| Subject | This binary | This host |
+| Side effects | None: no child, no registry, no container, no endpoint | A real scratch run: registry entry, container, control endpoint, all cleaned up |
+| Cost | Milliseconds | Under a second, bounded by `--timeout` (default `30s`) |
+| Run it | Before every launch, or at least whenever the binary may have changed | Once per host, at setup time — or when a host starts behaving differently |
+| Fail-closed code | `PROBE_INCOMPATIBLE` (110) | `HOST_UNQUALIFIED` (116) |
+
+The requirement flags gate the **exit code** only; the report carries the observed
+facts either way, so an adapter can act on the code and still log everything the
+qualification saw. `--require-resource-controller` needs
+`--check-resource-controller` alongside it — a requirement about a fact this
+invocation never observed is refused as a `USAGE` (100) rather than guessed.
+
+`doctor --json`'s shape is published like every other machine-readable output here:
+`fixtures/schema/cli/doctor.schema.json` and `doctor.jsonl`. See
+[`docs/troubleshooting.md`](troubleshooting.md), "Qualifying a host: `doctor`", for
+reading a negative verdict, and [`docs/exit-codes.md`](exit-codes.md), "Qualifying a
+host: `doctor`", for why `116` is its own code.
 
 ## 2. Launching a run
 
@@ -637,7 +686,9 @@ processkit-cli --error-format json inspect --run-id build-42
   `control_unreachable`, `ipc_deadline`, `not_found`, and the two refusals
   `incompatible_contract` and `peer_identity_unsupported` — those eight are the
   ones that exist *to split* the single `CONTROL` (103) — plus `not_a_member`
-  (the decided verdict, `115`), `registry`/`setup`/`internal`, `wait_timeout`,
+  (the decided verdict, `115`), `host_unqualified` (the other decided verdict,
+  `116`, and the one about the host rather than a run — §1),
+  `registry`/`setup`/`internal`, `wait_timeout`,
   `events_invalid`, `probe_incompatible`, and — for a failing `run` — the
   terminal `runner_exit` event's own `source` spellings (`spawn_error`,
   `container_error`, `timeout`, `cancelled`, `control_cancel`, `control_kill`,
@@ -669,10 +720,11 @@ are in [`docs/exit-codes.md`](exit-codes.md#machine-readable-failures---error-fo
 - [`fixtures/schema/cli/README.md`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/fixtures/schema/cli/README.md)
   — the JSON Schema documents and golden fixtures for every machine-readable
   output in this guide (`probe`, `list`, `inspect`, the `cancel`/`kill` acks,
-  `prune`, `wait --report-outcome`, `attest`, and the `--error-format json` failure
+  `prune`, `wait --report-outcome`, `attest`, `doctor`, and the `--error-format json`
+  failure
   envelope), and the versioning decision behind them (`probe`, `inspect`, `attest`,
-  and the envelope carry their own version field; the other four deliberately carry
-  none).
+  `doctor`, and the envelope carry their own version field; the other four
+  deliberately carry none).
 - [`docs/compatibility.md`](compatibility.md) — the compatibility surfaces, the
   pinning procedure, and the upgrade/downgrade checklists.
 - [`docs/exit-codes.md`](exit-codes.md) — the normative reserved exit-code

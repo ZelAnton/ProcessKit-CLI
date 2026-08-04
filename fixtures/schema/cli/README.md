@@ -14,6 +14,7 @@ same three-part contract discipline the JSONL lifecycle-event stream already has
 | `wait --report-outcome` (single outcome and the `--all` array) | `wait.schema.json` | `wait.jsonl` | [`docs/registry.md`](../../../docs/registry.md), "Waiting — `wait`" |
 | `--error-format json` failure envelope (**stderr**, every subcommand) | `error.schema.json` | `error.jsonl` | [`docs/exit-codes.md`](../../../docs/exit-codes.md), "Machine-readable failures: `--error-format json`"; [`docs/integration.md`](../../../docs/integration.md) §7 |
 | `attest --json` containment attestation | `attest.schema.json` | `attest.jsonl` | [`docs/control-plane.md`](../../../docs/control-plane.md), "`attest`" |
+| `doctor --json` host qualification | `doctor.schema.json` | `doctor.jsonl` | [`docs/troubleshooting.md`](../../../docs/troubleshooting.md), "Qualifying a host: `doctor`"; [`docs/integration.md`](../../../docs/integration.md) §1 |
 
 **The error envelope is the one family on stderr, and that is the point.** Every
 other row above is a *successful* command's stdout. The envelope is what a
@@ -22,7 +23,7 @@ reserved for success — a command that prints a report and *then* fails
 (`probe --json` exiting 110, `inspect --all --json` exiting 103, `attest --json`
 exiting 115) leaves its stdout byte-for-byte unchanged and adds the envelope beside
 it. It is not another *success* shape; it is the failure-side counterpart to all
-seven, which is also why success-output fixtures could never have covered it.
+eight, which is also why success-output fixtures could never have covered it.
 
 **`attest --json` is the one success-side family whose stdout accompanies a
 non-zero exit as a matter of course.** Two of its three verdicts make the invocation
@@ -54,13 +55,15 @@ validates both the golden fixture *and* the real binary's live output against
 every document. On a disagreement between a schema and the prose, trust the prose
 and treat the schema as needing a fix.
 
-## Versioning: four of these eight are versioned, four deliberately are not
+## Versioning: five of these nine are versioned, four deliberately are not
 
 `probe --json` carries `probe_version`, `inspect --json` carries
-`snapshot_version`, the failure envelope carries `error_version`, and
-`attest --json` carries `attestation_version`, so a bump is
-visible in the payload itself. `probe.schema.json`, `error.schema.json` and
-`attest.schema.json` pin their value with `const`; `inspect.schema.json`
+`snapshot_version`, the failure envelope carries `error_version`,
+`attest --json` carries `attestation_version`, and `doctor --json` carries
+`doctor_version`, so a bump is
+visible in the payload itself. `probe.schema.json`, `error.schema.json`,
+`attest.schema.json`, and `doctor.schema.json` pin their value with `const`;
+`inspect.schema.json`
 enumerates a *range* instead — the shape follows the **reader's** tolerance, not a
 sibling's precedent, and `inspect` is the one whose client genuinely decodes an
 older form (see "The `snapshot_version` range" below). The other four families here
@@ -102,6 +105,16 @@ diagnostics but not the invocation. That is a durable artifact read by a party t
 did not invoke this binary — the same test the four above pass. `const` rather than
 an enumerated range, like `probe_version`: this binary only ever *writes* an
 envelope, never reads one, so it has no tolerance window to express.
+
+**`doctor --json` meets the durable-artifact test more directly than any of them**,
+which is why it arrived versioned too. It is not merely *liable* to be kept: it is
+kept **by construction** — a failed qualification writes the report into the
+diagnostics directory it deliberately leaves behind (`diagnostics_dir`), alongside the
+scratch run's own JSONL stream, precisely so it can be read afterwards, elsewhere, by
+whoever is debugging that host rather than by whoever ran the command. A report about
+a machine outlives the invocation that produced it; that is its whole purpose. `const`
+for the same reason as the envelope: this binary only writes a qualification report,
+never reads one.
 
 The remaining outputs published here — `list --json`, `prune --json` (with and
 without `--dry-run`), the printed `cancel`/`kill` ack, the `--all` report arrays,
@@ -146,11 +159,13 @@ directory:
   For the four unversioned families there is simply no version field for a
   consumer to pin; if a future task ever decides one of them does need its own,
   that is the point at which a versioned directory should appear alongside it.
-  For `probe --json`, `inspect --json`, `attest --json`, and the failure envelope
+  For `probe --json`, `inspect --json`, `attest --json`, `doctor --json`, and the
+  failure envelope
   the pin already exists *inside* the document — a breaking change to those shapes
   bumps `probe_version` / `snapshot_version` / `attestation_version` /
+  `doctor_version` /
   `error_version`, and that field, not a directory name, is what a consumer checks.
-  Two of those four the client checks as well — `snapshot_version` against the range
+  Two of those five the client checks as well — `snapshot_version` against the range
   it decodes, `attestation_version` against the single version it reads — which is
   the next section.
 - **Additive changes stay additive.** A new field on one of these objects, or a
@@ -169,8 +184,9 @@ only value here that the *far side of a wire* supplies: `attest --json` publishe
 whole set of them — `verdict`, `mechanism`, `peer_pid`, `checked_at`, and its own
 `attestation_version` — which its client re-serializes from what it parsed, exactly
 as `inspect` does with a snapshot. What sets `snapshot_version` apart is the
-**reader**. The three other version pins here all end up reporting the number of the
-binary the caller just invoked: `probe_version` and `error_version` because this
+**reader**. The four other version pins here all end up reporting the number of the
+binary the caller just invoked: `probe_version`, `error_version`, and
+`doctor_version` because this
 binary writes them outright, and `attestation_version` because `attest`'s client
 refuses any version but its own before it renders anything, which is why that pin is
 `const` (see "Versioning" above). Only `snapshot_version` reports a version this build
@@ -211,6 +227,7 @@ own line:
 | `wait.jsonl` | a `reported` outcome; an `unknown` one; the `wait --all` report array |
 | `error.jsonl` | the variants of the one envelope shape: a named run id versus a `null` one, a retryable verdict versus a final one, four different reserved codes — `not_found`, `stale`, `unprobed`, `probe_incompatible`, `events_invalid`, `not_a_member` |
 | `attest.jsonl` | the two verdicts a platform that can name its peers produces: `member` (from a client inside the run) and `not_a_member` (from one outside it) |
+| `doctor.jsonl` | the qualified report a healthy host produces, and the unqualified one an unmeetable `--require-*` expectation produces — the same shape either way, which is the point of printing it either way |
 
 `docs/*` and the schema documents remain the complete list — the `already_gone`
 and `failed` arms of the `inspect --all` and `cancel`/`kill --all` reports, for
@@ -261,6 +278,23 @@ representative example an adapter can build and test a reader against.
   (`error_version`, `code`, `kind`, `operation`, `run_id`, `retryable`) is pinned
   exactly, and the real message is still schema-validated on the live output like
   every other field.
+
+- **`doctor.jsonl` normalizes more than any other fixture here, and for a reason
+  peculiar to it: it is the one output whose whole content is *about the host that
+  produced it*.** The registry directory, the owner-only mechanism, the containment
+  mechanism and its abrupt-cleanup level, the transport, the observed member counts,
+  the per-phase timings, and the free-text `failures`/`mismatches` (which quote those
+  same host values back) all differ between two platforms, and the timings differ
+  between two runs on one. Each is replaced by a fixed sample in
+  `tests/machine_output.rs`, so what this fixture pins is the report's **shape** —
+  which facts are present, which are `null`, which are counted, and which arrays are
+  empty. What each fact *says* on a given platform is asserted by `tests/doctor.rs`,
+  which runs on that platform and can therefore be specific about it (that a Windows
+  host reports a protected owner-only DACL, that a `process_group` host reports its
+  post-teardown snapshot as inconclusive, and so on). Two of the sample values it
+  reuses are shared with other families (`mechanism`, `endpoint`), so the fixture's
+  imaginary host is a composite rather than a portrait; the samples are per field, not
+  per machine.
 
 - `probe.jsonl`'s `surface` is truncated to a fixed two-token sample on purpose.
   The full token list is already pinned exhaustively — by the `fixtures/cli-help/`

@@ -23,6 +23,20 @@ processkit-cli probe --json \
 
 Add one `--require-surface` for every optional flag the workflow depends on.
 
+That checks the binary. On a machine this workflow has not run on before, check the
+**host** once as well — a compatible binary can still meet a registry directory it
+cannot create or a containment mechanism the kernel will not hand out:
+
+```sh
+processkit-cli doctor --json
+```
+
+It performs one bounded scratch containment of the binary's own harmless child and
+reports what this host actually did (registry, mechanism, control round-trip,
+confirmed cleanup), exiting `HOST_UNQUALIFIED` (116) if a phase failed. It has real
+side effects and cleans up after itself, so run it at setup time, not before every
+command.
+
 ## Run and observe
 
 Use absolute artifact paths when another process must read them. Always impose a

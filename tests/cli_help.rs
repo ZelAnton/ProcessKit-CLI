@@ -20,6 +20,7 @@ const CASES: &[(&str, &[&str])] = &[
     ("list", &["list"]),
     ("prune", &["prune"]),
     ("probe", &["probe"]),
+    ("doctor", &["doctor"]),
 ];
 
 fn fixture(name: &str) -> PathBuf {

@@ -44,7 +44,24 @@
 //! code, [`exit::NOT_A_MEMBER`]). [`events_cmd`]
 //! closes the loop by reading a run's JSONL stream back — rendering, following,
 //! passing through, or schema-checking the very events [`events`] wrote — resolving
-//! the stream through the same registry, and mutating nothing. [`error_envelope`]
+//! the stream through the same registry, and mutating nothing.
+//!
+//! The two preflight commands sit either side of the same question and answer
+//! different halves of it. [`probe`] is the side-effect-free one: it reports (and,
+//! with `--require-*`, verifies) what *this binary* is — its CLI surface, its
+//! reserved exit-code band, its JSONL `schema_version` — without spawning, opening,
+//! or binding anything. [`doctor`] is the side-effecting counterpart, and answers
+//! what *this host* can actually do: it performs a bounded scratch run of this
+//! binary's own harmless child through the ordinary `run`/control-plane path and
+//! reports the facts it observed doing so — the registry directory it created and its
+//! owner-only protection, the containment mechanism and abrupt-cleanup level this
+//! machine gave it, a full `inspect`/`cancel`/terminal round-trip over the local
+//! transport, a confirmed-empty teardown, and per-phase timings — leaving nothing
+//! behind on success and a named diagnostics directory on failure (a negative verdict
+//! is its own reserved code, [`exit::HOST_UNQUALIFIED`]). "The installed binary is
+//! compatible" and "this host has successfully exercised the containment and control
+//! path" are different claims, and these are the two commands that make them.
+//! [`error_envelope`]
 //! is the failure-side counterpart to all of them: under the global
 //! `--error-format json` it renders whatever any of these commands failed with as
 //! one bounded, versioned JSON object on stderr, so an adapter branches on a
@@ -52,7 +69,8 @@
 //! like every other machine-readable output it rides on the flag that turns it on
 //! and on the reserved code it carries, and pins its own shape in the payload with
 //! `error_version` — the same relationship `probe --json`'s `probe_version`,
-//! `inspect`'s `snapshot_version`, and `attest --json`'s `attestation_version` have
+//! `inspect`'s `snapshot_version`, `attest --json`'s `attestation_version`, and
+//! `doctor --json`'s `doctor_version` have
 //! to that surface (see `docs/compatibility.md`,
 //! "Machine-output schemas"). Those version fields are an independent axis *layered
 //! on* the three surfaces, never a count of them. The compatibility
@@ -67,6 +85,8 @@ pub mod capture;
 pub mod cli;
 #[doc(hidden)]
 pub mod control;
+#[doc(hidden)]
+pub mod doctor;
 #[doc(hidden)]
 pub mod duration_fmt;
 #[doc(hidden)]

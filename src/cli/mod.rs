@@ -13,7 +13,8 @@
 //! shared [`TargetArgs`] behind `cancel`/`kill`), `attest.rs` ([`AttestArgs`]),
 //! `wait.rs` ([`WaitArgs`]),
 //! `list.rs` ([`ListArgs`]), `prune.rs` ([`PruneArgs`]), `probe.rs`
-//! ([`ProbeArgs`]), and `events.rs` ([`EventsArgs`]) — and the hand-written value
+//! ([`ProbeArgs`]), `doctor.rs` ([`DoctorArgs`]), and `events.rs`
+//! ([`EventsArgs`]) — and the hand-written value
 //! parsers those arguments share live in `parse.rs`. Each file carries the unit
 //! tests for the shapes it defines. Two files' names do not match their
 //! implementing module: `events.rs`, because the `events` subcommand is implemented
@@ -31,6 +32,7 @@
 
 mod attest;
 mod control;
+mod doctor;
 mod events;
 mod list;
 mod parse;
@@ -44,6 +46,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
 pub use attest::AttestArgs;
 pub use control::{InspectArgs, TargetArgs};
+pub use doctor::DoctorArgs;
 pub use events::EventsArgs;
 pub use list::{ListArgs, ListHealth};
 pub use probe::ProbeArgs;
@@ -126,7 +129,8 @@ impl Cli {
             | Command::Events(_)
             | Command::List(_)
             | Command::Prune(_)
-            | Command::Probe(_) => Ok(()),
+            | Command::Probe(_)
+            | Command::Doctor(_) => Ok(()),
         };
         checked.map_err(|message| Self::command().error(ErrorKind::ArgumentConflict, message))
     }
@@ -174,6 +178,11 @@ pub enum Command {
     /// Report this binary's compatibility surface for a consumer's fail-closed
     /// compatibility preflight — no run, no child, no side effects.
     Probe(ProbeArgs),
+    /// Qualify *this host* by actually exercising it: a bounded scratch run of this
+    /// binary's own harmless child, reporting the registry, containment, control
+    /// transport, and cleanup facts it observed. The side-effecting counterpart to
+    /// `probe`.
+    Doctor(DoctorArgs),
 }
 
 impl Command {
@@ -196,6 +205,7 @@ impl Command {
             Self::List(_) => "list",
             Self::Prune(_) => "prune",
             Self::Probe(_) => "probe",
+            Self::Doctor(_) => "doctor",
         }
     }
 
@@ -206,7 +216,10 @@ impl Command {
     /// (`list`/`prune`), the self-contained `probe`, and a `run` that let the runner
     /// generate an id — the generated value is minted inside the run itself and is
     /// not knowable here, so reporting `null` is the truthful answer rather than a
-    /// guess.
+    /// guess. `doctor` is `None` for that same last reason: the only run it ever
+    /// names is the scratch one it mints for itself, inside
+    /// [`crate::doctor`], which no caller asked about and none can correlate
+    /// against.
     pub fn target_run_id(&self) -> Option<&str> {
         match self {
             Self::Run(args) => args.run_id.as_deref(),
@@ -217,7 +230,7 @@ impl Command {
             Self::Attest(args) => Some(&args.run_id),
             Self::Wait(args) => args.run_id.as_deref(),
             Self::Events(args) => args.run_id.as_deref(),
-            Self::List(_) | Self::Prune(_) | Self::Probe(_) => None,
+            Self::List(_) | Self::Prune(_) | Self::Probe(_) | Self::Doctor(_) => None,
         }
     }
 }
@@ -332,6 +345,7 @@ mod tests {
             vec!["list"],
             vec!["prune"],
             vec!["probe", "--json"],
+            vec!["doctor"],
         ] {
             let mut full = vec!["processkit-cli"];
             full.extend(argv.iter().copied());
@@ -411,6 +425,7 @@ mod tests {
             vec!["list", "--error-format", "json"],
             vec!["prune", "--error-format", "json"],
             vec!["probe", "--json", "--error-format", "json"],
+            vec!["doctor", "--error-format", "json"],
         ] {
             let mut full = vec!["processkit-cli"];
             full.extend(argv.iter().copied());
@@ -442,6 +457,9 @@ mod tests {
             (vec!["list"], "list", None),
             (vec!["prune"], "prune", None),
             (vec!["probe", "--json"], "probe", None),
+            // The scratch run `doctor` mints for itself is not a run the caller
+            // named, so there is nothing here to correlate against.
+            (vec!["doctor"], "doctor", None),
             (vec!["cancel", "--all"], "cancel", None),
             (vec!["kill", "--run-id", "r1"], "kill", Some("r1")),
             (vec!["attest", "--run-id", "r1"], "attest", Some("r1")),

@@ -39,11 +39,16 @@ run. It is resolved in this order:
 ### Permissions
 
 The registry directory is created **restricted to its owner**, and every *mutating*
-open (`run`'s path) guarantees that restriction before a record is written into it —
+open guarantees that restriction before a record is written into it —
 including on a pre-existing directory whose permissions were widened out of band,
 which is repaired rather than trusted. A record names a run's private control-channel
 endpoint, so a world-readable registry would hand that channel to any local process.
-The **read-only** open every other client takes — `list`, `prune`, `wait`, `events`,
+Two commands take that open: `run`, which is about to write a record, and `doctor`,
+whose whole job is to establish that this host reaches the state described here (it
+re-reads the resulting permissions and reports them, rather than assuming the open
+succeeded means it worked — see [`docs/troubleshooting.md`](troubleshooting.md),
+"Qualifying a host: `doctor`"). The **read-only** open every other client takes —
+`list`, `prune`, `wait`, `events`,
 and the control clients — deliberately does neither: it does not create the
 directory and does not touch its permissions, since a read-only scan must not
 mutate registry state.
@@ -307,7 +312,8 @@ wrong-target action. See
 
 `processkit-cli list [--json]` opens the registry through
 [`Registry::open_read_only`] (`src/registry/mod.rs`) — **not** the mutating
-[`Registry::open`] `run` uses, so listing never creates the registry directory and
+[`Registry::open`] `run` and `doctor` use, so listing never creates the registry
+directory and
 never touches its permissions — and scans it with [`Registry::entries`], the same
 scan every other client shares, printing every entry it finds, whatever its health:
 `run_id`, health (`live`/`stale`/`unprobed`), `started_at`, `hint`, `argv_sha256`,

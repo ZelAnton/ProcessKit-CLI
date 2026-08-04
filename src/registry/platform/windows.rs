@@ -3,9 +3,12 @@
 //!
 //! # Why the hardening is verify-then-repair rather than always-write (T-309)
 //!
-//! [`create_owner_only_dir`] runs on every `run` invocation — it is the one
-//! mutating registry open left after T-174 routed every reader through
-//! `Registry::open_read_only`. Writing the DACL unconditionally is not a
+//! [`create_owner_only_dir`] runs on every `run` invocation — after T-174 routed
+//! every reader through `Registry::open_read_only`, `run` was the only caller left
+//! on the mutating path, and it is still the only one on the *hot* path (`doctor`
+//! joined it in T-307, once per host qualification rather than once per run, and
+//! for the express purpose of confirming the state this function establishes).
+//! Writing the DACL unconditionally is not a
 //! constant-cost metadata write on this platform: the ACE is *inheritable*
 //! (`OICI`) and the object is a *directory*, so `SetNamedSecurityInfoW`
 //! re-propagates it over the directory's existing children — and the registry
@@ -659,9 +662,16 @@ unsafe fn wide_to_string(ptr: *const u16) -> String {
     String::from_utf16_lossy(slice)
 }
 
-/// Test-only: does `dir`'s DACL restrict it to the current user alone — protected
+/// Does `dir`'s DACL restrict it to the current user alone — protected
 /// (no inheritance) and granting access to the current user, with no ACE for any
 /// other account (Everyone included)?
+///
+/// Read back off the object rather than inferred from [`create_owner_only_dir`]
+/// having returned `Ok`, which is why it is worth having: the registry's own tests
+/// use it to hold the create path to its claim, and [`crate::doctor`] uses the very
+/// same predicate to report that claim as an observed fact about the host it is
+/// qualifying (`registry.owner_only`). One definition, so a report and a test can
+/// never disagree about what "owner-only" means here.
 ///
 /// The DACL is verified against the current user's **binary** SID (via [`EqualSid`],
 /// through [`dacl_is_owner_only`]), *not* by string-matching a read-back SDDL. The
@@ -680,7 +690,6 @@ unsafe fn wide_to_string(ptr: *const u16) -> String {
 /// [`EqualSid`]: windows_sys::Win32::Security::EqualSid
 /// [`ConvertSidToStringSidW`]: windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW
 /// [`ConvertSecurityDescriptorToStringSecurityDescriptorW`]: windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW
-#[cfg(test)]
 pub fn is_owner_only(dir: &Path) -> io::Result<bool> {
     let user_sid = current_user_sid_bytes()?;
     read_dacl(dir, |control, dacl| {
@@ -688,7 +697,7 @@ pub fn is_owner_only(dir: &Path) -> io::Result<bool> {
     })
 }
 
-/// Test-only: is `dacl` (with security-descriptor `control` flags) an owner-only
+/// Is `dacl` (with security-descriptor `control` flags) an owner-only
 /// grant to `user_sid` — present, protected (no inherited ACEs), and composed solely
 /// of allow-ACEs naming that one SID? An absent/null DACL (grants everyone), an
 /// unprotected DACL (could inherit wider ACEs), an empty DACL (denies even the
@@ -698,7 +707,6 @@ pub fn is_owner_only(dir: &Path) -> io::Result<bool> {
 /// Deliberately *weaker* than [`has_exact_owner_only_dacl`] below: this asks only
 /// "is any other principal named here", which is the question the pre-existing
 /// owner-only tests (and their unix counterpart, a plain `0700` compare) ask.
-#[cfg(test)]
 fn dacl_is_owner_only(control: u16, dacl: *const ACL, user_sid: &[u8]) -> bool {
     control & SE_DACL_PROTECTED != 0 && dacl_names_only(control, dacl, user_sid)
 }
@@ -722,10 +730,13 @@ pub fn grants_only_current_user(path: &Path) -> io::Result<bool> {
     })
 }
 
-/// Test-only: is `dacl` present, non-empty, and composed solely of allow-ACEs
+/// Is `dacl` present, non-empty, and composed solely of allow-ACEs
 /// naming `user_sid`? An absent (`NULL`) DACL grants everyone, and an empty one
 /// denies even the owner; both fail, as does any ACE for another account.
-#[cfg(test)]
+///
+/// Reached from [`dacl_is_owner_only`] (and so from [`is_owner_only`]), which
+/// [`crate::doctor`] calls in production; the test-only
+/// [`grants_only_current_user`] is its second caller.
 fn dacl_names_only(control: u16, dacl: *const ACL, user_sid: &[u8]) -> bool {
     if dacl.is_null() || control & SE_DACL_PRESENT == 0 {
         return false;
@@ -790,9 +801,9 @@ pub fn has_exact_owner_only_dacl(dir: &Path) -> io::Result<bool> {
     })
 }
 
-/// Test-only: the current user's binary SID copied into an owned buffer, so it
-/// outlives the process token it was read from.
-#[cfg(test)]
+/// The current user's binary SID copied into an owned buffer, so it
+/// outlives the process token it was read from. Reached from [`is_owner_only`], so
+/// it is production code on the same terms that predicate is.
 fn current_user_sid_bytes() -> io::Result<Vec<u8>> {
     let mut token: HANDLE = std::ptr::null_mut();
     // SAFETY: `GetCurrentProcess` is a pseudo-handle needing no close; `token`
@@ -807,11 +818,11 @@ fn current_user_sid_bytes() -> io::Result<Vec<u8>> {
     result
 }
 
-/// Test-only: read the `TokenUser` SID out of `token` and copy its bytes into an
-/// owned buffer (sized with [`GetLengthSid`]).
+/// Read the `TokenUser` SID out of `token` and copy its bytes into an
+/// owned buffer (sized with [`GetLengthSid`]). Reached from
+/// [`current_user_sid_bytes`].
 ///
 /// [`GetLengthSid`]: windows_sys::Win32::Security::GetLengthSid
-#[cfg(test)]
 fn token_user_sid_bytes(token: HANDLE) -> io::Result<Vec<u8>> {
     use windows_sys::Win32::Security::GetLengthSid;
 

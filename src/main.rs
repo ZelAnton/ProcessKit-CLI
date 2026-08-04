@@ -20,7 +20,7 @@ use clap::error::ErrorKind;
 use processkit_cli::cli::{Cli, Command, ErrorFormat};
 use processkit_cli::error_envelope;
 use processkit_cli::exit::{self, RunnerError};
-use processkit_cli::{control, events_cmd, list, probe, prune, run, wait};
+use processkit_cli::{control, doctor, events_cmd, list, probe, prune, run, wait};
 
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
@@ -56,7 +56,9 @@ fn main() -> ExitCode {
     // other subcommand either reaches a live runner over the control plane
     // (`inspect`/`cancel`/`kill`/`attest`), reads the per-user registry without contacting
     // any runner (`wait`/`list`/`prune`, and `events`, which also reads back the
-    // run's own JSONL file), or is entirely self-contained (`probe`) — and each
+    // run's own JSONL file), is entirely self-contained (`probe`), or drives a whole
+    // scratch run of this very binary and then reports on it (`doctor`, the one
+    // subcommand besides `run` that spawns anything) — and each
     // reports through the shared runner-error path below.
     match cli.command {
         Command::Run(args) => run::execute(*args, format),
@@ -112,6 +114,7 @@ fn main() -> ExitCode {
         Command::List(args) => report(list::run(args.json, &args.labels, args.health)),
         Command::Prune(args) => report(prune::run(args.json, args.dry_run, &args.labels)),
         Command::Probe(args) => report(probe::run(&args)),
+        Command::Doctor(args) => report(doctor::run(&args)),
     }
 }
 

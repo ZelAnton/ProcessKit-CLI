@@ -65,7 +65,8 @@ path = "src/lib.rs"
 # ---------------------------------------------------------------------------
 [dependencies]
 # Command-line parsing. The `derive` API expresses the normative CLI surface —
-# the ten subcommands (run/inspect/cancel/kill/attest/wait/events/list/prune/probe),
+# the eleven subcommands
+# (run/inspect/cancel/kill/attest/wait/events/list/prune/probe/doctor),
 # their flags, the one global option every subcommand shares (`--error-format`),
 # and the verbatim `-- <program> <args...>` tail — that AGENTS.md
 # counts as part of the compatibility surface.

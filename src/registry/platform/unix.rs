@@ -101,8 +101,15 @@ pub fn default_registry_dir() -> io::Result<PathBuf> {
     ))
 }
 
-/// Test-only: does `dir` grant access to its owner alone (mode `0700`)?
-#[cfg(test)]
+/// Does `dir` grant access to its owner alone (mode `0700`)?
+///
+/// Read back off the filesystem rather than inferred from
+/// [`create_owner_only_dir`] having returned `Ok`, which is why it is worth having:
+/// the registry's own tests use it to hold the create path to its claim, and
+/// [`crate::doctor`] uses the very same predicate to report that claim as an
+/// observed fact about the host it is qualifying (`registry.owner_only`). One
+/// definition, so a report and a test can never disagree about what "owner-only"
+/// means here.
 pub fn is_owner_only(dir: &Path) -> io::Result<bool> {
     let mode = fs::metadata(dir)?.permissions().mode();
     Ok(mode & 0o777 == 0o700)

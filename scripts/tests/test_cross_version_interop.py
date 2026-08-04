@@ -424,11 +424,11 @@ class PublishedFixtureTests(unittest.TestCase):
         return json.loads(next(line for line in lines if line.strip()))
 
     def test_the_versioned_output_pins_still_resolve_in_whichever_form(self):
-        # docs/compatibility.md pins four of the eight published CLI-output families
+        # docs/compatibility.md pins five of the nine published CLI-output families
         # on a version field of their own; this lane compares a released binary, so
         # it checks the two of them a released binary emits (the `--error-format
-        # json` envelope and `attest --json` are both new and unreleased — see
-        # `VERSIONED_CLI_OUTPUTS`).
+        # json` envelope, `attest --json`, and `doctor --json` are all new and
+        # unreleased — see `VERSIONED_CLI_OUTPUTS`).
         # If a document moves that field,
         # the scheduled lane must not quietly stop checking it. The *form* of the
         # pin deliberately differs between the two documents (`const` for probe, an

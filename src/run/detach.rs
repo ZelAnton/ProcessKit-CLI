@@ -501,11 +501,12 @@ fn detached_start_failure(status: ExitStatus, run_id: &str, jsonl: &Path) -> Run
 /// not because relaying one is a normal outcome.)
 ///
 /// Every **other** reserved-band number gets [`ErrorKind::Unknown`], and there are
-/// two ways to be one: a code no build assigns yet (`105`, `116`-`119` — already
+/// two ways to be one: a code no build assigns yet (`105`, `117`-`119` — already
 /// [`ErrorKind::for_code`]'s answer), and a code this build assigns to a *different
 /// subcommand* — [`exit::PROBE_INCOMPATIBLE`] (110), [`exit::WAIT_TIMEOUT`] (112),
-/// [`exit::EVENTS_INVALID`] (114), [`exit::NOT_A_MEMBER`] (115), minted only by
-/// `probe`/`wait`/`events --validate`/`attest`
+/// [`exit::EVENTS_INVALID`] (114), [`exit::NOT_A_MEMBER`] (115),
+/// [`exit::HOST_UNQUALIFIED`] (116), minted only by
+/// `probe`/`wait`/`events --validate`/`attest`/`doctor`
 /// and unreachable from `run`. Naming the second group from this build's table would
 /// invent a verdict about a run out of a foreign build's number; naming nothing is
 /// the honest answer, and the numeric `code` still reaches the caller untouched.

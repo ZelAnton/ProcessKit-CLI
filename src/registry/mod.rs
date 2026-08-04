@@ -84,6 +84,26 @@ pub(crate) fn setup_read_error(err: io::Error) -> RunnerError {
     .with_kind(ErrorKind::Registry)
 }
 
+/// How this platform expresses the registry directory's owner-only protection, as
+/// [`crate::doctor`] reports it: a POSIX mode on unix, a protected owner-only DACL on
+/// Windows. Named here, beside the code that applies it, so a report says *which*
+/// mechanism was checked rather than leaving "owner-only" as an unqualified opinion.
+#[cfg(unix)]
+pub(crate) const OWNER_ONLY_PROTECTION: &str = "posix_0700";
+#[cfg(windows)]
+pub(crate) const OWNER_ONLY_PROTECTION: &str = "windows_owner_only_dacl";
+
+/// Whether `dir` is protected to its owner alone, read back off the filesystem.
+///
+/// The crate-visible face of `platform::is_owner_only` — the same predicate the
+/// registry's own tests hold [`Registry::open`] to. [`crate::doctor`] calls it to
+/// report that protection as an *observed* fact about the host, so a qualification
+/// and a regression test can never disagree about what owner-only means (see
+/// [`OWNER_ONLY_PROTECTION`] for how each platform expresses it).
+pub(crate) fn dir_is_owner_only(dir: &Path) -> io::Result<bool> {
+    platform::is_owner_only(dir)
+}
+
 /// On-disk record format version. Independent of the JSONL event
 /// [`schema_version`](crate::events::SCHEMA_VERSION): the registry is a private
 /// per-user contract between a runner and its own control-plane clients, not the
@@ -498,6 +518,17 @@ impl Registry {
     /// delegates here). Never touches the filesystem — it cannot fail.
     pub fn open_read_only_in(dir: PathBuf) -> Self {
         Self { dir }
+    }
+
+    /// The directory this handle is rooted at.
+    ///
+    /// Every other consumer reaches records through the scan API and never needs the
+    /// path itself. [`crate::doctor`] does: "which directory did this host resolve,
+    /// and is *it* protected" is exactly the fact it reports, and a report that
+    /// re-derived the path instead of reading it off the open handle could name a
+    /// different directory than the one it checked.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
     }
 
     /// Register a starting run: write its [`Record`] and take the exclusive advisory

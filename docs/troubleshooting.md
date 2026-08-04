@@ -11,6 +11,70 @@ symptom rather than by call sequence, and each entry below is deliberately
 short. On any disagreement between this document and one of the normative
 ones, the normative document is the source of truth.
 
+## Qualifying a host: `doctor`
+
+**Symptom.** `probe` says the binary is compatible, but the first real `run` on this
+machine fails — or runs work on one host and not on another, and you want to know
+*which* part of the environment differs before spending a production run finding out.
+
+**Diagnose.** Run the host qualification:
+
+```sh
+processkit-cli doctor          # human-readable
+processkit-cli doctor --json   # one JSON line, for an adapter
+```
+
+`doctor` is the side-effecting counterpart of `probe`, and the difference is the whole
+point of having both. `probe` reads compile-time constants and the in-memory CLI tree:
+it proves *this binary* exposes the surface you need, spawns nothing, and touches no
+registry, container, or transport. `doctor` proves *this host* can actually run a
+contained process, by doing it: it performs a bounded scratch run of this binary's own
+harmless child (`doctor --scratch-child`, which sleeps briefly and does nothing else),
+drives that run as an ordinary control-plane client, and reports what it observed. A
+passing `probe` and a failing `doctor` is the normal shape of an environment problem.
+
+The report is a list of facts, never one boolean:
+
+| Fact | What it tells you |
+| --- | --- |
+| `registry.dir`, `registry.owner_only`, `registry.protection` | Which per-user registry directory this host resolves to, and whether it really is protected to its owner alone — re-read from the filesystem, not assumed from the create having succeeded ([`docs/registry.md`](registry.md)). |
+| `containment.mechanism`, `containment.abrupt_cleanup` | Which containment mechanism this host actually gave the run, and what still reaps the tree if the runner is killed outright. The same values the `run_started` event publishes ([`docs/schema.md`](schema.md#run_started)) — so a `cgroup_v2` → `process_group` fallback (above) is visible here at setup time instead of mid-incident. |
+| `control.*` | That the local transport bound, answered an `inspect` with real members, accepted a `cancel`, and that the run ended *because of that cancel* (`terminal_exit_code: 108`, `terminal_source: "control_cancel"`). |
+| `cleanup.*` | That teardown was **confirmed** empty rather than assumed — `read_error` says whether the member read even succeeded — and that every artifact is gone: the registry record, the control endpoint, the scratch files. |
+| `resource_controller` | Only with `--check-resource-controller`: whether a whole-tree cap (`run --max-processes`) can be installed here at all. `null` means *not checked*, never *not available*. |
+| `phases[].elapsed_ms` | Where the time went. A host that is merely slow is diagnosable as such instead of arriving as a generic hang. |
+
+**Reading a negative verdict.** `doctor` exits `HOST_UNQUALIFIED` (116) when a phase
+failed or a `--require-*` expectation was not met, and prints the report either way
+(see [`docs/exit-codes.md`](exit-codes.md), "Qualifying a host: `doctor`"). The two
+cases are distinguishable in the report itself: `failures` names phases that did not
+work, `mismatches` names host properties that are not what you asked for. **A failed
+phase keeps its evidence**: the scratch directory is not deleted, and
+`diagnostics_dir` names it — it holds the scratch run's own JSONL stream, the runner's
+stdout/stderr, and a copy of the report. A qualified host leaves nothing behind at all.
+
+**Pinning what you need.** The requirement flags gate the exit code and nothing else —
+the observed facts are reported identically with or without them:
+
+```sh
+processkit-cli doctor --json --require-abrupt-cleanup whole_tree
+processkit-cli doctor --json --require-mechanism cgroup_v2
+processkit-cli doctor --json --check-resource-controller --require-resource-controller
+```
+
+Each compares for **exact equality** against the value this host reports, and names
+both sides on a mismatch. `--require-abrupt-cleanup` in particular is not an "at least
+this strong" comparison: the three levels are platform facts
+([`docs/platform-support.md`](platform-support.md)), and this project publishes no
+ordering between them to compare against.
+
+**What it costs, and what it touches.** One (or, with
+`--check-resource-controller`, two) short scratch runs of this binary against itself,
+in the real per-user registry the host uses — which is the point: a qualification of an
+isolated sandbox would qualify the sandbox. The whole check is bounded by `--timeout`
+(default `30s`), and the scratch run and its child carry that bound themselves, so a
+`doctor` that is itself killed leaves nothing running behind it.
+
 ## `BACKEND` (102) with a `limit_hit` event, often only on CI or under systemd
 
 **Symptom.** `run --max-memory <size>` / `--max-processes <n>` / `--cpu-quota
@@ -324,3 +388,6 @@ platform.
   transport, wire protocol, and `inspect`/`cancel`/`kill`/`attest` behavior.
 - [`docs/integration.md`](integration.md) — the consumer/adapter walkthrough,
   organized by call sequence rather than by symptom.
+- [`docs/platform-support.md`](platform-support.md) — what each platform
+  guarantees, and which of those guarantees `doctor` confirms on the machine in
+  front of you.

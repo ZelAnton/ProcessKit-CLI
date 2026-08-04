@@ -186,6 +186,9 @@ processkit-cli probe --json \
   --require-exit-code-band 100-119 \
   --require-surface run:--capture-dir
 
+# 1b. Once per host: prove this machine can actually contain and control a process.
+processkit-cli doctor --json
+
 # 2. Start one shell-free command with a stable id and bounded transcripts.
 processkit-cli run --run-id demo --capture-dir ./demo-output \
   --jsonl demo.jsonl -- cargo test

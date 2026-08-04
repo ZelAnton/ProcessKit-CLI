@@ -1,0 +1,51 @@
+Qualify *this host* by actually exercising it: a bounded scratch run of this binary's own harmless child, reporting the registry, containment, control transport, and cleanup facts it observed. The side-effecting counterpart to `probe`
+
+Usage: processkit-cli doctor [OPTIONS]
+
+Options:
+      --error-format <format>
+          How a runner-own failure is reported on stderr. `human` (the default) prints the historical `processkit-cli: <message>` prose; `json` prints exactly one bounded, versioned JSON object instead, so an adapter can branch on stable fields (`code`, `kind`, `retryable`) rather than parsing prose.
+          
+          Global on purpose — it is accepted before or after the subcommand, and every subcommand honors it. It never changes stdout, an exit code, or the default prose; clap's own parse-time usage errors stay human-readable in v1. See [`crate::error_envelope`] and `docs/exit-codes.md`.
+
+          Possible values:
+          - human: The historical free-text line, unchanged byte for byte
+          - json:  One bounded, versioned JSON object per failed invocation (see [`crate::error_envelope`] and `fixtures/schema/cli/error.schema.json`)
+          
+          [default: human]
+
+      --json
+          Emit the report as one JSON line (`fixtures/schema/cli/doctor.schema.json`) instead of the human-readable rendering. Optional, unlike `probe --json`: `doctor` is run by an operator diagnosing a host at least as often as by an adapter qualifying one, so it has a readable form too — and both carry the same facts
+
+      --timeout <duration>
+          Give the whole qualification at most this long (default `30s`). The scratch run and its scratch child are bounded by the same budget, so a `doctor` that is itself killed still leaves nothing behind. A host that cannot finish inside the budget is reported as unqualified, with the per-phase timings naming which phase ran out of time — never a generic hang
+          
+          [default: 30s]
+
+      --check-resource-controller
+          Also qualify the **resource controller**: run a second, separate scratch run that asks for a whole-tree process cap, and report whether this host's containment mechanism could enforce it. Off by default — a host that never uses `run --max-memory`/`--max-processes`/`--cpu-quota` does not need the controller, and probing for it costs a second scratch run.
+          
+          Isolated on purpose: its failure never masks the mandatory phases, which have already completed against their own scratch run by the time this one starts.
+
+      --require-mechanism <name>
+          Require the containment mechanism this host selects to be exactly `<name>` (`job_object` / `cgroup_v2` / `process_group`, the same vocabulary the JSONL `run_started` event publishes — `docs/schema.md`). Compared for exact equality; a host that reports anything else is unqualified (`HOST_UNQUALIFIED`, 116) with a mismatch naming both the required and the observed value. The report still carries the observed mechanism either way
+
+      --require-abrupt-cleanup <level>
+          Require the abrupt-cleanup guarantee this host offers to be exactly `<level>` (`whole_tree` / `direct_child_only` / `none`, the same vocabulary the JSONL `run_started` event publishes — `docs/schema.md`). This is what survives a runner killed without destructors, so an adapter that depends on whole-tree reaping pins it here.
+          
+          Exact equality, deliberately **not** an "at least this strong" comparison: the three values are platform facts (`docs/platform-support.md`), and this project publishes no ordering between them that a caller could rely on.
+
+      --require-resource-controller
+          Require the resource-controller check to have found the controller available. Requires `--check-resource-controller`: a requirement about a fact this invocation never observed could only ever be answered by guessing, so clap refuses the pair as a usage error (100) instead — the same fail-closed stance every other requirement here takes
+
+      --scratch-child <duration>
+          **Be** the harmless scratch child instead of qualifying anything: sleep for at most `<duration>`, write nothing, read nothing, contact nothing, and exit `0`.
+          
+          This is the process `doctor` launches inside its scratch container — the pattern `src/bin/e2e_helper.rs` established for the end-to-end tier, applied to the shipped binary, which is what lets `doctor` contain *this binary's own code* rather than some program it found on the host. It is published rather than hidden precisely because that claim is worth being able to check: a reader can run it and see for themselves that it does nothing.
+          
+          Bounded like every `e2e_helper` mode, so a `doctor` that is killed mid-run leaves a child that self-terminates rather than one that lingers.
+          
+          **Cannot be combined with any other `doctor` flag**: clap rejects that combination as an ordinary usage error (exit `100`) rather than letting a requested qualification be silently replaced by a sleep, the same structural refusal `probe --print-schema` uses for the same reason (`src/cli/probe.rs`).
+
+  -h, --help
+          Print help (see a summary with '-h')

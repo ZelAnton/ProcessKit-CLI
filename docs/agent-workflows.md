@@ -70,6 +70,21 @@ processkit-cli probe --json \
   --require-surface cancel:--run-id
 ```
 
+That preflight is about the executable. If the agent runs on a machine it has not
+used before — a fresh CI image, a new container, an unfamiliar developer box — the
+host itself is worth qualifying once as well, since a compatible binary can still meet
+an unwritable registry directory or a containment mechanism the kernel will not hand
+out:
+
+```sh
+processkit-cli doctor --json
+```
+
+It performs one bounded scratch containment of this binary's own harmless child and
+reports what the host did, exiting `116` if a phase failed. Unlike `probe` it has real
+(self-cleaning) side effects, so it belongs at session setup rather than before every
+tool invocation.
+
 An agent can then adapt this invocation template to each tool:
 
 ```sh

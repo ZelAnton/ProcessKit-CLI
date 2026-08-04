@@ -166,6 +166,21 @@ fn probe_reports_a_consistent_compatible_surface() {
         "attest:--run-id",
         "attest:--json",
         "attest:--error-format",
+        // `doctor` (T-307) is the fourth, and the first whose *purpose* is the same
+        // as this command's: it qualifies the host where `probe` qualifies the
+        // binary. It still enters the surface the same way every other subcommand
+        // does — `src/probe.rs` was not touched to add it — so a consumer's
+        // fail-closed preflight can require the runtime-qualification command
+        // exactly as it requires any flag.
+        "doctor",
+        "doctor:--json",
+        "doctor:--timeout",
+        "doctor:--check-resource-controller",
+        "doctor:--require-mechanism",
+        "doctor:--require-abrupt-cleanup",
+        "doctor:--require-resource-controller",
+        "doctor:--scratch-child",
+        "doctor:--error-format",
     ] {
         assert!(
             surface.contains(&token),
@@ -457,6 +472,55 @@ fn print_schema_appears_in_the_advertised_surface() {
         "the surface must already advertise probe:--print-schema: {out:?}"
     );
     assert_eq!(parse_report(&out)["compatible"], true);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The runtime-qualification command and its flags reach the advertised surface the
+/// same way every other subcommand does — through the live clap tree, with no edit to
+/// `src/probe.rs` — so a consumer can require them in the very preflight that decides
+/// whether to run `doctor` at all.
+///
+/// Driven as a real `--require-surface` run rather than by reading the array, because
+/// what a consumer actually does is ask the binary to *verify* the token and act on
+/// the exit code: this asserts the fail-closed gate, not just the report's contents.
+/// It also pins the one thing `doctor` must **not** do to `probe`: a bare probe with
+/// these requirements still spawns nothing and leaves nothing behind.
+#[test]
+fn doctor_appears_in_the_advertised_surface() {
+    let dir = scratch("probe-doctor-surface");
+    let out = probe(
+        &dir,
+        &[
+            "--require-surface",
+            "doctor",
+            "--require-surface",
+            "doctor:--json",
+            "--require-surface",
+            "doctor:--require-abrupt-cleanup",
+            "--require-surface",
+            "doctor:--check-resource-controller",
+            "--require-surface",
+            "doctor:--scratch-child",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the surface must already advertise `doctor` and its flags: {out:?}"
+    );
+    assert_eq!(parse_report(&out)["compatible"], true);
+
+    // Requiring the *side-effecting* command from the side-effect-free one changes
+    // nothing about the latter: still no child, still nothing written.
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .expect("read the probe cwd")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "requiring `doctor` must not make `probe` do anything: {leftovers:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

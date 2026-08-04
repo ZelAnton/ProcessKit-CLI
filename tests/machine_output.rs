@@ -2,7 +2,8 @@
 //! `probe --json`, `list --json`, `inspect --json` (single and `--all`), the
 //! `cancel`/`kill` ack and its `--all` report array, `prune --json` (with and
 //! without `--dry-run`), `wait --report-outcome` (single and `--all`),
-//! `attest --json`, and the `--error-format json` failure envelope — the one family
+//! `attest --json`, `doctor --json`, and the `--error-format json` failure envelope
+//! — the one family
 //! whose channel is **stderr** rather than stdout, because that is precisely where
 //! it keeps stdout reserved for successful output.
 //!
@@ -31,11 +32,11 @@
 //!    the document rejects.
 //!
 //! See `fixtures/schema/cli/README.md` for the layout, the versioning decision
-//! these outputs embody (four of these eight families — `probe`, `inspect`,
-//! `attest`, and the error envelope — carry their own `probe_version` /
-//! `snapshot_version` / `attestation_version` / `error_version`; the other four
-//! deliberately carry no version field), and what the normalization does and does
-//! not touch.
+//! these outputs embody (five of these nine families — `probe`, `inspect`,
+//! `attest`, `doctor`, and the error envelope — carry their own `probe_version` /
+//! `snapshot_version` / `attestation_version` / `doctor_version` / `error_version`;
+//! the other four deliberately carry no version field), and what the normalization
+//! does and does not touch.
 
 mod common;
 
@@ -66,6 +67,7 @@ const FAMILIES: &[&str] = &[
     "wait",
     "error",
     "attest",
+    "doctor",
 ];
 
 // ---------------------------------------------------------------------------
@@ -100,6 +102,49 @@ const SAMPLE_ARGV_SHA256: &str = "1111111111111111111111111111111111111111111111
 const SAMPLE_VERSION: &str = "0.0.0";
 const SAMPLE_MECHANISM: &str = "job_object";
 
+// ---------------------------------------------------------------------------
+// `doctor --json`'s samples.
+//
+// A qualification report is the one family here whose content is *about the host
+// that produced it*, so almost every value in it legitimately differs between two
+// platforms — and, for the timings, between two runs on the same one.
+//
+// The samples below are therefore per-field fixed values, not a portrait of one
+// plausible machine: two of the fields this family carries reuse samples the other
+// families already fixed (`mechanism`'s `job_object` and `endpoint`'s unix socket
+// path), which no single host would report together. That is deliberate — sharing a
+// sample keeps one normalizer entry per field name across every family, and the
+// fixture's job is to pin **shapes**: which facts are present, which are null, which
+// are counted. What each fact actually says on a given platform is asserted by
+// `tests/doctor.rs`, which runs on that platform and can therefore be specific about
+// it.
+// ---------------------------------------------------------------------------
+
+const SAMPLE_OS: &str = "windows";
+const SAMPLE_REGISTRY_DIR: &str = "/samples/registry";
+const SAMPLE_PROTECTION: &str = "windows_owner_only_dacl";
+const SAMPLE_ABRUPT_CLEANUP: &str = "whole_tree";
+const SAMPLE_TRANSPORT: &str = "windows_named_pipe";
+/// Every `elapsed_ms`, top-level and per-phase: a wall-clock measurement is
+/// different on every single run, so pinning one would make this fixture fail at
+/// random rather than on a change.
+const SAMPLE_ELAPSED_MS: u64 = 12;
+/// The observed member counts a healthy qualification reports before teardown
+/// (`inspected_members`, `members_before`). How many processes a platform's member
+/// enumeration reports for the same two-process scratch tree is a property of that
+/// platform's containment mechanism.
+const SAMPLE_MEMBER_COUNT: u64 = 1;
+/// The post-teardown count (`remaining`). Its own sample rather than
+/// [`SAMPLE_MEMBER_COUNT`] so the sample host stays coherent — one member contained,
+/// none left — and because what a platform's post-kill snapshot can report differs
+/// from what its live one does: on the POSIX `process_group` fallback that snapshot
+/// still lists a just-exited child nobody has reaped (`docs/schema.md`,
+/// "cleanup_finished"), which is exactly what `teardown_snapshot_conclusive` is for.
+const SAMPLE_REMAINING: u64 = 0;
+/// The directory a failed qualification keeps its evidence in — an absolute path on
+/// the machine that ran the test.
+const SAMPLE_DIAGNOSTICS_DIR: &str = "/samples/doctor-diagnostics";
+
 /// The failure envelope's `message` is the one field this directory publishes that
 /// is **deliberately not part of its contract** (`fixtures/schema/cli/error.schema.json`):
 /// it may be reworded in any release, so pinning its prose in a golden would turn
@@ -118,6 +163,19 @@ const SAMPLE_MESSAGE: &str = "<free-text explanation, not part of the contract>"
 /// report's complete, real surface is still validated against the schema.
 fn sample_surface() -> Value {
     json!(["run", "run:--jsonl"])
+}
+
+/// `doctor`'s two diagnostic arrays, with their length preserved and their text
+/// replaced: an empty array stays empty (the schema conditions on that), and a
+/// non-empty one keeps its element count so a report naming two unmet requirements
+/// is still distinguishable from one naming a single reason.
+fn sample_reasons(value: &Value) -> Value {
+    let count = value.as_array().map_or(0, Vec::len);
+    Value::Array(
+        (0..count)
+            .map(|_| json!("<free-text reason, not part of the contract>"))
+            .collect(),
+    )
 }
 
 /// A live container's member list is genuinely variable (how many processes a
@@ -190,18 +248,27 @@ fn assert_validates(family: &str, what: &str, values: &[Value]) {
 /// value replaced by its fixed sample (see the constants above). Recursive, and
 /// deliberately keyed on **field names** rather than value patterns, so it is
 /// obvious from this one function what a fixture line does and does not pin.
-fn normalize(value: &Value) -> Value {
+///
+/// `family` scopes the field names that belong to exactly one output family. Two
+/// families now spell a field the same way and mean something with different
+/// stability: `probe --json`'s `mismatches` names only what the *caller asked for*
+/// (fixed text, pinned verbatim), while `doctor --json`'s also names what the *host
+/// answered* ("this host selected `job_object`"), which no two platforms agree on.
+/// The key alone stopped being enough to decide, so the family decides.
+fn normalize(family: &str, value: &Value) -> Value {
     match value {
         Value::Object(map) => {
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort();
             let mut out = Map::new();
             for key in keys {
-                out.insert(key.clone(), normalize_field(key, &map[key]));
+                out.insert(key.clone(), normalize_field(family, key, &map[key]));
             }
             Value::Object(out)
         }
-        Value::Array(items) => Value::Array(items.iter().map(normalize).collect()),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|item| normalize(family, item)).collect())
+        }
         other => other.clone(),
     }
 }
@@ -209,9 +276,18 @@ fn normalize(value: &Value) -> Value {
 /// The per-field half of [`normalize`]. A `null` is always left alone:
 /// nullability is part of the shape a fixture pins, never something the
 /// normalizer gets to decide.
-fn normalize_field(key: &str, value: &Value) -> Value {
+fn normalize_field(family: &str, key: &str, value: &Value) -> Value {
     if value.is_null() {
         return Value::Null;
+    }
+    // `doctor --json` is a report *about the host that produced it*, so its own
+    // fields are scoped to it rather than shared: every one of them is volatile in a
+    // way the other families' same-named fields need not be, and one of them
+    // (`mismatches`) is a name another family already pins verbatim.
+    if family == "doctor"
+        && let Some(sample) = normalize_doctor_field(key, value)
+    {
+        return sample;
     }
     match key {
         "started_at" => json!(SAMPLE_STARTED_AT),
@@ -231,8 +307,40 @@ fn normalize_field(key: &str, value: &Value) -> Value {
         "message" => json!(SAMPLE_MESSAGE),
         "surface" => sample_surface(),
         "members" => sample_members(),
-        _ => normalize(value),
+        _ => normalize(family, value),
     }
+}
+
+/// The `doctor --json`-only fields, or `None` for a key this family does not own
+/// (which then falls through to the shared table above — `version`, and the
+/// `mechanism` and `endpoint` it shares with the control-plane families).
+///
+/// `remaining_pids` is normalized to the empty array its healthy case carries rather
+/// than to a sample pid: the field's shape is what this fixture pins, and a pinned pid
+/// would only invite it to be read as a promise about the count.
+fn normalize_doctor_field(key: &str, value: &Value) -> Option<Value> {
+    Some(match key {
+        "os" => json!(SAMPLE_OS),
+        "dir" => json!(SAMPLE_REGISTRY_DIR),
+        "protection" => json!(SAMPLE_PROTECTION),
+        "abrupt_cleanup" => json!(SAMPLE_ABRUPT_CLEANUP),
+        "transport" => json!(SAMPLE_TRANSPORT),
+        "elapsed_ms" => json!(SAMPLE_ELAPSED_MS),
+        "inspected_members" | "members_before" => json!(SAMPLE_MEMBER_COUNT),
+        "remaining" => json!(SAMPLE_REMAINING),
+        "remaining_pids" => json!([]),
+        "confirmed_empty" | "teardown_snapshot_conclusive" => json!(true),
+        // Both diagnostic arrays name values read off the host that produced the
+        // report ("this host selected `job_object`"), so their *text* is as
+        // platform-bound as the facts it quotes. Emptiness is preserved because that
+        // is shape — the schema conditions on it — while the strings themselves are
+        // replaced, for the same reason `error.jsonl`'s `message` is: they are
+        // diagnostics, not a contract, and the live output is still schema-validated
+        // with its real text in place.
+        "failures" | "mismatches" => sample_reasons(value),
+        "diagnostics_dir" => json!(SAMPLE_DIAGNOSTICS_DIR),
+        _ => return None,
+    })
 }
 
 /// Render fixture text: one canonical JSON value per line, LF-terminated.
@@ -255,7 +363,7 @@ fn check_family(family: &str, live: &[Value]) {
     );
     assert_validates(family, &format!("`{family}`'s live output"), live);
 
-    let normalized: Vec<Value> = live.iter().map(normalize).collect();
+    let normalized: Vec<Value> = live.iter().map(|value| normalize(family, value)).collect();
     let rendered = render(&normalized);
     let path = fixture_path(family);
     if std::env::var_os(UPDATE_ENV).is_some() {
@@ -956,6 +1064,72 @@ fn attestations_match_their_schema_and_fixture() {
     check_family("attest", &lines);
 
     cancel_run(&registry, "build-42", child);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `doctor --json`: the qualified report a healthy host produces, and the
+/// unqualified one an unmeetable `--require-*` expectation produces (exit `116`,
+/// `qualified: false`, and the concrete `mismatches`). Both go through the same
+/// document — the shape does not change with the verdict, which is the point of
+/// printing it either way.
+///
+/// This is the one family here whose scenario is a real, side-effecting run: the
+/// command under test creates a registry, contains a process, round-trips the control
+/// plane, and cleans up. It is pointed at the same isolated scratch registry every
+/// other scenario uses, so it neither sees nor leaves anything in the developer's own.
+///
+/// The pair is also this family's differential proof, at the shape level: the two
+/// lines are produced by invocations that differ **only** in a requirement flag, and
+/// what differs between them is `qualified` and `mismatches` — every observed fact is
+/// reported identically. (`tests/doctor.rs` makes the same point field by field on
+/// the un-normalized reports; here it is visible in the committed fixture.)
+#[test]
+fn doctor_reports_match_their_schema_and_fixture() {
+    let dir = scratch("machine-doctor");
+    let registry = registry_dir(&dir);
+
+    let qualified = cli(&registry, &["doctor", "--json"]);
+    let mut lines = machine_output(&qualified, 0, "`doctor --json`");
+
+    // A mechanism no platform reports: the requirement is unmeetable everywhere, so
+    // this line's *shape* is the same on every host the tests run on, while the
+    // observed facts stay whatever this host really did.
+    let unqualified = cli(
+        &registry,
+        &[
+            "doctor",
+            "--json",
+            "--require-mechanism",
+            "no-such-mechanism",
+        ],
+    );
+    lines.extend(machine_output(
+        &unqualified,
+        116,
+        "`doctor --json` with an unmeetable requirement",
+    ));
+
+    assert_eq!(lines[0]["qualified"], json!(true));
+    assert_eq!(lines[0]["mismatches"], json!([]));
+    assert_eq!(lines[1]["qualified"], json!(false));
+    assert_eq!(
+        lines[1]["mismatches"].as_array().map(Vec::len),
+        Some(1),
+        "the unmet requirement is named: {}",
+        lines[1]
+    );
+    assert!(
+        lines[1]["failures"].as_array().is_some_and(Vec::is_empty),
+        "an unmet requirement is not a failed phase: {}",
+        lines[1]
+    );
+    assert!(
+        lines[1]["diagnostics_dir"].is_null(),
+        "nothing failed, so nothing is kept: {}",
+        lines[1]
+    );
+
+    check_family("doctor", &lines);
     let _ = fs::remove_dir_all(&dir);
 }
 

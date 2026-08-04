@@ -443,6 +443,19 @@ pub enum PeerIdentity {
 /// might not be there.
 pub const PEER_IDENTITY_SUPPORTED: bool = imp::PEER_IDENTITY_SUPPORTED;
 
+/// The name of the local transport this build binds — `unix_socket` or
+/// `windows_named_pipe`.
+///
+/// Owned here, next to the [`imp`] module that implements both, so the one place a
+/// report names the transport ([`crate::doctor`]) reads it from the transport rather
+/// than restating it. Not part of any wire contract: it is a fact about this build,
+/// published only in the human/JSON doctor report
+/// (`fixtures/schema/cli/doctor.schema.json`).
+#[cfg(unix)]
+pub(crate) const TRANSPORT: &str = "unix_socket";
+#[cfg(windows)]
+pub(crate) const TRANSPORT: &str = "windows_named_pipe";
+
 /// The channel the control server pushes a mutating command into, handed to the
 /// run's main loop. An **unbounded** sender so the server's send is synchronous and
 /// cannot yield or block between writing its ack and signaling teardown: the ack is
@@ -815,7 +828,10 @@ impl<'a> SnapshotSource<'a> {
 
 /// The [`events::mechanism_str`] spelling of the POSIX process-group fallback — the
 /// one mechanism whose member list is *not* the whole contained tree, which
-/// [`peer_is_member`] has to account for.
+/// [`peer_is_member`] has to account for. [`crate::doctor`] is its second consumer,
+/// for the neighbouring consequence: on this one mechanism a *post-teardown* member
+/// snapshot cannot tell a survivor from a just-exited child nobody has reaped yet, so
+/// a qualification reports such a count rather than calling it a failed teardown.
 ///
 /// Compared as a string because this module deliberately does not depend on
 /// `processkit` directly (see [`SnapshotSource::members`]); that the string is the
@@ -823,7 +839,7 @@ impl<'a> SnapshotSource<'a> {
 /// this module's tests holds it against `events::mechanism_str`'s own output for that
 /// variant, so a rename there fails here rather than silently turning this branch
 /// off.
-const PROCESS_GROUP_MECHANISM: &str = "process_group";
+pub(crate) const PROCESS_GROUP_MECHANISM: &str = "process_group";
 
 /// Whether `peer_pid` is inside a container that reports `members` under `mechanism`
 /// — the single membership predicate `attest` answers with.
@@ -1171,7 +1187,14 @@ async fn inspect_async(run_id: &str, json: bool) -> Result<(), RunnerError> {
 /// aggregate path's equivalent step ([`inspect_snapshot_target`]) already takes its
 /// registry and target explicitly, so both consumers of a [`SnapshotReply`] can now be
 /// covered by the same regression test with a real transport in front of them.
-async fn inspect_endpoint(endpoint: &str, run_id: &str) -> Result<Snapshot, RunnerError> {
+///
+/// [`crate::doctor`] is the third consumer, and for the same reason as the tests: it
+/// has already resolved its own scratch run's endpoint and wants the round-trip
+/// against *that* endpoint, without the rendering [`inspect_async`] adds.
+pub(crate) async fn inspect_endpoint(
+    endpoint: &str,
+    run_id: &str,
+) -> Result<Snapshot, RunnerError> {
     // Connect under a deadline: a runner that died between the liveness probe and now
     // fails fast here instead of hanging the client.
     let stream = connect_live(endpoint, "inspect", run_id).await?;
@@ -1650,8 +1673,13 @@ async fn mutate_async(run_id: &str, command: ControlCommand) -> Result<(), Runne
 /// The by-`run_id` mutation itself: registry lookup, connect, re-confirm the target
 /// is still the sole live match, send the verb, read and verify the ack — the exact
 /// exchange the single-run `cancel`/`kill` client drives. Returns the parsed
-/// [`ControlAck`] rather than printing it so lookup and rendering stay separate.
-async fn mutate_one(run_id: &str, command: ControlCommand) -> Result<ControlAck, RunnerError> {
+/// [`ControlAck`] rather than printing it so lookup and rendering stay separate —
+/// which is also what lets [`crate::doctor`] drive the same mutating round-trip
+/// against its own scratch run without printing an ack nobody asked for.
+pub(crate) async fn mutate_one(
+    run_id: &str,
+    command: ControlCommand,
+) -> Result<ControlAck, RunnerError> {
     let action = command.verb();
     let registry = open_registry(action, run_id)?;
     let endpoint = resolve_in_registry(&registry, action, run_id)?;
@@ -2043,11 +2071,15 @@ fn snapshot_target_state(
 
 /// Find the endpoint of the *live* run named `run_id`, or a distinguishable
 /// [`exit::CONTROL`] failure that says *why* it cannot be reached. Shared by every
-/// client (`inspect`/`cancel`/`kill`/`attest`); `action` names the verb in the
-/// message. Opens the env/platform-resolved registry and delegates the scan to
+/// client (`inspect`/`cancel`/`kill`/`attest`) and by [`crate::doctor`], which drives
+/// the same resolution against its own scratch run rather than a second one written
+/// to pass; `action` names the verb in the message. Opens the env/platform-resolved registry and delegates the scan to
 /// [`resolve_in_registry`], which the mutating verbs' pre-dispatch re-check
 /// ([`reconfirm_target`]) also drives, against the same open [`registry::Registry`].
-async fn resolve_live_endpoint(action: &str, run_id: &str) -> Result<String, RunnerError> {
+pub(crate) async fn resolve_live_endpoint(
+    action: &str,
+    run_id: &str,
+) -> Result<String, RunnerError> {
     let registry = open_registry(action, run_id)?;
     resolve_in_registry(&registry, action, run_id)
 }
@@ -2151,7 +2183,11 @@ fn resolve_in_registry(
 /// Connect to a live runner's endpoint under [`CONNECT_DEADLINE`]: a runner that
 /// died between the liveness probe and now fails fast as a bounded [`exit::CONTROL`]
 /// error instead of hanging the client.
-async fn connect_live(
+///
+/// [`crate::doctor`] calls it for the opposite outcome from every other caller: after
+/// its scratch run has ended it expects the connect to **fail**, which is how it
+/// establishes that nothing still answers on the endpoint that run published.
+pub(crate) async fn connect_live(
     endpoint: &str,
     action: &str,
     run_id: &str,

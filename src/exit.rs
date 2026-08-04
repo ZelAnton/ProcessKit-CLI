@@ -140,18 +140,21 @@ pub const PROBE_INCOMPATIBLE: u8 = 110;
 /// A **setup / support failure**: a prerequisite the runner needs to run — or to
 /// report a result — could not be established or produced for an ordinary reason.
 /// The runner's async runtime could not be built
-/// (`run`/`inspect`/`cancel`/`kill`/`attest`),
+/// (`run`/`inspect`/`cancel`/`kill`/`attest`/`doctor`),
 /// a required output the operator asked for could not be created (the `--jsonl`
 /// events file, the `--capture-dir`), or a report/reply the runner must emit could
 /// not be serialized (the `probe` report, an `inspect` snapshot, a control ack, an
-/// `attest` attestation).
+/// `attest` attestation, a `doctor` qualification report) — or, for `doctor` alone,
+/// that command's own machinery failing before it can qualify anything (no scratch
+/// directory, no path to this executable), which is deliberately not
+/// [`HOST_UNQUALIFIED`]: the check never ran, so there is no verdict about the host.
 /// These are peripheral support steps failing on an environment/resource condition
 /// the *caller* can usually act on — a bad path, missing permissions, exhausted OS
 /// resources — **not** the runner's own run-tracking logic being violated, which
 /// stays [`INTERNAL`]. Splitting them out keeps `INTERNAL` (104) honestly meaning
 /// "a runner bug", so a consumer is never misled into reading a setup error as one.
 /// Takes the next free code after [`PROBE_INCOMPATIBLE`] so no existing assignment
-/// shifts; `113`–`115` are assigned below and `116`–`119` remain reserved.
+/// shifts; `113`–`116` are assigned below and `117`–`119` remain reserved.
 pub const SETUP: u8 = 111;
 /// The **`wait` subcommand's own** deadline elapsed while its target(s) were still
 /// live: `wait --timeout <duration>`, either the single-run form (`--run-id <id>`) or
@@ -196,7 +199,7 @@ pub const OUTPUT_OVERFLOW: u8 = 113;
 /// names no single readable stream is still [`CONTROL`] — this code means the check
 /// ran and failed, so a CI job can gate a fixture on it and tell "invalid" apart from
 /// "could not check". Takes the next free code after [`OUTPUT_OVERFLOW`] so no
-/// existing assignment shifts; `116`–`119` remain reserved.
+/// existing assignment shifts; `117`–`119` remain reserved.
 pub const EVENTS_INVALID: u8 = 114;
 /// `attest` established that the calling process is **not** a member of the run it
 /// asked about: the runner was reached, it named the caller from the control
@@ -229,8 +232,40 @@ pub const EVENTS_INVALID: u8 = 114;
 /// take this code: nothing was established, so it reports [`CONTROL`] (103) with the
 /// `peer_identity_unsupported` kind, alongside every other "no answer you can act
 /// on". Takes the next free code after [`EVENTS_INVALID`] so no existing assignment
-/// shifts; `116`–`119` remain reserved.
+/// shifts; `117`–`119` remain reserved.
 pub const NOT_A_MEMBER: u8 = 115;
+/// `doctor` completed its **runtime qualification of this host** and the verdict is
+/// no: a phase of the qualification failed, or a `--require-*` expectation about the
+/// host was not met (`docs/troubleshooting.md`, "Qualifying a host: `doctor`").
+///
+/// It is the host-side twin of [`PROBE_INCOMPATIBLE`] (110), and the pairing is the
+/// whole reason it exists as its own number rather than reusing one. `110` says *this
+/// binary* does not expose the surface a consumer requires — a fact about a file on
+/// disk, established without running anything. `116` says *this machine* did not
+/// successfully create a registry, contain a process, round-trip its control plane,
+/// or clean up afterwards — a fact about the environment, established by doing all of
+/// it. An adapter's response to the two is opposite (install a different binary
+/// versus fix or avoid the host), so folding them together would make the one
+/// distinction this command exists to draw invisible to a shell.
+///
+/// **Why not the codes that describe the same failures inside a run**, since reuse is
+/// this project's default (`docs/exit-codes.md`, "Stability")? [`BACKEND`] (102) is
+/// what a *run* exits with when its own container or registry could not be
+/// established, and a `doctor` that returned it would be indistinguishable from the
+/// scratch run it drove having failed for reasons of its own — while also saying
+/// nothing at all for the second half of this code's meaning, an unmet `--require-*`
+/// against a host that works perfectly. [`SETUP`] (111) is likewise already taken by
+/// this command for the opposite case: `doctor`'s own machinery failing (no scratch
+/// directory, no path to this executable, an unserializable report) is a support
+/// failure and keeps `111`, so that `116` can mean "the check ran, and the answer is
+/// no" without ambiguity. Unlike [`BACKEND`]'s reuse for a resource limit, there is
+/// also no earlier, more specific event to lean on: `doctor` writes no JSONL stream
+/// of its own — the report on stdout, always printed, is where the per-phase detail
+/// is.
+///
+/// Takes the next free code after [`NOT_A_MEMBER`] so no existing assignment shifts;
+/// `117`–`119` remain reserved.
+pub const HOST_UNQUALIFIED: u8 = 116;
 
 /// A runner-own failure carrying the exit code it should surface and a
 /// human-readable message. Distinct from a child's exit — a child's code is
@@ -317,6 +352,7 @@ mod tests {
             OUTPUT_OVERFLOW,
             EVENTS_INVALID,
             NOT_A_MEMBER,
+            HOST_UNQUALIFIED,
         ] {
             assert!(
                 (RUNNER_RANGE_START..=RUNNER_RANGE_END).contains(&code),
@@ -346,6 +382,7 @@ mod tests {
             OUTPUT_OVERFLOW,
             EVENTS_INVALID,
             NOT_A_MEMBER,
+            HOST_UNQUALIFIED,
         ];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {

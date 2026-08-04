@@ -235,6 +235,22 @@ processkit-cli probe --json \
 Exit `110` means the binary is incompatible with at least one requirement. No
 child or registry entry is created.
 
+## Qualify the host, not just the binary
+
+```sh
+processkit-cli doctor --json
+processkit-cli doctor --require-abrupt-cleanup whole_tree
+processkit-cli doctor --json --check-resource-controller --require-resource-controller
+```
+
+`probe` proves the binary; `doctor` proves the machine, by running a bounded scratch
+containment of this binary's own harmless child and reporting the registry,
+containment, control-transport, and cleanup facts it observed. Exit `116` means a
+phase failed or a `--require-*` expectation about the host was not met — and a failed
+phase keeps a diagnostics directory the report names. Unlike `probe` it has real
+(self-cleaning) side effects, so run it once per host at setup time rather than before
+every launch.
+
 ## Export the exact event schema
 
 ```sh

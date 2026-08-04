@@ -11,7 +11,13 @@ mistake.
 This document is the normative description of the **local transport**, the **wire
 protocol**, and the four clients — the read-only **`inspect`** and **`attest`**, and
 the mutating **`cancel`** / **`kill`** — including their behavior when the runner
-cannot be reached.
+cannot be reached. Four *clients*, not four callers: `doctor`
+([`docs/troubleshooting.md`](troubleshooting.md), "Qualifying a host: `doctor`")
+drives two of these very verbs — `inspect`, then `cancel` — through the same client
+code, against the scratch run it started for itself and never against a caller's run.
+It adds no verb, no reply shape, and no behavior of its own here; it is a consumer of
+this contract, which is what makes a successful qualification evidence about *this*
+contract working on *this* host.
 Discovery — how a client *finds* a live runner — is the run registry, described in
 [`docs/registry.md`](registry.md). The in-code source of truth is `src/control/`.
 

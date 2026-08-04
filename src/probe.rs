@@ -31,6 +31,13 @@
 //! no container. Running `probe` on a candidate is therefore safe to do as a
 //! preflight, with none of the effects a real `run` would have.
 //!
+//! That purity is also this module's limit, and the reason it has a sibling. A probe
+//! establishes what this *binary* is; it establishes nothing about whether the *host*
+//! can create a registry, contain a process, or bind a local endpoint — which is a
+//! question that can only be answered by doing those things. [`crate::doctor`] is the
+//! side-effecting command that does, and `probe` stays exactly as it is precisely so
+//! the two claims never blur into one (`docs/integration.md`, §1).
+//!
 //! ## The three consumer-side outcomes it grounds
 //!
 //! The consumer runs `<path> probe --json [--require-...]`; the outcomes this

@@ -179,7 +179,23 @@ code/docs it is implemented and described in.
   (110) with the concrete mismatches on any unmet expectation, rather than
   ever letting an adapter silently proceed with an incompatible binary
   (`src/probe.rs`; consumer walkthrough in
-  [`docs/integration.md`](integration.md), "Fail-closed preflight: `probe`").
+  [`docs/integration.md`](integration.md), "Fail-closed preflight").
+- **A host qualification that is itself a way in.** `doctor` is the one subcommand
+  besides `run` that spawns anything, so what it spawns and where it writes are part
+  of this model rather than an implementation detail. It contains **only this
+  binary's own code** — the child is `processkit-cli doctor --scratch-child`, a mode
+  that sleeps for a bounded duration and does nothing else — rather than a shell or
+  any program found on the host, so a qualification introduces no new argv, no new
+  parsing, and no new attack surface from the environment it is qualifying. Its
+  scratch directory is created **fresh and owner-only** (`0700` at creation on unix,
+  the per-user `%TEMP%` on Windows) with a non-recursive create, so an existing path
+  — including one a different local user pre-created under a guessed name in a
+  world-writable `/tmp` — is a hard failure rather than a directory it adopts and
+  writes into; that is the same stance the control transport takes for its own
+  private socket directory. Everything it creates in the real per-user registry is a
+  single scratch record it also removes, and the report says whether the removal was
+  confirmed (`src/doctor.rs`; operator walkthrough in
+  [`docs/troubleshooting.md`](troubleshooting.md), "Qualifying a host: `doctor`").
 - **Resource exhaustion from a pathological child output stream.** The
   `--capture-dir` tee enforces a hard per-stream byte ceiling
   (`CAPTURE_MAX_BYTES`, configurable via `--capture-max-bytes`) with an

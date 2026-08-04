@@ -51,8 +51,9 @@ failure is not mistaken for a child result.
 | 113  | `OUTPUT_OVERFLOW` | A capture stream exceeded `--capture-max-bytes` while `--capture-overflow cancel` was active. The runner ended the tree through its graceful-stop and escalation path. Distinct from a time deadline; `output_overflow` identifies the stream and limit. |
 | 114  | `EVENTS_INVALID`  | `events --validate` found at least one line of the JSONL stream it checked that does not conform to the event schema this binary embeds (the document `probe --print-schema` prints). A verdict about a **document**, not about any run — `events` spawns no child, contacts no runner, and mutates nothing. Deliberately not `PROBE_INCOMPATIBLE` (110), whose subject is the opposite direction (*this binary* failing a consumer's `--require-*` expectations), and not `SETUP` (111): the stream was found, opened, and read perfectly well, and "it does not conform" is the answer, not a failure to produce one. A stream that could not be read at all is still `SETUP` (111) and a `--run-id` naming no single readable stream is still `CONTROL` (103), so a CI job can tell "invalid" from "could not be checked". See "Checking a stream: `events --validate`" below. |
 | 115  | `NOT_A_MEMBER`    | `attest --run-id <id>` established that the **calling process is not inside that run's container**: the runner was reached, it named the caller from the control transport itself (unix peer credentials / `GetNamedPipeClientProcessId`), and that identity is not one of its container's members. A *decided verdict*, not a failure to obtain one — which is exactly why it is not `CONTROL` (103), whose every meaning is "no answer you can act on". `attest`'s other failing outcome, a runner that could not obtain a kernel-authenticated identity for the caller at all, **is** a `103` (`kind: peer_identity_unsupported`), because nothing was established either way. See "A membership verdict is not an unreachable target" below and [`docs/control-plane.md`](control-plane.md), "`attest`". |
+| 116  | `HOST_UNQUALIFIED` | `doctor` finished its **runtime qualification of this host** and the verdict is no: a phase of the qualification failed (the registry could not be created or is not owner-only, the scratch run never became reachable, the control-plane round-trip did not complete, teardown left the container unconfirmed, an artifact was not cleaned up) or a `--require-*` expectation about the host was not met. The host-side twin of `PROBE_INCOMPATIBLE` (110): that one says *this binary* lacks a surface, this one says *this machine* did not do the job. The report is printed on stdout either way and names which phase and which requirement; a failed phase also leaves a named diagnostics directory (see "Qualifying a host: `doctor`" below). |
 
-Codes `116`–`119` are **reserved** for future runner-own conditions. `--help`
+Codes `117`–`119` are **reserved** for future runner-own conditions. `--help`
 and `--version` are not failures: they print to stdout and exit `0`.
 
 A code is deliberately coarse — `CONTROL` (103) alone covers eight different
@@ -200,6 +201,50 @@ touches a run's JSONL stream, so the code (and, under `--error-format json`, the
 Like `WAIT_TIMEOUT` (112), this code says nothing about the run itself: `attest` is
 read-only, and the run it asked about is untouched and still going either way.
 
+## Qualifying a host: `doctor`
+
+`HOST_UNQUALIFIED` (116) is the verdict of the one subcommand whose subject is neither a
+run nor this binary, but the **machine**. `doctor` performs a bounded scratch run of this
+binary's own harmless child (see [`docs/troubleshooting.md`](troubleshooting.md),
+"Qualifying a host: `doctor`") and reports what it observed; `116` is what it exits when
+the answer is no.
+
+It is deliberately the twin of `PROBE_INCOMPATIBLE` (110), not a variant of it:
+
+- **`110` is about the file.** `probe` reads compile-time constants and the in-memory
+  clap tree; a `110` means the binary you found does not expose the surface you need.
+  Install or point at a different build.
+- **`116` is about the environment.** `doctor` creates a registry, contains a process,
+  round-trips the control plane, and cleans up; a `116` means *this machine* did not
+  complete that, or completed it and is not the machine you required. Fix or avoid the
+  host — a different build of this binary will not help.
+
+Two different situations share the code, and the report distinguishes them without a
+consumer having to parse prose:
+
+| Report | Meaning |
+| --- | --- |
+| `failures` non-empty | A phase failed: the registry could not be created or is not owner-only, the scratch run never became reachable, the control-plane round-trip did not complete, teardown was not confirmed, or an artifact was not cleaned up. The scratch directory is **kept**, and `diagnostics_dir` names it. |
+| `mismatches` non-empty | Every phase succeeded, but a `--require-*` expectation about the host was not met (`--require-mechanism`, `--require-abrupt-cleanup`, `--require-resource-controller`). Nothing failed, so nothing is kept. |
+
+The codes it does **not** use are as deliberate as the one it does:
+
+- **`BACKEND` (102)** is what a *run* exits with when its own container or registry could
+  not be established. A `doctor` returning it would be indistinguishable from the scratch
+  run it drove having failed on its own account — and would say nothing at all for the
+  second row above, where the host works perfectly and simply is not the one that was
+  asked for.
+- **`SETUP` (111)** is already this command's code for the opposite case: `doctor`'s own
+  machinery failing (no scratch directory, no path to this executable, a report that will
+  not serialize). Keeping that on `111` is what lets `116` mean "the check ran, and the
+  answer is no" without ambiguity.
+- No run-ending code applies. `doctor` ends no run of the caller's: the only run it ever
+  touches is the scratch one it minted for itself, which it also ends.
+
+The report is printed on stdout in **both** cases, exactly as `probe` prints its report
+whether or not it is compatible — so a caller always has a parseable result, and the
+number is the best-effort signal for a shell that cannot read it.
+
 ## Setup failures vs internal faults
 
 `SETUP` (111) and `INTERNAL` (104) are deliberately kept apart so the code alone tells a
@@ -211,8 +256,12 @@ caller which one happened:
   build; a required `--jsonl` events file, `--capture-dir`, or `--stdin-file` the
   operator asked for but that cannot be opened or created (an unwritable path, a missing
   parent, denied permissions); and a
-  `probe` / `inspect` / `attest` / control (`cancel`/`kill`) reply that cannot be
-  serialized. It also
+  `probe` / `inspect` / `attest` / `doctor` / control (`cancel`/`kill`) report or reply
+  that cannot be
+  serialized. For `doctor` it additionally covers that command's own machinery failing
+  before it can qualify anything — no scratch directory, no path to this executable —
+  which is deliberately *not* `HOST_UNQUALIFIED` (116): the check never ran, so there is
+  no verdict about the host to report (see "Qualifying a host: `doctor`" above). It also
   covers the two failures that belong to `--detach`'s wrapper rather than to the run — the
   detached runner could not be spawned, or it never reported a started run before the
   startup budget elapsed (see "Detached runs" below). In every
@@ -272,7 +321,7 @@ run can fail before it begins — a program that is not there (`SPAWN` 101), a c
 that cannot be created or a limit that cannot be applied (`BACKEND` 102), an unwritable
 `--jsonl`/`--capture-dir` (`SETUP` 111) — and the detached copy exits with precisely
 that code, which the caller then relays unchanged. A caller therefore reads `run
---detach`'s failures with the same table as `run`'s, and the reserved range `116`–`119`
+--detach`'s failures with the same table as `run`'s, and the reserved range `117`–`119`
 stays free. Two failures belong to the detach wrapper itself rather than to the run, and
 both take `SETUP` (111): the detached copy could not be spawned at all (a support step
 failed; blaming `SPAWN` would point at the caller's program, which was never reached),
@@ -286,10 +335,10 @@ never relayed, because no run path can exit successfully without having written
 `--error-format json` (below), a relayed code that `run` itself mints reports the kind
 the foreground failure would have reported — `spawn_error`, `container_error`, `setup`,
 and so on. A reserved-band code `run` *cannot* mint reports `kind: "unknown"` instead:
-that is `PROBE_INCOMPATIBLE` (110), `WAIT_TIMEOUT` (112), `EVENTS_INVALID` (114), and
-`NOT_A_MEMBER` (115),
-which only `probe`, `wait`, `events --validate`, and `attest` produce, plus any number
-no build assigns yet. The respawned copy can be a *different build* — the binary on disk may have
+that is `PROBE_INCOMPATIBLE` (110), `WAIT_TIMEOUT` (112), `EVENTS_INVALID` (114),
+`NOT_A_MEMBER` (115), and `HOST_UNQUALIFIED` (116),
+which only `probe`, `wait`, `events --validate`, `attest`, and `doctor` produce, plus
+any number no build assigns yet. The respawned copy can be a *different build* — the binary on disk may have
 been replaced between the spawn and the exec — so reading its number through this
 build's table would invent a verdict: a relayed `112` would say `wait_timeout`, the one
 kind that reports `retryable: true` and means "the run is still going, wait again",
@@ -373,8 +422,8 @@ and `tests/error_envelope.rs`. The in-code source of truth is
 | `error_version` | yes | The envelope's own format version, currently `1`. Pin it. A breaking change to the shape bumps it; a new field or a new `kind` value does not (both are additive). |
 | `code` | yes | The reserved-band code this invocation exits with — the same number `$?` reports, so the two can never disagree. |
 | `kind` | yes | What actually failed, finer than `code`. The vocabulary is below. |
-| `operation` | yes | The subcommand that failed: `run`, `inspect`, `cancel`, `kill`, `attest`, `wait`, `events`, `list`, `prune`, `probe`. |
-| `run_id` | yes | The run id the invocation named, or `null` when it named none (an `--all` fan-out, `list`/`prune`/`probe`, or a `run` that let the runner generate one). Present-and-null, never omitted. |
+| `operation` | yes | The subcommand that failed: `run`, `inspect`, `cancel`, `kill`, `attest`, `wait`, `events`, `list`, `prune`, `probe`, `doctor`. |
+| `run_id` | yes | The run id the invocation named, or `null` when it named none (an `--all` fan-out, `list`/`prune`/`probe`, a `doctor`, whose only run is the scratch one it mints for itself, or a `run` that let the runner generate one). Present-and-null, never omitted. |
 | `retryable` | yes | Whether repeating this exact invocation may succeed later. A pure function of `kind` — see below. |
 | **`message`** | **no** | The same free-text explanation the default prose prints. **Never branch on it**: it may be reworded in any release, and the golden fixture deliberately does not pin its text. |
 
@@ -400,7 +449,8 @@ either: every assigned code has at least one kind of its own, so branching on
 | `setup` | 111 | Any other prerequisite: an unwritable output, an unreadable stream, a runtime that would not build, a reply that would not serialize. |
 | `wait_timeout` | 112 | `wait`'s own deadline elapsed; the run was never touched and is still going. |
 | `events_invalid` | 114 | `events --validate` checked a document and it does not conform. |
-| `not_a_member` | 115 | `attest` established that the calling process is **not** in the container of the run it asked about. The one kind here that reports a decided verdict rather than something that went wrong. |
+| `not_a_member` | 115 | `attest` established that the calling process is **not** in the container of the run it asked about. One of the two kinds here that report a decided verdict rather than something that went wrong. |
+| `host_unqualified` | 116 | `doctor` finished qualifying this host and the verdict is no — a phase failed, or a `--require-*` expectation about the host was not met. The other decided verdict, and the one about the *machine* rather than a run; the per-phase detail is in `doctor`'s own report on stdout. |
 | `usage` | 100 | An invalid command line detected after parsing — in practice only a detached start relaying the code its respawned copy reported. clap's own parse-time errors are outside this envelope (below). |
 | `spawn_error` | 101 | The child could not be started. |
 | `container_error` | 102 | The container / job object / IPC endpoint / registry could not be established, including an unappliable resource limit. |
@@ -410,7 +460,7 @@ either: every assigned code has at least one kind of its own, so branching on
 | `control_cancel` | 108 | A control-plane `cancel` ended the run. |
 | `control_kill` | 109 | A control-plane `kill` ended the run. |
 | `output_overflow` | 113 | A capture stream exceeded `--capture-max-bytes` under `--capture-overflow cancel`. |
-| `unknown` | any | A reserved-band code this build will not name here. Read `code`. Reachable only when a `run --detach` relays the code of a respawned copy that turned out to be a different build, and covering both shapes of that: a code no build assigns yet (the retired `105`, the reserved `116`–`119`), and a code this build assigns to a *different* subcommand (`110`, `112`, `114`, `115` — minted only by `probe`, `wait`, `events --validate`, and `attest`, never by `run`), which the relay refuses to read as a verdict about a run. |
+| `unknown` | any | A reserved-band code this build will not name here. Read `code`. Reachable only when a `run --detach` relays the code of a respawned copy that turned out to be a different build, and covering both shapes of that: a code no build assigns yet (the retired `105`, the reserved `117`–`119`), and a code this build assigns to a *different* subcommand (`110`, `112`, `114`, `115`, `116` — minted only by `probe`, `wait`, `events --validate`, `attest`, and `doctor`, never by `run`), which the relay refuses to read as a verdict about a run. |
 
 The nine `run`-family values in that table (`usage` is not one of them: a
 `run --detach` can relay it, but it names no run *ending*) are **not a second
@@ -496,7 +546,13 @@ Two things, both deliberate and both stated here rather than left as silent gaps
 - New runner-own conditions take the **next free code** in the reserved range
   rather than overloading an existing one, and only when no existing code (or an
   earlier, more specific event or field) already tells the new situation apart.
-  `NOT_A_MEMBER` (115) is the most recent, taking the next free slot after
+  `HOST_UNQUALIFIED` (116) is the most recent, taking the next free slot after
+  `NOT_A_MEMBER` (115) rather than overloading `BACKEND` (102) — which would make a
+  *qualification's verdict about a host* indistinguishable from the scratch run it
+  drove having failed on its own account, and would say nothing at all for this code's
+  other half, an unmet `--require-*` against a host that works perfectly (see
+  "Qualifying a host: `doctor`" below); `NOT_A_MEMBER` (115) did the same before it,
+  taking the slot after
   `EVENTS_INVALID` (114) rather than overloading `CONTROL` (103), whose every meaning
   is the absence of an answer rather than a decided one (see "A membership verdict is
   not an unreachable target" above); `EVENTS_INVALID` (114) did the same before it,
@@ -505,7 +561,7 @@ Two things, both deliberate and both stated here rather than left as silent gaps
   than a document's (see "Checking a stream: `events --validate`" above); and `WAIT_TIMEOUT`
   (112) before that, taking the slot after `SETUP` (111) rather than
   overloading `TIMEOUT` (106), whose meaning is the opposite one (see "A waiter's
-  deadline is not a run's deadline" above). Codes `116`–`119` remain reserved.
+  deadline is not a run's deadline" above). Codes `117`–`119` remain reserved.
 - The **`--error-format json` envelope** versions on its own axis, `error_version`
   (currently `1`), independent of every code above: removing or re-typing a stable
   field, or changing what an existing `kind` means, is a breaking change and bumps

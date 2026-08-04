@@ -129,6 +129,26 @@ That matrix proves the repository's release contract; it does not prove that a
 particular Linux deployment grants cgroup controllers. Test mechanism selection
 and limit application in the actual service/container environment.
 
+## Confirming the table on the machine in front of you
+
+Everything above is what a platform *can* give. Which of it this particular host
+actually gives is a question about the host — cgroup delegation may be absent, a
+registry directory may be unwritable, a local endpoint may not bind — and
+`doctor` answers it by running a bounded scratch containment and reporting what it
+observed:
+
+```sh
+processkit-cli doctor --json
+```
+
+Its `containment.mechanism` and `containment.abrupt_cleanup` are the same two fields
+this page's first table lists, read off a real run on this host rather than inferred
+from the platform; `--check-resource-controller` additionally reports whether the
+limit rows of the capability matrix are available here. It is the setup-time
+counterpart to the run-time acceptance policy below, and unlike `probe` it proves the
+containment path end to end — see [`docs/troubleshooting.md`](troubleshooting.md),
+"Qualifying a host: `doctor`".
+
 ## Choosing an acceptance policy
 
 An adapter can read the first `run_started` event and fail closed:
@@ -137,6 +157,19 @@ An adapter can read the first `run_started` event and fail closed:
 require mechanism == job_object or cgroup_v2
 require abrupt_cleanup == whole_tree        # Windows-only today
 ```
+
+The same two policies can be applied one step earlier, to the host rather than to a
+run, with the same vocabulary and an exit code instead of a field to compare:
+
+```sh
+processkit-cli doctor --require-mechanism cgroup_v2
+processkit-cli doctor --require-abrupt-cleanup whole_tree
+```
+
+Each is an exact match against what this host reports — deliberately not an "at least
+this strong" comparison, because the three `abrupt_cleanup` levels are platform facts
+and this project publishes no ordering between them. An unmet requirement exits
+`HOST_UNQUALIFIED` (116) and still prints the full report.
 
 These are separate policies. A Linux cgroup gives strong normal teardown but
 not Windows-equivalent abrupt cleanup.
@@ -147,3 +180,5 @@ not Windows-equivalent abrupt cleanup.
 - [Resource limits](resource-limits.md).
 - [Timeouts and cancellation](timeouts-and-cancellation.md).
 - [JSONL event schema](schema.md#run_started).
+- [Troubleshooting](troubleshooting.md#qualifying-a-host-doctor) — qualifying a
+  host with `doctor`, and reading a negative verdict.
