@@ -55,7 +55,15 @@ accordingly (bounded parsing, validation before use, no blind trust in shape):
     rendering: it passes the runner's own bytes through byte for byte (a line
     that is not JSON is reported instead of emitted), relying on JSON's own
     escaping exactly as this project's other machine-readable outputs do —
-    the line `src/text.rs` draws explicitly between the two.
+    the line `src/text.rs` draws explicitly between the two. The
+    `--error-format json` failure envelope (`src/error_envelope.rs`) sits on the
+    same side of that line, and it is worth being explicit because it prints to
+    **stderr**, where a terminal may be watching: its `message` is the very string
+    the prose mode prints, but serialized by `serde_json`, so a control sequence or
+    bidi override that reached a diagnostic (through an OS error text, say) is
+    escaped rather than emitted, and the object is always exactly one line. The
+    fragments that are sanitized at construction — the events locator above, for
+    instance — stay sanitized in both modes, because both render the same message.
 
   See "Supply-chain compromise" below for what the fuzz tier does and does not
   currently exercise on this surface.

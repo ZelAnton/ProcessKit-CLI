@@ -12,6 +12,31 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- `--error-format <human|json>`, the CLI's first **global** option: accepted before
+  or after the subcommand, honored by every subcommand, and off by default. Under
+  `--error-format json` a post-parse failure prints exactly one bounded, versioned
+  JSON object on **stderr** instead of the `processkit-cli: <message>` prose —
+  `error_version`, `code`, `kind`, `operation`, `run_id`, `retryable`, `message` —
+  so an adapter branches on a published `kind` rather than on English. The point is
+  that an exit code is coarse: `CONTROL` (103) alone covers six situations, and
+  `kind` splits it into `not_found` / `stale` / `unprobed` / `ambiguous_run_id` /
+  `control_unreachable` / `ipc_deadline` / `incompatible_contract` (and splits
+  `SETUP` 111 into `registry` versus `setup`). **No exit code was minted or
+  changed**: the taxonomy is a finer axis over the existing band, and for a failing
+  `run` its values are the terminal `runner_exit` event's own `source` spellings
+  rather than a second vocabulary for the same endings. `message` is deliberately
+  *not* part of the contract and may be reworded in any release. Invariants: stdout
+  is never touched (a command that prints a report and then fails, like
+  `probe --json` exiting 110, still prints exactly what it always did), the default
+  stderr prose is byte-for-byte unchanged, and the exit code is unchanged. The
+  shape is published as `fixtures/schema/cli/error.schema.json` with a golden
+  `error.jsonl` beside it and its own `error_version` (currently `1`) — the third
+  versioned family in that directory, for the reason the other two are versioned: a
+  captured stderr line is routinely read out of its invoking context. One
+  documented gap: clap's *parse-time* usage errors (exit 100) stay human-readable
+  in v1, since they happen before the binary knows what it was asked to do. See
+  `docs/exit-codes.md`, "Machine-readable failures: `--error-format json`", and
+  `docs/integration.md` §7.
 - `events`, a read-only subcommand that reads a run's JSONL lifecycle stream back:
   it resolves the stream through the per-user registry (`--run-id`, the same
   locator `list --json` publishes) or takes an explicit `--file <events.jsonl>` for

@@ -232,18 +232,33 @@ fn evaluate(args: &ProbeArgs) -> Vec<String> {
 
 /// The binary's CLI surface tokens, derived from the **live** clap definition so the
 /// report can never drift from the real parser: for each subcommand, its name, plus
-/// `<name>:--<long>` for each of its long flags. The clap-injected `--help` /
+/// `<name>:--<long>` for each of its long flags — its own, and the top-level
+/// **global** options every subcommand accepts (`--error-format`), which are declared
+/// once on [`crate::cli::Cli`] and belong to each subcommand's real surface just the
+/// same. The clap-injected `--help` /
 /// `--version` flags are excluded — they are not part of the compatibility surface.
 /// Sorted and deduplicated for a deterministic, stable order.
+///
+/// The token *grammar* is unchanged by the global pass: a consumer pins
+/// `inspect:--error-format` exactly as it pins `inspect:--json`, because
+/// `processkit-cli inspect --error-format json …` is a real, supported invocation.
+/// The globals are walked explicitly rather than by building the clap command (which
+/// is what would otherwise propagate them), because building also injects clap's own
+/// `help` subcommand and would silently widen the published surface with tokens no
+/// task asked for.
 fn surface_tokens() -> Vec<String> {
     use clap::CommandFactory;
 
     let command = crate::cli::Cli::command();
+    let globals: Vec<&clap::Arg> = command
+        .get_arguments()
+        .filter(|arg| arg.is_global_set())
+        .collect();
     let mut tokens = Vec::new();
     for sub in command.get_subcommands() {
         let name = sub.get_name();
         tokens.push(name.to_string());
-        for arg in sub.get_arguments() {
+        for arg in sub.get_arguments().chain(globals.iter().copied()) {
             if let Some(long) = arg.get_long() {
                 if long == "help" || long == "version" {
                     continue;
@@ -392,6 +407,19 @@ mod tests {
             "probe:--require-exit-code-band",
             "probe:--require-surface",
             "probe:--print-schema",
+            // The global `--error-format` (T-305) reaches every subcommand's token
+            // set. Unlike every entry above it, this one did require a change to the
+            // derivation itself: a global option is declared on `Cli`, not on a
+            // subcommand, so `surface_tokens` had to learn that category exists — the
+            // token *grammar*, and the absence of any hand-maintained token list, are
+            // unchanged.
+            "run:--error-format",
+            "inspect:--error-format",
+            "wait:--error-format",
+            "events:--error-format",
+            "list:--error-format",
+            "prune:--error-format",
+            "probe:--error-format",
         ] {
             assert!(
                 surface.iter().any(|t| t == expected),

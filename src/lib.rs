@@ -38,10 +38,15 @@
 //! runner's parent and so cannot wait on it as a child process. [`events_cmd`]
 //! closes the loop by reading a run's JSONL stream back — rendering, following,
 //! passing through, or schema-checking the very events [`events`] wrote — resolving
-//! the stream through the same registry, and mutating nothing. The compatibility
+//! the stream through the same registry, and mutating nothing. [`error_envelope`]
+//! is the failure-side counterpart to all of them: under the global
+//! `--error-format json` it renders whatever any of these commands failed with as
+//! one bounded, versioned JSON object on stderr, so an adapter branches on a
+//! published `kind` instead of on prose. The compatibility
 //! surface — CLI flags (see [`cli`]), the exit-code
-//! contract (see [`exit`] and `docs/exit-codes.md`), and the JSONL `schema_version`
-//! (see [`events`] and `docs/schema.md`) — is fixed.
+//! contract (see [`exit`] and `docs/exit-codes.md`), the JSONL `schema_version`
+//! (see [`events`] and `docs/schema.md`), and the machine-error envelope's own
+//! `error_version` (see [`error_envelope`] and `docs/exit-codes.md`) — is fixed.
 
 #[doc(hidden)]
 pub mod capture;
@@ -51,6 +56,8 @@ pub mod cli;
 pub mod control;
 #[doc(hidden)]
 pub mod duration_fmt;
+#[doc(hidden)]
+pub mod error_envelope;
 #[doc(hidden)]
 pub mod events;
 #[doc(hidden)]

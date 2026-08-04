@@ -71,9 +71,9 @@ validate what it parsed instead of re-deriving the shape by hand. Every
 machine-readable output in this guide has such a pair; see
 [`fixtures/schema/cli/README.md`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/fixtures/schema/cli/README.md)
 for the full table, and `docs/compatibility.md`, "Machine-output schemas", for
-why these outputs carry no version field of their own (the `probe` report's
-`probe_version` and the `inspect` snapshot's `snapshot_version` are the two that
-do).
+why most of these outputs carry no version field of their own (the `probe`
+report's `probe_version`, the `inspect` snapshot's `snapshot_version`, and the
+failure envelope's `error_version` — §7 — are the three that do).
 
 `probe --print-schema` is a separate, simpler mode on the same subcommand: it
 prints this binary's embedded JSONL event-schema document instead of the
@@ -450,7 +450,13 @@ list), each with a golden `*.jsonl` fixture beside it.
 
 ## 6. Typical errors
 
-- **Stale registry entry.** The runner behind a `run_id` died abruptly
+Every distinction in this section is available as a **machine-readable value**, not
+only as prose: run any of these commands with the global `--error-format json` and
+the failure prints one bounded JSON object on stderr whose `kind` names exactly the
+case below (`stale`, `unprobed`, `ambiguous_run_id`, `incompatible_contract`, …).
+The `kind` column is noted per bullet; §7 has the full contract.
+
+- **Stale registry entry.** (`kind: "stale"`) The runner behind a `run_id` died abruptly
   (crash, `SIGKILL`, a parent's Job Object terminate); its record is left
   behind but its liveness lock is released. `inspect`/`cancel`/`kill` detect
   this *before* connecting and report it as a `CONTROL` (103) failure with an
@@ -462,7 +468,7 @@ list), each with a golden `*.jsonl` fixture beside it.
   the cleanup pair, `runner_exit` `cancelled`/`107`, and removal of the registry
   entry), so stopping a run with `kill <pid>` (Unix) or a closed console
   (Windows) leaves neither a stale entry nor a surviving descendant.
-- **Unprobeable registry entry.** The entry's liveness lock could not be probed
+- **Unprobeable registry entry.** (`kind: "unprobed"`) The entry's liveness lock could not be probed
   at all (permission denied, a rejected symlink/reparse point, a non-regular
   file in its place), so nothing about the run is confirmed either way. This is
   the same `CONTROL` (103) refusal — `inspect`/`cancel`/`kill` act only on a
@@ -470,18 +476,18 @@ list), each with a golden `*.jsonl` fixture beside it.
   a gone runner; `list` shows the same entry as `unprobed` and `prune` leaves
   it in place. Investigate the registry directory rather than deleting the
   record by hand (see [`docs/troubleshooting.md`](troubleshooting.md)).
-- **Died mid-conversation.** The registry entry read as live, but the runner
+- **Died mid-conversation.** (`kind: "control_unreachable"`, or `"ipc_deadline"` when a bounded window elapsed instead) The registry entry read as live, but the runner
   exited between the liveness check and the reply reaching the client — the
   connect fails, or the connection closes before a complete response. Also a
   bounded `CONTROL` (103) failure, never a wedge: every wait in the control
   plane (connecting, and the request/response exchange) is deadline-bounded.
-- **Ambiguous `run_id`.** The registry does not enforce `run_id` uniqueness;
+- **Ambiguous `run_id`.** (`kind: "ambiguous_run_id"`) The registry does not enforce `run_id` uniqueness;
   if more than one **live** entry matches, every by-`run-id` command — the
   read-only `inspect` and `wait` included — fails closed with `CONTROL` (103)
   rather than guessing which entry the scan happened to return first. Keep
   `run_id`s unique among an adapter's own concurrently-live runs (§2) to avoid
   this entirely.
-- **An unreadable snapshot version (`inspect` only).** The runner was reached and
+- **An unreadable snapshot version (`inspect` only).** (`kind: "incompatible_contract"`) The runner was reached and
   answered, but its reply declared a control-plane `snapshot_version` outside the
   range this client reads — newer than the version it implements, or older than the
   version it still decodes — so `inspect` refuses the answer instead of rendering it
@@ -517,12 +523,56 @@ list), each with a golden `*.jsonl` fixture beside it.
   `runner_exit` event (§3), reached after `wait` (§4). See
   [`docs/exit-codes.md`](exit-codes.md#detached-runs-the-code-reports-the-start),
   "Detached runs".
-- **`SETUP` (111) vs. `INTERNAL` (104).** A `run` that could not write its
+- **`SETUP` (111) vs. `INTERNAL` (104).** (`kind: "setup"` versus `"internal"`; an unreadable *registry* narrows further to `"registry"`) A `run` that could not write its
   `--jsonl`/`--capture-dir`, or open a `--stdin-file`, fails closed with
   `SETUP` (111) — an ordinary, usually-actionable environment problem (bad
   path, permissions), not a runner bug. `INTERNAL` (104) is reserved for a
   genuine invariant violation in the runner's own logic. See "Setup failures
   vs internal faults" in [`docs/exit-codes.md`](exit-codes.md#setup-failures-vs-internal-faults).
+
+## 7. Machine-readable failures: `--error-format json`
+
+Everything in §6 is a real distinction the CLI already makes — but by default an
+adapter can only read it as English on stderr, because the exit code is coarse
+(`CONTROL` (103) covers six of those bullets at once). The global, opt-in
+`--error-format json` publishes the distinction instead:
+
+```sh
+processkit-cli --error-format json inspect --run-id build-42
+# stderr, exactly one line:
+# {"error_version":1,"code":103,"kind":"stale","operation":"inspect",
+#  "run_id":"build-42","retryable":false,"message":"cannot inspect run `build-42`: …"}
+```
+
+- **Opt in wherever it is convenient.** The flag is global: it parses before or
+  after the subcommand, and every subcommand honors it. Pin it in the preflight
+  like any other flag — `--require-surface inspect:--error-format` (§1).
+- **Branch on `kind` (and `code`), never on `message`.** `error_version`, `code`,
+  `kind`, `operation`, `run_id`, and `retryable` are the contract; `message` is
+  free text that may be reworded in any release.
+- **`kind` maps onto §6.** `stale`, `unprobed`, `ambiguous_run_id`,
+  `control_unreachable`, `ipc_deadline`, `incompatible_contract`, `not_found`,
+  plus `registry`/`setup`, `wait_timeout`, `events_invalid`, `probe_incompatible`,
+  and — for a failing `run` — the terminal `runner_exit` event's own `source`
+  spellings (`spawn_error`, `container_error`, `timeout`, `cancelled`,
+  `control_cancel`, `control_kill`, `output_overflow`). Unrecognized value? Fall
+  back to `code`; the vocabulary grows additively.
+- **stdout is untouched.** The envelope is on stderr, so an adapter can leave the
+  flag on for every invocation without any risk to the JSON it parses from stdout —
+  including for a command that prints a report *and then* fails, such as
+  `probe --json` exiting 110 or `inspect --all --json` exiting 103.
+- **The default is unchanged.** Without the flag, stderr is byte-for-byte the prose
+  every earlier release printed.
+- **One documented gap.** clap's *parse-time* usage errors (exit `USAGE`, 100 — an
+  unknown flag, a malformed duration, a missing subcommand) stay human-readable in
+  v1: they happen before the binary knows what it was asked to do, so there is no
+  operation to name. Use the §1 preflight to establish that a flag exists before
+  using it. Every **post-parse** failure is covered.
+
+The shape is published like every other machine-readable output in this guide:
+`fixtures/schema/cli/error.schema.json` with a golden `error.jsonl` beside it. The
+normative field-by-field contract, the full `kind` table, and the `retryable` rule
+are in [`docs/exit-codes.md`](exit-codes.md#machine-readable-failures---error-format-json).
 
 ## See also
 
@@ -533,9 +583,9 @@ list), each with a golden `*.jsonl` fixture beside it.
 - [`fixtures/schema/cli/README.md`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/fixtures/schema/cli/README.md)
   — the JSON Schema documents and golden fixtures for every machine-readable
   output in this guide (`probe`, `list`, `inspect`, the `cancel`/`kill` acks,
-  `prune`, `wait --report-outcome`), and the versioning decision behind them
-  (`probe` and `inspect` carry their own version field; the other four
-  deliberately carry none).
+  `prune`, `wait --report-outcome`, and the `--error-format json` failure
+  envelope), and the versioning decision behind them (`probe`, `inspect`, and the
+  envelope carry their own version field; the other four deliberately carry none).
 - [`docs/compatibility.md`](compatibility.md) — the compatibility surfaces, the
   pinning procedure, and the upgrade/downgrade checklists.
 - [`docs/exit-codes.md`](exit-codes.md) — the normative reserved exit-code

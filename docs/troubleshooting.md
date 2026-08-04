@@ -142,7 +142,12 @@ nothing to any run; **`cancel --all` / `kill --all` are the exception** — see
 "`cancel --all` / `kill --all` and a partial `103`" below before assuming
 nothing happened.
 
-**Diagnose.** stderr names which of three reasons applied — a **stale registry
+**Diagnose.** stderr names which of three reasons applied — and if you are
+diagnosing this from a script rather than by eye, re-run the same command with
+`--error-format json`, which prints the reason as a machine-readable `kind`
+(`stale` / `unprobed` / `control_unreachable`, plus `not_found`,
+`ambiguous_run_id`, `ipc_deadline`, and `incompatible_contract`) instead of a
+sentence: a **stale registry
 entry** (the runner died abruptly, so the entry's record is left behind but
 its liveness lock has been released, detected *before* connecting), an
 **unprobeable registry entry** (the liveness lock could not be probed at all,

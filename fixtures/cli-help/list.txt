@@ -3,7 +3,27 @@ List every run recorded in the per-user registry, whatever its health (live/stal
 Usage: processkit-cli list [OPTIONS]
 
 Options:
-      --json               Emit one JSON object per entry (one per line) instead of a human-readable table. Unlike `inspect`/`probe`, this flag is optional — `list` has a human-readable form of its own
-      --label <KEY=VALUE>  Keep only entries carrying this exact operator label. Repeat for logical AND
-      --health <health>    Keep only entries with this registry-health verdict [possible values: live, stale, unprobed]
-  -h, --help               Print help
+      --error-format <format>
+          How a runner-own failure is reported on stderr. `human` (the default) prints the historical `processkit-cli: <message>` prose; `json` prints exactly one bounded, versioned JSON object instead, so an adapter can branch on stable fields (`code`, `kind`, `retryable`) rather than parsing prose.
+          
+          Global on purpose — it is accepted before or after the subcommand, and every subcommand honors it. It never changes stdout, an exit code, or the default prose; clap's own parse-time usage errors stay human-readable in v1. See [`crate::error_envelope`] and `docs/exit-codes.md`.
+
+          Possible values:
+          - human: The historical free-text line, unchanged byte for byte
+          - json:  One bounded, versioned JSON object per failed invocation (see [`crate::error_envelope`] and `fixtures/schema/cli/error.schema.json`)
+          
+          [default: human]
+
+      --json
+          Emit one JSON object per entry (one per line) instead of a human-readable table. Unlike `inspect`/`probe`, this flag is optional — `list` has a human-readable form of its own
+
+      --label <KEY=VALUE>
+          Keep only entries carrying this exact operator label. Repeat for logical AND
+
+      --health <health>
+          Keep only entries with this registry-health verdict
+          
+          [possible values: live, stale, unprobed]
+
+  -h, --help
+          Print help (see a summary with '-h')

@@ -258,6 +258,9 @@ processkit-cli prune   [--json] [--dry-run] [--label <KEY=VALUE>]...
 processkit-cli probe   --json [--require-schema-version <N>]
                        [--require-exit-code-band <start>-<end>]
                        [--require-surface <token>]...
+
+# accepted by every subcommand above, before or after it:
+                       [--error-format <human|json>]
 ```
 
 The command is intentionally shell-free: `run` executes `<program> <args...>`
@@ -270,6 +273,18 @@ surface (version, `schema_version`, exit-code band, and CLI surface tokens) as o
 JSON line and — with `--require-*` — verifies it, so a consumer can confirm a
 runner is usable **before** launching a payload. It spawns no child and touches no
 registry or container.
+
+`--error-format` is the CLI's one **global** option: it parses before or after the
+subcommand and every subcommand honors it. `--error-format json` replaces the
+`processkit-cli: <message>` prose a failure prints on stderr with exactly one
+bounded, versioned JSON object — `{"error_version":1,"code":103,"kind":"stale",
+"operation":"inspect","run_id":"build-42","retryable":false,"message":"…"}` — so an
+adapter can branch on a stable `kind` instead of parsing English (a single `103`
+covers six different situations). It is opt-in and stdout-safe: without it stderr
+is byte-for-byte what it always was, and with it stdout is untouched, so it can be
+left on for every invocation. clap's own parse-time usage errors stay
+human-readable in v1. See [the exit-code contract](docs/exit-codes.md), and
+`fixtures/schema/cli/error.schema.json` for the published shape.
 
 By default, live output is **pipe + echo, not a real inherited terminal**:
 ProcessKit reads the child's stdout/stderr through pipes and this runner re-emits
@@ -631,6 +646,13 @@ elapsing while the run it was watching is still live. That last one describes th
 from the run's own `TIMEOUT` (`106`). `events --validate` adds `EVENTS_INVALID`
 (`114`) in the same spirit — a verdict about a *document*, not about any run: the
 stream it checked does not conform to this binary's event schema.
+
+A code is necessarily coarse — `CONTROL` (`103`) alone covers six different
+situations, from a stale registry entry to an ambiguous run id. A consumer that
+needs the finer verdict without parsing prose adds the global `--error-format json`,
+which prints one bounded JSON object on stderr naming that same code plus a more
+specific `kind`; see
+[Machine-readable failures](docs/exit-codes.md#machine-readable-failures---error-format-json).
 
 `run --detach` is the single exception to the first sentence, and it mints no code
 of its own: with the run handed to a detached copy there is no child left for this

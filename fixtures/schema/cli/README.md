@@ -12,8 +12,18 @@ same three-part contract discipline the JSONL lifecycle-event stream already has
 | `cancel`/`kill` ack (single) and the `--all` report array | `control-ack.schema.json` | `control-ack.jsonl` | [`docs/control-plane.md`](../../../docs/control-plane.md), "The ack", "`cancel --all` / `kill --all`" |
 | `prune --json` (tally and `--dry-run`) | `prune.schema.json` | `prune.jsonl` | [`docs/registry.md`](../../../docs/registry.md), "Reaping — `prune`" |
 | `wait --report-outcome` (single outcome and the `--all` array) | `wait.schema.json` | `wait.jsonl` | [`docs/registry.md`](../../../docs/registry.md), "Waiting — `wait`" |
+| `--error-format json` failure envelope (**stderr**, every subcommand) | `error.schema.json` | `error.jsonl` | [`docs/exit-codes.md`](../../../docs/exit-codes.md), "Machine-readable failures: `--error-format json`"; [`docs/integration.md`](../../../docs/integration.md) §7 |
 
-**Why `events --json` is not a seventh family.** It is not a *non-event* output:
+**The error envelope is the one family on stderr, and that is the point.** Every
+other row above is a *successful* command's stdout. The envelope is what a
+**failed** invocation prints, and it goes to stderr precisely so that stdout stays
+reserved for success — a command that prints a report and *then* fails
+(`probe --json` exiting 110, `inspect --all --json` exiting 103) leaves its stdout
+byte-for-byte unchanged and adds the envelope beside it. It is not a seventh
+*success* shape; it is the failure-side counterpart to all six, which is also why
+success-output fixtures could never have covered it.
+
+**Why `events --json` is not a family here.** It is not a *non-event* output:
 `events --json` passes the runner's own JSONL lines through byte for byte, so the
 document that describes it is [`fixtures/schema/v1/schema.json`](../v1/schema.json)
 itself — the very one this directory exists to complement. Publishing a second
@@ -37,11 +47,12 @@ validates both the golden fixture *and* the real binary's live output against
 every document. On a disagreement between a schema and the prose, trust the prose
 and treat the schema as needing a fix.
 
-## Versioning: two of these six are versioned, four deliberately are not
+## Versioning: three of these seven are versioned, four deliberately are not
 
-`probe --json` carries `probe_version` and `inspect --json` carries
-`snapshot_version`, so a bump is visible in the payload itself. `probe.schema.json`
-pins its value with `const`; `inspect.schema.json` enumerates a *range* instead,
+`probe --json` carries `probe_version`, `inspect --json` carries
+`snapshot_version`, and the failure envelope carries `error_version`, so a bump is
+visible in the payload itself. `probe.schema.json` and `error.schema.json` pin
+their value with `const`; `inspect.schema.json` enumerates a *range* instead,
 because that field is the only value published here that the far side of a wire
 supplies — see "The `snapshot_version` range" below. The other four families here
 carry no version field, and that was an explicit decision, not an oversight (see
@@ -60,6 +71,17 @@ binary**:
   the runner are two separate processes that can be two separate builds;
 - the probe report exists precisely to be read by a consumer that does *not yet
   know* the binary's version — it bootstraps the whole compatibility check.
+
+**The failure envelope meets that same test**, which is why it is the third
+versioned family rather than a fourth unversioned one. It is the only shape here
+that a consumer reads *when things went wrong*, and that is exactly when the
+invoking context is least likely to be intact: captured stderr sitting in a CI log,
+read back hours later by a different tool than the one that ran the binary; a
+wrapper script that invoked whatever was on `PATH`; an incident triage holding the
+diagnostics but not the invocation. That is a durable artifact read by a party that
+did not invoke this binary — the same test the four above pass. `const` rather than
+an enumerated range, like `probe_version`: this binary only ever *writes* an
+envelope, never reads one, so it has no tolerance window to express.
 
 The remaining outputs published here — `list --json`, `prune --json` (with and
 without `--dry-run`), the printed `cancel`/`kill` ack, the `--all` report arrays,
@@ -104,11 +126,11 @@ directory:
   For the four unversioned families there is simply no version field for a
   consumer to pin; if a future task ever decides one of them does need its own,
   that is the point at which a versioned directory should appear alongside it.
-  For `probe --json` and `inspect --json` the pin already exists *inside* the
-  document — a breaking change to those shapes bumps `probe_version` /
-  `snapshot_version`, and that field, not a directory name, is what a consumer
-  checks. For `snapshot_version` the client checks it as well, which is the next
-  section.
+  For `probe --json`, `inspect --json`, and the failure envelope the pin already
+  exists *inside* the document — a breaking change to those shapes bumps
+  `probe_version` / `snapshot_version` / `error_version`, and that field, not a
+  directory name, is what a consumer checks. For `snapshot_version` the client
+  checks it as well, which is the next section.
 - **Additive changes stay additive.** A new field on one of these objects, or a
   new value in an open-ended string field, is a minor/patch change; a reader that
   consumes the fields it knows is unaffected. Note that these documents set
@@ -121,7 +143,8 @@ directory:
 
 `inspect.schema.json`'s `snapshot_version` is the one value published in this
 directory that the *far side of a wire* supplies: every other field on every other
-form is produced by the binary the caller just invoked, but this number is what the
+form — including both other version pins, `probe_version` and `error_version` — is
+produced by the binary the caller just invoked, but this number is what the
 **runner** declared, echoed unchanged. A run started by an older build therefore
 reports that build's number even though the surrounding object is the invoked
 binary's own shape (the client re-serializes what it parsed — see the ack discussion
@@ -157,6 +180,7 @@ own line:
 | `control-ack.jsonl` | a `cancel` ack; a `kill` ack; the `cancel --all` report array |
 | `prune.jsonl` | the plain tally; the `--dry-run` report with both candidate kinds |
 | `wait.jsonl` | a `reported` outcome; an `unknown` one; the `wait --all` report array |
+| `error.jsonl` | the variants of the one envelope shape: a named run id versus a `null` one, a retryable verdict versus a final one, three different reserved codes — `not_found`, `stale`, `unprobed`, `probe_incompatible`, `events_invalid` |
 
 `docs/*` and the schema documents remain the complete list — the `already_gone`
 and `failed` arms of the `inspect --all` and `cancel`/`kill --all` reports, for
@@ -192,6 +216,16 @@ representative example an adapter can build and test a reader against.
      actual values. The **shapes** (which fields exist, their types, whether they
      are null) are never normalized — those are exactly what the fixture pins.
 
+- `error.jsonl`'s `message` is replaced by a fixed sample for a different reason
+  than everything in (2) above: it is not *volatile*, it is **not part of the
+  contract**. `error.schema.json` says so, and the fixture is where that decision
+  is enforced rather than merely stated — pinning the prose would turn every
+  reworded diagnostic into a golden conflict while guarding nothing a consumer is
+  allowed to depend on. Everything a consumer *is* allowed to depend on
+  (`error_version`, `code`, `kind`, `operation`, `run_id`, `retryable`) is pinned
+  exactly, and the real message is still schema-validated on the live output like
+  every other field.
+
 - `probe.jsonl`'s `surface` is truncated to a fixed two-token sample on purpose.
   The full token list is already pinned exhaustively — by the `fixtures/cli-help/`
   golden snapshots (`docs/compatibility.md`, "Compatibility and upgrades") and by
@@ -201,11 +235,27 @@ representative example an adapter can build and test a reader against.
   `probe.schema.json` on every test run.
 
 - Closed vocabularies are enumerated in these documents where they are small and
-  stable (`health`, `mechanism`, the `status` sets, the ack `action`). The
+  stable (`health`, `mechanism`, the `status` sets, the ack `action`, the
+  envelope's `kind` and `operation`). The
   terminal-event `source` vocabulary that `wait --report-outcome` echoes is
   deliberately **not** duplicated here: it grows additively, and
   [`fixtures/schema/v1/schema.json`](../v1/schema.json)'s `runnerExit.source` is
   its single source of truth.
+
+- **`error.schema.json`'s `kind` enum is the one place that rule is bent, on
+  purpose and under a test.** A failing `run` reports a `kind` spelled exactly like
+  the `runnerExit.source` value for the same ending (`spawn_error`,
+  `container_error`, `timeout`, `cancelled`, `control_cancel`, `control_kill`,
+  `output_overflow`, `setup`, `internal`), because the alternative — inventing a
+  second set of names for endings that already have published ones — is precisely
+  the parallel contract this directory exists to avoid. The reuse is
+  one-directional: `runnerExit.source` remains the source of truth for those
+  spellings, the envelope mirrors it, and `src/error_envelope.rs`'s
+  `the_run_family_kinds_are_spelled_exactly_as_the_event_streams_source_values`
+  reads both documents off disk and fails if they ever drift apart. The rest of the
+  `kind` vocabulary (the CONTROL/SETUP refinements, `wait_timeout`,
+  `events_invalid`, `probe_incompatible`, `usage`, `unknown`) belongs to the
+  envelope alone and appears nowhere else.
 
 ## What the tests guarantee
 
@@ -223,3 +273,13 @@ documents set `additionalProperties: false` and list every field in `required`, 
 a field added to or removed from a Rust struct fails the test until the schema is
 updated with it), and (3) keeps the fixture representative of what the binary
 actually prints today.
+
+For the `error` family, "the real binary's output" is read from **stderr** rather
+than stdout, and the same test additionally asserts that stdout carries no envelope
+at all — the invariant that lets an adapter turn `--error-format json` on
+permanently. Its behavioral half (the flag's position independence, the unchanged
+default prose, and the kinds no fixture line pins) lives in
+`tests/error_envelope.rs`, and its vocabulary is held against `src/error_envelope.rs`
+by that module's own unit tests: one asserts the schema's `kind` enum lists exactly
+the kinds the build can emit, in the same order, so a kind can never be added in
+code without being published here.

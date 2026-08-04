@@ -3,6 +3,17 @@ Read back a run's JSONL lifecycle stream: render it, follow it, pass it through,
 Usage: processkit-cli events [OPTIONS]
 
 Options:
+      --error-format <format>
+          How a runner-own failure is reported on stderr. `human` (the default) prints the historical `processkit-cli: <message>` prose; `json` prints exactly one bounded, versioned JSON object instead, so an adapter can branch on stable fields (`code`, `kind`, `retryable`) rather than parsing prose.
+          
+          Global on purpose — it is accepted before or after the subcommand, and every subcommand honors it. It never changes stdout, an exit code, or the default prose; clap's own parse-time usage errors stay human-readable in v1. See [`crate::error_envelope`] and `docs/exit-codes.md`.
+
+          Possible values:
+          - human: The historical free-text line, unchanged byte for byte
+          - json:  One bounded, versioned JSON object per failed invocation (see [`crate::error_envelope`] and `fixtures/schema/cli/error.schema.json`)
+          
+          [default: human]
+
       --run-id <id>
           Resolve the stream through the per-user registry: the JSONL locator published by the record(s) registered under this run id (`list --json`'s `jsonl` field). Works for a live run *and* for a finished-but-not-yet-reaped one, whose record still names the completed stream. Mutually exclusive with `--file`; exactly one of the two is required
 

@@ -14,6 +14,16 @@
 //! number inside this band, the authoritative disambiguator is always the
 //! `runner_exit` JSONL event — the numeric code is the best-effort signal for shells
 //! that cannot read the event stream.
+//!
+//! A shell has one byte to read, so these codes are necessarily coarse: [`CONTROL`]
+//! alone covers six genuinely different situations. A caller that wants the finer
+//! verdict without parsing prose asks for it explicitly with `--error-format json`,
+//! which prints one bounded JSON object naming both this code and an
+//! [`ErrorKind`](crate::error_envelope::ErrorKind) — a *finer axis over these very
+//! codes*, never a competing set of them. See [`crate::error_envelope`] and
+//! `docs/exit-codes.md`, "Machine-readable failures: `--error-format json`".
+
+use crate::error_envelope::ErrorKind;
 
 /// Inclusive lower bound of the runner-own exit-code band. Read by the preflight
 /// probe (`src/probe.rs`) so a consumer can pin the reserved band before a launch.
@@ -181,21 +191,50 @@ pub const EVENTS_INVALID: u8 = 114;
 #[derive(Debug)]
 pub struct RunnerError {
     code: u8,
+    /// The finer name of this failure, when the failing path knew one. `None` means
+    /// "whatever the code's widest honest reading is" — see [`RunnerError::kind`].
+    kind: Option<ErrorKind>,
     message: String,
 }
 
 impl RunnerError {
     /// Construct a runner error with an explicit code from the runner-own band.
+    ///
+    /// The machine-readable [`ErrorKind`] defaults to the code's widest honest
+    /// reading; a call site that knows *which* of a code's several situations it is
+    /// in narrows it with [`RunnerError::with_kind`].
     pub fn new(code: u8, message: impl Into<String>) -> Self {
         Self {
             code,
+            kind: None,
             message: message.into(),
         }
+    }
+
+    /// Name this failure more precisely than its exit code can.
+    ///
+    /// Only meaningful for the two codes that genuinely carry several situations —
+    /// [`CONTROL`] (a target that is missing / confirmed stale / unprobeable /
+    /// ambiguous / unreachable / too slow / speaking a version this build refuses)
+    /// and [`SETUP`] (the run registry itself, versus every other prerequisite). It
+    /// changes **only** what `--error-format json` prints; the exit code and the
+    /// human-readable message are untouched, so no caller of the default prose path
+    /// can observe it. See [`crate::error_envelope`].
+    #[must_use]
+    pub fn with_kind(mut self, kind: ErrorKind) -> Self {
+        self.kind = Some(kind);
+        self
     }
 
     /// The runner-own exit code this error should surface to the process's caller.
     pub fn code(&self) -> u8 {
         self.code
+    }
+
+    /// The machine-readable kind this failure reports under `--error-format json`:
+    /// the one its call site named, or the code's own default reading.
+    pub fn kind(&self) -> ErrorKind {
+        self.kind.unwrap_or_else(|| ErrorKind::for_code(self.code))
     }
 }
 

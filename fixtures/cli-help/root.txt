@@ -1,6 +1,6 @@
 Run one shell-free command inside ProcessKit's containment boundary.
 
-Usage: processkit-cli <COMMAND>
+Usage: processkit-cli [OPTIONS] <COMMAND>
 
 Commands:
   run      Run a program inside a ProcessKit container and report its lifecycle
@@ -15,5 +15,19 @@ Commands:
   help     Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help     Print help
-  -V, --version  Print version
+      --error-format <format>
+          How a runner-own failure is reported on stderr. `human` (the default) prints the historical `processkit-cli: <message>` prose; `json` prints exactly one bounded, versioned JSON object instead, so an adapter can branch on stable fields (`code`, `kind`, `retryable`) rather than parsing prose.
+          
+          Global on purpose — it is accepted before or after the subcommand, and every subcommand honors it. It never changes stdout, an exit code, or the default prose; clap's own parse-time usage errors stay human-readable in v1. See [`crate::error_envelope`] and `docs/exit-codes.md`.
+
+          Possible values:
+          - human: The historical free-text line, unchanged byte for byte
+          - json:  One bounded, versioned JSON object per failed invocation (see [`crate::error_envelope`] and `fixtures/schema/cli/error.schema.json`)
+          
+          [default: human]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version

@@ -5,7 +5,8 @@
 //! subcommand into that library. Keeping the binary thin lets the runner's
 //! internals be exercised directly by the crate's unit/property/fuzz/bench tiers
 //! through the library target, while the shipped binary — its CLI flags, exit
-//! codes, and JSONL `schema_version` — remains the only supported compatibility
+//! codes, JSONL `schema_version`, and the `--error-format json` envelope's
+//! `error_version` — remains the only supported compatibility
 //! surface. The library is explicitly **not** a stable public Rust API; see the
 //! library crate's own docs (`src/lib.rs`) for that disclaimer and the module map.
 
@@ -14,7 +15,8 @@ use std::process::ExitCode;
 use clap::Parser;
 use clap::error::ErrorKind;
 
-use processkit_cli::cli::{Cli, Command};
+use processkit_cli::cli::{Cli, Command, ErrorFormat};
+use processkit_cli::error_envelope;
 use processkit_cli::exit::{self, RunnerError};
 use processkit_cli::{control, events_cmd, list, probe, prune, run, wait};
 
@@ -23,6 +25,16 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(err) => return report_parse_error(err),
     };
+
+    // How a failure is *rendered* is decided once, here, from the one global option
+    // (`--error-format`, accepted before or after the subcommand), and carried into
+    // every reporting path below. What failed, and with which code, is decided
+    // exactly as before: this choice changes stderr's shape and nothing else.
+    let format = cli.error_format;
+    let operation = cli.command.name();
+    let target_run_id = cli.command.target_run_id().map(str::to_string);
+    let run_id = target_run_id.as_deref();
+    let report = |result| report_result(result, format, operation, run_id);
 
     // `run` owns the process's exit path: on a completed container it hard-exits
     // with the child's exact (full-width) code, so it never returns here. The one
@@ -35,7 +47,7 @@ fn main() -> ExitCode {
     // run's own JSONL file), or is entirely self-contained (`probe`) — and each
     // reports through the shared runner-error path below.
     match cli.command {
-        Command::Run(args) => run::execute(*args),
+        Command::Run(args) => run::execute(*args, format),
         Command::Inspect(args) => report(if args.all {
             control::inspect_all(&args.labels, args.json)
         } else {
@@ -89,13 +101,26 @@ fn main() -> ExitCode {
 }
 
 /// Map a non-`run` command's result onto the process's exit code: success is
-/// `0`, a runner-own failure prints its message to stderr and exits with its
+/// `0`, a runner-own failure reports itself on stderr and exits with its
 /// reserved-band code (see `src/exit.rs` and `docs/exit-codes.md`).
-fn report(result: Result<(), RunnerError>) -> ExitCode {
+///
+/// *How* the failure is reported is the invocation's own choice: the historical
+/// prose line by default, one bounded versioned JSON object under
+/// `--error-format json`. Only stderr changes — the exit code is the same number
+/// either way, and stdout is untouched, so a command that printed a JSON report
+/// before failing (`probe --json`, `inspect --all --json`) still prints exactly what
+/// it always did. The rendering itself lives in [`error_envelope::report_failure`],
+/// shared with [`run::execute`]'s own exit path so the two cannot drift.
+fn report_result(
+    result: Result<(), RunnerError>,
+    format: ErrorFormat,
+    operation: &'static str,
+    run_id: Option<&str>,
+) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("processkit-cli: {err}");
+            error_envelope::report_failure(&err, format, operation, run_id);
             ExitCode::from(err.code())
         }
     }
@@ -109,6 +134,17 @@ fn report(result: Result<(), RunnerError>) -> ExitCode {
 /// [`exit::USAGE`] code instead of clap's default `2`, keeping the runner's
 /// failures inside its documented band and failing loudly rather than reporting
 /// success for an invalid command line.
+///
+/// **These stay human-readable even under `--error-format json`, and that boundary
+/// is deliberate** (`docs/exit-codes.md`, "What the envelope does not cover";
+/// `docs/integration.md` §7). A parse error happens before this binary knows what it
+/// was asked to do — there is no `operation` to name and no run to point at — and
+/// clap's text is a usage/suggestion rendering for a human, not a verdict about a
+/// run. A machine still learns everything the envelope would have told it from the
+/// reserved `USAGE` (100) code, and `probe --require-surface`
+/// (`docs/integration.md` §1) is the supported way to establish that a flag exists
+/// *before* using it. Note that the value is not even reliably known here: an
+/// invocation whose `--error-format` itself failed to parse has no format to honor.
 fn report_parse_error(err: clap::Error) -> ExitCode {
     let _ = err.print();
     match err.kind() {

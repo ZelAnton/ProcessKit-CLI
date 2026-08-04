@@ -171,7 +171,7 @@ cleanup path. See the [architecture](architecture.md) and
 | [Live-run control plane](control-plane.md) | IPC transport, inspect/cancel/kill semantics, and safe targeting. |
 | [Run registry](registry.md) | Per-user records, liveness probing, ambiguity, waiting, and pruning. |
 | [JSONL event schema](schema.md) | The normative `schema_version = 1` contract and golden fixtures. |
-| [Exit-code contract](exit-codes.md) | Child-code fidelity and the reserved runner failure band. |
+| [Exit-code contract](exit-codes.md) | Child-code fidelity, the reserved runner failure band, and the `--error-format json` machine-error envelope built over it. |
 | [Troubleshooting](troubleshooting.md) | Symptom-to-cause diagnosis for operators and CI. |
 | [Threat model](threat-model.md) | Trusted boundaries, hostile inputs, local IPC, and supply chain. |
 | [Architecture](architecture.md) | Module map and the data flow of one run. |

@@ -6,7 +6,10 @@ surface**, alongside the CLI flags and the JSONL `schema_version` (see
 on these codes, so changing them incompatibly is a **major** version bump.
 
 The in-code source of truth for these values is `src/exit.rs`; this document is
-the normative description that external consumers pin against.
+the normative description that external consumers pin against. It also defines the
+**machine-error envelope** the global `--error-format json` prints (its
+`error_version`, its `kind` taxonomy, and the scope boundary around clap's
+parse-time errors) — see "Machine-readable failures: `--error-format json`".
 
 ## The core rule: child fidelity
 
@@ -50,6 +53,12 @@ failure is not mistaken for a child result.
 
 Codes `115`–`119` are **reserved** for future runner-own conditions. `--help`
 and `--version` are not failures: they print to stdout and exit `0`.
+
+A code is deliberately coarse — `CONTROL` (103) alone covers six different
+situations. A consumer that needs the finer verdict without parsing the stderr
+prose asks for it with the global `--error-format json`, which prints one bounded
+JSON object naming this same code plus a more specific `kind`; see
+"Machine-readable failures" below.
 
 ## Timeout, cancel, and kill: runner-imposed outcomes
 
@@ -268,6 +277,150 @@ always tell a runner failure apart from a child that merely exited with the same
 number. A child's own code is never lost or aliased, because the runner's failures
 are additionally recorded out of band.
 
+There is a second way the band is not enough, and it applies to the commands that
+never start a run at all: a code is **coarse**. `CONTROL` (103) alone covers six
+genuinely different situations — no such run id, a confirmed-stale entry, an
+unprobeable one, an ambiguous id, a runner that could not be reached, and a reply
+whose version this build refuses — and `inspect`/`cancel`/`kill`/`wait`/`events`
+have no event stream of their own to disambiguate them in. Historically the only
+finer signal was the English sentence on stderr. The next section is the machine-readable
+answer to that.
+
+## Machine-readable failures: `--error-format json`
+
+`--error-format json` is a **global, opt-in** flag: accepted before or after the
+subcommand, honored by every one of them, and off by default. Under it, a failure
+that would have printed
+
+```text
+processkit-cli: cannot inspect run `build-42`: its registry entry is stale — the runner is gone (it exited without cleaning up)
+```
+
+prints exactly one bounded JSON object on **stderr** instead:
+
+```json
+{"error_version":1,"code":103,"kind":"stale","operation":"inspect","run_id":"build-42","retryable":false,"message":"cannot inspect run `build-42`: its registry entry is stale — the runner is gone (it exited without cleaning up)"}
+```
+
+The shape is published as a schema plus a golden fixture, exactly like this
+project's other machine-readable outputs:
+[`fixtures/schema/cli/error.schema.json`](https://github.com/ZelAnton/ProcessKit-CLI/blob/main/fixtures/schema/cli/error.schema.json)
+and `error.jsonl`, validated against the real binary by `tests/machine_output.rs`
+and `tests/error_envelope.rs`. The in-code source of truth is
+`src/error_envelope.rs`.
+
+### The fields
+
+| Field | Stable? | Meaning |
+| --- | --- | --- |
+| `error_version` | yes | The envelope's own format version, currently `1`. Pin it. A breaking change to the shape bumps it; a new field or a new `kind` value does not (both are additive). |
+| `code` | yes | The reserved-band code this invocation exits with — the same number `$?` reports, so the two can never disagree. |
+| `kind` | yes | What actually failed, finer than `code`. The vocabulary is below. |
+| `operation` | yes | The subcommand that failed: `run`, `inspect`, `cancel`, `kill`, `wait`, `events`, `list`, `prune`, `probe`. |
+| `run_id` | yes | The run id the invocation named, or `null` when it named none (an `--all` fan-out, `list`/`prune`/`probe`, or a `run` that let the runner generate one). Present-and-null, never omitted. |
+| `retryable` | yes | Whether repeating this exact invocation may succeed later. A pure function of `kind` — see below. |
+| **`message`** | **no** | The same free-text explanation the default prose prints. **Never branch on it**: it may be reworded in any release, and the golden fixture deliberately does not pin its text. |
+
+### The `kind` vocabulary
+
+`kind` is a **finer axis over the codes above, not a competing set of them** — no
+new exit code was minted for this feature. It is never *coarser* than the code
+either: every assigned code has at least one kind of its own, so branching on
+`kind` alone loses nothing.
+
+| `kind` | Code | What it says |
+| --- | --- | --- |
+| `not_found` | 103 | Nothing in the registry names that run — or, for `events`, the record names no stream to read (the run ran without `--jsonl`). |
+| `stale` | 103 | The entry is **confirmed** stale: the probe ran and the runner is gone. |
+| `unprobed` | 103 | The entry could not be probed at all, so nothing is established either way. Not the same claim as `stale`. |
+| `ambiguous_run_id` | 103 | More than one live run (or, for `events`, more than one stream) is registered under that id, so the command refuses to guess. |
+| `control_unreachable` | 103 | A single target was resolved but could not be reached or did not answer — no endpoint, a failed connect, a runner that died mid-conversation. Also the verdict of an `--all` fan-out where some targets could not be acted on. |
+| `ipc_deadline` | 103 | A bounded control-plane window (connect, or request/response) elapsed against a runner that was there. |
+| `incompatible_contract` | 103 | The other side declared a contract this build does not implement and the answer was refused rather than misread — today, an `inspect` reply whose `snapshot_version` is outside the range this client reads. Says nothing about the run's liveness. |
+| `probe_incompatible` | 110 | The preflight found this binary does not satisfy a `--require-*` expectation. The concrete reasons are in `probe --json`'s own `mismatches` array on stdout. |
+| `registry` | 111, or 103 | The per-user run registry itself could not be opened or scanned. The one kind reachable under two codes: `SETUP` (111) for a whole-registry command, `CONTROL` (103) when it is why a by-`run-id` client could not resolve its target. |
+| `setup` | 111 | Any other prerequisite: an unwritable output, an unreadable stream, a runtime that would not build, a reply that would not serialize. |
+| `wait_timeout` | 112 | `wait`'s own deadline elapsed; the run was never touched and is still going. |
+| `events_invalid` | 114 | `events --validate` checked a document and it does not conform. |
+| `usage` | 100 | An invalid command line detected after parsing — in practice only a detached start relaying the code its respawned copy reported. clap's own parse-time errors are outside this envelope (below). |
+| `spawn_error` | 101 | The child could not be started. |
+| `container_error` | 102 | The container / job object / IPC endpoint / registry could not be established, including an unappliable resource limit. |
+| `internal` | 104 | A genuine runner bug. |
+| `timeout` | 106 | The run exceeded `--timeout` or `--idle-timeout` and the runner tore the tree down. |
+| `cancelled` | 107 | A local stop signal (`Ctrl-C`, `SIGTERM`/`SIGHUP`, a Windows console event) ended the run. |
+| `control_cancel` | 108 | A control-plane `cancel` ended the run. |
+| `control_kill` | 109 | A control-plane `kill` ended the run. |
+| `output_overflow` | 113 | A capture stream exceeded `--capture-max-bytes` under `--capture-overflow cancel`. |
+| `unknown` | any | A reserved-band code this build has no name for. Read `code`. Reachable only when a `run --detach` relays the code of a respawned copy that turned out to be a different build. |
+
+The nine values in that table's `run` block (`usage` aside) are **not a second
+vocabulary**: `spawn_error`, `container_error`, `timeout`, `cancelled`,
+`control_cancel`, `control_kill`, `output_overflow`, `setup`, and `internal` are
+spelled exactly as the terminal `runner_exit` event's `source` spells the same
+endings, and `fixtures/schema/v1/schema.json`'s `runnerExit.source` remains their
+single source of truth. A failing `run` gets an envelope because the flag is
+global and because a run started without `--jsonl` (or a `--detach` that never got
+far enough to write one) has no stream to read — not because the envelope wants to
+restate a stream that exists.
+
+New `kind` values may be added in a minor release. A consumer that meets one it
+does not recognize should fall back to `code`, which is always present and always
+inside the reserved band.
+
+### `retryable`
+
+`retryable` is derived from `kind` alone, so the two can never disagree. Exactly
+three kinds are `true`:
+
+- **`unprobed`** — nothing at all was established, so a second probe may establish
+  something. If it persists, investigate the registry directory rather than the
+  retry count.
+- **`ipc_deadline`** — a live runner was merely slower than a bounded window.
+- **`wait_timeout`** — the run is still live and untouched, so waiting again is
+  the intended response.
+
+`false` is conservative: it means *this build does not promise a retry helps*, not
+that the condition is provably permanent. Every `run`-family kind is `false` on
+purpose — re-running a command is a new run with new side effects, not a retry of
+a read-only query, and whether that is safe is the caller's judgement.
+
+### What the envelope does not cover
+
+Two things, both deliberate and both stated here rather than left as silent gaps:
+
+- **clap's parse-time usage errors.** An unknown flag, a malformed `--timeout`, a
+  missing subcommand — everything that exits `USAGE` (100) *before* the binary has
+  decided what it was asked to do — keeps clap's own human-readable
+  usage/suggestion text even under `--error-format json`. There is no `operation`
+  to name and no run to point at, and clap's text is a rendering for a human, not
+  a verdict about a run; forcing it into an envelope would distort both. A machine
+  still gets the reserved `100`, and the supported way to establish that a flag
+  exists *before* using it is the `probe` preflight
+  (`--require-surface inspect:--error-format`, see
+  [`docs/integration.md`](integration.md#1-fail-closed-preflight-probe)). Note too
+  that an invocation whose own `--error-format` value failed to parse has no format
+  to honor. Should a future version cover these as well, that is an additive change
+  and will be announced in `CHANGELOG.md`.
+- **`processkit-cli: warning: …` lines.** These are not failures; the envelope is
+  printed once, on the way out, for the failure that ends the process. They keep
+  their prose in both modes.
+
+### Invariants
+
+- **stdout is never touched.** The envelope is always on stderr, so a command that
+  prints a machine-readable report and *then* fails — `probe --json` with an unmet
+  expectation (110), `inspect --all --json` with an unreachable target (103) — still
+  prints exactly the stdout it always did. A caller may leave the flag on
+  permanently for every invocation.
+- **The default is unchanged, byte for byte.** Without the flag (or with
+  `--error-format human`) stderr is exactly what every earlier release printed.
+- **The exit code is unchanged.** The envelope reports the code; it never changes
+  which one is chosen.
+- **Exactly one envelope per failed invocation**, on one line. For every command
+  except `run` it is the only thing on stderr; for `run` the child's echoed stderr
+  shares the stream, so it is the runner's own *final* line (use `--capture-dir` or
+  `--no-echo` for a clean channel).
+
 ## Stability
 
 - The **band** (`100`–`119`) and the **assigned codes** above are stable; moving
@@ -285,3 +438,11 @@ are additionally recorded out of band.
   (112) did the same before it, taking the slot after `SETUP` (111) rather than
   overloading `TIMEOUT` (106), whose meaning is the opposite one (see "A waiter's
   deadline is not a run's deadline" above); codes `115`–`119` remain reserved.
+- The **`--error-format json` envelope** versions on its own axis, `error_version`
+  (currently `1`), independent of every code above: removing or re-typing a stable
+  field, or changing what an existing `kind` means, is a breaking change and bumps
+  it; adding a field or a new `kind` value is additive and does not. A `kind` is
+  never repurposed for a different meaning, for the same reason a retired code is
+  not. The taxonomy adds no exit code and never will on its own — it is a finer
+  axis over the codes above, so a new *code* still follows the next-free-slot rule
+  in the bullet above and gains a matching kind in the same change.

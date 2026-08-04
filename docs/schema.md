@@ -510,6 +510,17 @@ not be opened — and carries the reserved `SETUP` code (111), distinct from `in
 (a genuine runner fault) so a consumer never reads a bad path as a runner bug (see
 `docs/exit-codes.md`).
 
+This `source` vocabulary has one **mirror**, and it is deliberately a mirror rather
+than a fork: a `run` that fails under the global `--error-format json` reports a
+`kind` spelled with these same words (`timeout`, `cancelled`, `control_cancel`,
+`control_kill`, `output_overflow`, `spawn_error`, `container_error`, `setup`,
+`internal` — everything but `child_exit`, which is not a failure). The table above
+remains their single source of truth; the envelope exists for the case where there
+is no stream to read at all (a run started without `--jsonl`, or a `--detach` that
+never got far enough to write one), and a test holds the two spellings together so
+they cannot drift. See `docs/exit-codes.md`, "Machine-readable failures:
+`--error-format json`".
+
 The "runner process" here is always the process that *ran* the child. Under
 `run --detach` that is the detached copy, not the invocation the caller waited on:
 the caller's own exit code reports only whether the run started, which is exactly

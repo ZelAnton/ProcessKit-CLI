@@ -135,6 +135,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::cli::EventsArgs;
+use crate::error_envelope::ErrorKind;
 use crate::events::SCHEMA_VERSION;
 use crate::exit::{self, RunnerError};
 use crate::registry::{self, Health, Registry, RunStatus};
@@ -345,7 +346,8 @@ fn locate_by_run_id(registry: &Registry, run_id: &str) -> Result<PathBuf, Runner
                  exits cleanly deletes its own record, so read its stream directly with \
                  `--file <events.jsonl>`"
             ),
-        ));
+        )
+        .with_kind(ErrorKind::NotFound));
     }
 
     let mut locators: Vec<String> = matching
@@ -356,6 +358,10 @@ fn locate_by_run_id(registry: &Registry, run_id: &str) -> Result<PathBuf, Runner
     locators.dedup();
 
     match locators.len() {
+        // There is no stream to find: the record exists but never named one. That is
+        // the same verdict for a machine as "no record names this run" — nothing to
+        // read, and no retry will produce one — so both report `not_found`, with the
+        // message carrying which of the two it was.
         0 => Err(RunnerError::new(
             exit::CONTROL,
             format!(
@@ -363,7 +369,8 @@ fn locate_by_run_id(registry: &Registry, run_id: &str) -> Result<PathBuf, Runner
                  stream — the run was started without `--jsonl`, so it has no lifecycle stream \
                  to read"
             ),
-        )),
+        )
+        .with_kind(ErrorKind::NotFound)),
         1 => Ok(PathBuf::from(locators.remove(0))),
         streams => Err(RunnerError::new(
             exit::CONTROL,
@@ -373,7 +380,8 @@ fn locate_by_run_id(registry: &Registry, run_id: &str) -> Result<PathBuf, Runner
                  `--file <events.jsonl>`",
                 matching.len()
             ),
-        )),
+        )
+        .with_kind(ErrorKind::AmbiguousRunId)),
     }
 }
 

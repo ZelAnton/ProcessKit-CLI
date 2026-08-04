@@ -142,6 +142,24 @@ fn probe_reports_a_consistent_compatible_surface() {
         // `members_snapshot` cadence: still no hand-maintained token list in
         // production code, so the flag advertises itself.
         "run:--snapshot-interval",
+        // `--error-format` (T-305) is the first **global** option this CLI has, and
+        // it is the one case that did need a production-code change in
+        // `src/probe.rs`: a global is declared once on `Cli`, not on any subcommand,
+        // so the derivation had to learn a new *category* of surface rather than
+        // pick up a new instance of an existing one. What did not change is the
+        // token grammar or any hand-maintained list — the globals are still read off
+        // the live clap tree, and every subcommand really does accept the flag
+        // (`src/cli/mod.rs`'s `every_subcommand_accepts_the_global_error_format`),
+        // so none of these tokens is a promise the binary does not keep.
+        "run:--error-format",
+        "inspect:--error-format",
+        "cancel:--error-format",
+        "kill:--error-format",
+        "wait:--error-format",
+        "events:--error-format",
+        "list:--error-format",
+        "prune:--error-format",
+        "probe:--error-format",
     ] {
         assert!(
             surface.contains(&token),

@@ -52,6 +52,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::error_envelope::ErrorKind;
 use crate::events;
 use crate::exit::{self, RunnerError};
 
@@ -64,16 +65,23 @@ pub(crate) fn open_read_only_for_setup() -> Result<Registry, RunnerError> {
             exit::SETUP,
             format!("could not open the run registry: {err}"),
         )
+        .with_kind(ErrorKind::Registry)
     })
 }
 
 /// Map a whole-registry scan failure onto the shared `SETUP` diagnostic used by
 /// `list`, `prune`, `wait`, `events`, and aggregate control operations.
+///
+/// Both helpers here narrow the machine-readable kind to [`ErrorKind::Registry`]
+/// while keeping the `SETUP` code they always had: an unreadable *registry* points an
+/// operator at one specific, inspectable directory (`docs/registry.md`), unlike the
+/// unwritable outputs and unserializable reports that share the code.
 pub(crate) fn setup_read_error(err: io::Error) -> RunnerError {
     RunnerError::new(
         exit::SETUP,
         format!("could not read the run registry: {err}"),
     )
+    .with_kind(ErrorKind::Registry)
 }
 
 /// On-disk record format version. Independent of the JSONL event

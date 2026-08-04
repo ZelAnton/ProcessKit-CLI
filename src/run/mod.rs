@@ -73,8 +73,9 @@ use std::time::Duration;
 use processkit::Outcome;
 
 use crate::capture::CaptureOverflow;
-use crate::cli::RunArgs;
+use crate::cli::{ErrorFormat, RunArgs};
 use crate::control;
+use crate::error_envelope;
 use crate::exit::RunnerError;
 
 use detach::start_detached;
@@ -98,22 +99,35 @@ use launch::run_async;
 /// code is ever forwarded on this path (there is no child of ours to forward one
 /// from); it lives on in the detached run's own `runner_exit` event. See
 /// [`start_detached`].
-pub fn execute(args: RunArgs) -> ExitCode {
+///
+/// `format` is the invocation's global `--error-format`, and it governs **only** the
+/// shape of the stderr line a runner-own failure prints (prose, or the bounded JSON
+/// envelope — see [`crate::error_envelope`]). It changes no exit code, nothing on
+/// stdout, and none of the child's own output; the `processkit-cli: warning: …`
+/// lines this run may emit along the way are not failures and stay prose either way.
+/// A failing `run` is also the one place the envelope restates something the JSONL
+/// stream already carries: its `kind` is spelled exactly like the terminal
+/// `runner_exit` event's `source`, deliberately reusing that vocabulary rather than
+/// forking it, and it is the account available when a run was started without
+/// `--jsonl` (or, with `--detach`, never got far enough to write one).
+pub fn execute(args: RunArgs, format: ErrorFormat) -> ExitCode {
+    // The id the *invocation* named, not the one the runner may generate: an
+    // envelope reports what the caller can correlate against (see
+    // `cli::Command::target_run_id`).
+    let run_id = args.run_id.clone();
+    let report = |err: &RunnerError| {
+        error_envelope::report_failure(err, format, "run", run_id.as_deref());
+        ExitCode::from(err.code())
+    };
     if args.detach {
         return match start_detached(&args) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(err) => {
-                eprintln!("processkit-cli: {err}");
-                ExitCode::from(err.code())
-            }
+            Err(err) => report(&err),
         };
     }
     match run_inner(args) {
         Ok(child_code) => std::process::exit(child_code),
-        Err(err) => {
-            eprintln!("processkit-cli: {err}");
-            ExitCode::from(err.code())
-        }
+        Err(err) => report(&err),
     }
 }
 

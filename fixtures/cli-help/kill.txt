@@ -3,7 +3,25 @@ Hard-kill a live run's container immediately, by `--run-id` or, in aggregate, `-
 Usage: processkit-cli kill [OPTIONS]
 
 Options:
-      --run-id <id>        The single run to act on. Mutually exclusive with `--all`; exactly one of the two is required
-      --all                Act on every run confirmed live in a snapshot taken the moment this invocation starts, instead of one named run — the aggregate counterpart to `--run-id`, for the typical orchestrator teardown sequence (cancel everything, wait for it all to be gone, then prune). A run that registers *after* the snapshot is out of scope for this invocation and is never acted on. Mutually exclusive with `--run-id`; exactly one of the two is required. See [`crate::control::cancel_all`] / [`crate::control::kill_all`] and `docs/control-plane.md` for the snapshot and per-run report semantics
-      --label <KEY=VALUE>  With `--all`, restrict the snapshot to runs carrying this exact operator label (repeatable; multiple filters combine with logical AND)
-  -h, --help               Print help
+      --error-format <format>
+          How a runner-own failure is reported on stderr. `human` (the default) prints the historical `processkit-cli: <message>` prose; `json` prints exactly one bounded, versioned JSON object instead, so an adapter can branch on stable fields (`code`, `kind`, `retryable`) rather than parsing prose.
+          
+          Global on purpose — it is accepted before or after the subcommand, and every subcommand honors it. It never changes stdout, an exit code, or the default prose; clap's own parse-time usage errors stay human-readable in v1. See [`crate::error_envelope`] and `docs/exit-codes.md`.
+
+          Possible values:
+          - human: The historical free-text line, unchanged byte for byte
+          - json:  One bounded, versioned JSON object per failed invocation (see [`crate::error_envelope`] and `fixtures/schema/cli/error.schema.json`)
+          
+          [default: human]
+
+      --run-id <id>
+          The single run to act on. Mutually exclusive with `--all`; exactly one of the two is required
+
+      --all
+          Act on every run confirmed live in a snapshot taken the moment this invocation starts, instead of one named run — the aggregate counterpart to `--run-id`, for the typical orchestrator teardown sequence (cancel everything, wait for it all to be gone, then prune). A run that registers *after* the snapshot is out of scope for this invocation and is never acted on. Mutually exclusive with `--run-id`; exactly one of the two is required. See [`crate::control::cancel_all`] / [`crate::control::kill_all`] and `docs/control-plane.md` for the snapshot and per-run report semantics
+
+      --label <KEY=VALUE>
+          With `--all`, restrict the snapshot to runs carrying this exact operator label (repeatable; multiple filters combine with logical AND)
+
+  -h, --help
+          Print help (see a summary with '-h')

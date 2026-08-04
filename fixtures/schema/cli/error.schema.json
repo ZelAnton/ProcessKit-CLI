@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/ZelAnton/ProcessKit-CLI/main/fixtures/schema/cli/error.schema.json",
+  "title": "processkit-cli `--error-format json` failure envelope",
+  "description": "The single JSON line printed to **stderr** when an invocation run with the global `--error-format json` fails after parsing. Exactly one object per failed invocation, on stderr and never on stdout, so a command that printed a machine-readable report before failing (`probe --json`, `inspect --all --json`) leaves stdout byte-for-byte unchanged. `code` and `kind` carry the decision; `message` is explanatory only and is deliberately not pinned by the golden fixture. clap's parse-time usage errors (exit 100) stay human-readable in v1 — that boundary, and the `processkit-cli: warning: …` lines that are not failures at all, are stated in docs/exit-codes.md, \"What the envelope does not cover\". The normative prose is docs/exit-codes.md, \"Machine-readable failures: `--error-format json`\", and docs/integration.md §7; the in-code source of truth is src/error_envelope.rs. Validated against fixtures/schema/cli/error.jsonl, and against the real binary's stderr, by tests/machine_output.rs; its behavior (the flag's position independence, the unchanged default prose, and the kinds no fixture line pins) is covered by tests/error_envelope.rs.",
+  "$ref": "#/$defs/errorEnvelope",
+  "$defs": {
+    "errorEnvelope": {
+      "type": "object",
+      "description": "One failed invocation. Bounded by construction: seven fields, every one of them a scalar — no nesting, no arrays, one line.",
+      "properties": {
+        "error_version": {
+          "const": 1,
+          "description": "The envelope's own format version (src/error_envelope.rs, ERROR_VERSION) — an axis of its own, independent of the JSONL `schema_version`, the control-plane `snapshot_version`, the `registry_version`, and the probe report's `probe_version`. Pinned with `const` rather than enumerated as a range because this binary only ever *writes* an envelope, never reads one, so it has no tolerance window to express (contrast `inspect.schema.json`'s `snapshot_version`, which the client acts on). Bumped only by a breaking change to this shape; a new field, or a new `kind` value, is additive and does not bump it."
+        },
+        "code": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 119,
+          "description": "The reserved-band exit code this invocation exits with — the same number the process returns, so `$?` and the envelope can never disagree. See docs/exit-codes.md for the band and each code's meaning."
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "usage",
+            "spawn_error",
+            "container_error",
+            "not_found",
+            "stale",
+            "unprobed",
+            "ambiguous_run_id",
+            "control_unreachable",
+            "ipc_deadline",
+            "incompatible_contract",
+            "internal",
+            "timeout",
+            "cancelled",
+            "control_cancel",
+            "control_kill",
+            "probe_incompatible",
+            "registry",
+            "setup",
+            "wait_timeout",
+            "output_overflow",
+            "events_invalid",
+            "unknown"
+          ],
+          "description": "What actually failed — a finer axis over `code`, never a competing one, and never coarser than it: `control_unreachable`/`not_found`/`stale`/`unprobed`/`ambiguous_run_id`/`ipc_deadline`/`incompatible_contract` all split CONTROL (103), and `registry` splits SETUP (111) away from every other prerequisite failure. The `run` family's values (`spawn_error`, `container_error`, `timeout`, `cancelled`, `control_cancel`, `control_kill`, `output_overflow`, `setup`, `internal`) are the terminal `runner_exit` event's `source` values, spelled identically: fixtures/schema/v1/schema.json's `runnerExit.source` remains their single source of truth and this envelope mirrors rather than forks that vocabulary. The list grows additively (a new value is a minor change); a reader that meets one it does not know falls back to `code`, which is always present. `unknown` is that fallback from this binary's own side — a reserved-band code this build has no assigned name for."
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "run",
+            "inspect",
+            "cancel",
+            "kill",
+            "wait",
+            "events",
+            "list",
+            "prune",
+            "probe"
+          ],
+          "description": "The subcommand that failed, spelled exactly as on the command line. Derived from the CLI definition itself (src/cli/mod.rs, `Command::name`), never from caller-supplied text, so it is always one of this closed set; a future subcommand joins it as an additive change."
+        },
+        "run_id": {
+          "type": ["string", "null"],
+          "description": "The run id the invocation named, or null when it named none: an `--all` fan-out (whose targets are a snapshot, not one id), a whole-registry command (`list`/`prune`), the self-contained `probe`, or a `run` that let the runner generate its id — a generated id is minted inside the run and is not knowable at this point, so null is the truthful answer rather than a guess. Always present rather than omitted, so a consumer never has to distinguish absent from unknown."
+        },
+        "retryable": {
+          "type": "boolean",
+          "description": "Whether repeating this exact invocation, unchanged, may succeed later without the caller changing anything. A pure function of `kind` (src/error_envelope.rs, `ErrorKind::retryable`), so the two fields can never disagree — an adapter may equally well keep its own copy of the table. True for exactly three kinds: `unprobed` (nothing was established, so a second probe may establish something), `ipc_deadline` (a live runner was merely slower than a bounded window), and `wait_timeout` (the run is still live and untouched, so waiting again is the intended response). False is conservative — it means this build does not promise a retry helps, not that the condition is provably permanent — and every `run`-family kind is false on purpose: re-running a command is a new run with new side effects, not a retry of a read-only query."
+        },
+        "message": {
+          "type": "string",
+          "description": "The human-readable explanation — the very text the default prose mode prints after `processkit-cli: `. **Explicitly not part of the stable contract**: free to be reworded, re-punctuated, or made more specific in any release, which is why fixtures/schema/cli/error.jsonl replaces it with a fixed sample instead of pinning it. Log it, show it to a human, attach it to a ticket; never branch on it. Control characters are escaped by the JSON encoder rather than stripped, so the line is always exactly one line."
+        }
+      },
+      "required": [
+        "error_version",
+        "code",
+        "kind",
+        "operation",
+        "run_id",
+        "retryable",
+        "message"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": ["unprobed", "ipc_deadline", "wait_timeout"]
+              }
+            },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": { "retryable": { "const": true } },
+            "description": "The three retryable kinds, pinned so the derived flag cannot drift from the vocabulary it is derived from."
+          },
+          "else": {
+            "properties": { "retryable": { "const": false } },
+            "description": "Every other kind reports no retry advice."
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "not_found",
+                  "stale",
+                  "unprobed",
+                  "ambiguous_run_id",
+                  "control_unreachable",
+                  "ipc_deadline",
+                  "incompatible_contract"
+                ]
+              }
+            },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": { "code": { "const": 103 } },
+            "description": "The kinds that exist to split CONTROL (103) always carry that code. `registry` is deliberately absent from this list — it is the one kind reachable under two codes, CONTROL (103) when a by-`run-id` control client cannot resolve its target because the registry itself is unreadable, and SETUP (111) when a whole-registry command hits the same condition."
+          }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "const": "wait_timeout" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "code": { "const": 112 },
+              "operation": { "const": "wait" }
+            },
+            "description": "Only `wait` has a deadline of its own, and it is never the run's TIMEOUT (106) — see docs/exit-codes.md, \"A waiter's deadline is not a run's deadline\"."
+          }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "const": "events_invalid" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "code": { "const": 114 },
+              "operation": { "const": "events" }
+            },
+            "description": "A verdict about a document, produced only by `events --validate`."
+          }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "const": "probe_incompatible" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "code": { "const": 110 },
+              "operation": { "const": "probe" },
+              "run_id": { "type": "null" }
+            },
+            "description": "A pre-launch verdict about this binary: no run is involved, so there is no run id to name. The concrete unmet expectations are in `probe --json`'s own `mismatches` array on stdout."
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": { "enum": ["list", "prune", "probe"] }
+            },
+            "required": ["operation"]
+          },
+          "then": {
+            "properties": { "run_id": { "type": "null" } },
+            "description": "These three take no `--run-id` at all, so they can never name one."
+          }
+        }
+      ]
+    }
+  }
+}

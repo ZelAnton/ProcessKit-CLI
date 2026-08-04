@@ -1,7 +1,10 @@
 //! Golden schema tests for the CLI's **non-event** machine-readable outputs:
 //! `probe --json`, `list --json`, `inspect --json` (single and `--all`), the
 //! `cancel`/`kill` ack and its `--all` report array, `prune --json` (with and
-//! without `--dry-run`), and `wait --report-outcome` (single and `--all`).
+//! without `--dry-run`), `wait --report-outcome` (single and `--all`), and the
+//! `--error-format json` failure envelope — the one family whose channel is
+//! **stderr** rather than stdout, because that is precisely where it keeps stdout
+//! reserved for successful output.
 //!
 //! These are the counterpart of what `tests/events.rs` does for the JSONL
 //! lifecycle stream and `tests/cli_help.rs` does for the help surface: every case
@@ -28,9 +31,10 @@
 //!    the document rejects.
 //!
 //! See `fixtures/schema/cli/README.md` for the layout, the versioning decision
-//! these outputs embody (`probe` and `inspect` carry their own `probe_version` /
-//! `snapshot_version`; the other four deliberately carry no version field), and
-//! what the normalization does and does not touch.
+//! these outputs embody (`probe`, `inspect`, and the error envelope carry their own
+//! `probe_version` / `snapshot_version` / `error_version`; the other four
+//! deliberately carry no version field), and what the normalization does and does
+//! not touch.
 
 mod common;
 
@@ -52,7 +56,15 @@ const UPDATE_ENV: &str = "UPDATE_MACHINE_SCHEMA_GOLDEN";
 
 /// The output families published under `fixtures/schema/cli/`, each with a
 /// `<family>.schema.json` document and a `<family>.jsonl` fixture.
-const FAMILIES: &[&str] = &["probe", "list", "inspect", "control-ack", "prune", "wait"];
+const FAMILIES: &[&str] = &[
+    "probe",
+    "list",
+    "inspect",
+    "control-ack",
+    "prune",
+    "wait",
+    "error",
+];
 
 // ---------------------------------------------------------------------------
 // Fixed sample values.
@@ -77,6 +89,17 @@ const SAMPLE_SOCKET_DIR: &str = "/samples/pkc-0123456789abcdef";
 const SAMPLE_ARGV_SHA256: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const SAMPLE_VERSION: &str = "0.0.0";
 const SAMPLE_MECHANISM: &str = "job_object";
+
+/// The failure envelope's `message` is the one field this directory publishes that
+/// is **deliberately not part of its contract** (`fixtures/schema/cli/error.schema.json`):
+/// it may be reworded in any release, so pinning its prose in a golden would turn
+/// every clarification into a fixture conflict while guarding nothing a consumer is
+/// allowed to depend on. Replacing it with a fixed sample is how that decision is
+/// *stated* rather than merely intended — the fixture pins the envelope's shape, its
+/// `code`, `kind`, `operation`, `run_id`, and `retryable`, and says out loud that the
+/// prose is free. The live, real message is still validated against the schema (as a
+/// string that must be present), like every other field.
+const SAMPLE_MESSAGE: &str = "<free-text explanation, not part of the contract>";
 
 /// The `surface` token list is truncated to this fixed sample on purpose: the
 /// real list is already pinned exhaustively by the `fixtures/cli-help/` golden
@@ -190,6 +213,10 @@ fn normalize_field(key: &str, value: &Value) -> Value {
         "argv_sha256" => json!(SAMPLE_ARGV_SHA256),
         "version" => json!(SAMPLE_VERSION),
         "mechanism" => json!(SAMPLE_MECHANISM),
+        // Only the failure envelope has a `message`; no other family published here
+        // carries a field by that name (the JSONL event stream's own `message` lives
+        // in `fixtures/schema/v1/` and is pinned by `tests/events.rs`, not here).
+        "message" => json!(SAMPLE_MESSAGE),
         "surface" => sample_surface(),
         "members" => sample_members(),
         _ => normalize(value),
@@ -290,6 +317,43 @@ fn machine_output(out: &Output, code: i32, what: &str) -> Vec<Value> {
                 .unwrap_or_else(|err| panic!("{what} prints valid JSON: {line}: {err}"))
         })
         .collect()
+}
+
+/// Assert the command exited with `code` and parse its **stderr** as one JSON value
+/// per non-empty line — the failure envelope's channel.
+///
+/// The counterpart of [`machine_output`] for the one family that is deliberately not
+/// on stdout, and it asserts that invariant rather than assuming it: stdout must
+/// carry no envelope, because a failure must never contaminate the successful output
+/// a caller may already be parsing (`fixtures/schema/cli/error.schema.json`).
+fn machine_stderr(out: &Output, code: i32, what: &str) -> Vec<Value> {
+    assert_eq!(
+        out.status.code(),
+        Some(code),
+        "{what} must exit {code}; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("error_version"),
+        "{what} must keep its envelope off stdout: {stdout}"
+    );
+    let text = String::from_utf8(out.stderr.clone())
+        .unwrap_or_else(|err| panic!("{what} is UTF-8: {err}"));
+    let lines: Vec<Value> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|err| panic!("{what} prints valid JSON on stderr: {line}: {err}"))
+        })
+        .collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "{what} prints exactly one envelope, nothing else: {text}"
+    );
+    lines
 }
 
 /// Poll `cond` until it holds or `timeout` elapses (then panic).
@@ -652,6 +716,136 @@ fn prune_reports_match_their_schema_and_fixture() {
     check_family("prune", &lines);
 
     cancel_run(&registry, "build-42", child);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `--error-format json`: the bounded failure envelope, in the variants worth
+/// pinning — a run id that is named versus one that cannot be (`null`), a retryable
+/// verdict versus a final one, and three different reserved codes.
+///
+/// The scenarios are deliberately the cheap, deterministic ones (no live run is
+/// needed to fail a lookup), and two of them also pin the invariant that gives this
+/// family its own channel: `probe --json` prints its full report to stdout *and*
+/// exits 110, and `events --validate` prints its human summary to stdout *and* exits
+/// 114 — in both cases the envelope is on stderr and stdout is exactly what it always
+/// was. The kinds not pinned here are covered by `tests/error_envelope.rs`, which
+/// drives the remaining taxonomy against the live binary without re-pinning the
+/// shape.
+#[test]
+fn error_envelopes_match_their_schema_and_fixture() {
+    let dir = scratch("machine-error");
+    let registry = registry_dir(&dir);
+    // A confirmed-stale entry and an unprobeable one: the two registry states whose
+    // difference this envelope exists to make machine-readable.
+    write_stale_entry(&registry, "build-43", "build-43");
+    write_unprobeable_entry(&registry, "build-44", "build-44");
+
+    // Nothing names `build-99` at all — not the same fact as either state above.
+    let missing = cli(
+        &registry,
+        &["--error-format", "json", "inspect", "--run-id", "build-99"],
+    );
+    let mut lines = machine_stderr(&missing, 103, "`inspect` against an unregistered run");
+    assert_eq!(lines[0]["kind"], json!("not_found"));
+    assert_eq!(lines[0]["run_id"], json!("build-99"));
+    assert!(
+        missing.stdout.is_empty(),
+        "a failed inspect prints nothing at all on stdout: {}",
+        String::from_utf8_lossy(&missing.stdout)
+    );
+
+    // The runner is *confirmed* gone. Flag after the subcommand on purpose: the
+    // position must not matter, and the fixture is generated by whichever spelling
+    // this test uses.
+    let stale = cli(
+        &registry,
+        &["inspect", "--run-id", "build-43", "--error-format", "json"],
+    );
+    let stale_lines = machine_stderr(&stale, 103, "`inspect` against a confirmed-stale entry");
+    assert_eq!(stale_lines[0]["kind"], json!("stale"));
+    assert_eq!(stale_lines[0]["code"], json!(103));
+    assert_eq!(
+        stale_lines[0]["retryable"],
+        json!(false),
+        "a gone runner does not come back on a retry"
+    );
+    lines.extend(stale_lines);
+
+    // Nothing at all was established about this one — the single retryable member of
+    // the CONTROL family, and the distinction that would be invisible in the exit
+    // code alone.
+    let unprobed = cli(
+        &registry,
+        &["inspect", "--run-id", "build-44", "--error-format", "json"],
+    );
+    let unprobed_lines = machine_stderr(&unprobed, 103, "`inspect` against an unprobeable entry");
+    assert_eq!(unprobed_lines[0]["kind"], json!("unprobed"));
+    assert_eq!(
+        unprobed_lines[0]["retryable"],
+        json!(true),
+        "an unprobeable entry is the one CONTROL failure a second probe may settle"
+    );
+    assert_eq!(
+        unprobed_lines[0]["code"],
+        json!(103),
+        "the three kinds above all refine the one exit code a shell would have seen"
+    );
+    lines.extend(unprobed_lines);
+
+    // A failure with no run to name, and with a full machine-readable report of its
+    // own already on stdout.
+    let probe = cli(
+        &registry,
+        &[
+            "probe",
+            "--json",
+            "--require-surface",
+            "run:--not-a-real-flag",
+            "--error-format",
+            "json",
+        ],
+    );
+    let probe_lines = machine_stderr(&probe, 110, "`probe --json` with an unmet expectation");
+    assert_eq!(probe_lines[0]["kind"], json!("probe_incompatible"));
+    assert_eq!(probe_lines[0]["run_id"], Value::Null);
+    let report: Value = serde_json::from_str(String::from_utf8_lossy(&probe.stdout).trim())
+        .expect("the probe report is still valid JSON on stdout");
+    assert_eq!(
+        report["compatible"],
+        json!(false),
+        "stdout still carries the probe's own report, unchanged: {report}"
+    );
+    lines.extend(probe_lines);
+
+    // A verdict about a document rather than a run: `events` never contacts a runner.
+    let bad_stream = dir.join("not-conforming.jsonl");
+    fs::write(
+        &bad_stream,
+        b"{\"schema_version\":1,\"event\":\"not_an_event\"}\n",
+    )
+    .expect("write the non-conforming stream fixture");
+    let invalid = cli(
+        &registry,
+        &[
+            "events",
+            "--file",
+            &bad_stream.to_string_lossy(),
+            "--validate",
+            "--error-format",
+            "json",
+        ],
+    );
+    let invalid_lines = machine_stderr(&invalid, 114, "`events --validate` on a bad stream");
+    assert_eq!(invalid_lines[0]["kind"], json!("events_invalid"));
+    assert_eq!(invalid_lines[0]["operation"], json!("events"));
+    assert!(
+        !invalid.stdout.is_empty(),
+        "the human-readable conformance report still goes to stdout"
+    );
+    lines.extend(invalid_lines);
+
+    check_family("error", &lines);
+
     let _ = fs::remove_dir_all(&dir);
 }
 

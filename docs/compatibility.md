@@ -124,6 +124,14 @@ fixture under
 | `cancel`/`kill` ack, `cancel --all`/`kill --all` report | `fixtures/schema/cli/control-ack.schema.json` | `control-ack.jsonl` |
 | `prune --json`, `prune --dry-run --json` | `fixtures/schema/cli/prune.schema.json` | `prune.jsonl` |
 | `wait --report-outcome`, `wait --all --report-outcome` | `fixtures/schema/cli/wait.schema.json` | `wait.jsonl` |
+| the `--error-format json` failure envelope (stderr, any subcommand) | `fixtures/schema/cli/error.schema.json` | `error.jsonl` |
+
+The last row is the odd one out in two ways, both deliberate. It is printed on
+**stderr**, not stdout — that is what keeps stdout reserved for successful output,
+so a command that prints a report and then fails leaves its stdout untouched — and
+it describes a *failure* rather than a success, which is exactly why the six
+success shapes above could never have covered it. It is opt-in: without
+`--error-format json`, a failure prints the same free-text prose it always did.
 
 `events --json` is deliberately absent from that table: it passes the runner's own
 JSONL lines through byte for byte, so the document that describes it is the event
@@ -136,22 +144,26 @@ instead of reaching an adapter. A document whose family has more than one output
 form has a root `oneOf` over named `$defs`, so a consumer can validate against the
 exact form it invoked — for example `inspect.schema.json#/$defs/snapshot`.
 
-**Two rows of that table carry a version field; the other four deliberately do
-not.** `probe --json` carries `probe_version` and `inspect --json` carries
-`snapshot_version` — the same field the runner puts on the control-plane wire.
-`probe.schema.json` pins its value with `const`; `inspect.schema.json` admits the
+**Three rows of that table carry a version field; the other four deliberately do
+not.** `probe --json` carries `probe_version`, `inspect --json` carries
+`snapshot_version` — the same field the runner puts on the control-plane wire —
+and the failure envelope carries `error_version`.
+`probe.schema.json` and `error.schema.json` pin their value with `const`;
+`inspect.schema.json` admits the
 range of snapshot versions this build renders (see the `snapshot_version` bullet
 below), because that field reports the *runner's* contract, not the invoked
-binary's. Either way a bump is visible in the payload itself. **Pin those two on
+binary's. Either way a bump is visible in the payload itself. **Pin those three on
 their own version field**, not on the CLI version alone: ignoring a
 `snapshot_version` bump across an upgrade is exactly the class of mistake this
-section exists to prevent. Both
+section exists to prevent. All three
 are versioned for the reason the project's other two versioned contracts (the
 durable JSONL stream's `schema_version` and the registry record's
 `registry_version`) are: each can be read by a party that did not invoke the
 binary — the snapshot crosses a process boundary to a runner that may be a
-different build, and the probe report's whole job is to be read *before* the
-binary's version is known.
+different build, the probe report's whole job is to be read *before* the
+binary's version is known, and a failure envelope is routinely read out of its
+invoking context altogether (captured stderr in a CI log, read back later by a
+different tool than the one that ran the binary).
 
 **The remaining four — `list --json`, the `cancel`/`kill` ack and `--all` report,
 `prune --json`, and `wait --report-outcome` in both its forms — carry no version
@@ -172,9 +184,15 @@ Consequently:
   names and flags), not on a version integer of their own. A breaking change to
   any of them — removing a field, renaming it, changing its type or the meaning
   of a value — is a **major** release, announced in the changelog.
-- **`probe --json` and `inspect --json` additionally bump their own field.** A
-  breaking change to either shape bumps `probe_version` / `snapshot_version`
-  respectively, and that field is what a consumer should check. For the snapshot,
+- **`probe --json`, `inspect --json`, and the failure envelope additionally bump
+  their own field.** A
+  breaking change to either of the first two shapes bumps `probe_version` /
+  `snapshot_version` respectively, and that field is what a consumer should check.
+  The envelope's `error_version` works the same way: removing or re-typing one of
+  its stable fields, or changing what an existing `kind` means, bumps it, while a
+  new field or a new `kind` value is additive and does not (see
+  [`docs/exit-codes.md`](exit-codes.md#machine-readable-failures---error-format-json),
+  "Machine-readable failures", and the "Stability" section there). For the snapshot,
   this binary's own `inspect` client checks it too, and does so **asymmetrically**:
   a runner answering with a `snapshot_version` *newer* than this build implements
   is refused with `CONTROL` (103) rather than rendered under semantics its sender

@@ -431,3 +431,11 @@ hit it — their ack carries no version.
 This is the exit-code half of the contract: a caller distinguishes "here is the run's
 state" / "the command was accepted" (exit `0`, JSON on stdout) from "that run is not
 reachable" (exit `103`, message on stderr) without parsing free text.
+
+Telling the reasons *within* that `103` apart is the one thing the code cannot do —
+which is what the global `--error-format json` is for: under it the same failure
+prints a bounded JSON object on stderr whose `kind` is exactly the distinction this
+section draws (`stale`, `unprobed`, `control_unreachable`, `ipc_deadline`,
+`ambiguous_run_id`, `not_found`, and — for the refusal above —
+`incompatible_contract`). Still no free text parsed, and stdout is untouched. See
+[`docs/exit-codes.md`](exit-codes.md#machine-readable-failures---error-format-json).

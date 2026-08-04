@@ -48,10 +48,13 @@ use clap_complete::aot::{Shell, generate_to};
 // submodules define, so the library keeps one `crate::cli::<Item>` path per
 // item. This generator only ever names `Cli`, and `mod cli;` is private here, so
 // those re-exports lead nowhere in *this* compilation — which is precisely what
-// `unused_imports` reports. Allowed for the same reason the two sibling modules
-// below allow `dead_code`: the unused part belongs to the library, not to a
-// mistake in this script.
-#[allow(unused_imports)]
+// `unused_imports` reports. `dead_code` is the same story one level down: the
+// helpers `Command` carries for the runtime binary (`name`, `target_run_id`,
+// which name a failed invocation for `--error-format json`) have no caller in a
+// generator that only walks the parse tree. Allowed for the same reason the two
+// sibling modules below allow `dead_code`: the unused part belongs to the
+// library, not to a mistake in this script.
+#[allow(unused_imports, dead_code)]
 mod cli;
 #[path = "src/labels.rs"]
 #[allow(dead_code)]

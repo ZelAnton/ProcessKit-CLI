@@ -27,6 +27,18 @@ pub fn scratch_registry(tag: &str) -> PathBuf {
 /// Write the record half of a fixture through the real serializable type, so a
 /// format change cannot leave a hand-written JSON template silently stale.
 fn write_record(dir: &Path, stem: &str, run_id: &str, labels: BTreeMap<String, String>) -> PathBuf {
+    write_record_with_stream(dir, stem, run_id, labels, None)
+}
+
+/// [`write_record`] with an explicit JSONL locator, for the fixtures whose point is
+/// the *stream* a record publishes rather than the record itself.
+fn write_record_with_stream(
+    dir: &Path,
+    stem: &str,
+    run_id: &str,
+    labels: BTreeMap<String, String>,
+    jsonl: Option<String>,
+) -> PathBuf {
     fs::create_dir_all(dir).expect("create the registry fixture directory");
     let record = Record {
         registry_version: REGISTRY_VERSION,
@@ -36,7 +48,7 @@ fn write_record(dir: &Path, stem: &str, run_id: &str, labels: BTreeMap<String, S
         argv_sha256: None,
         hint: None,
         labels,
-        jsonl: None,
+        jsonl,
         capture_dir: None,
         liveness: Liveness {
             kind: "advisory_lock".to_string(),
@@ -62,6 +74,18 @@ pub fn write_stale_entry_with_labels(
     labels: BTreeMap<String, String>,
 ) -> PathBuf {
     let path = write_record(dir, stem, run_id, labels);
+    fs::write(dir.join(format!("{stem}.lock")), b"").expect("write the unlocked fixture lock file");
+    path
+}
+
+/// Write a confirmed-stale record that publishes a JSONL locator.
+///
+/// The one fixture shape that lets a reader command see *several* streams under one
+/// run id — which is how `events --run-id` reaches its ambiguity refusal without two
+/// live runners to arrange it.
+pub fn write_stale_entry_with_stream(dir: &Path, stem: &str, run_id: &str, jsonl: &str) -> PathBuf {
+    let path =
+        write_record_with_stream(dir, stem, run_id, BTreeMap::new(), Some(jsonl.to_string()));
     fs::write(dir.join(format!("{stem}.lock")), b"").expect("write the unlocked fixture lock file");
     path
 }

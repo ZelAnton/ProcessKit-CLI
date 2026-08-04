@@ -200,6 +200,7 @@ use tokio::io::{
     split,
 };
 
+use crate::error_envelope::ErrorKind;
 use crate::events::{self, Member};
 use crate::exit::{self, RunnerError};
 use crate::registry::{self, Health};
@@ -1049,6 +1050,11 @@ fn refuse_snapshot_version(declared: u64, expected_run_id: &str) -> RunnerError 
              (for a newer runner, one at least as new as the binary that started the run)"
         ),
     )
+    // The one `CONTROL` failure that says nothing about the run's liveness: the
+    // target is registered, live, and reachable. `incompatible_contract` keeps that
+    // apart from every "could not reach it" reading for a machine consumer, exactly
+    // as this message does for a human.
+    .with_kind(ErrorKind::IncompatibleContract)
 }
 
 /// Refuse a snapshot describing a run other than the one that was addressed — the
@@ -1513,11 +1519,16 @@ async fn resolve_live_endpoint(action: &str, run_id: &str) -> Result<String, Run
 /// distinguishable [`exit::CONTROL`] shape every other unreachable-run result uses.
 fn open_registry(action: &str, run_id: &str) -> Result<registry::Registry, RunnerError> {
     registry::Registry::open_read_only().map_err(|err| {
+        // The code stays `CONTROL` — from the caller's side the target could not be
+        // resolved — while the machine-readable kind names the actual cause, which
+        // is the registry itself rather than this run (`docs/registry.md` is where
+        // an operator goes next, not the run's own logs).
         unreachable_run(
             action,
             run_id,
             format!("could not open the run registry: {err}"),
         )
+        .with_kind(ErrorKind::Registry)
     })
 }
 
@@ -1538,6 +1549,7 @@ fn resolve_in_registry(
             run_id,
             format!("could not read the run registry: {err}"),
         )
+        .with_kind(ErrorKind::Registry)
     })?;
 
     let matches: Vec<registry::Entry> = entries
@@ -1549,7 +1561,8 @@ fn resolve_in_registry(
             action,
             run_id,
             "no run with that id is registered".to_string(),
-        ));
+        )
+        .with_kind(ErrorKind::NotFound));
     }
 
     // Count *live* entries first — regardless of whether they advertise an
@@ -1620,6 +1633,7 @@ async fn connect_live(
                 run_id,
                 "timed out connecting to the live runner".into(),
             )
+            .with_kind(ErrorKind::IpcDeadline)
         })?
         .map_err(|err| {
             unreachable_run(
@@ -1724,7 +1738,13 @@ where
 {
     tokio::time::timeout(CONVERSATION_DEADLINE, converse::<S, T>(stream, verb))
         .await
-        .map_err(|_| unreachable_run(action, run_id, "the runner did not answer in time".into()))?
+        .map_err(|_| {
+            // A bounded window elapsed against a runner that was there — the one
+            // control-plane failure where nothing established the target is
+            // unreachable, and so the one the envelope reports as retryable.
+            unreachable_run(action, run_id, "the runner did not answer in time".into())
+                .with_kind(ErrorKind::IpcDeadline)
+        })?
         .map_err(|err| unreachable_run(action, run_id, err.to_string()))
 }
 
@@ -1747,7 +1767,11 @@ fn unreachable_run(action: &str, run_id: &str, detail: String) -> RunnerError {
 /// whose probe could not run at all ([`registry::Health::Unprobed`], T-206), and the
 /// distinction is load-bearing for the operator even though it changes nothing about
 /// what the client *does*: every verb here still refuses, because it acts only on
-/// [`registry::Health::Live`]. What it must not do is *assert* the runner exited when
+/// [`registry::Health::Live`]. It is load-bearing for a *machine* too, and no longer
+/// only in prose: the two branches carry different
+/// [`ErrorKind`]s (`stale` versus `unprobed`, the latter the one this file calls
+/// retryable), so an adapter reading `--error-format json` gets the same distinction
+/// this message spells out. What it must not do is *assert* the runner exited when
 /// nothing established that. Saying "the runner is gone" for an unprobeable entry
 /// would be the very unconfirmed positive claim `list` stopped making (see
 /// `docs/registry.md`, "Discovery — `list`"), and would send an operator following
@@ -1768,7 +1792,8 @@ fn no_live_entry(action: &str, run_id: &str, matches: &[registry::Entry]) -> Run
              lock call itself failed — so the runner is not confirmed gone; `list` reports \
              this entry as `unprobed`"
                 .to_string(),
-        );
+        )
+        .with_kind(ErrorKind::Unprobed);
     }
     unreachable_run(
         action,
@@ -1776,6 +1801,7 @@ fn no_live_entry(action: &str, run_id: &str, matches: &[registry::Entry]) -> Run
         "its registry entry is stale — the runner is gone (it exited without cleaning up)"
             .to_string(),
     )
+    .with_kind(ErrorKind::Stale)
 }
 
 /// An "ambiguous run id" error: `count` distinct live registry entries share
@@ -1797,6 +1823,7 @@ pub(crate) fn ambiguous_run(action: &str, run_id: &str, count: usize) -> RunnerE
              registered under it; re-run with a run id that is unique among live runs"
         ),
     )
+    .with_kind(ErrorKind::AmbiguousRunId)
 }
 
 /// Re-run [`resolve_in_registry`] against the same open `registry` right before a

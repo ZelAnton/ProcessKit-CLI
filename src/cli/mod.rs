@@ -34,7 +34,7 @@ mod prune;
 mod run;
 mod wait;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 pub use control::{InspectArgs, TargetArgs};
 pub use events::EventsArgs;
@@ -54,7 +54,8 @@ pub use parse::{
     parse_positive_duration, parse_run_id, parse_size,
 };
 
-/// Top-level parser: one required subcommand, no global options.
+/// Top-level parser: one required subcommand, plus the one global option every
+/// subcommand shares ([`Cli::error_format`]).
 #[derive(Debug, Parser)]
 #[command(
     name = "processkit-cli",
@@ -63,8 +64,37 @@ pub use parse::{
     long_about = None
 )]
 pub struct Cli {
+    /// How a runner-own failure is reported on stderr. `human` (the default) prints
+    /// the historical `processkit-cli: <message>` prose; `json` prints exactly one
+    /// bounded, versioned JSON object instead, so an adapter can branch on stable
+    /// fields (`code`, `kind`, `retryable`) rather than parsing prose.
+    ///
+    /// Global on purpose — it is accepted before or after the subcommand, and every
+    /// subcommand honors it. It never changes stdout, an exit code, or the default
+    /// prose; clap's own parse-time usage errors stay human-readable in v1. See
+    /// [`crate::error_envelope`] and `docs/exit-codes.md`.
+    #[arg(
+        long,
+        global = true,
+        value_name = "format",
+        value_enum,
+        default_value_t = ErrorFormat::Human
+    )]
+    pub error_format: ErrorFormat,
+
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// How a runner-own failure is rendered on stderr — the value of `--error-format`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum ErrorFormat {
+    /// The historical free-text line, unchanged byte for byte.
+    #[default]
+    Human,
+    /// One bounded, versioned JSON object per failed invocation (see
+    /// [`crate::error_envelope`] and `fixtures/schema/cli/error.schema.json`).
+    Json,
 }
 
 /// The commands that make up the runner's control surface.
@@ -94,6 +124,48 @@ pub enum Command {
     /// Report this binary's compatibility surface for a consumer's fail-closed
     /// compatibility preflight — no run, no child, no side effects.
     Probe(ProbeArgs),
+}
+
+impl Command {
+    /// The subcommand's own name, exactly as it is spelled on the command line.
+    ///
+    /// This is what a failure envelope reports as its `operation`
+    /// ([`crate::error_envelope`]), so it is derived from this enum rather than
+    /// re-typed anywhere else, and the `match` is exhaustive: a new subcommand
+    /// cannot be added without naming it here — and, through the envelope's schema
+    /// test, without publishing it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Run(_) => "run",
+            Self::Inspect(_) => "inspect",
+            Self::Cancel(_) => "cancel",
+            Self::Kill(_) => "kill",
+            Self::Wait(_) => "wait",
+            Self::Events(_) => "events",
+            Self::List(_) => "list",
+            Self::Prune(_) => "prune",
+            Self::Probe(_) => "probe",
+        }
+    }
+
+    /// The run id this invocation named, if it named one.
+    ///
+    /// `None` covers every honest way there is no single run to name: an `--all`
+    /// fan-out (whose targets are a snapshot, not one id), a whole-registry command
+    /// (`list`/`prune`), the self-contained `probe`, and a `run` that let the runner
+    /// generate an id — the generated value is minted inside the run itself and is
+    /// not knowable here, so reporting `null` is the truthful answer rather than a
+    /// guess.
+    pub fn target_run_id(&self) -> Option<&str> {
+        match self {
+            Self::Run(args) => args.run_id.as_deref(),
+            Self::Inspect(args) => args.run_id.as_deref(),
+            Self::Cancel(args) | Self::Kill(args) => args.run_id.as_deref(),
+            Self::Wait(args) => args.run_id.as_deref(),
+            Self::Events(args) => args.run_id.as_deref(),
+            Self::List(_) | Self::Prune(_) | Self::Probe(_) => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -147,6 +219,139 @@ mod tests {
                 "{sub} labels require --all"
             );
         }
+    }
+
+    #[test]
+    fn error_format_defaults_to_the_historical_prose() {
+        // The envelope is strictly opt-in: an invocation that says nothing about it
+        // gets exactly what every release before it printed.
+        let cli = Cli::try_parse_from(["processkit-cli", "list"]).expect("a bare list parses");
+        assert_eq!(cli.error_format, ErrorFormat::Human);
+    }
+
+    #[test]
+    fn error_format_is_accepted_on_either_side_of_the_subcommand() {
+        // `global = true` is what makes both spellings equivalent, and an adapter
+        // that appends its flags after the subcommand (the common case when the
+        // subcommand is chosen first) must not have to know that.
+        for argv in [
+            vec![
+                "processkit-cli",
+                "--error-format",
+                "json",
+                "inspect",
+                "--run-id",
+                "build-42",
+            ],
+            vec![
+                "processkit-cli",
+                "inspect",
+                "--run-id",
+                "build-42",
+                "--error-format",
+                "json",
+            ],
+            vec![
+                "processkit-cli",
+                "inspect",
+                "--error-format",
+                "json",
+                "--run-id",
+                "build-42",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(&argv).unwrap_or_else(|err| panic!("{argv:?}: {err}"));
+            assert_eq!(cli.error_format, ErrorFormat::Json, "{argv:?}");
+            assert_eq!(cli.command.name(), "inspect");
+            assert_eq!(cli.command.target_run_id(), Some("build-42"));
+        }
+    }
+
+    #[test]
+    fn every_subcommand_accepts_the_global_error_format() {
+        // A global option that some subcommand silently rejected would be worse than
+        // no option at all: `probe --json` advertises `<sub>:--error-format` for each
+        // of these, and a consumer's fail-closed preflight would then pin a promise
+        // the binary does not keep.
+        for argv in [
+            vec![
+                "run",
+                "--jsonl",
+                "events.jsonl",
+                "--error-format",
+                "json",
+                "--",
+                "true",
+            ],
+            vec!["inspect", "--error-format", "json", "--run-id", "r1"],
+            vec!["cancel", "--error-format", "json", "--run-id", "r1"],
+            vec!["kill", "--error-format", "json", "--run-id", "r1"],
+            vec!["wait", "--error-format", "json", "--run-id", "r1"],
+            vec!["events", "--error-format", "json", "--run-id", "r1"],
+            vec!["list", "--error-format", "json"],
+            vec!["prune", "--error-format", "json"],
+            vec!["probe", "--json", "--error-format", "json"],
+        ] {
+            let mut full = vec!["processkit-cli"];
+            full.extend(argv.iter().copied());
+            let cli = Cli::try_parse_from(&full).unwrap_or_else(|err| panic!("{full:?}: {err}"));
+            assert_eq!(cli.error_format, ErrorFormat::Json, "{full:?}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_error_format_is_a_parse_time_refusal() {
+        // Fail closed: a typo must not degrade to prose while the caller believes it
+        // asked for machine output.
+        assert!(
+            Cli::try_parse_from(["processkit-cli", "--error-format", "yaml", "list"]).is_err(),
+            "an unsupported format is refused rather than ignored"
+        );
+        assert!(
+            Cli::try_parse_from(["processkit-cli", "list", "--error-format"]).is_err(),
+            "the flag takes a value"
+        );
+    }
+
+    #[test]
+    fn a_commands_name_and_target_are_read_off_the_parsed_invocation() {
+        // These two feed the envelope's `operation` and `run_id`; an aggregate or
+        // whole-registry invocation names no single run and must report null rather
+        // than invent one.
+        for (argv, name, run_id) in [
+            (vec!["list"], "list", None),
+            (vec!["prune"], "prune", None),
+            (vec!["probe", "--json"], "probe", None),
+            (vec!["cancel", "--all"], "cancel", None),
+            (vec!["kill", "--run-id", "r1"], "kill", Some("r1")),
+            (vec!["wait", "--all"], "wait", None),
+            (vec!["wait", "--run-id", "r2"], "wait", Some("r2")),
+            (vec!["events", "--run-id", "r3"], "events", Some("r3")),
+            (vec!["events", "--file", "e.jsonl"], "events", None),
+            (vec!["inspect", "--all"], "inspect", None),
+        ] {
+            let mut full = vec!["processkit-cli"];
+            full.extend(argv.iter().copied());
+            let cli = Cli::try_parse_from(&full).unwrap_or_else(|err| panic!("{full:?}: {err}"));
+            assert_eq!(cli.command.name(), name, "{full:?}");
+            assert_eq!(cli.command.target_run_id(), run_id, "{full:?}");
+        }
+
+        let run = Cli::try_parse_from([
+            "processkit-cli",
+            "run",
+            "--jsonl",
+            "events.jsonl",
+            "--",
+            "true",
+        ])
+        .expect("a run that names no id");
+        assert_eq!(run.command.name(), "run");
+        assert_eq!(
+            run.command.target_run_id(),
+            None,
+            "a generated run id is minted inside the run and is not knowable here"
+        );
     }
 
     #[test]
