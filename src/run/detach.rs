@@ -812,9 +812,12 @@ mod tests {
                 );
             }
         }
-        // `CONTROL` (103) is the one assigned code deliberately absent from the set
-        // above: `run` never speaks to a control plane as a client, so a relayed 103
-        // would be a foreign build's verdict about someone else's target.
+        // `CONTROL` (103) is one of the assigned codes deliberately absent from the
+        // set above, spelled out here because its absence has a reason of its own:
+        // `run` never speaks to a control plane as a client, so a relayed 103 would be
+        // a foreign build's verdict about someone else's target. `NOT_A_MEMBER` (115)
+        // is absent for the same shape of reason — `run` never attests — and the loop
+        // above already covers it.
         assert_eq!(relayed_kind(exit::CONTROL), ErrorKind::Unknown);
     }
 

@@ -152,8 +152,8 @@
 //! at all. A snapshot is read-only output whose only failure mode is being *misread*,
 //! which is exactly what the range check prevents.
 //!
-//! Both consumers of a reply — [`inspect_endpoint`] for `inspect --run-id` and
-//! [`inspect_snapshot_target`] for `inspect --all` — go through the one shared
+//! Both consumers of a *snapshot* reply — [`inspect_endpoint`] for `inspect --run-id`
+//! and [`inspect_snapshot_target`] for `inspect --all` — go through the one shared
 //! acceptance step ([`SnapshotReply::accept`], which also carries the run-identity
 //! check the two call sites already shared), so neither path can drift into a weaker
 //! bar than the other. The version verdict is reached **before** the payload's shape
@@ -165,9 +165,14 @@
 //!
 //! Line-oriented and deliberately tiny. A client writes one request verb line
 //! (`inspect\n`; an empty line is also treated as `inspect`) and reads back one JSON
-//! line, then the server closes the connection. Three verbs share this one framing:
+//! line, then the server closes the connection. Four verbs share this one framing —
+//! two read-only, two mutating:
 //!
 //! - **`inspect`** — read-only; the reply is a [`Snapshot`].
+//! - **`attest`** — read-only; the reply is an [`Attestation`]. Like the others it
+//!   carries no argument, and here that is load-bearing rather than incidental: the
+//!   identity the verdict is about is the one the transport reports for the
+//!   connecting client, never one the request could name.
 //! - **`cancel`** — mutating; the runner runs its shared soft-stop → grace →
 //!   hard-kill teardown (the same one a `Ctrl-C` uses) and the run exits with the
 //!   reserved [`exit::CONTROL_CANCELLED`] (108). The reply is a [`ControlAck`].
@@ -354,7 +359,8 @@ impl ControlCommand {
 /// I/O — so it can be driven directly with arbitrary bytes without a live
 /// transport, which is what lets it double as half of the control-plane wire
 /// fuzz target (`fuzz/fuzz_targets/control_wire.rs`, T-186; the other half is
-/// the client-side JSON decode of [`Snapshot`]/[`ControlAck`]).
+/// the client-side JSON decode of the reply shapes a client parses, which since
+/// T-306 include [`AttestationReply`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
 pub enum RequestVerb {
@@ -1333,10 +1339,15 @@ fn refuse_snapshot_version(declared: u64, expected_run_id: &str) -> RunnerError 
              (for a newer runner, one at least as new as the binary that started the run)"
         ),
     )
-    // The one `CONTROL` failure that says nothing about the run's liveness: the
-    // target is registered, live, and reachable. `incompatible_contract` keeps that
-    // apart from every "could not reach it" reading for a machine consumer, exactly
-    // as this message does for a human.
+    // A `CONTROL` failure that says nothing about the run's liveness: the target is
+    // registered, live, reachable, and it answered. Two of the eight kinds that exist
+    // to split 103 have that shape — this one and `peer_identity_unsupported`, which
+    // `attest_outcome` mints when the runner answers but cannot name its peer — and
+    // two sites mint *this* one: `AttestationReply::accept` refuses an
+    // `attestation_version` this build does not read exactly as this refuses a
+    // `snapshot_version`. The `kind` is what keeps that reading apart from every
+    // "could not reach it" one for a machine consumer, exactly as this message does
+    // for a human.
     .with_kind(ErrorKind::IncompatibleContract)
 }
 

@@ -1,10 +1,10 @@
 //! Golden schema tests for the CLI's **non-event** machine-readable outputs:
 //! `probe --json`, `list --json`, `inspect --json` (single and `--all`), the
 //! `cancel`/`kill` ack and its `--all` report array, `prune --json` (with and
-//! without `--dry-run`), `wait --report-outcome` (single and `--all`), and the
-//! `--error-format json` failure envelope — the one family whose channel is
-//! **stderr** rather than stdout, because that is precisely where it keeps stdout
-//! reserved for successful output.
+//! without `--dry-run`), `wait --report-outcome` (single and `--all`),
+//! `attest --json`, and the `--error-format json` failure envelope — the one family
+//! whose channel is **stderr** rather than stdout, because that is precisely where
+//! it keeps stdout reserved for successful output.
 //!
 //! These are the counterpart of what `tests/events.rs` does for the JSONL
 //! lifecycle stream and `tests/cli_help.rs` does for the help surface: every case
@@ -31,8 +31,9 @@
 //!    the document rejects.
 //!
 //! See `fixtures/schema/cli/README.md` for the layout, the versioning decision
-//! these outputs embody (`probe`, `inspect`, and the error envelope carry their own
-//! `probe_version` / `snapshot_version` / `error_version`; the other four
+//! these outputs embody (four of these eight families — `probe`, `inspect`,
+//! `attest`, and the error envelope — carry their own `probe_version` /
+//! `snapshot_version` / `attestation_version` / `error_version`; the other four
 //! deliberately carry no version field), and what the normalization does and does
 //! not touch.
 

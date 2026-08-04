@@ -246,7 +246,8 @@ allows, so a bump is not automatically a fleet-wide outage; deciding whether the
 moves with it is part of making the bump, and both are announced in `CHANGELOG.md`.
 `cancel`/`kill` are unaffected (their ack carries no version and is verified by
 `accepted`/`action`/`run_id` instead), as are `list`, `wait`, and `prune`, which never
-read a snapshot.
+read a snapshot, and `attest`, whose reply is versioned on its own separate axis
+("Attestation version" below) and moves only when that number does.
 
 ## `attest`
 

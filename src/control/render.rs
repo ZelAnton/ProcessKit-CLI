@@ -1,4 +1,5 @@
-//! Human and JSON rendering for control-plane snapshots.
+//! Human and JSON rendering for the control plane's two read-only replies: `inspect`
+//! snapshots and `attest` attestations.
 //!
 //! Every [`Snapshot`] that reaches this module came out of
 //! [`super::SnapshotReply::accept`] — that is the only way to obtain one from the
@@ -11,6 +12,12 @@
 //! the parent module's "The snapshot version a runner declares — checked, and acted
 //! on"). Nothing here re-checks any of that: a second copy of the policy is exactly
 //! the drift the shared acceptance step exists to prevent.
+//!
+//! [`Attestation`] arrives under the identical discipline, through
+//! [`super::AttestationReply::accept`]. Its version axis is the stricter one, so the
+//! `attestation_version` printed here is always this build's own
+//! [`super::ATTESTATION_VERSION`] — the difference from the snapshot's range is
+//! decided there, not re-argued here.
 
 use crate::exit::{self, RunnerError};
 

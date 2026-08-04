@@ -306,9 +306,12 @@ class VersionPinTests(unittest.TestCase):
 
     `probe.schema.json` pins `probe_version` with `const`, while
     `inspect.schema.json` enumerates the *range* of `snapshot_version` values this
-    build renders, because that number is supplied by the runner on the far side of
-    the control-plane wire (`fixtures/schema/cli/README.md`, "The
-    `snapshot_version` range"). The driver has to read either form: hard-coding one
+    build renders, because its client genuinely decodes an older runner's shape.
+    The form follows the reader's tolerance rather than where the number comes
+    from — `attest.schema.json`'s `attestation_version` is supplied by the runner
+    too and is pinned with `const`, because its client refuses every version but
+    its own (`fixtures/schema/cli/README.md`, "The `snapshot_version` range").
+    The driver has to read either form: hard-coding one
     keyword makes a documented change of *form* read as the version field having
     disappeared, which both blinds the version check and downgrades every genuine
     shape defect in that family to a declared break.
@@ -421,10 +424,11 @@ class PublishedFixtureTests(unittest.TestCase):
         return json.loads(next(line for line in lines if line.strip()))
 
     def test_the_versioned_output_pins_still_resolve_in_whichever_form(self):
-        # docs/compatibility.md pins three of the seven published CLI-output families
+        # docs/compatibility.md pins four of the eight published CLI-output families
         # on a version field of their own; this lane compares a released binary, so
         # it checks the two of them a released binary emits (the `--error-format
-        # json` envelope is new and unreleased — see `VERSIONED_CLI_OUTPUTS`).
+        # json` envelope and `attest --json` are both new and unreleased — see
+        # `VERSIONED_CLI_OUTPUTS`).
         # If a document moves that field,
         # the scheduled lane must not quietly stop checking it. The *form* of the
         # pin deliberately differs between the two documents (`const` for probe, an

@@ -1131,8 +1131,18 @@ fn registry_scans_never_lose_or_duplicate_records_under_churn() {
 // Invariant 3 — control clients refuse boundedly, never hang
 // ---------------------------------------------------------------------------
 
-/// The three verbs that reach a live runner over its control transport
-/// (`src/control/mod.rs`) — all three must refuse the same bounded way when it is gone.
+/// The three verbs this scenario hammers — all three must refuse the same bounded way
+/// when the runner is gone.
+///
+/// They are three of the **four** verbs that reach a live runner over its control
+/// transport (`src/control/mod.rs`); `attest` is deliberately not among them. This
+/// scenario's invariant is "success, or exactly `CONTROL` (103)", and that holds only
+/// for verbs whose answer against a *live* runner is a success: `attest` asked by this
+/// harness — a process outside every run it launches — answers `not_a_member` on any
+/// platform that can name its peers, exiting `NOT_A_MEMBER` (115): a decided verdict
+/// rather than the unreachability this test is about. Its refusal against a *gone* runner is the very `resolve_in_registry` path
+/// all four verbs share, which these three exercise here; its own verdicts are covered
+/// by `tests/attest.rs`.
 const CONTROL_VERBS: [&str; 3] = ["inspect", "cancel", "kill"];
 
 /// A `run_id` no run in this tier ever registers: the pure "unreachable" case, with

@@ -146,11 +146,13 @@ directory:
   For the four unversioned families there is simply no version field for a
   consumer to pin; if a future task ever decides one of them does need its own,
   that is the point at which a versioned directory should appear alongside it.
-  For `probe --json`, `inspect --json`, and the failure envelope the pin already
-  exists *inside* the document — a breaking change to those shapes bumps
-  `probe_version` / `snapshot_version` / `error_version`, and that field, not a
-  directory name, is what a consumer checks. For `snapshot_version` the client
-  checks it as well, which is the next section.
+  For `probe --json`, `inspect --json`, `attest --json`, and the failure envelope
+  the pin already exists *inside* the document — a breaking change to those shapes
+  bumps `probe_version` / `snapshot_version` / `attestation_version` /
+  `error_version`, and that field, not a directory name, is what a consumer checks.
+  Two of those four the client checks as well — `snapshot_version` against the range
+  it decodes, `attestation_version` against the single version it reads — which is
+  the next section.
 - **Additive changes stay additive.** A new field on one of these objects, or a
   new value in an open-ended string field, is a minor/patch change; a reader that
   consumes the fields it knows is unaffected. Note that these documents set
@@ -161,14 +163,21 @@ directory:
 
 ## The `snapshot_version` range
 
-`inspect.schema.json`'s `snapshot_version` is the one value published in this
-directory that the *far side of a wire* supplies: every other field on every other
-form — including both other version pins, `probe_version` and `error_version` — is
-produced by the binary the caller just invoked, but this number is what the
-**runner** declared, echoed unchanged. A run started by an older build therefore
-reports that build's number even though the surrounding object is the invoked
-binary's own shape (the client re-serializes what it parsed — see the ack discussion
-above, which is the same mechanism).
+`inspect.schema.json`'s `snapshot_version` is the one **version** published in this
+directory whose value can differ from the invoked build's own. It is not the
+only value here that the *far side of a wire* supplies: `attest --json` publishes a
+whole set of them — `verdict`, `mechanism`, `peer_pid`, `checked_at`, and its own
+`attestation_version` — which its client re-serializes from what it parsed, exactly
+as `inspect` does with a snapshot. What sets `snapshot_version` apart is the
+**reader**. The three other version pins here all end up reporting the number of the
+binary the caller just invoked: `probe_version` and `error_version` because this
+binary writes them outright, and `attestation_version` because `attest`'s client
+refuses any version but its own before it renders anything, which is why that pin is
+`const` (see "Versioning" above). Only `snapshot_version` reports a version this build
+did not choose — what the **runner** declared, echoed unchanged. A run started by an
+older build therefore reports that build's number even though the surrounding object
+is the invoked binary's own shape (the client re-serializes what it parsed — see the
+ack discussion above, which is the same mechanism).
 
 That is why the document enumerates `[1, 2]` rather than pinning `const: 2`, and the
 enumeration is exact rather than permissive: the client **acts** on the value before

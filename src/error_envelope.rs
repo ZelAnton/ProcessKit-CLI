@@ -38,9 +38,14 @@
 //!   [`ErrorKind::IncompatibleContract`], and
 //!   [`ErrorKind::PeerIdentityUnsupported`] — which are exactly the distinctions
 //!   `docs/integration.md` §6 ("Typical errors") already draws in prose, and
-//!   [`crate::control`]'s
-//!   `no_live_entry`/`ambiguous_run`/`refuse_snapshot_version`/`attest_outcome`
-//!   already make in code (that count is the kinds that exist *to split* 103, which
+//!   [`crate::control`]'s `no_live_entry` / `ambiguous_run` /
+//!   `refuse_snapshot_version` / `AttestationReply::accept` / `attest_outcome`
+//!   already make in code — `refuse_snapshot_version` and
+//!   `AttestationReply::accept` being the only two sites that mint
+//!   [`ErrorKind::IncompatibleContract`], one per version axis
+//!   (`snapshot_version` and `attestation_version`), and `attest_outcome` the only
+//!   source of [`ErrorKind::PeerIdentityUnsupported`] (that count is the kinds that
+//!   exist *to split* 103, which
 //!   is what `fixtures/schema/cli/error.schema.json` conditions on; the one further
 //!   kind that can arrive under 103 is [`ErrorKind::Registry`], below);
 //! - it splits [`exit::SETUP`] (111) into [`ErrorKind::Registry`] (the per-user run
@@ -106,7 +111,7 @@ use crate::exit::{self, RunnerError};
 /// Version of the envelope's field set and of the [`ErrorKind`] vocabulary's
 /// meanings — the pin a consumer reads before trusting the object's shape.
 ///
-/// **Why this contract carries a version when four of the six *other* families
+/// **Why this contract carries a version when four of the seven *other* families
 /// under `fixtures/schema/cli/` do not.** Those are synchronous stdout
 /// renderings consumed by whoever just invoked this exact binary, so the caller
 /// already knows which version produced them and can pin it with `probe`
@@ -116,7 +121,8 @@ use crate::exit::{self, RunnerError};
 /// incident triage that has the stderr but not the invocation. That is the same
 /// "durable artifact / read by a party that did not invoke this binary" test the
 /// JSONL `schema_version`, the registry `registry_version`, the control-plane
-/// `snapshot_version`, and the probe report's `probe_version` all meet.
+/// `snapshot_version`, the attestation's `attestation_version`, and the probe
+/// report's `probe_version` all meet.
 ///
 /// Carrying a version does **not** make this a fourth compatibility surface. The
 /// crate's supported surface is still the three `AGENTS.md` fixes — CLI flags, the

@@ -22,8 +22,10 @@ unusable binary). A skip always carries its reason — a scenario is never silen
 dropped.
 
 A *failure* is a compatibility break that no version field declares. A bump of one
-of the three versioned contracts (`schema_version`, `snapshot_version`,
-`probe_version`) is instead reported as a **declared break** (`Scenario.warn`):
+of the three versioned contracts this lane compares (`schema_version`,
+`snapshot_version`, `probe_version` — the project publishes others, and the scope
+this lane checks is fixed by `VERSIONED_CLI_OUTPUTS` below) is instead reported as a
+**declared break** (`Scenario.warn`):
 bumping is the sanctioned way to break these, so failing on it would leave the
 lane red from the moment a legitimate bump lands until the next release.
 
@@ -93,25 +95,30 @@ SCHEMA_LIST_VALUED = ("oneOf", "anyOf", "allOf", "prefixItems")
 SCHEMA_MAP_VALUED = ("properties", "patternProperties", "$defs", "definitions",
                      "dependentSchemas")
 
-# `docs/compatibility.md`, "Machine-output schemas": of the seven published
-# `fixtures/schema/cli/` families, THREE carry a version field of their own —
-# `probe --json` (`probe_version`), `inspect --json` (`snapshot_version`), and the
-# `--error-format json` failure envelope (`error_version`). The other four (`list`,
-# `control-ack`, `prune`, `wait`) deliberately do not and ride on the CLI surface
-# instead. This lane compares a *released* binary against the current documents, so
-# it checks the two of those three a released binary can actually be compared on:
-# the envelope is new in the current release and no published binary emits it yet,
-# leaving nothing on the other side of the comparison. Add it here the first time a
-# release ships `--error-format`. Keep that scope explicit either way: it must not
-# be generalised in either direction.
+# `docs/compatibility.md`, "Machine-output schemas": of the eight published
+# `fixtures/schema/cli/` families, FOUR carry a version field of their own —
+# `probe --json` (`probe_version`), `inspect --json` (`snapshot_version`),
+# `attest --json` (`attestation_version`), and the `--error-format json` failure
+# envelope (`error_version`). The other four (`list`, `control-ack`, `prune`,
+# `wait`) deliberately do not and ride on the CLI surface instead. This lane
+# compares a *released* binary against the current documents, so it checks the two
+# of those four a released binary can actually be compared on: the envelope and
+# `attest` are both new in the current release and no published binary emits
+# either yet, leaving nothing on the other side of the comparison. Add each here
+# the first time a release ships it (`--error-format`, `attest`). Keep that scope
+# explicit either way: it must not be generalised in either direction.
 #
 # Each entry addresses the version field's own schema NODE, not one pinning
-# keyword inside it, because the two documents pin in two deliberately different
-# forms: `probe.schema.json` pins `probe_version` with `const` (the invoked binary
-# writes that value itself), while `inspect.schema.json` enumerates the *range* of
-# `snapshot_version` values this build renders, because that number is supplied by
-# the *runner* on the far side of the control-plane wire and a run started by an
-# older build reports that build's number (`fixtures/schema/cli/README.md`, "The
+# keyword inside it, because the published documents pin in two deliberately
+# different forms — and which form a family uses follows its *reader's* tolerance,
+# not where the number comes from. `probe.schema.json` pins `probe_version` with
+# `const` (the invoked binary writes that value itself), while
+# `inspect.schema.json` enumerates the *range* of `snapshot_version` values this
+# build renders, because its client genuinely decodes an older runner's shape and a
+# run started by an older build reports that build's number. Crossing the wire is
+# not by itself what makes a range: `attest.schema.json`'s `attestation_version`
+# comes off the wire too and is pinned with `const`, because that client refuses
+# every version but its own (`fixtures/schema/cli/README.md`, "The
 # `snapshot_version` range"; `docs/compatibility.md`, "Machine-output schemas").
 # `version_pin()` below reads whichever form a document publishes, so a pin that
 # changes *shape* is followed rather than misread as the field having disappeared
@@ -437,9 +444,10 @@ class Scenario:
     def warn(self, message: str) -> None:
         """Record a licensed break: visible, but not a lane failure.
 
-        A change to one of the three versioned contracts (`schema_version`,
-        `snapshot_version`, `probe_version`) is the *sanctioned* way to make a
-        breaking change — the field exists so the break is detectable — and the
+        A change to one of the three versioned contracts this lane compares
+        (`schema_version`, `snapshot_version`, `probe_version`) is the
+        *sanctioned* way to make a breaking change — the field exists so the
+        break is detectable — and the
         binary that bumped it did the right thing. Failing here would leave the
         lane permanently red from the moment a legitimate bump lands until the
         next release, which is precisely the kind of noise that trains a reader to

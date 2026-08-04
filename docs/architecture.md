@@ -205,6 +205,10 @@ by PID; they resolve it through the run registry (`src/registry/mod.rs`):
    unix domain socket or a Windows named pipe, both owner-restricted — and
    speaks the shared line-oriented wire protocol: one request-verb line out,
    one JSON reply line in. `inspect` is read-only and prints a `Snapshot`;
+   `attest` is read-only too and prints an `Attestation` — the runner's verdict
+   on whether the process that opened *this* connection is inside its container,
+   taken from the transport's own kernel-reported peer identity and answered on
+   its own `attestation_version` axis;
    `cancel`/`kill` are mutating and reuse `run`'s own teardown tiers exactly as
    described above — `cancel` the graceful soft-stop → grace → hard-kill tier,
    `kill` the immediate hard-kill tier — replying with a `ControlAck` before
