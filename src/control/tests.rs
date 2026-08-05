@@ -1435,6 +1435,50 @@ async fn server_rejects_an_oversized_request_line_without_unbounded_buffering() 
     );
 }
 
+/// A request line that is valid at the request boundary can still contain enough
+/// unknown text to overflow the error envelope. The server must shorten that
+/// diagnostic before writing it, so the normal bounded client reads the complete
+/// response line and reports the structured error rather than a framing overflow.
+#[tokio::test]
+async fn unknown_request_at_line_limit_gets_a_bounded_error_reply() {
+    let request = "x".repeat(MAX_LINE_BYTES - 1);
+    assert_eq!(request.len(), MAX_LINE_BYTES - 1);
+
+    let members = || Some(vec![Member::from_pid(1)]);
+    let source = SnapshotSource::new(
+        "run-error",
+        "job_object",
+        Some(1),
+        SystemTime::UNIX_EPOCH,
+        "/runs/run-error.jsonl",
+        None,
+        &members,
+    );
+    let (client, server) = tokio::io::duplex(MAX_LINE_BYTES + 4096);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (server_result, client_result) = tokio::join!(
+        serve_one(server, PeerIdentity::Pid(1), &source, &tx),
+        converse::<_, Snapshot>(client, &request),
+    );
+
+    server_result.expect("the server writes a bounded structured error response");
+    let err = client_result.expect_err("an unknown request is not a Snapshot");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    let message = err.to_string();
+    assert!(
+        message.contains(ERROR_TRUNCATION_SUFFIX),
+        "the bounded error diagnostic is marked truncated: {message}"
+    );
+    assert!(
+        !message.contains("line exceeded the 65536-byte control-plane limit"),
+        "the client read the complete response instead of rejecting an oversized line: {message}"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "an unknown request must never route a teardown command"
+    );
+}
+
 #[tokio::test]
 async fn bounded_line_distinguishes_mid_line_eof_from_limit_exhaustion() {
     let mut short_reader = BufReader::new(&b"inspect"[..]);
@@ -1503,7 +1547,7 @@ async fn oversized_snapshot_becomes_a_bounded_structured_error() {
 
     let response = serialize_snapshot(&snapshot);
     assert!(
-        response.len() + 1 <= MAX_LINE_BYTES,
+        response.len() < MAX_LINE_BYTES,
         "the replacement response, including newline, fits the reader bound"
     );
     let error: ErrorReply = serde_json::from_str(&response)

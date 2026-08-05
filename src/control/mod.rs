@@ -681,14 +681,15 @@ fn snapshot_version_is_readable(declared: u64) -> bool {
 /// client never asks for anything else, so it only ever sees a [`Snapshot`]; this
 /// exists so a future/foreign client gets a structured answer rather than silence.
 ///
-/// `error: &'a str` is zero-copy on the *serialize* side ([`serialize_error`] never
-/// needs to allocate), but that shape cannot be reused to deserialize a reply: serde
-/// can only borrow a JSON string field when it contains no escape sequence, so a
-/// server's diagnostic that happens to include a quote, backslash, or control
-/// character (a Windows named-pipe path, for instance) would fail to parse as this
-/// type and fall through to the generic "unreadable response" message the fallback
-/// exists to avoid. [`converse`] instead deserializes replies into the owned
-/// [`ErrorReply`] sibling below, which always parses regardless of escaping.
+/// `error: &'a str` borrows the diagnostic on the *serialize* side, but that shape
+/// cannot be reused to deserialize a reply: serde can only borrow a JSON string field
+/// when it contains no escape sequence, so a server's diagnostic that happens to
+/// include a quote, backslash, or control character (a Windows named-pipe path, for
+/// instance) would fail to parse as this type and fall through to the generic
+/// "unreadable response" message the fallback exists to avoid. [`converse`] instead
+/// deserializes replies into the owned [`ErrorReply`] sibling below, which always
+/// parses regardless of escaping. [`serialize_error`] also bounds the serialized
+/// envelope, so a long diagnostic cannot make the response line unreadable.
 #[derive(Debug, Serialize)]
 struct ErrorResponse<'a> {
     error: &'a str,
@@ -1092,11 +1093,20 @@ where
 
 /// Write one JSON response line and end the response: flush it, then half-close the
 /// write side (best-effort — some transports have no half-close) so the client's
-/// read completes at once.
+/// read completes at once. The final size check is deliberately here as well as in
+/// the individual serializers: an unexpectedly large acknowledgement or attestation
+/// must still fail closed to a bounded structured error rather than violate the
+/// reader's framing contract.
 async fn write_response<W>(write_half: &mut W, response: &str) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
+    let fallback = if response.len() >= MAX_LINE_BYTES {
+        Some(serialize_error(RESPONSE_TOO_LARGE_ERROR))
+    } else {
+        None
+    };
+    let response = fallback.as_deref().unwrap_or(response);
     write_half.write_all(response.as_bytes()).await?;
     write_half.write_all(b"\n").await?;
     write_half.flush().await?;
@@ -1129,10 +1139,53 @@ fn serialize_attestation(attestation: &Attestation) -> String {
         .unwrap_or_else(|_| String::from(r#"{"error":"could not render the attestation"}"#))
 }
 
-/// Serialize an error response for an unrecognized request.
+/// A fixed fallback for a response that was unexpectedly too large after its own
+/// serializer ran. This is also short enough to be passed through [`serialize_error`]
+/// without triggering its truncation path.
+const RESPONSE_TOO_LARGE_ERROR: &str =
+    "control-plane response exceeds the 65536-byte response limit";
+
+/// The suffix used when a peer-controlled diagnostic is shortened to preserve the
+/// response-line bound. It is part of the diagnostic contract, not a second framing
+/// marker: the JSON newline remains the only wire terminator.
+const ERROR_TRUNCATION_SUFFIX: &str = "... (truncated)";
+
+/// Serialize an error response for an unrecognized request. Short diagnostics retain
+/// their existing text. If JSON escaping would make the complete envelope reach the
+/// line ceiling, keep the longest valid UTF-8 prefix whose envelope plus the writer's
+/// newline still fits and mark the diagnostic as truncated.
 fn serialize_error(message: &str) -> String {
+    let response = serialize_error_message(message);
+    if response.len() < MAX_LINE_BYTES {
+        return response;
+    }
+
+    let chars: Vec<char> = message.chars().collect();
+    let mut low = 0;
+    let mut high = chars.len();
+    while low < high {
+        let midpoint = low + (high - low).div_ceil(2);
+        let candidate = error_message_prefix(&chars, midpoint);
+        if serialize_error_message(&candidate).len() < MAX_LINE_BYTES {
+            low = midpoint;
+        } else {
+            high = midpoint - 1;
+        }
+    }
+
+    serialize_error_message(&error_message_prefix(&chars, low))
+}
+
+fn serialize_error_message(message: &str) -> String {
     serde_json::to_string(&ErrorResponse { error: message })
         .unwrap_or_else(|_| String::from(r#"{"error":"control error"}"#))
+}
+
+fn error_message_prefix(chars: &[char], prefix_len: usize) -> String {
+    let mut message = String::new();
+    message.extend(chars.iter().take(prefix_len).copied());
+    message.push_str(ERROR_TRUNCATION_SUFFIX);
+    message
 }
 
 /// Serialize a `cancel`/`kill` acknowledgement for the wire. A struct of owned
