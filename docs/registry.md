@@ -116,6 +116,21 @@ file** (`<opaque-stem>.lock`). The record is a single JSON object:
 | `capture_dir`      | Absolute output-capture directory, or `null` when capture is disabled or the record predates this field. |
 | `liveness`         | How to decide whether the record is live or stale (see below). |
 
+### Serialized size policy
+
+The serialized record has an inclusive limit of **65,536 bytes (64 KiB)**. Readers
+read one byte beyond that boundary so they can distinguish an exact-boundary record
+from an oversized one. Writers serialize the complete JSON object first and apply the
+same byte limit before creating the `.json` file; a record exactly at 64 KiB remains
+discoverable by `list`, `wait`, and the control-plane readers.
+
+An oversized record is rejected as `InvalidData` with its measured size and the
+supported maximum in the diagnostic. The runner treats this as best-effort registry
+degradation: it warns on stderr, continues the contained child, and preserves the
+child's exit code. It does not truncate or silently drop individual labels or artifact
+locators. The reservation guard removes the pre-publication `.lock`, so a rejected
+record cannot leave a `.json`/`.lock` pair for `prune` to recover.
+
 Registry identity, endpoint, and artifact-path strings remain byte-for-byte intact
 for matching and JSON output. Every human-readable renderer of one sanitizes
 terminal formatting and limits the field to 256 characters plus an explicit `...`

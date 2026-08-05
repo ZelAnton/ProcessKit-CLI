@@ -52,8 +52,7 @@ fn oversized_records_are_skipped_by_scans_and_rejected_by_point_probes() {
         .register_plain("healthy", None, SystemTime::now())
         .expect("register healthy entry");
     let oversized_path = dir.join("oversized.json");
-    fs::write(&oversized_path, "x".repeat(MAX_RECORD_BYTES as usize + 1))
-        .expect("write oversized record");
+    fs::write(&oversized_path, "x".repeat(MAX_RECORD_BYTES + 1)).expect("write oversized record");
 
     let entries = registry.entries().expect("scan ignores corrupt record");
     assert_eq!(entries.len(), 1);
@@ -67,6 +66,168 @@ fn oversized_records_are_skipped_by_scans_and_rejected_by_point_probes() {
     );
 
     drop(registration);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The writer and reader share an inclusive serialized-byte boundary. A record that
+/// lands exactly on it must still be published and remain visible to the same scan
+/// that control-plane clients and `list` use.
+#[test]
+fn a_record_at_the_serialized_reader_boundary_is_published_and_visible() {
+    let dir = scratch("record-boundary");
+    let registry = Registry::open_in(dir.clone()).expect("open registry");
+    let started = UNIX_EPOCH + Duration::from_millis(1_700_000_000_123);
+    let command = events::CommandFingerprint::for_argv(["fixture"]);
+
+    // `next_stem` always emits 53 ASCII characters, so the generated lock-file name
+    // has the same serialized length as this representative value regardless of time
+    // or the per-process uniqueness counter.
+    let lock_file = format!("{}.lock", "x".repeat(53));
+    let mut expected = Record {
+        registry_version: REGISTRY_VERSION,
+        run_id: String::new(),
+        endpoint: None,
+        started_at: events::format_rfc3339_utc(started),
+        argv_sha256: Some(command.argv_sha256.clone()),
+        hint: command.hint.map(str::to_string),
+        labels: BTreeMap::new(),
+        jsonl: None,
+        capture_dir: None,
+        liveness: Liveness {
+            kind: LIVENESS_ADVISORY_LOCK.to_string(),
+            lock_file,
+        },
+    };
+    let baseline = serde_json::to_vec(&expected)
+        .expect("serialize the boundary fixture")
+        .len();
+    assert!(
+        baseline < MAX_RECORD_BYTES,
+        "the fixture must fit before its run id"
+    );
+    expected.run_id = "r".repeat(MAX_RECORD_BYTES - baseline);
+    assert_eq!(
+        serialize_record_for_publication(&expected)
+            .expect("the exact boundary is accepted")
+            .len(),
+        MAX_RECORD_BYTES
+    );
+
+    let registration = registry
+        .register(&expected.run_id, None, started, &command)
+        .expect("a record at the reader boundary must publish");
+    let bytes = fs::read(registration.record_path()).expect("read the published boundary record");
+    assert_eq!(
+        bytes.len(),
+        MAX_RECORD_BYTES,
+        "the writer must measure the exact bytes the reader will consume"
+    );
+
+    let entries = registry.entries().expect("scan the boundary record");
+    assert_eq!(entries.len(), 1, "the boundary record remains discoverable");
+    assert_eq!(entries[0].record.run_id, expected.run_id);
+    assert_eq!(entries[0].health, Health::Live);
+    assert_eq!(
+        registry
+            .probe_run(&expected.run_id)
+            .expect("probe the boundary run"),
+        RunStatus::Live,
+        "the by-id reader sees the same live record as the list-style scan"
+    );
+
+    registration.remove();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+fn assert_oversized_registration_is_rejected(
+    registry: &Registry,
+    dir: &Path,
+    labels: &BTreeMap<String, String>,
+    artifacts: ArtifactLocators<'_>,
+) {
+    let error = match registry.register_with_labels_and_artifacts(
+        "oversized",
+        None,
+        SystemTime::now(),
+        &events::CommandFingerprint::for_argv(["fixture"]),
+        labels,
+        artifacts,
+    ) {
+        Ok(registration) => {
+            registration.remove();
+            panic!("an oversized serialized record must be rejected before publication")
+        }
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("serialized registry record"));
+    assert!(
+        error
+            .to_string()
+            .contains("maximum supported size is 65536 bytes"),
+        "the diagnostic must state the reader-compatible ceiling: {error}"
+    );
+    assert!(
+        fs::read_dir(dir)
+            .expect("read the registry after rejected registration")
+            .next()
+            .is_none(),
+        "the reservation guard must remove the lock when no JSON record is published"
+    );
+    assert!(
+        registry
+            .entries()
+            .expect("scan after rejected registration")
+            .is_empty(),
+        "an oversized run is absent from discovery because registration was rejected"
+    );
+    assert_eq!(
+        registry.prune().expect("prune after rejected registration"),
+        PruneOutcome::default(),
+        "prune has no leaked pair to reap"
+    );
+}
+
+#[test]
+fn oversized_labels_are_rejected_before_publication_and_cleanup_is_safe() {
+    let dir = scratch("oversized-labels");
+    let registry = Registry::open_in(dir.clone()).expect("open registry");
+    let labels = (0..300)
+        .map(|index| {
+            (
+                format!("label_{index}"),
+                "v".repeat(crate::labels::MAX_VALUE_CHARS),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    assert_oversized_registration_is_rejected(
+        &registry,
+        &dir,
+        &labels,
+        ArtifactLocators::default(),
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn oversized_artifact_locators_are_rejected_before_publication_and_cleanup_is_safe() {
+    let dir = scratch("oversized-artifacts");
+    let registry = Registry::open_in(dir.clone()).expect("open registry");
+    let jsonl = "j".repeat(MAX_RECORD_BYTES);
+    let capture_dir = "c".repeat(MAX_RECORD_BYTES);
+
+    assert_oversized_registration_is_rejected(
+        &registry,
+        &dir,
+        &BTreeMap::new(),
+        ArtifactLocators {
+            jsonl: Some(&jsonl),
+            capture_dir: Some(&capture_dir),
+        },
+    );
+
     let _ = fs::remove_dir_all(&dir);
 }
 
