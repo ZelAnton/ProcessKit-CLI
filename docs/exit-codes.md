@@ -531,8 +531,12 @@ Two things, both deliberate and both stated here rather than left as silent gaps
   which one is chosen.
 - **Exactly one envelope per failed invocation**, on one line. For every command
   except `run` it is the only thing on stderr; for `run` the child's echoed stderr
-  shares the stream, so it is the runner's own *final* line (use `--capture-dir` or
-  `--no-echo` for a clean channel).
+  shares the stream, so it is the runner's own *final* line. `--no-echo` is the flag
+  that keeps the child's bytes off that stream — it skips only the runner-side echo
+  write, so a `--capture-dir` transcript still receives them in full — while
+  `--capture-dir` on its own suppresses nothing and leaves the echo interleaved. On
+  either channel, a reader identifies the envelope by its shape, not by being alone:
+  the `processkit-cli: warning: …` lines named above are prose on the same stream.
 
 ## Stability
 

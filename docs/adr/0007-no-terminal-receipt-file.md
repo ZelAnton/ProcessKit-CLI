@@ -46,8 +46,12 @@ The adapter-facing form of this rule is in the integration guide,
      only in the stream. To actually retire that reader the receipt would have to grow
      into a second, full serialization of the run.
   2. *The read is six lines.* A foreground run emits six events, seven with
-     `--capture-dir`. The stream only grows past that when a caller opts into
-     `--snapshot-interval`, i.e. asks for more events on purpose.
+     `--capture-dir`, and eight if a requested resource cap (`--max-memory` /
+     `--max-processes` / `--cpu-quota`) also contributes its post-run
+     `limit_evidence`. Every way the stream grows past those six is a caller opting
+     in — those two axes plus `--snapshot-interval`'s extra `members_snapshot`
+     samples — i.e. asking for more events on purpose. The full ordering rule is in
+     [`docs/schema.md`](../schema.md#ordering), "Ordering".
   3. *A cheaper answer already exists.* The `--error-format json` envelope resolves
      exactly the ambiguity the proposal names, with no path to allocate, no artifact
      to clean up, and no new schema family to version.

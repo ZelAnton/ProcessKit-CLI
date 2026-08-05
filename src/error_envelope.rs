@@ -102,8 +102,12 @@
 //! with an unmet `--require-*`, `inspect --all --json` with an unreachable target)
 //! leaves stdout byte-for-byte unchanged and adds the envelope to stderr. For
 //! `run`, note that the child's own echoed stderr shares the stream: the envelope is
-//! the runner's own final line there rather than the only line (use `--capture-dir`
-//! or `--no-echo` for a clean channel).
+//! the runner's own final line there rather than the only line. `--no-echo` is what
+//! keeps the child's bytes off that stream — it skips only the runner-side echo
+//! write, so a `--capture-dir` transcript still receives them in full — while
+//! `--capture-dir` alone suppresses nothing. Either way a reader identifies the
+//! envelope by its shape, not by being alone on the stream, since the warning lines
+//! above are prose on the same channel.
 
 use crate::cli::ErrorFormat;
 use crate::exit::{self, RunnerError};

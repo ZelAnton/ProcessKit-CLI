@@ -351,6 +351,7 @@ check, no parsing needed) and the terminal `runner_exit` event's `source` and
 | --- | --- | --- |
 | `child_exit` | the child's own code (`child_code`, echoed in `code` too) | The child ran to completion on its own. |
 | `timeout` | `106` | A runner deadline elapsed and the runner tore the tree down — the whole-run `--timeout` or the `--idle-timeout` (child silent past the idle window). The preceding `timeout` event's `reason` (`overall` / `idle`) says which; both reuse this one source and code. |
+| `output_overflow` | `113` | A capture stream crossed `--capture-max-bytes` while `--capture-overflow cancel` was active, and the runner tore the tree down through the same graceful path a timeout takes. The preceding `output_overflow` event names the `stream` that crossed first and the `max_bytes` ceiling (see [`docs/schema.md`](schema.md#output_overflow)). |
 | `cancelled` | `107` | A local stop signal cancelled the run: a `Ctrl-C`, on Unix a `SIGTERM`/`SIGHUP` (an external `kill`/`systemctl stop`/cancelled CI job, or a hung-up terminal), or on Windows a `Ctrl-Break`/console close/logoff/system shutdown. The preceding `cancelled` event's `source` (`ctrl_c` / `sigterm` / `sighup` / `ctrl_break` / `ctrl_close` / `ctrl_logoff` / `ctrl_shutdown`) says which; all reuse this one source and code. |
 | `control_cancel` | `108` | A control-plane `cancel` (§4) cancelled the run. |
 | `control_kill` | `109` | A control-plane `kill` (§4) force-killed the run. |
@@ -378,14 +379,30 @@ envelope line on stderr and a child's own exit prints none, so the envelope's
 processkit-cli --error-format json run --run-id build-42 \
   --jsonl .processkit/build-42.jsonl --no-echo -- ./build.sh 2>build-42.err
 rc=$?
-# rc=106, build-42.err empty        -> the child itself exited 106
-# rc=106, one envelope line in it   -> {"error_version":1,"code":106,"kind":"timeout",...}
+# rc=106, no envelope line in build-42.err -> the child itself exited 106
+# rc=106, one envelope line in it          -> {"error_version":1,"code":106,"kind":"timeout",...}
 ```
 
-The envelope's `kind` is spelled exactly like the `source` column of the table above,
-so the two channels need no separate vocabulary. Pair the flag with `--no-echo` (or
-`--capture-dir`) as shown, so the runner's stderr carries only the runner's own text:
-with the live echo on, the child's stderr is interleaved with it.
+**Test for the envelope's presence, not for an empty file.** Even with the echo
+suppressed, stderr may carry `processkit-cli: warning: …` prose lines — a registry
+that could not be opened, event logging that switched itself off, a member read that
+failed. Those are not envelopes and not failures, and they keep their prose in both
+modes (see [`docs/exit-codes.md`](exit-codes.md#what-the-envelope-does-not-cover),
+"What the envelope does not cover"), so an adapter that reads an *empty* file as "the
+child's own code" will misread a genuine `106` the moment any harmless warning
+appears. Look for the one line that parses as JSON carrying `error_version`: there is
+at most one per invocation.
+
+The envelope's `kind` is spelled exactly like the `source` column of the table above —
+every row of it but `child_exit`, which is by definition the reading that prints no
+envelope — so the two channels need no separate vocabulary. `--no-echo` is what keeps
+the child's own bytes off the runner's stderr, and it is the only flag that does —
+`--capture-dir` is an independent axis that files a transcript without suppressing
+anything, so pass it *alongside* `--no-echo` when the child's output is still wanted
+(the pump stays wired either way, so the transcript is complete). With the echo left
+on, the envelope is still emitted — it is the runner's own *final* stderr line — but
+the child's stderr is interleaved with it, which is one more reason to match on the
+line rather than on the stream as a whole.
 
 This does not make the stream optional, and it is not a second outcome artifact.
 `--jsonl` is required on every `run`, the envelope reports only the runner-owned
@@ -759,8 +776,12 @@ is [ADR 0007](adr/0007-no-terminal-receipt-file.md).
   terminal facts; the start-time facts exist only in the stream (§3). Such an adapter
   would gain a second artifact and keep the loop.
 - **The read is six lines.** A foreground run emits six events — seven with
-  `--capture-dir`. The stream grows past that only when a caller passes
-  `--snapshot-interval`, that is, asks for more events on purpose.
+  `--capture-dir`, and one more again when a requested resource cap
+  (`--max-memory` / `--max-processes` / `--cpu-quota`) adds its post-run
+  `limit_evidence`. Every way the stream grows past those six is a caller opting in,
+  `--snapshot-interval`'s extra `members_snapshot` samples included — that is, asking
+  for more events on purpose. [`docs/schema.md`](schema.md#ordering), "Ordering", is
+  the full rule.
 - **A cheaper answer already exists**, and it is the recipe in §3: the
   `--error-format json` envelope resolves exactly this ambiguity with no path to
   allocate, no artifact to clean up, and no second durable shape to version.
