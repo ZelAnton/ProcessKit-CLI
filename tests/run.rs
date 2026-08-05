@@ -636,6 +636,90 @@ fn run_id_env_colliding_with_an_explicit_env_is_refused_before_the_run_starts() 
     let _ = std::fs::remove_dir_all(&ok_dir);
 }
 
+/// Every bare environment-key spelling accepted by `--run-id-env` is also the
+/// spelling accepted by `--env-remove`: malformed values fail as `USAGE` before
+/// the runner creates its event stream or starts the requested child.
+#[test]
+fn malformed_env_remove_keys_are_rejected_before_the_child_starts() {
+    for (index, key) in ["", "KEY=value", "BAD KEY", "TAB\tKEY", "BEL\u{7}KEY"]
+        .into_iter()
+        .enumerate()
+    {
+        let dir = scratch(&format!("env-remove-invalid-{index}"));
+        let out = run_with_flags(
+            &dir,
+            &[],
+            &["--env-remove", key],
+            shell_inline("echo child-must-not-start"),
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(100),
+            "malformed --env-remove value {key:?} must be a usage error; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "a rejected --env-remove value must not forward child output: {key:?}"
+        );
+        assert!(
+            !events_path(&dir).exists(),
+            "a rejected --env-remove value must fail before creating the event stream: {key:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A valid bare name still reaches ProcessKit's `env_remove` builder call and
+/// removes the value inherited by the child.
+#[test]
+fn env_remove_removes_an_inherited_variable_through_the_binary() {
+    const KEY: &str = "PROCESSKIT_TEST_ENV_REMOVE";
+    const VALUE: &str = "inherited-before-remove";
+    let program = if cfg!(windows) {
+        format!("echo %{KEY}%")
+    } else {
+        format!("printf '%s\\n' \"${}\"", KEY)
+    };
+    let inherited = [(KEY, Path::new(VALUE))];
+
+    let baseline_dir = scratch("env-remove-baseline");
+    let baseline = run_with_flags(&baseline_dir, &inherited, &[], shell_inline(&program));
+    assert_eq!(
+        baseline.status.code(),
+        Some(0),
+        "the baseline child exits cleanly; stderr: {}",
+        String::from_utf8_lossy(&baseline.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&baseline.stdout).contains(VALUE),
+        "the baseline proves the runner environment reaches the child: {:?}",
+        String::from_utf8_lossy(&baseline.stdout)
+    );
+
+    let removed_dir = scratch("env-remove-applied");
+    let removed = run_with_flags(
+        &removed_dir,
+        &inherited,
+        &["--env-remove", KEY],
+        shell_inline(&program),
+    );
+    assert_eq!(
+        removed.status.code(),
+        Some(0),
+        "the child exits cleanly after removal; stderr: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&removed.stdout).contains(VALUE),
+        "--env-remove strips the inherited value from the child: {:?}",
+        String::from_utf8_lossy(&removed.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&baseline_dir);
+    let _ = std::fs::remove_dir_all(&removed_dir);
+}
+
 // ---------------------------------------------------------------------------
 // Applied order, end to end (T-304, R-02).
 //
