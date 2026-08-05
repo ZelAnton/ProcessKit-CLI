@@ -195,7 +195,10 @@
 //! buffer an unbounded amount of memory just to find one out. Exceeding the ceiling
 //! is a protocol violation, not silent truncation: the server answers with the same
 //! structured-error closing path an unrecognized verb gets, and the client surfaces
-//! the same `io::Error` shape an unparsable reply already does.
+//! the same `io::Error` shape an unparsable reply already does. The runner applies
+//! the same bound before writing an `inspect` snapshot, counting the terminating
+//! newline; a snapshot that cannot fit becomes a bounded structured error instead
+//! of an oversized or truncated reply.
 
 use std::convert::Infallible;
 use std::io;
@@ -538,20 +541,22 @@ const CONVERSATION_DEADLINE: Duration = Duration::from_secs(5);
 const CONNECTION_DEADLINE: Duration = Duration::from_secs(5);
 
 /// The byte ceiling on the *one* line either side of the wire protocol reads: the
-/// request verb ([`serve_one`]) and the JSON reply ([`converse`]). The protocol is
-/// deliberately tiny (module doc, "Wire protocol") — a request line is `inspect` /
-/// `cancel` / `kill` / empty plus `\n` (a handful of bytes), and a reply line is a
-/// [`Snapshot`] (JSON of a handful of scalar fields plus an enriched `members` array),
-/// a [`ControlAck`], or an error object. `64 KiB` sits comfortably above even a
-/// generously large `members` list — the sole field with unbounded real-world size —
-/// while staying nowhere near "unbounded": a peer that never sends a `\n` (an
-/// owner-local client gone rogue, or a wedged runner on the reply side) is capped
-/// here instead of growing the live runner's — or the client's — memory without
-/// limit, which is the vulnerability this constant closes. It is not tuned to the
-/// wire's typical size (bytes to low kilobytes); it is tuned to be small relative to
-/// "no limit at all" while leaving generous headroom over anything the protocol
-/// legitimately sends.
+/// request verb ([`serve_one`]) and the JSON reply ([`converse`]). The terminating
+/// newline counts against this ceiling, so a response payload may occupy at most
+/// `MAX_LINE_BYTES - 1` bytes. The protocol is deliberately tiny (module doc,
+/// "Wire protocol") — a request line is `inspect` / `cancel` / `kill` / empty plus
+/// `\n` (a handful of bytes), and a reply line is a [`Snapshot`] (JSON of a handful
+/// of scalar fields plus an enriched `members` array), a [`ControlAck`], or an error
+/// object. A snapshot whose complete JSON payload cannot fit is represented by the
+/// bounded [`SNAPSHOT_TOO_LARGE_ERROR`] response; it is never truncated or emitted
+/// over the reader's limit.
 const MAX_LINE_BYTES: usize = 64 * 1024;
+
+/// The stable diagnostic returned when the complete `inspect` snapshot cannot fit
+/// in the one-line control-plane response. Keep this short and fixed: the fallback
+/// itself must always fit the same bound it protects.
+const SNAPSHOT_TOO_LARGE_ERROR: &str =
+    "control-plane inspect snapshot exceeds the 65536-byte response limit";
 
 /// The machine-readable state `inspect` prints: what a control-plane client can learn
 /// about a live run. `Serialize` on the server side, `Deserialize` on the client side
@@ -1099,11 +1104,19 @@ where
     Ok(())
 }
 
-/// Serialize a snapshot for the wire. A struct of owned strings and numbers cannot
-/// fail to serialize; the fallback is defensive only.
+/// Serialize a snapshot for the wire, including the response-size check required by
+/// [`MAX_LINE_BYTES`]. The terminating newline is written by [`write_response`], so
+/// the JSON payload must be strictly shorter than the reader's byte ceiling. An
+/// oversized snapshot is refused with the bounded structured error used by other
+/// control-plane failures; it is never truncated, fragmented, or sent oversized.
 fn serialize_snapshot(snapshot: &Snapshot) -> String {
-    serde_json::to_string(snapshot)
-        .unwrap_or_else(|_| String::from(r#"{"error":"could not render the snapshot"}"#))
+    let response = serde_json::to_string(snapshot)
+        .unwrap_or_else(|_| String::from(r#"{"error":"could not render the snapshot"}"#));
+    if response.len() < MAX_LINE_BYTES {
+        response
+    } else {
+        serialize_error(SNAPSHOT_TOO_LARGE_ERROR)
+    }
 }
 
 /// Serialize an attestation for the wire. A struct of owned strings, a unit enum and

@@ -416,6 +416,51 @@ fn snapshot_line_declaring(run_id: &str, snapshot_version: u32) -> String {
     serialize_snapshot(&snapshot_declaring(run_id, snapshot_version))
 }
 
+/// Build a snapshot whose unbounded run-id field makes the raw JSON payload exactly
+/// `target_bytes` long. The helper uses the raw serializer deliberately so the
+/// boundary tests can exercise [`serialize_snapshot`]'s bounded decision itself.
+fn snapshot_with_serialized_size(target_bytes: usize) -> Snapshot {
+    let mut snapshot = snapshot_declaring("run-a", SNAPSHOT_VERSION);
+    let base = serde_json::to_string(&snapshot).expect("the snapshot serializes");
+    let fixed_bytes = base.len() - snapshot.run_id.len();
+    snapshot.run_id = "r".repeat(target_bytes - fixed_bytes);
+    assert_eq!(
+        serde_json::to_string(&snapshot)
+            .expect("the boundary snapshot serializes")
+            .len(),
+        target_bytes,
+        "the test fixture must land on the requested raw JSON size"
+    );
+    snapshot
+}
+
+/// Use large enriched member fields as the realistic source of an oversized
+/// snapshot. The response policy must refuse the complete list, not silently drop
+/// fields or members to create a plausible-looking partial snapshot.
+fn oversized_members() -> Vec<Member> {
+    (0..512u32)
+        .map(|pid| Member {
+            pid: 10_000 + pid,
+            ppid: Some(9_999),
+            name: Some(format!("worker-{pid}-{}", "x".repeat(192))),
+            start_time: Some("133456789000000000".to_string()),
+        })
+        .collect()
+}
+
+fn oversized_member_snapshot() -> Snapshot {
+    let mut snapshot = snapshot_declaring("run-large", SNAPSHOT_VERSION);
+    snapshot.members = oversized_members();
+    assert!(
+        serde_json::to_string(&snapshot)
+            .expect("the oversized snapshot serializes")
+            .len()
+            >= MAX_LINE_BYTES,
+        "the enriched member fixture must cross the response boundary"
+    );
+    snapshot
+}
+
 /// A reply line in the **historical version-1 shape**, as the released binaries
 /// (v0.1.0 … v0.3.1) actually wrote it: `jsonl` and `capture_dir` are *absent*, not
 /// `null`, because the fields did not exist yet. It is hand-written on purpose —
@@ -1417,6 +1462,81 @@ async fn bounded_line_distinguishes_mid_line_eof_from_limit_exhaustion() {
     assert!(
         limit_err.to_string().contains("exceeded"),
         "cap exhaustion keeps the bounded-read diagnostic: {limit_err}"
+    );
+}
+
+/// The writer and reader agree that the terminating newline consumes one byte of
+/// the 64 KiB budget: a JSON payload of exactly `MAX_LINE_BYTES - 1` is accepted,
+/// and the complete line is read at exactly the cap rather than rejected as
+/// oversized.
+#[tokio::test]
+async fn snapshot_response_at_line_limit_includes_its_terminating_newline() {
+    let snapshot = snapshot_with_serialized_size(MAX_LINE_BYTES - 1);
+    let response = serialize_snapshot(&snapshot);
+    assert_eq!(response.len(), MAX_LINE_BYTES - 1);
+
+    let (client, mut server) = tokio::io::duplex(MAX_LINE_BYTES + 4096);
+    write_response(&mut server, &response)
+        .await
+        .expect("a response exactly at the line limit can be written");
+
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    let read = read_bounded_line(&mut reader, &mut line)
+        .await
+        .expect("the reader accepts the payload plus its terminating newline");
+    assert_eq!(read, MAX_LINE_BYTES);
+    let parsed: Snapshot = serde_json::from_str(line.trim()).expect("the boundary line parses");
+    assert_eq!(parsed.run_id, snapshot.run_id);
+}
+
+/// A realistic large member list with enriched fields is refused before the complete
+/// snapshot reaches `write_response`. The replacement is a complete structured error
+/// that still fits the reader's bound, so the client gets the existing
+/// `InvalidData`/`CONTROL` error path instead of an oversized reply or an apparently
+/// complete partial list.
+#[tokio::test]
+async fn oversized_snapshot_becomes_a_bounded_structured_error() {
+    let snapshot = oversized_member_snapshot();
+    let raw_snapshot = serde_json::to_string(&snapshot).expect("the snapshot serializes");
+    assert!(raw_snapshot.len() >= MAX_LINE_BYTES);
+
+    let response = serialize_snapshot(&snapshot);
+    assert!(
+        response.len() + 1 <= MAX_LINE_BYTES,
+        "the replacement response, including newline, fits the reader bound"
+    );
+    let error: ErrorReply = serde_json::from_str(&response)
+        .expect("an oversized snapshot becomes a structured error response");
+    assert_eq!(error.error, SNAPSHOT_TOO_LARGE_ERROR);
+
+    let member_provider = || Some(oversized_members());
+    let source = SnapshotSource::new(
+        "run-large",
+        "job_object",
+        Some(4242),
+        SystemTime::UNIX_EPOCH,
+        "/runs/run-large.jsonl",
+        None,
+        &member_provider,
+    );
+    let (client, server) = tokio::io::duplex(MAX_LINE_BYTES + 4096);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (server_result, client_result) = tokio::join!(
+        serve_one(server, PeerIdentity::Pid(1), &source, &tx),
+        converse::<_, Snapshot>(client, INSPECT_REQUEST),
+    );
+    server_result.expect("the oversized inspect response uses a normal error reply");
+    let err = client_result
+        .expect_err("an oversized snapshot is an inspect failure, not a partial Snapshot");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains(SNAPSHOT_TOO_LARGE_ERROR),
+        "the existing structured-error path preserves the honest diagnostic: {err}"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "inspect is read-only even when its complete snapshot cannot fit"
     );
 }
 

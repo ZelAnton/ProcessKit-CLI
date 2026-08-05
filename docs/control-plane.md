@@ -123,6 +123,14 @@ transport rather than from the request — see below.
 An unrecognized verb yields a JSON error object (`{"error":"..."}`) instead, and
 changes nothing about the run — a foreign client cannot end a run by sending garbage.
 
+Every request and response line, including its terminating newline, is bounded at
+64 KiB. The runner checks a complete `inspect` snapshot before writing it. If the
+member list or enriched member fields make that snapshot too large, it sends the
+bounded structured error `{"error":"control-plane inspect snapshot exceeds the 65536-byte response limit"}` instead of truncating or fragmenting the snapshot.
+The client reports that reply through the existing `CONTROL` (103) error path; it is
+not a successful, partial snapshot and does not change `attest`, version, or other
+error reply semantics.
+
 For the mutating verbs the runner writes its **ack first**, then signals its own main
 loop to tear down. The client therefore always receives its confirmation even though
 the run ends the instant the signal lands; and if the ack cannot even be written (a
