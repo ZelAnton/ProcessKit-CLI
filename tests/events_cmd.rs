@@ -370,12 +370,7 @@ fn follow_ignores_a_malformed_runner_exit_until_a_valid_terminal_arrives() {
     );
 
     let mut follower = Command::new(bin())
-        .args([
-            "events",
-            "--run-id",
-            "malformed-terminal",
-            "--follow",
-        ])
+        .args(["events", "--run-id", "malformed-terminal", "--follow"])
         .env("PROCESSKIT_CLI_REGISTRY_DIR", &registry)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -394,19 +389,15 @@ fn follow_ignores_a_malformed_runner_exit_until_a_valid_terminal_arrives() {
         .append(true)
         .open(&stream)
         .expect("open the stream for the malformed event");
-    writeln!(
-        appended,
-        r#"{{"schema_version":1,"event":"runner_exit"}}"#
-    )
-    .expect("append the malformed terminal");
+    let malformed_terminal = r#"{"schema_version":1,"event":"runner_exit"}"#;
+    writeln!(appended, "{malformed_terminal}").expect("append the malformed terminal");
 
     // Wait until the malformed line has actually reached the follower before ending
     // the run; otherwise this test could pass without exercising the old predicate.
     let mut line = String::new();
     loop {
         line.clear();
-        out.read_line(&mut line)
-            .expect("read the malformed event");
+        out.read_line(&mut line).expect("read the malformed event");
         assert!(!line.is_empty(), "the live follower remains attached");
         rendered.push_str(&line);
         if line.contains("runner_exit") {
@@ -426,8 +417,7 @@ fn follow_ignores_a_malformed_runner_exit_until_a_valid_terminal_arrives() {
         "a later valid terminal ends the follow"
     );
     assert!(
-        rendered.matches("runner_exit").count() >= 2
-            && rendered.contains("source=control_kill"),
+        rendered.matches("runner_exit").count() >= 2 && rendered.contains("source=control_kill"),
         "the malformed and later valid terminal were both consumed: {rendered}"
     );
 
