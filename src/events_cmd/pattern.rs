@@ -145,6 +145,27 @@ impl Anchored {
     }
 }
 
+fn is_escaped_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        '.' | '\\'
+            | '^'
+            | '$'
+            | '['
+            | ']'
+            | '('
+            | ')'
+            | '{'
+            | '}'
+            | '|'
+            | '*'
+            | '+'
+            | '?'
+            | '-'
+            | '/'
+    )
+}
+
 fn parse_atom(characters: &[char], index: &mut usize, pattern: &str) -> Result<Atom, String> {
     let character = characters[*index];
     *index += 1;
@@ -160,8 +181,7 @@ fn parse_atom(characters: &[char], index: &mut usize, pattern: &str) -> Result<A
                 // characters a schema pattern plausibly escapes, so an unknown
                 // class escape (`\w`, `\s`, `\b`, …) is refused rather than read as
                 // a literal letter, which would silently change the meaning.
-                '.' | '\\' | '^' | '$' | '[' | ']' | '(' | ')' | '{' | '}' | '|' | '*' | '+'
-                | '?' | '-' | '/' => Ok(Atom::Literal(escaped)),
+                escaped if is_escaped_punctuation(escaped) => Ok(Atom::Literal(escaped)),
                 other => Err(format!(
                     "pattern `{pattern}` uses the unsupported escape `\\{other}`"
                 )),
@@ -199,6 +219,11 @@ fn parse_class(characters: &[char], index: &mut usize, pattern: &str) -> Result<
                 return Err(format!("pattern `{pattern}` ends with a dangling escape"));
             };
             *index += 1;
+            if !is_escaped_punctuation(escaped) {
+                return Err(format!(
+                    "pattern `{pattern}` uses the unsupported escape `\\{escaped}`"
+                ));
+            }
             escaped
         } else {
             character
@@ -206,6 +231,11 @@ fn parse_class(characters: &[char], index: &mut usize, pattern: &str) -> Result<
         // A `-` immediately before the closing `]` is a literal `-`, the ordinary
         // regex convention the label-key pattern above relies on.
         if characters.get(*index) == Some(&'-') && characters.get(*index + 1) != Some(&']') {
+            if character == '\\' || characters.get(*index + 1) == Some(&'\\') {
+                return Err(format!(
+                    "pattern `{pattern}` uses an escaped range endpoint"
+                ));
+            }
             *index += 1;
             let Some(high) = characters.get(*index).copied() else {
                 return Err(format!("pattern `{pattern}` has an unterminated range"));
@@ -399,6 +429,13 @@ mod tests {
             "^.$",       // any-character
             r"^\w$",     // class escape
             r"^\s{2}$",  // class escape
+            r"^[\d]$",   // class escape
+            r"^[\w]$",   // class escape
+            r"^[\b]$",   // unsupported non-punctuation class escape
+            r"^[\x]$",   // unsupported non-punctuation class escape
+            r"^[a-\d]$", // escaped upper range endpoint
+            r"^[\d-a]$", // escaped lower range endpoint
+            r"^[!-\]]$", // escaped punctuation range endpoint
             "^a{2,}$",   // open-ended bound
             "^a{3,1}$",  // inverted bound
             "^a{2000}$", // beyond the repetition cap
