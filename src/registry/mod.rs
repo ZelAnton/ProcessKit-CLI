@@ -155,10 +155,12 @@ const REGISTRY_DIR_ENV: &str = "PROCESSKIT_CLI_REGISTRY_DIR";
 /// reaping safety invariant".
 const ORPHAN_LOCK_MIN_AGE: Duration = Duration::from_secs(5);
 
-/// Largest registry record accepted from disk. Records are small JSON metadata, so
-/// this leaves generous room for legitimate labels while preventing one corrupt file
-/// from making every discovery or polling pass allocate without bound.
-const MAX_RECORD_BYTES: u64 = 64 * 1024;
+/// Largest serialized registry record accepted by both the writer and the reader.
+/// The inclusive boundary is part of the private runner/control-plane contract:
+/// allowing the writer to publish exactly what the reader accepts keeps a live run
+/// discoverable, while rejecting larger records before publication avoids creating a
+/// `.json` file that every scan would silently skip.
+const MAX_RECORD_BYTES: usize = 64 * 1024;
 
 /// The registry record a runner writes at start and removes on a clean exit.
 ///
@@ -616,10 +618,13 @@ impl Registry {
                 lock_file: file_name(&reserved.lock_path),
             },
         };
-        let json = serde_json::to_string(&record).map_err(io::Error::other)?;
+        // Serialize and enforce the same byte ceiling that readers apply before the
+        // record becomes visible. The reservation guard remains armed until the write
+        // succeeds, so an oversized record cannot strand its sibling `.lock` file.
+        let json = serialize_record_for_publication(&record)?;
         // The record is written only after the lock is held, so an entry is never
         // visible to a scanner in a state where it looks live but no lock exists.
-        fs::write(&reserved.json_path, json)?;
+        fs::write(&reserved.json_path, &json)?;
         // The record is now published: disarm the Drop backstop so it does not
         // delete the very lock file the just-written record names. Every earlier
         // return above (the `?` on `fs::write` failing) leaves the guard armed, so
@@ -1350,15 +1355,34 @@ impl Registry {
 /// metadata that could race with a concurrent writer.
 fn read_record_text(path: &Path) -> io::Result<String> {
     let file = File::open(path)?;
-    let mut bytes = Vec::with_capacity(MAX_RECORD_BYTES as usize + 1);
-    file.take(MAX_RECORD_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_RECORD_BYTES {
+    let mut bytes = Vec::with_capacity(MAX_RECORD_BYTES + 1);
+    file.take((MAX_RECORD_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_RECORD_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "registry record exceeds the maximum supported size",
         ));
     }
     String::from_utf8(bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+/// Serialize a record using the exact bytes that will be written to disk, and reject
+/// it when those bytes exceed the reader's inclusive ceiling. Truncating fields or
+/// writing a partial JSON object would make the run silently disappear from every
+/// discovery client, so the caller gets an honest setup-style error instead.
+fn serialize_record_for_publication(record: &Record) -> io::Result<Vec<u8>> {
+    let json = serde_json::to_vec(record).map_err(io::Error::other)?;
+    if json.len() > MAX_RECORD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "serialized registry record is {} bytes; maximum supported size is {MAX_RECORD_BYTES} bytes",
+                json.len()
+            ),
+        ));
+    }
+    Ok(json)
 }
 
 /// A newly-created lock before it becomes a full [`ReservedEntry`]. Field order is
