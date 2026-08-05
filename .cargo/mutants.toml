@@ -25,13 +25,13 @@ exclude_globs = [
     # `--features e2e,bench`), so cargo-mutants could not build a mutant for
     # them anyway — excluded explicitly so that is documented, not incidental.
     "src/bin/*.rs",
-    # Windows-only module (`#[cfg(windows)]` in src/lib.rs): the Job Object
-    # security-descriptor helpers backing the registry's protected-DACL
-    # directory and the e2e tier's nested-Job-Object scenario. The CI job
-    # below runs on `ubuntu-latest` only (a single, cheaper runner given how
-    # expensive a full per-mutant test run already is — see the workflow's own
-    # comment), so this module never compiles into that build and
-    # cargo-mutants could not construct a viable mutant for it there either;
-    # listed explicitly rather than relying on that being incidental.
+    # Windows-only modules (`#[cfg(windows)]` at their declarations): Job
+    # Object security, named-pipe transport, and protected-DACL/liveness-lock
+    # helpers. The mutation tier runs on Ubuntu only, and cargo-mutants does
+    # not evaluate conditional compilation when discovering mutants. Without
+    # explicit exclusions it therefore reports mutations in these inactive
+    # files as missed after needlessly running the full test suite for each.
     "src/win_security.rs",
+    "src/control/platform/windows.rs",
+    "src/registry/platform/windows.rs",
 ]

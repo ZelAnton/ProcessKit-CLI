@@ -457,15 +457,15 @@ it has no root-level alternative it searches, so this is not a repo
 convention choice). It scopes mutation to `src/**/*.rs`, excluding the thin
 `src/main.rs` entry point, the feature-gated helper binaries under `src/bin/`
 (the `e2e` and `bench` tiers' worker binaries — test/bench harnesses, not
-library logic), and the Windows-only `src/win_security.rs` (the CI job runs
-on `ubuntu-latest` only, so that module never compiles into the build it
-mutates); see the file's own comments for the reasoning behind each
-exclusion.
+library logic), and the Windows-only implementation files (the CI job runs
+on `ubuntu-latest` only, and cargo-mutants does not account for conditional
+compilation when discovering mutants); see the file's own comments for the
+reasoning behind each exclusion.
 
 This is by far the most expensive tier in this repo — a full run reruns the
 whole test suite once per mutant — so, like `fuzz.yml`, it is scheduled
 weekly and manual-dispatch only, never on push/pull request. CI splits the
-scoped tree across 8 parallel shards (cargo-mutants' `--shard k/n`; see
+scoped tree across 16 parallel shards (cargo-mutants' `--shard k/n`; see
 `.github/workflows/mutants.yml`) so that each job finishes inside a
 GitHub-hosted runner's job time limit.
 
@@ -489,7 +489,7 @@ or one of CI's shards, to sample the full scoped tree without waiting for
 all of it:
 
 ```sh
-cargo mutants --shard 0/8
+cargo mutants --shard 0/16
 ```
 
 The `just mutants` target forwards any arguments straight to `cargo mutants`,
@@ -497,7 +497,7 @@ so both look like:
 
 ```sh
 just mutants --file src/hash.rs
-just mutants --shard 0/8
+just mutants --shard 0/16
 ```
 
 Results land under `mutants.out/`: `missed.txt` lists survivors, `caught.txt`/
