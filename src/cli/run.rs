@@ -309,7 +309,7 @@ pub struct RunArgs {
     /// Remove an inherited environment variable by name (repeatable). Applied
     /// after `--env-clear` and before `--env-file`/`--env`, so either later source
     /// can restore the same key. Maps onto `processkit::Command::env_remove()`.
-    #[arg(long = "env-remove", value_name = "KEY")]
+    #[arg(long = "env-remove", value_name = "KEY", value_parser = parse_env_key)]
     pub env_remove: Vec<String>,
 
     /// Read child environment entries from a UTF-8 `KEY=VALUE` file (repeatable).
