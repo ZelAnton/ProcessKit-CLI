@@ -129,6 +129,7 @@ mod validate;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -411,13 +412,25 @@ impl StreamLine<'_> {
     }
 }
 
-/// Whether a parsed line is the stream's terminal event.
+/// The checker used by the terminal predicate. It is the same document-driven
+/// checker used by `--validate`, compiled once because a followed stream may contain
+/// many events. A compile failure is fail-closed: without a trustworthy schema there
+/// is no line this command should treat as terminal.
+fn terminal_schema() -> Option<&'static schema::SchemaChecker> {
+    static CHECKER: OnceLock<Option<schema::SchemaChecker>> = OnceLock::new();
+    CHECKER
+        .get_or_init(|| schema::SchemaChecker::compile().ok())
+        .as_ref()
+}
+
+/// Whether a parsed line is a complete, schema-conforming v1 terminal event.
 fn is_terminal(value: &Value) -> bool {
     value.get("event").and_then(Value::as_str) == Some(TERMINAL_EVENT)
         && value
             .get("schema_version")
             .and_then(Value::as_u64)
             .is_some_and(|version| version == u64::from(SCHEMA_VERSION))
+        && terminal_schema().is_some_and(|checker| checker.conforms(value))
 }
 
 /// What this invocation does with each line, and what it reports at the end.
@@ -677,6 +690,7 @@ mod tests {
     use super::*;
     use crate::registry::test_support::scratch_registry as scratch;
     use clap::Parser;
+    use std::io::Write;
 
     fn args(argv: &[&str]) -> EventsArgs {
         let mut full = vec!["processkit-cli", "events"];
@@ -709,22 +723,84 @@ mod tests {
 
     const RUN_STARTED: &str = r#"{"schema_version":1,"time":"2026-07-22T09:00:00.000Z","event":"run_started","run_id":"r1"}"#;
     const RUNNER_EXIT: &str = r#"{"schema_version":1,"time":"2026-07-22T09:00:01.000Z","event":"runner_exit","code":0,"source":"child_exit","child_code":0}"#;
+    const MALFORMED_RUNNER_EXIT: &str = r#"{"schema_version":1,"event":"runner_exit"}"#;
 
-    /// The terminal predicate is the pair `wait`'s tail scan also requires: the
-    /// event name *and* the schema version this build speaks — a `runner_exit` from
-    /// a schema this build does not know is not treated as this stream's end.
+    /// The terminal predicate is the complete v1 runner-exit shape, not merely its
+    /// event tag: required fields, types, allowed values, and extra fields all matter.
     #[test]
-    fn only_a_known_schema_runner_exit_ends_the_stream() {
+    fn only_a_schema_conforming_runner_exit_ends_the_stream() {
         let terminal: Value = serde_json::from_str(RUNNER_EXIT).expect("valid JSON");
         assert!(is_terminal(&terminal));
 
         for other in [
             RUN_STARTED,
+            MALFORMED_RUNNER_EXIT,
+            r#"{"schema_version":1,"time":"2026-07-22T09:00:01.000Z","event":"runner_exit","code":"zero","source":"child_exit","child_code":0}"#,
+            r#"{"schema_version":1,"time":"2026-07-22T09:00:01.000Z","event":"runner_exit","code":0,"source":"teleported","child_code":null}"#,
+            r#"{"schema_version":1,"time":"2026-07-22T09:00:01.000Z","event":"runner_exit","code":0,"source":"child_exit","child_code":0,"extra":true}"#,
             r#"{"schema_version":99,"event":"runner_exit","code":0}"#,
             r#"{"event":"runner_exit","code":0}"#,
         ] {
             let value: Value = serde_json::from_str(other).expect("valid JSON");
             assert!(!is_terminal(&value), "must not end the stream: {other}");
+        }
+    }
+
+    /// A malformed runner-exit line must not end a follow before a later complete
+    /// terminal line arrives. This models the append boundary that `--follow` polls.
+    #[test]
+    fn a_malformed_runner_exit_does_not_end_follow_before_a_valid_terminal() {
+        let dir = scratch("events-follow-malformed-terminal");
+        std::fs::create_dir_all(&dir).expect("create the fixture directory");
+        let path = dir.join("events.jsonl");
+        std::fs::write(&path, format!("{MALFORMED_RUNNER_EXIT}\n"))
+            .expect("write the malformed terminal");
+
+        let mut session = Session::new(&args(&["--file", "x"])).expect("the session builds");
+        let mut reader = StreamReader::open(&path).expect("open the fixture stream");
+        reader
+            .drain(&mut session)
+            .expect("drain the malformed line");
+        assert!(
+            !session.terminal_seen,
+            "malformed terminal must not stop follow"
+        );
+
+        let mut appended = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("reopen the fixture for appending");
+        writeln!(appended, "{RUNNER_EXIT}").expect("append the valid terminal");
+        reader
+            .drain(&mut session)
+            .expect("drain the valid terminal");
+        assert!(
+            session.terminal_seen,
+            "the later valid terminal ends follow"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Validation still reports the malformed runner-exit line while consuming the
+    /// later valid terminal event in the same stream.
+    #[test]
+    fn validation_reports_malformed_runner_exit_before_a_valid_terminal() {
+        let stream = format!("{RUN_STARTED}\n{MALFORMED_RUNNER_EXIT}\n{RUNNER_EXIT}\n");
+        let (session, lines) = read_all(stream.as_bytes(), &["--file", "x", "--validate"]);
+        assert_eq!(lines, 3, "all lines are consumed");
+        assert!(
+            session.terminal_seen,
+            "the later valid terminal is consumed"
+        );
+        match session.output {
+            Output::Validate(report) => {
+                let err = report
+                    .finish()
+                    .expect_err("the malformed terminal must fail validation");
+                assert_eq!(err.code(), exit::EVENTS_INVALID);
+            }
+            _ => panic!("the test must use validation output"),
         }
     }
 
