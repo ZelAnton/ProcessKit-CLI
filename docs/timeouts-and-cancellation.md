@@ -169,9 +169,16 @@ runner_exit
 
 `resource_summary` — what the tree consumed — is part of the tail on **every** ending,
 not just a natural exit: the child ran, so it has consumption to report. It sits between
-the reason event and `cleanup_started` because the counters live in the container that
+the reason event and `cleanup_started` because what it reads lives in the container that
 `cleanup_finished` hard-kills. A run that also requested a resource cap emits
 `limit_evidence` immediately before it, from the same read point.
+
+On these endings the read happens **before** the soft stop, while the tree is still
+running — which is why a forced ending is the *better* case for the numbers, not the
+worse one. On Linux cgroup v2 it is in fact the only case that populates
+`peak_memory_bytes` and `total_cpu_ms` at all: there they are summed over the members
+live at the read point, so a child that exited on its own leaves both `null`
+([resource limits](resource-limits.md#what-the-tree-consumed), consequence 5).
 
 `members_snapshot` is not part of that tail: one is emitted right after
 `run_started`, and — with the opt-in `--snapshot-interval <duration>` cadence —

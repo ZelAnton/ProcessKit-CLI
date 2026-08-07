@@ -107,11 +107,12 @@ A capability token's **presence is a guarantee**, and it is worth being precise 
 the peer, so a negative membership answer from it is a real verdict rather than a
 missing capability in disguise. `run:resource-summary` guarantees the event will be in
 the stream — **not** that any particular measurement in it is populated: which axes
-carry numbers is a property of the containment mechanism (`run_started.mechanism`), and
-the normative matrix is in
+carry numbers is a property of the containment mechanism (`run_started.mechanism`) and,
+for memory and CPU on Linux cgroup v2, of how the run ended. The normative matrix is in
 [`docs/resource-limits.md`](resource-limits.md#what-the-tree-consumed). A single token
 could not honestly carry five per-platform facts, and splitting it into five would
-publish as capabilities what are really documented properties of the mechanism.
+publish as capabilities what are really documented properties of the mechanism — which
+is also why no token could have promised numbers a *read point* decides.
 
 A capability's **absence withholds its guarantee rather than predicting failure** —
 `attest` on a build without the token still answers from whatever the kernel actually
@@ -183,13 +184,16 @@ is what requires a new schema version — nothing below does.
 
    The `resource_summary` event carries the same obligation in a stronger form,
    because *every* one of its measurements is nullable: a `null` means "this
-   mechanism does not account for it" and must not be read as, or replaced by, `0`.
-   Check its `read_error` flag before drawing any conclusion from a `null` — an
-   all-`null` summary is a correct reading on a mechanism with no whole-tree
-   accounting, and only that flag distinguishes it from a read that failed. The
-   per-axis platform matrix is in
-   [`docs/resource-limits.md`](resource-limits.md#what-the-tree-consumed), and its two
-   IO counters are explicitly **not** comparable across platforms.
+   mechanism, at this read point, does not account for it" and must not be read as, or
+   replaced by, `0`. Check its `read_error` flag before drawing any conclusion from a
+   `null` — an all-`null` summary is a correct reading on a mechanism with no whole-tree
+   accounting, and equally on a flagless Linux cgroup v2 run whose child exited on its
+   own; only that flag distinguishes either from a read that failed. The per-axis
+   platform matrix is in
+   [`docs/resource-limits.md`](resource-limits.md#what-the-tree-consumed) — read it
+   before relying on an axis, because two of them are governed by the read point and not
+   by the platform alone — and its two IO counters are explicitly **not** comparable
+   across platforms.
 4. **New values in an open-ended descriptive string field** — a new `cancelled`
    `source`, a new `runner_exit` `source`, a new `hint` label. Treat an unrecognized
    value as "some other trigger" and keep routing by event type.

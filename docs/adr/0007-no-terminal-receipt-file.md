@@ -87,7 +87,7 @@ The adapter-facing form of this rule is in the integration guide,
   finished foreground run has already deleted its own registry record, so
   `wait --report-outcome` honestly answers `status: "unknown"` for it. `events` reads
   a stream a different way on purpose and offers no terminal-only mode. If reason 2's
-  six-line read is ever *measured* to matter, the answer is to expose that existing
+  seven-line read is ever *measured* to matter, the answer is to expose that existing
   read-side primitive over `--file` — one flag on a read-only subcommand, reusing the
   already-published `wait --report-outcome` shape — rather than to add a second write
   path. Recorded so a revisit starts from the smaller option.

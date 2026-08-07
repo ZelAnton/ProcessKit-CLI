@@ -1237,6 +1237,15 @@ const RESOURCE_SUMMARY_MEASUREMENTS: [&str; 5] = [
 /// rather than having quietly inherited its neighbour's `limits_requested` gate (which
 /// is the shape a regression here would most plausibly take, since the two are emitted
 /// from adjacent lines).
+///
+/// Its per-field check is deliberately the weak "honest `null` or a non-negative integer"
+/// one, because this test is cross-platform and *which* axes carry numbers is a
+/// per-mechanism, per-read-point fact. The exact claims live in the platform-gated tests
+/// below it — `windows_resource_summary_reports_no_peak_process_count`,
+/// `linux_resource_summary_reports_io_bytes_only_where_the_controller_exists`,
+/// `linux_resource_summary_reports_no_memory_or_cpu_after_a_natural_exit`, and
+/// `linux_resource_summary_reports_memory_and_cpu_on_a_forced_ending` — each asserting
+/// its documented row of the matrix as an equality rather than a tolerance.
 #[test]
 fn a_normal_run_emits_one_resource_summary_before_the_terminal_event() {
     let dir = scratch("resource-summary-order");
@@ -1392,6 +1401,133 @@ fn linux_resource_summary_reports_io_bytes_only_where_the_controller_exists() {
         summary["io_write_bytes"].is_null(),
         "both halves of one counter block are accounted for, or neither is: {summary}"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The mechanism `run_started` reported, for the two Linux read-point tests below.
+#[cfg(target_os = "linux")]
+fn run_mechanism(events: &[Value]) -> String {
+    events
+        .iter()
+        .find(|event| event["event"] == "run_started")
+        .and_then(|event| event["mechanism"].as_str())
+        .expect("a spawned run always reports its containment mechanism")
+        .to_string()
+}
+
+/// The read-point half of the Linux contract, and the one an adapter is most likely to
+/// get wrong: after a **natural exit** neither `peak_memory_bytes` nor `total_cpu_ms`
+/// carries a number, and that is a correct reading rather than a failure.
+///
+/// Why it holds, and why the assertion is an equality rather than a tolerance: neither
+/// axis is a counter the cgroup keeps. ProcessKit sums both from `/proc` over the members
+/// listed in `cgroup.procs` **at the moment of the read** — regardless of any requested
+/// cap, since `memory.peak`/`cpu.stat` are never consulted — and a process leaves
+/// `cgroup.procs` as soon as it exits. The read happens after the ending is decided, so on
+/// this path the child has already exited and been reaped and there is nothing left to
+/// sum. The process-group fallback reaches the same `null` by the blunter route of keeping
+/// no accounting at all (matrix row 3), so the claim holds for either mechanism a Linux
+/// host gives us, and the mechanism is read only to make a failure message diagnostic.
+///
+/// `read_error` is asserted `false` in the same breath, because that is the whole point:
+/// this all-`null` shape is *indistinguishable by its numbers* from a failed `stats()`
+/// read, so only the flag separates them — and a consumer told (as
+/// `docs/resource-limits.md` now tells it) that an all-`null` summary with
+/// `read_error: false` is legitimate on cgroup v2 needs that to be a tested fact and not
+/// a documented intention. Pairs with
+/// `linux_resource_summary_reports_memory_and_cpu_on_a_forced_ending`, which pins the
+/// other side of the same read-point property.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_resource_summary_reports_no_memory_or_cpu_after_a_natural_exit() {
+    let dir = scratch("resource-summary-linux-natural-exit");
+    let out = run(&dir, &[], shell_inline("exit 0"));
+    assert_eq!(out.status.code(), Some(0), "the trivial child exits 0");
+
+    let events = read_run_events(&dir);
+    let mechanism = run_mechanism(&events);
+    let summary = events
+        .iter()
+        .find(|event| event["event"] == "resource_summary")
+        .expect("every run emits a resource_summary");
+
+    assert_eq!(
+        summary["read_error"], false,
+        "the read itself succeeded — the nulls below are about the read point, not a \
+         failure ({mechanism}): {summary}"
+    );
+    for field in ["peak_memory_bytes", "total_cpu_ms"] {
+        assert!(
+            summary[field].is_null(),
+            "`{field}` is summed over the members live at the read point, and a child that \
+             exited on its own has left none, so it is null after a natural exit on \
+             {mechanism} — a number here would mean either a surviving descendant was \
+             reported as a whole-tree total, or the runner started manufacturing one: \
+             {summary}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The other side of the same property: on a **runner-imposed** ending the read happens
+/// before the soft stop, while the tree is still running, so a Linux cgroup v2 run *does*
+/// report memory and CPU. Without this test the sibling above would be satisfied by a
+/// runner that had simply stopped reading those two axes altogether.
+///
+/// A two-way case analysis on `run_started.mechanism` rather than a skip, because both
+/// outcomes are documented behaviour and the host decides which applies: a cgroup has
+/// per-member `/proc` counters to sum for a live tree, while the process-group fallback
+/// keeps no accounting at any read point (matrix row 3) and stays `null`.
+///
+/// The cgroup assertion is deliberately "is a number", not "is greater than zero":
+/// `total_cpu_ms` truncates toward zero, so a sleeping child legitimately reports a
+/// *measured* `0`, and the contract being pinned is that the axis is populated at all —
+/// `null` versus a number — not how large it is.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_resource_summary_reports_memory_and_cpu_on_a_forced_ending() {
+    let dir = scratch("resource-summary-linux-forced-ending");
+    let out = run_with_flags(
+        &dir,
+        &[],
+        &["--timeout", "1s", "--grace", "200ms"],
+        shell_inline("sleep 300"),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(106),
+        "a timeout takes the reserved TIMEOUT code; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let events = read_run_events(&dir);
+    let mechanism = run_mechanism(&events);
+    let summary = events
+        .iter()
+        .find(|event| event["event"] == "resource_summary")
+        .expect("every run emits a resource_summary");
+    assert_eq!(
+        summary["read_error"], false,
+        "the container was readable while the tree still ran ({mechanism}): {summary}"
+    );
+
+    for field in ["peak_memory_bytes", "total_cpu_ms"] {
+        if mechanism == "cgroup_v2" {
+            assert!(
+                summary[field].as_u64().is_some(),
+                "`{field}` is populated on a forced ending, whose read precedes the soft \
+                 stop and so still sees the live tree: {summary}"
+            );
+        } else {
+            assert!(
+                summary[field].is_null(),
+                "the process-group fallback keeps no accounting at any read point, so \
+                 `{field}` stays null even for a live tree: {summary}"
+            );
+        }
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }

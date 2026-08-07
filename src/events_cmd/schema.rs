@@ -42,10 +42,12 @@
 //!
 //! # Reporting: naming the branch, not just "no match"
 //!
-//! The document is a 15-way `oneOf` over the event types, so a bad line's honest
-//! root-level verdict — *"matches none of the 15 shapes"* — says nothing useful
-//! about *what* is wrong. When a failing line's own `event` tag names a branch, the
-//! report is that branch's errors instead (`/code: expected type "integer", found
+//! The document is one `oneOf` over **every** event type it defines, so a bad line's
+//! honest root-level verdict — *"matches none of the N shapes the schema defines"*,
+//! whose `N` the report fills in from `branches.len()` rather than from a number
+//! written down here (K-020) — says nothing useful about *what* is wrong. When a
+//! failing line's own `event` tag names a branch, the report is that branch's errors
+//! instead (`/code: expected type "integer", found
 //! string`). The tag-to-branch map is derived from the document itself — every
 //! `oneOf` entry's `$ref` resolved into `$defs`, each branch's own
 //! `properties.event.const` read as its tag — so there is no hand-maintained event

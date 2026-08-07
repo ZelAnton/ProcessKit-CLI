@@ -33,7 +33,7 @@ events, and a run-id-based control plane.
 | A command never finishes | `--timeout` bounds total runtime. |
 | A worker becomes silent | `--idle-timeout` detects missing output activity. |
 | The tool's process tree grew or lingered, and nobody was watching | `--snapshot-interval` records periodic `members_snapshot` events into the JSONL for post-hoc reading. |
-| How much did that step actually cost | The terminal `resource_summary` event reports the tree's peak memory, total CPU, IO bytes, and peak process count — on every run, with no flag. Each measurement is `null` where the containment mechanism does not account for it, never `0` (see [resource limits](resource-limits.md#what-the-tree-consumed)). |
+| How much did that step actually cost | The terminal `resource_summary` event carries the tree's peak memory, total CPU, IO bytes, and peak process count — on every run, with no flag — but *which* of them carry a number is the mechanism's answer, not the event's promise: each is `null` where the mechanism does not account for it or kept no record surviving to the read point, never `0`. On Linux cgroup v2, memory and CPU are `null` after a natural exit and populated on a `--timeout`/cancel/kill ending. Read the per-mechanism matrix before relying on an axis ([resource limits](resource-limits.md#what-the-tree-consumed)). |
 | Live output is too noisy | `--no-echo` suppresses relay while capture continues. |
 | Output is needed after failure | `--capture-dir` keeps bounded stdout/stderr files with hashes and truncation metadata. |
 | The agent loses its local process handle | `list`, `inspect`, and `wait` operate through the per-user run registry. |

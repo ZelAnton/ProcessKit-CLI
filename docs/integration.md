@@ -61,8 +61,11 @@ The report (one line, shown reformatted here):
   that before a run: an older binary simply writes no such line, which an adapter would
   otherwise discover by finding it missing from a stream it has already finished
   collecting. The token guarantees the **event**, not any particular number in it —
-  which measurements are populated follows the containment mechanism, per
-  [`docs/resource-limits.md`](resource-limits.md#what-the-tree-consumed).
+  which measurements are populated follows the containment mechanism and, for memory and
+  CPU on Linux cgroup v2, how the run ended, per
+  [`docs/resource-limits.md`](resource-limits.md#what-the-tree-consumed). Read that matrix
+  before building an adapter around a specific axis; pinning the token is not the same as
+  learning a number will be there.
 - Pin **`attest:peer-identity`** if the adapter will gate anything on
   containment membership (§4). It is the other
   *capability* rather than a spelling — note the missing `--` — and it says this
@@ -348,10 +351,12 @@ emits, in order:
    step 3 and its `cleanup_started`. Exactly one, on **every** run that spawned the
    child: no flag turns it on and no platform turns it off (a `limit_evidence`, when a
    cap was requested, sits immediately before it). Every measurement is independently
-   nullable, `null` means "this mechanism does not account for it" rather than zero, and
-   `read_error` must be checked before concluding anything from a `null` — see
-   [`docs/schema.md`](schema.md#resource_summary) and the platform matrix in
-   [`docs/resource-limits.md`](resource-limits.md#what-the-tree-consumed).
+   nullable, `null` means "this mechanism, at this read point, does not account for it"
+   rather than zero, and `read_error` must be checked before concluding anything from a
+   `null`. The event's presence is guaranteed; its *contents* are not — on Linux cgroup v2
+   an ordinary run whose child exited on its own reports all five as `null` with
+   `read_error: false`. See [`docs/schema.md`](schema.md#resource_summary) and the platform
+   matrix in [`docs/resource-limits.md`](resource-limits.md#what-the-tree-consumed).
 5. `output_captured`, only when `--capture-dir` was set.
 6. `runner_exit` — always the **last line**, the terminal event of every run,
    including a runner failure before the child ever started (in which case

@@ -77,17 +77,31 @@ claim post-run limit attribution on Windows or POSIX fallback runs.
 Whole-tree resource **measurement** — as distinct from that limit attribution — is now
 consumed through `processkit` 3.3.0's `ProcessGroup::stats()`. Every run that spawned a
 child emits the additive `resource_summary` event exactly once, from the same read point
-as `limit_evidence` and immediately after it: peak memory, total CPU, IO bytes read and
-written, and peak process count, each independently nullable. This is deliberately the
-answer to a *different* question than `limit_hit`/`limit_evidence` — how much the tree
-used, not whether a cap engaged — and it is what partially closes the gap the paragraph
-above leaves open on Windows: post-run limit attribution there remains `unknown` by
-mechanism, but the measured `peak_memory_bytes` from the Job Object's own accounting
-block is now available as an honest substitute, which is the reason this was worth
-taking. Two axes stay unavailable by mechanism rather than by omission —
-`peak_process_count` on Windows (a Job Object keeps no peak-concurrency counter) and
-both IO counters on macOS/BSD and the Linux process-group fallback — and on Linux the IO
-counters additionally need the cgroup v2 `io` controller, which this CLI does not
-enable. The normative matrix, including why the two platforms' IO counters are not
-comparable with each other, is in
+as `limit_evidence` and immediately after it, with a slot for peak memory, total CPU, IO
+bytes read and written, and peak process count, each independently nullable. This is
+deliberately the answer to a *different* question than `limit_hit`/`limit_evidence` — how
+much the tree used, not whether a cap engaged — and it is what partially closes the gap
+the paragraph above leaves open **on Windows**: post-run limit attribution there remains
+`unknown` by mechanism, but the measured `peak_memory_bytes` from the Job Object's own
+accounting block is now available as an honest substitute, which is the reason this was
+worth taking. The closure is specific to that mechanism and no wider. Axes stay
+unavailable by mechanism rather than by omission — `peak_process_count` on Windows (a Job
+Object keeps no peak-concurrency counter), both IO counters on macOS/BSD and the Linux
+process-group fallback, and on Linux the IO counters additionally need the cgroup v2 `io`
+controller, which this CLI does not enable. **On Linux cgroup v2 memory and CPU are also
+bounded by the read point** rather than by the controller set: `stats()` sums them from
+`/proc` over the members live when it runs, so a run that ended by its child exiting
+reports both as `null`, and only a runner-imposed ending (read while the tree still runs)
+populates them. The normative matrix, including that consequence and why the two
+platforms' IO counters are not comparable with each other, is in
 [`docs/resource-limits.md`](resource-limits.md), "What the tree consumed".
+
+That last point is an **upstream** limitation, not a CLI one, and is recorded here so a
+revisit starts from the right place: cgroup v2 does keep whole-tree accumulators that
+outlive their members (`memory.peak`, `cpu.stat`), but `processkit`'s Linux backend
+deliberately folds per-member `/proc` counters instead, because the cgroup it creates
+enables no controller unless a cap asks for one. Closing the gap means asking `processkit`
+for a memory/CPU reading sourced from those controller files (and enabling the controllers
+to make them exist), not adding sampling here — a runner-side maximum over its own reads
+would report when this CLI looked rather than what the tree did, which the event's contract
+rules out.

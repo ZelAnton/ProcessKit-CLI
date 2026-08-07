@@ -348,17 +348,18 @@ additive event within `schema_version = 1`.
 
 ### `resource_summary`
 
-What the contained tree actually **consumed**. The runner reads the container's own
-kernel accounting once (`ProcessGroup::stats()`) after the ending is decided and
-before `cleanup_finished` hard-kills the group — the same read point, and for the
-same reason, as `limit_evidence`: the counters live in the container, so they are
-gone with it.
+What the contained tree actually **consumed**. The runner takes one `ProcessGroup::stats()`
+reading after the ending is decided and before `cleanup_finished` hard-kills the group —
+the same read point, and for the same reason, as `limit_evidence`: what it reads lives in
+the container, so it is gone with it. *What* that reading can cover is per-mechanism, and
+on Linux cgroup v2 memory and CPU depend on the read point itself (see the platform matrix
+linked below, consequence 5).
 
 | Field | Type | Notes |
 |---|---|---|
 | `read_error` | boolean | `true` when the `stats()` read itself failed; every measurement below is then `null` as a **gap**. See "Honest degradation, and why the flag is load-bearing". |
-| `peak_memory_bytes` | integer, nullable | Peak whole-tree memory in bytes. |
-| `total_cpu_ms` | integer, nullable | Total CPU time (user + kernel) in **milliseconds**, truncated toward zero. |
+| `peak_memory_bytes` | integer, nullable | Peak whole-tree memory in bytes. On Linux cgroup v2 this is summed over the members live *at the read point*, so it is `null` after a natural exit — see the matrix. |
+| `total_cpu_ms` | integer, nullable | Total CPU time (user + kernel) in **milliseconds**, truncated toward zero. On Linux cgroup v2 it covers the members live *at the read point*, so it is `null` after a natural exit — see the matrix. |
 | `io_read_bytes` | integer, nullable | Bytes the tree read. |
 | `io_write_bytes` | integer, nullable | Bytes the tree wrote. |
 | `peak_process_count` | integer, nullable | High-water mark of processes held **at once** — not the count *now*. |
@@ -384,37 +385,49 @@ than left implicit. Three reasons:
   flag, and a conditional in the ordering rule, all to gate a single line.
 
 The cost is paid honestly: this event does grow every run's stream by one line, so the
-"a foreground run emits six events" count in
-[`docs/integration.md`](integration.md) and
-[ADR 0007](adr/0007-no-terminal-receipt-file.md) is now **seven**, and it is the one
-growth that is *not* a caller opting in. A reader that routes by `event` type — which
+foreground-run event count in [`docs/integration.md`](integration.md) and
+[ADR 0007](adr/0007-no-terminal-receipt-file.md) is now **seven** rather than six, and
+it is the one growth that is *not* a caller opting in. A reader that routes by `event` type — which
 [`docs/compatibility.md`](compatibility.md#what-a-reader-must-tolerate-within-one-version)
 requires within a version — is unaffected.
 
 **Honest degradation, and why the flag is load-bearing.** A failed `stats()` does not
 skip the event: it is emitted with `read_error: true` and every measurement `null`.
 That flag is not ceremony. An all-`null` summary is *also* a perfectly correct
-**success** — it is exactly what a mechanism with no whole-tree accounting reports
-(macOS/the BSDs, the Linux process-group fallback) — so the numbers alone cannot
-distinguish "this platform measures nothing" from "we could not measure". Only
-`read_error` can. A consumer must check it before concluding anything from a `null`.
+**success**: it is what a mechanism with no whole-tree accounting reports (macOS/the
+BSDs, the Linux process-group fallback), and it is equally what a plain flagless run on
+**Linux cgroup v2** reports when its child exited on its own — memory and CPU have no
+live member left to sum at the read point, and no `io`/`pids` controller is enabled to
+answer for the rest. So the numbers alone cannot distinguish "this mechanism measured
+nothing here" from "we could not measure", on any platform. Only `read_error` can, and a
+consumer must check it before concluding anything from a `null`.
 A foreground run also gets a stderr warning, but that reaches nobody on a `--detach`
 run (whose stderr is `Stdio::null()`), which is why the fact is recorded in the stream.
 
 **Nothing here is improved, and `null` never means zero.** Each axis is independently
-nullable, and `null` always means *this mechanism does not account for it*. The runner
-does not substitute `0`, and does not take a maximum over its own periodic reads to
-fill a gap — that would describe **when the runner looked**, not what the tree did. A
-caller who wants a sampled series wants `--snapshot-interval`'s own event, knowingly.
+nullable, and `null` always means *this mechanism, at this read point, does not account
+for it*. The runner does not substitute `0`, and does not take a maximum over its own
+periodic reads to fill a gap — that would describe **when the runner looked**, not what
+the tree did. A caller who wants a sampled series over the run wants
+`--snapshot-interval`'s own event, knowingly — noting that it samples the tree's
+*membership*, not its consumption, so no event in this stream is a consumption series.
 
-The normative platform matrix — which axis is `null` where, and why two platforms'
+The normative platform matrix — which axis is `null` where, why the read point decides
+two of them, and why two platforms'
 IO counters are **not comparable with each other** — is in
 [`docs/resource-limits.md`](resource-limits.md#what-the-tree-consumed), together with
-what this event does **not** prove about a limit. Two consequences worth stating here
+what this event does **not** prove about a limit. Three consequences worth stating here
 because they are easy to misread as bugs:
 
 - `peak_process_count` is `null` on **all** of Windows. A Job Object counts how many
   processes are in it *now* and how many were *ever* assigned to it; neither is a peak.
+- On **Linux cgroup v2**, `peak_memory_bytes` and `total_cpu_ms` are `null` after a
+  natural exit. They are not cgroup counters: they are summed from `/proc` over the
+  members live at the read point, and a child that exited on its own has left none. The
+  same two axes *are* populated on a runner-imposed ending (`timeout`, `cancelled`,
+  `killed`, `output_overflow`), whose read happens while the tree still runs. Windows,
+  whose Job Object accounting outlives its processes, is unaffected. This is the ordinary
+  case on Linux, not an edge one — consequence 5 of the matrix states it normatively.
 - `total_cpu_ms` truncates, so a run using under a millisecond of CPU reports a
   **measured** `0`. `null` is the only value that means unknown.
 

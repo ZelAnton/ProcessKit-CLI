@@ -37,13 +37,14 @@
 //! - **Whole-tree resource measurements (shipped in T-317).**
 //!   [`Event::ResourceSummary`]'s five measurements are each declared `Option` for the
 //!   same reason as the enriched member fields above: the containment mechanism, not
-//!   this crate, decides which counters exist, so a `null` is an honest per-axis
-//!   platform gap and never a placeholder or a stand-in `0`. This group adds one
-//!   qualifier the other two do not need — `read_error` — because here an all-`null`
-//!   payload is *also* a legitimate successful reading (a mechanism that keeps no
-//!   whole-tree accounting at all), so the values alone cannot distinguish a gap from a
-//!   failed read. See that variant's own docs and `docs/resource-limits.md`, "What the
-//!   tree consumed", for the normative platform matrix.
+//!   this crate, decides which counters exist — and, on Linux, whether they survive to
+//!   the read point — so a `null` is an honest per-axis gap and never a placeholder or a
+//!   stand-in `0`. This group adds one qualifier the other two do not need —
+//!   `read_error` — because here an all-`null` payload is *also* a legitimate successful
+//!   reading (a mechanism that keeps no whole-tree accounting at all, or a Linux cgroup
+//!   v2 read after the tree has exited), so the values alone cannot distinguish a gap
+//!   from a failed read. See that variant's own docs and `docs/resource-limits.md`, "What
+//!   the tree consumed", for the normative platform matrix.
 
 use std::io::Write;
 use std::path::Path;
@@ -220,11 +221,21 @@ pub enum Event {
         /// CPU-quota verdict: `tripped`, `not_tripped`, or `unknown`.
         cpu: &'static str,
     },
-    /// What the contained tree actually consumed, read once from the container's own
-    /// kernel accounting (`ProcessGroup::stats()`) after the ending is decided and
+    /// What the contained tree actually consumed: one `ProcessGroup::stats()` reading of
+    /// whatever the active mechanism accounts for, taken after the ending is decided and
     /// before teardown consumes the group — the same read point as
-    /// [`Event::LimitEvidence`], for the same reason: the counters live in the
-    /// container, so they are gone once it is.
+    /// [`Event::LimitEvidence`], for the same reason: what it reads lives in the
+    /// container, so it is gone once the container is.
+    ///
+    /// **The read point is part of the contract, not an implementation detail.** A
+    /// Windows Job Object's accounting block outlives the processes charged to it, so
+    /// its figures cover the whole job whatever the ending; a Linux cgroup v2 sums
+    /// memory and CPU out of `/proc` over the members live *at that instant*, so on the
+    /// natural-exit path — where the child has already exited and been reaped — those
+    /// two axes are `null` there, and only a runner-imposed ending (read before the soft
+    /// stop) populates them. See `docs/resource-limits.md`, "What the tree consumed",
+    /// consequence 5; that matrix, not this event's field list, is the authority on
+    /// which axis carries a number where.
     ///
     /// **Emitted on every run that spawned the child**, cap or no cap, on every
     /// platform — unlike `limit_evidence`, which only answers a question a `--max-*`
@@ -234,33 +245,35 @@ pub enum Event {
     /// decision and its cost).
     ///
     /// **Every measurement is independently nullable, and `null` always means *this
-    /// mechanism does not account for it*** — never "zero", and never a value this
-    /// runner improved by taking a maximum over its own periodic reads (that would
-    /// describe when we looked, not what the tree did). The platform matrix is
-    /// normative and lives in `docs/resource-limits.md`, "What the tree consumed":
-    /// `peak_process_count` is always `null` on Windows, the IO byte counters are
-    /// always `null` on macOS/BSD and the POSIX fallback and need Linux cgroup v2's
-    /// `io` controller enabled, and neither IO counter is comparable *across*
+    /// mechanism, at this read point, does not account for it*** — never "zero", and
+    /// never a value this runner improved by taking a maximum over its own periodic
+    /// reads (that would describe when we looked, not what the tree did). Per the
+    /// normative matrix: `peak_process_count` is always `null` on Windows, the IO byte
+    /// counters are always `null` on macOS/BSD and the POSIX fallback and need Linux
+    /// cgroup v2's `io` controller enabled, memory and CPU are `null` on a Linux cgroup
+    /// v2 natural exit as described above, and neither IO counter is comparable *across*
     /// platforms (a Job Object counts all read/write traffic; cgroup `io.stat` counts
     /// only what crossed the block layer).
     ///
     /// `read_error` is `true` when `stats()` itself failed; every measurement is then
     /// `null` and the event is emitted anyway, rather than skipped. That flag is not
     /// ceremony here — it is the **only** thing that separates a failed read from a
-    /// legitimate all-`null` success, which is exactly what a POSIX-fallback run
-    /// reports by design. Without it the two would be indistinguishable on the wire
-    /// (the same honest-degradation contract as `members_snapshot`'s `read_error`,
-    /// where an empty `members` array is likewise ambiguous without the flag).
+    /// legitimate all-`null` success, which is what a POSIX-fallback run reports by
+    /// design and what a flagless Linux cgroup v2 run reports on a natural exit. Without
+    /// it the two would be indistinguishable on the wire (the same honest-degradation
+    /// contract as `members_snapshot`'s `read_error`, where an empty `members` array is
+    /// likewise ambiguous without the flag).
     ResourceSummary {
         /// `true` when the `stats()` read failed: every measurement below is then
         /// `null` as a gap, not as a platform's confirmed "not accounted". First on
         /// the wire so the qualifier is read before the numbers it qualifies.
         read_error: bool,
-        /// Peak memory the whole tree used, bytes; `null` where the mechanism keeps
-        /// no accumulator. Platform-specific in meaning and **not** comparable across
-        /// platforms — a Windows Job Object reports peak *committed* memory
-        /// (`PeakJobMemoryUsed`), a Linux cgroup v2 the sum of currently-live members'
-        /// peak resident sets.
+        /// Peak memory the whole tree used, bytes; `null` where the mechanism keeps no
+        /// accumulator this read can reach. Platform-specific in meaning and **not**
+        /// comparable across platforms — a Windows Job Object reports peak *committed*
+        /// memory (`PeakJobMemoryUsed`), a Linux cgroup v2 the sum of the peak resident
+        /// sets of the members live *at the read point*, which is why it is `null` after
+        /// a natural exit.
         peak_memory_bytes: Option<u64>,
         /// Total CPU time (user + kernel) the tree accumulated, **milliseconds** —
         /// the unit every other duration in this schema uses (`elapsed_ms`,
@@ -268,6 +281,8 @@ pub enum Event {
         /// ProcessKit's `total_cpu_time` rather than carrying an opaque `Duration`.
         /// Truncated toward zero, so a run that used less than a millisecond of CPU
         /// reports a **measured** `0`; `null` is the only value that means unknown.
+        /// Windows counts every process ever in the job; a Linux cgroup v2 only the
+        /// members live at the read point, so it too is `null` after a natural exit.
         total_cpu_ms: Option<u64>,
         /// Bytes the tree read, `null` where the mechanism does not account for IO.
         io_read_bytes: Option<u64>,

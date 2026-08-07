@@ -530,7 +530,10 @@ file — not the control client — still sees that the run ended by an outside 
 
 An outside command therefore does not cost the observer the run's consumption figures:
 `resource_summary` is emitted on these endings exactly as on a natural exit, before the
-teardown that destroys the counters it reads.
+teardown that destroys what it reads. The reading is if anything more complete here,
+because it happens while the tree is still running — on Linux cgroup v2 that is what
+makes `peak_memory_bytes` and `total_cpu_ms` present at all
+([resource limits](resource-limits.md#what-the-tree-consumed), consequence 5).
 
 See [`docs/schema.md`](schema.md) for these events.
 

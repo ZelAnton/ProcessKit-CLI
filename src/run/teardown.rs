@@ -102,10 +102,11 @@ fn limit_verdict_str(verdict: LimitVerdict) -> &'static str {
 /// and `docs/schema.md`, "resource_summary").
 ///
 /// Note what the `Err` arm must *not* be confused with: an all-`None` summary is also
-/// a perfectly good **success** on a mechanism that keeps no whole-tree accounting
-/// (the POSIX process group, macOS/the BSDs). The numbers are therefore identical in
-/// both cases and `read_error` is the sole discriminator — the same relationship
-/// [`snapshot_members_or_unknown`]'s empty `members` has to its own flag.
+/// a perfectly good **success** — on a mechanism that keeps no whole-tree accounting
+/// (the POSIX process group, macOS/the BSDs), and equally on a Linux cgroup v2 read taken
+/// once the tree has exited (see [`emit_resource_summary`]). The numbers are therefore
+/// identical in both cases and `read_error` is the sole discriminator — the same
+/// relationship [`snapshot_members_or_unknown`]'s empty `members` has to its own flag.
 ///
 /// Pulled out as a pure function for the K-059/[K-070] reason its three siblings in
 /// this module already are: `stats()`'s real `Err` is backend-internal plumbing, not
@@ -143,7 +144,22 @@ fn resource_summary_event(stats: Result<ProcessGroupStats, PkError>) -> Event {
 }
 
 /// Emit what the contained tree actually consumed, while the owning group — and so
-/// the kernel accounting it holds — still exists.
+/// whatever accounting it holds — still exists.
+///
+/// **A live group is not the same as a live tree, and the difference is visible on the
+/// wire.** On Windows the Job Object's accounting block outlives the processes charged
+/// to it, so a caller's position in the teardown tail does not change the figures. On
+/// Linux cgroup v2, memory and CPU are summed from `/proc` over the members listed in
+/// `cgroup.procs` at this instant, so the call sites reached on a natural exit — where
+/// the child has already exited and been reaped — get `None` for both, while the
+/// forced-ending call sites, which run before the soft stop, get real numbers. That
+/// asymmetry is contract rather than accident: it is consequence 5 of
+/// `docs/resource-limits.md`, "What the tree consumed", and `tests/run.rs`'s
+/// `linux_resource_summary_reports_no_memory_or_cpu_after_a_natural_exit` /
+/// `..._reports_memory_and_cpu_on_a_forced_ending` pin both sides. It is deliberately
+/// not smoothed over — there is no earlier point at which the ending is known, and
+/// filling the gap from the runner's own periodic reads would report when this process
+/// looked rather than what the tree did.
 ///
 /// **Unconditional**, unlike its neighbour [`emit_limit_evidence`]: every run that
 /// got as far as spawning the child emits exactly one of these, whether or not a

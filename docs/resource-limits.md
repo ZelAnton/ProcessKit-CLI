@@ -140,9 +140,12 @@ still treats it as a hard failure signal in that scope (see
 installed, the other whether it fired. Neither says how much the tree actually used.
 That is the separate `resource_summary` event, which every run that spawned a child
 emits exactly once — no flag, no cap required, every platform (normative field list:
-[`docs/schema.md`](schema.md#resource_summary)). With `processkit` 3.3.0 it reads the
-container's own accounting through `ProcessGroup::stats()`, at the same point in the
-teardown tail as `limit_evidence` and immediately after it.
+[`docs/schema.md`](schema.md#resource_summary)). With `processkit` 3.3.0 it takes one
+`ProcessGroup::stats()` reading of whatever the active mechanism accounts for — a Job
+Object's own accounting block on Windows; on Linux the cgroup's `io.stat`/`pids.peak`
+counters plus a per-member `/proc` sum for memory and CPU, which is why the matrix below
+ties those two axes to the read point — at the same place in the teardown tail as
+`limit_evidence` and immediately after it.
 
 ### What it does not prove
 
@@ -152,8 +155,9 @@ teardown tail as `limit_evidence` and immediately after it.
   as "it was capped" would invent an attribution the kernel never made.
 - **It is not a time series.** One reading at the end of the run, not a sample. It
   cannot say *when* the peak occurred, or what the tree looked like at any earlier
-  moment. `run --snapshot-interval` is the event for that question, and it is opt-in
-  precisely because it has an ongoing cost.
+  moment. `run --snapshot-interval` answers the second of those — the tree's *shape* over
+  time, and it is opt-in precisely because that has an ongoing cost — but it carries no
+  resource numbers, so nothing in this stream is a consumption series.
 - **It is not a per-process breakdown.** Every number is whole-tree. A member's
   individual share is not recoverable from it.
 - **It does not measure disk.** Bytes written to a capture file are
@@ -163,20 +167,22 @@ teardown tail as `limit_evidence` and immediately after it.
 
 ### Platform matrix
 
-Every measurement is independently nullable, and `null` means **this mechanism does
-not account for it** — never zero, and never a number the runner improved by taking a
-maximum over its own periodic reads (that would report when the runner looked, not
-what the tree did). This matrix is normative; do not read completeness into the event's
-field list.
+Every measurement is independently nullable, and `null` means **this mechanism, at this
+read point, does not account for it** — never zero, and never a number the runner
+improved by taking a maximum over its own periodic reads (that would report when the
+runner looked, not what the tree did). Two of the axes below depend on the read point and
+not on the platform alone, so the "mechanism" column is a *necessary* condition for a
+number, never a sufficient one. This matrix is normative; do not read completeness into
+the event's field list.
 
 | Mechanism | `peak_memory_bytes` | `total_cpu_ms` | `io_read_bytes` / `io_write_bytes` | `peak_process_count` |
 | --- | --- | --- | --- | --- |
 | Windows Job Object | Yes — peak *committed* memory (`PeakJobMemoryUsed`) | Yes — every process ever in the job, terminated ones included | Yes — `IO_COUNTERS`, **all** read/write traffic (file, pipe, device) | **Always `null`** |
-| Linux cgroup v2 | Yes — sum of currently-live members' `VmHWM` | Yes — currently-live members only | Only with the `io` controller enabled — `io.stat` `rbytes`/`wbytes`, **block layer only** | Only with the `pids` controller enabled — `pids.peak` |
+| Linux cgroup v2 | Only for members **live at the read point** — the sum of their `VmHWM`; `null` once the tree has exited, which is the natural-exit case (consequence 5) | Only for members **live at the read point**; `null` once the tree has exited (consequence 5) | Only with the `io` controller enabled — `io.stat` `rbytes`/`wbytes`, **block layer only** | Only with the `pids` controller enabled — `pids.peak` |
 | Linux process-group fallback | `null` | `null` | `null` | `null` |
 | macOS / BSD process group | `null` | `null` | `null` | `null` |
 
-Four consequences that are easy to misread as bugs:
+Five consequences that are easy to misread as bugs:
 
 1. **`peak_process_count` is always `null` on Windows.** A Job Object keeps
    `ActiveProcesses` (how many are in it now) and `TotalProcesses` (how many were ever
@@ -201,19 +207,54 @@ Four consequences that are easy to misread as bugs:
    the kernel writes the page back, which may be after the member that dirtied it
    exited — or never, if the page is still dirty when the group is torn down. A short
    write-and-exit run can report fewer bytes than it handed to `write(2)`.
+5. **On Linux cgroup v2, `peak_memory_bytes` and `total_cpu_ms` are `null` after a
+   natural exit** — the most common ending, so this is the ordinary reading there and
+   not a corner case. Unlike the two axes beside them, these are not counters the
+   cgroup keeps: ProcessKit sums them out of `/proc/<pid>` over the members listed in
+   `cgroup.procs` **at the moment of the read**, and it does so whether or not a cap
+   was requested (`memory.peak` and `cpu.stat` are never consulted, so `--max-memory`
+   does not change it). A process leaves `cgroup.procs` as soon as it exits — a zombie
+   never appears there — and this read happens *after* the ending is decided, so on
+   the natural-exit path the child has already exited and been reaped and there is
+   normally nothing left to sum. Both axes then come back `null` with `read_error:
+   false`, which is a correct answer about that read point and not a failure. Two
+   corollaries follow, and the second is the useful one:
+   - A child that leaked a descendant which outlived it makes the two axes
+     **non-`null`** — but they then cover only the survivor, arbitrarily far below what
+     the tree as a whole used. A small number here is not a whole-tree total.
+   - On a runner-imposed ending (`timeout`, `cancelled`, `killed`, `output_overflow`)
+     the read happens *before* the soft stop, while the tree is still running, so there
+     both axes are populated. If a workload's memory or CPU is what you need on Linux, a
+     run the runner itself ended is the only place this stream carries it: no other event
+     does, `members_snapshot` (including `--snapshot-interval`'s samples) carrying member
+     identity only — `pid`, `ppid`, `name`, `start_time`.
+
+   Neither Windows nor Linux's other two axes are affected. A Job Object's accounting
+   block outlives the processes charged to it, so its memory and CPU cover the whole
+   job whatever the ending; `io_read_bytes`/`io_write_bytes` and `peak_process_count`
+   on Linux *are* cgroup-kept counters and likewise survive their members — whether
+   they are present is the controller question in consequence 2.
 
 `peak_memory_bytes` and `total_cpu_ms` are likewise platform-specific in *meaning*
-(committed memory vs. resident high-water mark; whole-job history vs. live members
-only), so the same caution applies to them: comparable within a mechanism, not across.
+(committed memory vs. resident high-water mark; the whole job's history vs. only the
+members live at the read point), so the same caution applies to them: comparable
+within a mechanism, not across.
 
 ### A failed read is in the stream, not missing from it
 
 If `stats()` fails, the event is still emitted with `read_error: true` and every
 measurement `null`. Check that flag before drawing a conclusion from a `null`, because
 an all-`null` summary is *also* a correct success — it is exactly what row 3 and row 4
-of the matrix above report by design. `read_error` is the only thing that separates
-"this mechanism accounts for nothing" from "the read failed", and a foreground run's
-stderr warning does not help a `--detach` run, whose stderr is null.
+of the matrix above report by design, **and what row 2 reports as well** for the
+commonest case of all: a plain `run` on Linux cgroup v2 that ended by its child exiting
+has no live member left to sum for memory and CPU (consequence 5) and — unless the
+environment itself enabled the `io` controller, and `--max-processes` the `pids` one —
+no container counter to answer for the other three (consequence 2), so all five
+measurements are `null` with `read_error: false`. An all-`null` summary therefore
+carries no information about whether the read worked, on any platform: `read_error` is
+the only thing that separates "this mechanism, at this read point, accounts for
+nothing" from "the read failed", and a foreground run's stderr warning does not help a
+`--detach` run, whose stderr is null.
 
 ### Preflighting it
 
@@ -225,8 +266,9 @@ processkit-cli probe --json --require-surface run:resource-summary
 ```
 
 That token's presence guarantees the event will be in the stream. It does **not**
-promise any particular axis is populated — that is what the matrix above governs, and
-it follows from `run_started.mechanism`, not from a `probe` token.
+promise any particular axis is populated — that is what the matrix above governs, and it
+follows from `run_started.mechanism`, plus (on Linux cgroup v2, for memory and CPU) from
+how the run ended. Never from a `probe` token.
 
 ## Limits and outer containers
 
@@ -251,8 +293,11 @@ limit request attached to this specific run.
    exist to be queried.
 6. For actual consumption, read `resource_summary` — present on every run that
    spawned a child, capped or not. Check `read_error` first, then treat each `null`
-   as "this mechanism does not account for it" per the matrix in "What the tree
-   consumed", never as zero, and never compare its IO counters across platforms.
+   as "this mechanism does not account for it *at this read point*" per the matrix in
+   "What the tree consumed", never as zero, and never compare its IO counters across
+   platforms. On Linux cgroup v2 in particular, do not expect `peak_memory_bytes` or
+   `total_cpu_ms` from a run whose child exited on its own — there they are `null` by
+   construction (consequence 5).
 7. Keep a separate outer-runtime signal for limits imposed outside this run.
 
 ## See also

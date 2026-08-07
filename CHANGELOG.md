@@ -17,8 +17,8 @@ to a dated version section.
   `io_write_bytes`, and `peak_process_count`. Until now the stream said *nothing* about
   resource usage: `members_snapshot` carried only `pid`/`ppid`/`name`/`start_time`, so
   peak memory and total CPU were neither readable nor reconstructible from it. The
-  runner reads the container's own kernel accounting once (`ProcessGroup::stats()`, via
-  the `processkit` `3.2` → `3.3` bump) after the ending is decided and before
+  runner takes one `ProcessGroup::stats()` reading of what the active mechanism accounts
+  for (via the `processkit` `3.2` → `3.3` bump) after the ending is decided and before
   `cleanup_finished` hard-kills the group — the same read point as `limit_evidence`, and
   immediately after it, because both facts live *in* the container and vanish with it.
   It is emitted by **every** run that spawned a child: no flag, no cap required, every
@@ -30,8 +30,8 @@ to a dated version section.
   — Windows, where `limit_evidence` can only ever answer `unknown` for a capped axis —
   silent unless a caller knew to ask. The honest cost is that a default run's stream is
   now **seven** lines rather than six, and this is the one growth a caller did not opt
-  into; the "six lines" arguments in `docs/integration.md` and ADR 0007 are updated
-  accordingly. Each measurement is **independently nullable**, and `null` always means
+  into; the line-count arguments in `docs/integration.md` and ADR 0007 are restated
+  against the new count. Each measurement is **independently nullable**, and `null` always means
   *this mechanism does not account for it* — never a stand-in `0`, and never a value
   improved by taking a maximum over the runner's own periodic reads, which would
   describe when the runner looked rather than what the tree did. Consequently
@@ -39,7 +39,17 @@ to a dated version section.
   `ActiveProcesses` and `TotalProcesses`; neither is a peak), both IO counters are
   always `null` on macOS/the BSDs and the Linux process-group fallback, and on Linux
   they need the cgroup v2 `io` controller — which this CLI never enables, since
-  `processkit` enables exactly the controllers a requested cap needs. The two
+  `processkit` enables exactly the controllers a requested cap needs. On **Linux cgroup
+  v2** the availability of `peak_memory_bytes`/`total_cpu_ms` is a property of the read
+  point rather than of the controller set, and the documentation says so instead of
+  implying completeness: those two are summed from `/proc` over the members live when
+  `stats()` runs (the cgroup keeps no CPU/memory accumulator this backend reads), so a
+  run that ended by its child exiting — the commonest ending — reports both as `null`
+  with `read_error: false`, a run whose child leaked a surviving descendant reports
+  numbers covering only that survivor, and only a runner-imposed ending (`timeout` /
+  `cancelled` / `killed` / `output_overflow`, read before the soft stop) reports the
+  whole tree. Windows is unaffected: a Job Object's accounting block outlives the
+  processes charged to it. The two
   platforms' IO counters are explicitly **not comparable with each other** (a Job
   Object counts all read/write traffic whatever the target; cgroup `io.stat` counts only
   what crossed the block layer), and `total_cpu_ms` truncates, so a run using under a
@@ -53,8 +63,9 @@ to a dated version section.
   it is emitted with `read_error: true` and every measurement `null`, mirroring
   `members_snapshot`/`cleanup_started`/`cleanup_finished`'s existing
   honest-degradation flags — and here the flag is load-bearing rather than ceremonial,
-  because an all-`null` summary is *also* a correct success on a mechanism with no
-  whole-tree accounting, so nothing else could distinguish a gap from a platform fact.
+  because an all-`null` summary is *also* a correct success — on a mechanism with no
+  whole-tree accounting, and equally on a flagless Linux cgroup v2 run that ended by its
+  child exiting — so nothing else could distinguish a gap from a platform fact.
   The event is additive within `schema_version = 1`: no existing field was renamed,
   retyped, or given a new meaning, and the golden fixture gained one appended line with
   every prior line byte-for-byte unchanged. `events --validate` accepts a conforming

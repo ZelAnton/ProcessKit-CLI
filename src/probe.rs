@@ -265,9 +265,9 @@ fn evaluate(args: &ProbeArgs) -> Vec<String> {
 const PEER_IDENTITY_TOKEN: &str = "attest:peer-identity";
 
 /// The second **capability** token: this build's `run` emits the terminal
-/// `resource_summary` event — what the contained tree actually consumed, read from
-/// the container's own kernel accounting (`crate::events::Event::ResourceSummary`,
-/// `docs/schema.md`, "resource_summary").
+/// `resource_summary` event — what the contained tree actually consumed, from one
+/// reading of whatever the active mechanism accounts for
+/// (`crate::events::Event::ResourceSummary`, `docs/schema.md`, "resource_summary").
 ///
 /// **Why it needs a token at all**, when no flag turns it on and no platform turns it
 /// off: precisely *because* of that. There is nothing else for a consumer to pin. An
@@ -280,12 +280,14 @@ const PEER_IDENTITY_TOKEN: &str = "attest:peer-identity";
 ///
 /// **Presence is not a promise of numbers.** It says the event will be there, not that
 /// any given axis will be populated: `peak_process_count` is `null` on all of Windows
-/// and the IO counters on all of macOS/BSD by mechanism, and a run may report
-/// `read_error`. Those are per-axis platform facts a *single* token could not honestly
-/// carry (`docs/resource-limits.md`, "What the tree consumed", is the matrix), and
-/// splitting them into five platform tokens would publish as capabilities what are
-/// really documented properties of the mechanism named by `run_started.mechanism`.
-/// This token is deliberately the weaker, checkable claim.
+/// and the IO counters on all of macOS/BSD by mechanism, on Linux cgroup v2 memory and
+/// CPU are `null` after a natural exit because they are summed over the members live at
+/// the read point, and any run may report `read_error`. Those are facts about the
+/// mechanism and the read point that a *single* token could not honestly carry
+/// (`docs/resource-limits.md`, "What the tree consumed", is the matrix), and splitting
+/// them into five platform tokens would still not carry them — a token published at
+/// preflight cannot know how the run will end. This token is deliberately the weaker,
+/// checkable claim.
 ///
 /// Unlike [`PEER_IDENTITY_TOKEN`] it is unconditional — hence no `if` at its push
 /// site. That is the honest form: this build always emits the event, so a condition
