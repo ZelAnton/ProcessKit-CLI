@@ -28,8 +28,8 @@
         },
         "mechanism": {
           "type": "string",
-          "enum": ["job_object", "cgroup_v2", "process_group", "unknown"],
-          "description": "The containment mechanism the verdict is about — the same vocabulary the JSONL `run_started` and the `inspect` snapshot use (docs/schema.md). It fixes the *scope* of the fact, which genuinely differs: a Job Object or a cgroup enumerates the whole contained tree, while the POSIX `process_group` fallback contains a tree but enumerates only its group leaders, so membership there is decided against the peer's own process group — the predicate that mechanism actually enforces. Read this to know how strong the containment behind a `member` answer is; see docs/control-plane.md, \"What `member` means, per mechanism\"."
+          "enum": ["job_object", "cgroup_v2", "process_group", "process_reaper", "unknown"],
+          "description": "The containment mechanism the verdict is about — the same vocabulary the JSONL `run_started` and the `inspect` snapshot use (docs/schema.md). It fixes the *scope* of the fact: a Job Object, cgroup, or FreeBSD process reaper enumerates the whole contained tree, while the POSIX `process_group` fallback contains a tree but enumerates only its group leaders, so membership there is decided against the peer's own process group. `unknown` is the conservative fallback for a future mechanism this build does not recognize. Read this to know how strong the containment behind a `member` answer is; see docs/control-plane.md, \"What `member` means, per mechanism\"."
         },
         "checked_at": {
           "type": "string",

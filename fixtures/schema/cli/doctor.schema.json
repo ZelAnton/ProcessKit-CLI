@@ -155,8 +155,8 @@
       "properties": {
         "mechanism": {
           "type": "string",
-          "enum": ["job_object", "cgroup_v2", "process_group", "unknown"],
-          "description": "The containment mechanism this host selected — the same vocabulary the JSONL `run_started` event publishes (docs/schema.md; `unknown` is that event's own forward-compatible fallback for a mechanism this build predates). `--require-mechanism` compares against this value exactly."
+          "enum": ["job_object", "cgroup_v2", "process_group", "process_reaper", "unknown"],
+          "description": "The containment mechanism this host selected — the same vocabulary the JSONL `run_started` event publishes (docs/schema.md; FreeBSD's process reaper is `process_reaper`; `unknown` is that event's own forward-compatible fallback for a mechanism this build predates). `--require-mechanism` compares against this value exactly."
         },
         "abrupt_cleanup": {
           "type": "string",

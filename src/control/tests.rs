@@ -1035,6 +1035,13 @@ fn mechanism_names_stay_in_step() {
         events::mechanism_str(processkit::Mechanism::ProcessGroup),
         "the process-group fallback's name must match the one the rest of the binary emits"
     );
+    let process_reaper = processkit::Mechanism::from_name("process_reaper")
+        .expect("ProcessKit 3.3 exposes the process-reaper identifier");
+    assert_eq!(
+        events::mechanism_str(process_reaper),
+        "process_reaper",
+        "the FreeBSD process reaper must use ProcessKit's stable identifier"
+    );
 }
 
 /// On the mechanisms that enumerate the **whole** contained tree, membership is the
@@ -1044,7 +1051,7 @@ fn mechanism_names_stay_in_step() {
 #[test]
 fn whole_tree_mechanisms_decide_membership_by_pid_alone() {
     let members = [Member::from_pid(101), Member::from_pid(202)];
-    for mechanism in ["job_object", "cgroup_v2"] {
+    for mechanism in ["job_object", "cgroup_v2", "process_reaper"] {
         assert!(peer_is_member(101, mechanism, &members));
         assert!(peer_is_member(202, mechanism, &members));
         assert!(

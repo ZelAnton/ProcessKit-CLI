@@ -315,7 +315,14 @@ fn run_started_reports_root_pid_mechanism_and_redacts_the_command() {
     );
     let mechanism = started["mechanism"].as_str().expect("mechanism string");
     assert!(
-        ["job_object", "cgroup_v2", "process_group"].contains(&mechanism),
+        [
+            "job_object",
+            "cgroup_v2",
+            "process_group",
+            "process_reaper",
+            "unknown",
+        ]
+        .contains(&mechanism),
         "mechanism must be one of the documented values, got {mechanism:?}"
     );
     let expected_abrupt_cleanup = if cfg!(windows) {

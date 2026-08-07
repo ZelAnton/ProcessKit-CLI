@@ -145,7 +145,8 @@ preflight through cleanup.
 | --- | --- | --- |
 | Windows | Job Object | Whole tree is reaped by kernel kill-on-close. |
 | Linux | cgroup v2, with process-group fallback | Direct child only when parent-death signaling is available. |
-| macOS / other Unix | POSIX process group | No automatic whole-tree guarantee after an uncatchable runner death. |
+| FreeBSD | ProcessKit process reaper | No automatic whole-tree guarantee after an uncatchable runner death; normal teardown covers the reaper tree. |
+| macOS / non-FreeBSD Unix | POSIX process group | No automatic whole-tree guarantee after an uncatchable runner death. |
 
 Every ordinary teardown still uses the active container on every supported
 platform. The last column is intentionally narrower: it describes only a crash,

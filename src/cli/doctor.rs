@@ -64,9 +64,9 @@ pub struct DoctorArgs {
     pub check_resource_controller: bool,
 
     /// Require the containment mechanism this host selects to be exactly `<name>`
-    /// (`job_object` / `cgroup_v2` / `process_group`, the same vocabulary the JSONL
-    /// `run_started` event publishes — `docs/schema.md`). Compared for exact
-    /// equality; a host that reports anything else is unqualified
+    /// (`job_object` / `cgroup_v2` / `process_group` / `process_reaper` / `unknown`,
+    /// the same vocabulary the JSONL `run_started` event publishes —
+    /// `docs/schema.md`). Compared for exact equality; a host that reports anything else is unqualified
     /// (`HOST_UNQUALIFIED`, 116) with a mismatch naming both the required and the
     /// observed value. The report still carries the observed mechanism either way.
     #[arg(long, value_name = "name")]

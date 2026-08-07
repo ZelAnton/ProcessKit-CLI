@@ -1,6 +1,7 @@
 # Platform support
 
-ProcessKit CLI exposes one command surface across Windows, Linux, and macOS,
+ProcessKit CLI exposes one command surface across Windows, Linux, macOS, and
+source-built BSD targets,
 but it does not pretend their kernel containment primitives are equivalent.
 Every run reports both the mechanism it obtained and what happens if the runner
 dies before it can execute teardown.
@@ -33,7 +34,8 @@ release-artifact or CI promise unless listed here.
 | Windows Job Object | `job_object` | `whole_tree` |
 | Linux cgroup v2 | `cgroup_v2` | `direct_child_only` |
 | Linux process-group fallback | `process_group` | `direct_child_only` |
-| macOS / other Unix process group | `process_group` | `none` |
+| FreeBSD process reaper | `process_reaper` | `none` |
+| macOS / non-FreeBSD Unix process group | `process_group` | `none` |
 
 Normal completion, timeout, caught cancellation signals, and control-plane
 actions still run the full owned-container teardown on every platform. The
@@ -87,7 +89,23 @@ Linux parent-death signaling kills the direct child if the runner dies
 abruptly. The cgroup itself persists and does not automatically kill every
 grandchild, hence `direct_child_only` rather than `whole_tree`.
 
-## macOS and other Unix
+## FreeBSD process reaper
+
+On FreeBSD, ProcessKit 3.3 uses the kernel's `procctl(2)` process reaper.
+Normal teardown and member discovery cover the whole reaper tree, including
+descendants that call `setsid` or double-fork. This is stronger than the POSIX
+process-group fallback for membership and kill scope, so it reports
+`process_reaper` rather than `process_group`.
+
+FreeBSD does not provide the resource-limit or statistics primitives used by
+ProcessKit's other backends. A run that requests a resource cap fails before
+spawn with the normal `limit_hit`/backend-error sequence; an unrestricted run
+reports `resource_summary` with all measurements `null` and
+`read_error: false`. Parent-death cleanup remains `none`: `procctl(2)` gives
+normal teardown a whole-tree scope, but ProcessKit 3.3 has no supported
+owner-death primitive for this path.
+
+## macOS and non-FreeBSD Unix
 
 The runner uses a POSIX process group. Normal teardown signals and kills the
 group, covering ordinary descendants that remain in it.
@@ -105,22 +123,23 @@ its workload requires stronger containment.
 
 ## Capability matrix
 
-| Capability | Windows Job | Linux cgroup v2 | POSIX process group |
-| --- | --- | --- | --- |
-| Normal whole-tree hard teardown | Yes | Yes | Group members only |
-| Whole-tree abrupt runner-death reap | Yes | No | No |
-| Enriched member snapshots | Yes | Yes | Backend-dependent |
-| Memory limit | Yes | With controller access | No |
-| Process-count limit | Yes | With controller access | No |
-| CPU quota | Yes | With controller access | No |
-| Soft-stop request | Window close plus opt-in console `CTRL_BREAK` | `SIGTERM` | `SIGTERM` |
-| Direct inherited terminal | Yes | Yes | Yes |
-| PTY emulation | No | No | No |
+| Capability | Windows Job | Linux cgroup v2 | FreeBSD process reaper | POSIX process group |
+| --- | --- | --- | --- | --- |
+| Normal whole-tree hard teardown | Yes | Yes | Yes | Group members only |
+| Whole-tree abrupt runner-death reap | Yes | No | No | No |
+| Enriched member snapshots | Yes | Yes | Backend-dependent | Backend-dependent |
+| Memory limit | Yes | With controller access | No | No |
+| Process-count limit | Yes | With controller access | No | No |
+| CPU quota | Yes | With controller access | No | No |
+| Soft-stop request | Window close plus opt-in console `CTRL_BREAK` | `SIGTERM` | Whole-tree hard-stop | `SIGTERM` |
+| Direct inherited terminal | Yes | Yes | Yes | Yes |
+| PTY emulation | No | No | No | No |
 
 ## CI coverage
 
 The repository's GitHub Actions matrix builds and tests Windows, Linux, and
-macOS, including Arm runners where available. The opt-in E2E tier drives the
+macOS, including Arm runners where available. FreeBSD is source-build-only and
+is not currently a CI or release-artifact target. The opt-in E2E tier drives the
 built binary through real containment scenarios: leaked descendants, nonzero
 roots, abrupt runner death, nested Windows jobs, PID reuse, real console/terminal
 I/O, and cancellation.

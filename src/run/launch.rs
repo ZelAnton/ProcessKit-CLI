@@ -1066,8 +1066,9 @@ fn set_terminal_foreground(fd: libc::c_int, pgrp: libc::pid_t) -> std::io::Resul
 /// so **pre-spawn** — the child never started, so no child code is ever at risk.
 /// Because the CLI parsers (`src/cli/parse.rs`) already reject every nonsensical value as
 /// a `USAGE` (100) form error *before* we reach here, the only reasons that survive
-/// to this point are the "could not be applied" ones — `Unsupported` (macOS/BSD and
-/// the Linux process-group fallback have no whole-tree container at all) and
+/// to this point are the "could not be applied" ones — `Unsupported` (FreeBSD's
+/// process reaper, macOS/other BSDs, and the Linux process-group fallback have no
+/// resource-limit-capable container) and
 /// `Unenforceable` (a Linux cgroup v2 whose controllers can't be enabled — under
 /// systemd, an ordinary container, or typical CI). That is the **same class** of
 /// failure as the existing `ProcessGroup::new()` container-creation error ("a

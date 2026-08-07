@@ -111,7 +111,7 @@ The run has begun: the child is spawned into the container.
 | `run_id`         | string            | The `--run-id` value, or a generated `run-<pid>-<unix_nanos>`.         |
 | `labels`         | object            | Operator labels from `run --label`; empty when none were supplied. Keys are sorted for deterministic JSON. |
 | `root_pid`       | integer, nullable | The root child's PID; `null` if the backend exposed none.             |
-| `mechanism`      | string            | Containment mechanism: `job_object`, `cgroup_v2`, or `process_group`. |
+| `mechanism`      | string            | Containment mechanism: `job_object`, `cgroup_v2`, `process_group`, `process_reaper`, or `unknown`. The FreeBSD process reaper is the whole-tree `procctl(2)` backend; `unknown` is the conservative fallback for a future ProcessKit mechanism this build does not recognize. |
 | `abrupt_cleanup` | string            | Cleanup surviving abrupt runner death: `whole_tree`, `direct_child_only`, or `none`. |
 | `cwd`            | string, nullable  | The child's absolute working directory; `null` if it could not be resolved. |
 | `command`        | object            | The command, redacted by default — see "Command redaction".           |
@@ -120,8 +120,8 @@ The run has begun: the child is spawned into the container.
 `whole_tree` on Windows because closing the runner's last Job Object handle kills
 all members; `direct_child_only` on Linux because the runner enables ProcessKit's
 parent-death signal for the root child while cgroups themselves persist; and
-`none` on macOS/other Unix because the current public API has no parent-death
-primitive there. Normal completion, timeout, and cancellation still invoke the
+`none` on FreeBSD, macOS, and other Unix because the current public API has no
+parent-death primitive there. Normal completion, timeout, and cancellation still invoke the
 reported container mechanism's regular teardown.
 
 ### `members_snapshot`
@@ -341,8 +341,9 @@ engaged; `not_tripped` is authoritative evidence that it did not engage (and is
 also ProcessKit's result for an uncapped axis); `unknown` means a successfully
 created group's mechanism cannot provide a post-run answer. Linux cgroup v2 can
 report all three states. A successfully created Windows Job Object reports
-`unknown` for capped axes. POSIX process-group fallback and macOS/BSD process
-groups fail before a capped group exists, so they emit `limit_hit` and no
+`unknown` for capped axes. FreeBSD's process reaper, the POSIX process-group
+fallback, and macOS/other BSD process groups fail before a capped group exists,
+so they emit `limit_hit` and no
 `limit_evidence`. The event is absent when no cap was requested. This is an
 additive event within `schema_version = 1`.
 
@@ -526,7 +527,7 @@ their default disposition terminates the runner outright, which would skip the
 run's registry entry behind stale until `prune` — the ending would go unreported to
 any observer of the event stream or registry, even though the tree itself is not left
 orphaned on every platform: the abrupt-owner-death reap covers only the direct child
-on Linux, nothing at all on macOS/BSD, and the *whole* tree on Windows (closing the
+on Linux, nothing at all on FreeBSD, macOS, or other BSDs, and the *whole* tree on Windows (closing the
 runner's last Job Object handle; see `cleanup_finished` and `docs/registry.md`).
 One exception, deliberate: a Unix signal whose disposition is already `SIG_IGN` when
 the runner starts (what `nohup` does to `SIGHUP`) is left ignored rather than
@@ -882,3 +883,15 @@ filled the same way once ProcessKit shipped `members_info()`. Adding a new `hint
 catalog is likewise additive, but renaming or removing an existing `hint` label, or
 changing the fingerprint's canonical encoding, changes the meaning of a value and
 so is a breaking change.
+
+The `mechanism` field is the deliberate exception to the usual closed-enum reading of
+the JSON Schema. Its vocabulary grows additively within `schema_version = 1`: adding
+ProcessKit's `process_reaper` value changes no existing value's meaning, and readers
+must route by event/output type while treating an unfamiliar mechanism as unsupported
+rather than rejecting the entire record. `unknown` is a real contract value, not a
+projection defect: it is the conservative result of `mechanism_str`'s
+`#[non_exhaustive]` fallback when a newer ProcessKit mechanism reaches an older CLI.
+The current schemas enumerate all values known by this release, including both
+`process_reaper` and `unknown`; a frozen older schema may reject a newly added enum
+value, so strict validation must use the schema matching the producer and adapters
+must not use an old enum as an exhaustive runtime parser.

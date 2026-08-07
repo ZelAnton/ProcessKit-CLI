@@ -12,6 +12,13 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- **`process_reaper` containment vocabulary**: project ProcessKit 3.3's FreeBSD
+  process-reaper mechanism into `run_started`, `inspect`, `attest`, and `doctor`,
+  with schema-v1 fixtures and validators accepting `process_reaper` plus the
+  intentional `unknown` fallback. FreeBSD is documented separately from the
+  POSIX process-group fallback: it has whole-tree kill and membership semantics
+  but no resource-limit or statistics support, while abrupt owner death remains
+  `none`.
 - **`resource_summary`**: a new terminal JSONL event reporting what the contained tree
   actually **consumed** — `peak_memory_bytes`, `total_cpu_ms`, `io_read_bytes`,
   `io_write_bytes`, and `peak_process_count`. Until now the stream said *nothing* about

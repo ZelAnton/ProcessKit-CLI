@@ -65,7 +65,8 @@ pub(super) async fn idle_deadline(idle: Option<Duration>, clock: &IdleClock) {
 /// dispositions all terminate the runner outright, which would skip teardown entirely:
 /// no terminal JSONL events, a registry entry left behind, and — the guarantee that
 /// actually matters — no explicit kill of the container, whose abrupt-owner-death reap
-/// covers only the direct child on Linux and nothing at all on macOS/BSD (see
+/// covers only the direct child on Linux and nothing at all on FreeBSD, macOS, or
+/// other BSDs (see
 /// [`crate::events::abrupt_cleanup_str`], K-005). Catching them turns the most common
 /// way a supervisor stops this runner into the same clean, fully-reported teardown a
 /// `Ctrl-C` already got.

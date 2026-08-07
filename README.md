@@ -195,7 +195,7 @@ The **musl** builds link libc statically, so they run on minimal, glibc-less
 container images (Alpine, distroless) as a single dependency-free file. They are
 shipped **alongside** the corresponding glibc Linux build, not as a replacement.
 
-The three mechanisms are not equally strong, and the runner reports which one is
+The four mechanisms are not equally strong, and the runner reports which one is
 in force rather than papering over the difference:
 
 - **Windows — Job Object.** The whole process tree is reaped even if the runner
@@ -208,14 +208,19 @@ in force rather than papering over the difference:
   `process_group`; it never claims a cgroup it did not get. If the runner itself
   dies abruptly, the enabled parent-death signal kills the direct child, but the
   cgroup persists and does not automatically kill grandchildren.
-- **macOS and other Unix — process group.** Teardown signals the process group;
+- **FreeBSD — process reaper.** ProcessKit uses FreeBSD's `procctl(2)` process
+  reaper for whole-tree membership and normal teardown, including descendants
+  that call `setsid` or double-fork. FreeBSD has no ProcessKit resource-limit or
+  statistics support, and `abrupt_cleanup` remains `none` because the reaper is
+  owned by the runner.
+- **macOS and non-FreeBSD Unix — process group.** Teardown signals the process group;
   a descendant that deliberately leaves it (`setsid` / double-fork) can escape,
   and a just-exited child may still be listed in the post-kill snapshot. The
   current ProcessKit API provides no parent-death cleanup on these targets.
 
 Every `run_started` event reports this separate abrupt-owner-death contract as
 `abrupt_cleanup`: `whole_tree` on Windows, `direct_child_only` on Linux, and
-`none` on macOS/other Unix. Normal completion, timeout, and a cancel signal — a
+`none` on FreeBSD, macOS, and other Unix. Normal completion, timeout, and a cancel signal — a
 `Ctrl-C`, on Unix a `SIGTERM`/`SIGHUP`, or on Windows a `Ctrl-Break`/console
 close/logoff/system shutdown, all of which the runner catches — still run
 the owned container's ordinary teardown path on every supported platform; this
@@ -1039,7 +1044,8 @@ read of counters the kernel already keeps. **Which slots carry a number is a pro
 the mechanism, not a promise of the event**, and each measurement is independently `null`
 where the mechanism does not account for it — never `0`, and never a number this runner
 improved by sampling itself. So `peak_process_count` is always `null` on Windows; the IO
-counters are `null` on macOS/BSD and need Linux cgroup v2's `io` controller; and on Linux
+counters are `null` on FreeBSD, macOS, other BSDs, and the Linux process-group fallback,
+and need Linux cgroup v2's `io` controller otherwise; and on Linux
 cgroup v2 memory and CPU are summed over the members still live when the read happens, so
 a run whose child exited on its own reports both as `null` while a `--timeout`/cancel/kill
 ending, read while the tree still runs, reports them. The two platforms' IO counters are

@@ -23,7 +23,7 @@ the choices below can also be layered.
 
 | Option | Process boundary | If its immediate launcher dies abruptly | Result and observability | Where that option wins |
 | --- | --- | --- | --- | --- |
-| ProcessKit CLI | The obtained ProcessKit mechanism: Windows Job Object, Linux cgroup v2, or a reported process-group fallback | Explicit `abrupt_cleanup`: `whole_tree` on Windows, `direct_child_only` on Linux, `none` on macOS/other Unix | Ordinary child status is preserved; runner-imposed endings and runner failures are distinct. Versioned JSONL, bounded diagnostics, local inspect/cancel/kill/wait. | One binary and one adapter contract across Windows, Linux, and macOS. |
+| ProcessKit CLI | The obtained ProcessKit mechanism: Windows Job Object, Linux cgroup v2, FreeBSD process reaper, or a reported process-group fallback | Explicit `abrupt_cleanup`: `whole_tree` on Windows, `direct_child_only` on Linux, `none` on FreeBSD/macOS/other Unix | Ordinary child status is preserved; runner-imposed endings and runner failures are distinct. Versioned JSONL, bounded diagnostics, local inspect/cancel/kill/wait. | One binary and one adapter contract across Windows, Linux, macOS, and source-built FreeBSD. |
 | GNU `timeout` | A time limit and signal policy around one command; default and foreground modes have different process-group behavior | No separate kill-on-owner-death containment contract | Familiar shell status conventions and stderr diagnostics, not a versioned lifecycle stream | Near-ubiquitous, tiny, and ideal when a deadline is the whole requirement. |
 | `setsid` / `start_new_session` | A POSIX session and process group, not a resource container | No owner-death reap; a descendant can create another session | Whatever wait, exit, logging, and cleanup logic the caller writes | Minimal mechanism for terminal detachment and shell/job-control composition. |
 | systemd service or scope | A cgroup owned by the system or user service manager | The unit remains manager-owned rather than depending on the short-lived CLI client; stop and restart behavior follows unit policy | Native unit state, cgroup accounting, journal integration, and systemd resource controls | Durable Linux host supervision, delegated cgroups, boot integration, restart policy, and administrator tooling. |
@@ -34,7 +34,7 @@ the choices below can also be layered.
 
 The ProcessKit row is deliberately conditional. Read the actual `mechanism` and
 `abrupt_cleanup` values from `run_started`; do not infer Windows' `whole_tree`
-owner-death guarantee on Linux or macOS. The normative matrix is in
+owner-death guarantee on Linux, FreeBSD, or macOS. The normative matrix is in
 [Platform support](platform-support.md#mechanism-and-abrupt-cleanup).
 
 ## Compared with GNU `timeout`
@@ -62,11 +62,13 @@ a cooperating or hostile descendant may start another session, and the session
 does not gain a kill-on-owner-death policy.
 
 ProcessKit itself may honestly fall back to a process group, especially on
-macOS or when Linux cgroup delegation is unavailable. In that case the CLI does
-not claim a stronger boundary: `mechanism` is `process_group`, resource-limit
-requests fail rather than becoming no-ops, and the documented escape and abrupt
-death limitations apply. Use plain `setsid` when that primitive plus your own
-wait/signal code is sufficient.
+macOS/non-FreeBSD BSDs or when Linux cgroup delegation is unavailable. In that
+case the CLI reports `mechanism` as `process_group`; resource-limit requests fail
+rather than becoming no-ops, and the documented escape and abrupt-death
+limitations apply. FreeBSD instead reports its distinct `process_reaper`
+mechanism, whose normal teardown and membership scope cover the whole reaper
+tree but whose resource limits and statistics remain unsupported. Use plain
+`setsid` when that primitive plus your own wait/signal code is sufficient.
 
 ## Compared with `systemd-run --scope`
 
