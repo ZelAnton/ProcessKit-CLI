@@ -515,6 +515,102 @@ fn validate_accepts_a_conforming_stream_and_the_golden_fixture() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `--validate` accepts a well-formed `resource_summary` and rejects a corrupted one,
+/// through the built binary.
+///
+/// The accepted line is the **fully degraded** shape (`read_error: true`, every
+/// measurement `null`), deliberately: the shape a real run on this host produces is
+/// already covered by the test above, whereas the all-`null` form is the one a naive
+/// schema would be tempted to forbid. Its acceptance is what makes the honest-degradation
+/// contract enforceable rather than merely documented.
+///
+/// The rejections cover the three ways the new branch could be written too loosely,
+/// one line each: a measurement typed as a string instead of integer-or-null, the
+/// `read_error` qualifier missing altogether (which would let a reader take an
+/// all-`null` gap for a platform fact), and a negative byte count.
+#[test]
+fn validate_accepts_a_resource_summary_and_rejects_a_corrupted_one() {
+    let dir = scratch("events-validate-resource-summary");
+    let registry = registry_dir(&dir);
+
+    let good = concat!(
+        r#"{"schema_version":1,"time":"2026-08-07T09:00:00.000Z","event":"resource_summary","#,
+        r#""read_error":true,"peak_memory_bytes":null,"total_cpu_ms":null,"#,
+        r#""io_read_bytes":null,"io_write_bytes":null,"peak_process_count":null}"#,
+    );
+    let terminal = concat!(
+        r#"{"schema_version":1,"time":"2026-08-07T09:00:01.000Z","event":"runner_exit","#,
+        r#""code":0,"source":"child_exit","child_code":0}"#,
+    );
+    let accepted = dir.join("resource-summary-ok.jsonl");
+    std::fs::write(&accepted, format!("{good}\n{terminal}\n")).expect("write the fixture");
+    let out = events(
+        &registry,
+        &["--file", &accepted.to_string_lossy(), "--validate"],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an all-null, read_error resource_summary is a conforming line, not a violation; \
+         stdout: {}, stderr: {}",
+        stdout(&out),
+        stderr(&out)
+    );
+
+    // Three separately-broken lines, so the report has to name each one rather than
+    // failing once and stopping.
+    let string_measurement = concat!(
+        r#"{"schema_version":1,"time":"2026-08-07T09:00:00.000Z","event":"resource_summary","#,
+        r#""read_error":false,"peak_memory_bytes":"lots","total_cpu_ms":1500,"#,
+        r#""io_read_bytes":4096,"io_write_bytes":8192,"peak_process_count":null}"#,
+    );
+    let missing_flag = concat!(
+        r#"{"schema_version":1,"time":"2026-08-07T09:00:00.000Z","event":"resource_summary","#,
+        r#""peak_memory_bytes":null,"total_cpu_ms":null,"#,
+        r#""io_read_bytes":null,"io_write_bytes":null,"peak_process_count":null}"#,
+    );
+    let negative_bytes = concat!(
+        r#"{"schema_version":1,"time":"2026-08-07T09:00:00.000Z","event":"resource_summary","#,
+        r#""read_error":false,"peak_memory_bytes":268435456,"total_cpu_ms":1500,"#,
+        r#""io_read_bytes":-1,"io_write_bytes":8192,"peak_process_count":null}"#,
+    );
+    let rejected = dir.join("resource-summary-bad.jsonl");
+    std::fs::write(
+        &rejected,
+        format!("{string_measurement}\n{missing_flag}\n{negative_bytes}\n{terminal}\n"),
+    )
+    .expect("write the fixture");
+    let out = events(
+        &registry,
+        &["--file", &rejected.to_string_lossy(), "--validate"],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(i32::from(exit::EVENTS_INVALID)),
+        "a corrupted resource_summary fails closed; stdout: {}",
+        stdout(&out)
+    );
+    let report = stdout(&out);
+    assert!(
+        report.contains("line 1: /peak_memory_bytes:"),
+        "a measurement typed as a string is named at its own pointer: {report}"
+    );
+    assert!(
+        report.contains("line 2:") && report.contains("read_error"),
+        "a missing read_error qualifier is a violation, not a tolerated omission: {report}"
+    );
+    assert!(
+        report.contains("line 3: /io_read_bytes:"),
+        "a negative byte count is rejected: {report}"
+    );
+    assert!(
+        report.contains("3 invalid"),
+        "each broken line is reported, not just the first: {report}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The gate an adapter author actually wants: a non-conforming line fails with the
 /// reserved `EVENTS_INVALID` code and a report naming the line and what it violated
 /// — never a silent pass, and never a generic error.

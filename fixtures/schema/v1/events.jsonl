@@ -19,3 +19,4 @@
 {"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"runner_exit","code":109,"source":"control_kill","child_code":null}
 {"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"output_overflow","stream":"stdout","max_bytes":65536,"grace_ms":2000}
 {"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"runner_exit","code":113,"source":"output_overflow","child_code":null}
+{"schema_version":1,"time":"2023-11-14T22:13:20.123Z","event":"resource_summary","read_error":false,"peak_memory_bytes":268435456,"total_cpu_ms":1500,"io_read_bytes":4096,"io_write_bytes":8192,"peak_process_count":null}

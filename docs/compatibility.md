@@ -73,24 +73,47 @@ inspect
 inspect:--json
 cancel:--all
 attest:peer-identity
+run:resource-summary
 ```
 
 The first two forms name a **spelling** the parser accepts, and are derived from the
 live clap definition so they cannot drift from the real one. The third names a
-platform **capability** instead — "can this binary *do* the thing that spelling asks
-for here", which no parser can answer — and is told apart by carrying **no `--`**:
-`attest:peer-identity` is today the only one. It is published exactly where this
-build can obtain a kernel-authenticated identity for a control-plane client, which is
-what makes `attest` able to return a membership verdict at all (see
-[`docs/control-plane.md`](control-plane.md) and [`docs/integration.md`](integration.md),
-§1). The missing `--` is what keeps the two categories from being read as one
+**capability** instead — "can this binary *do* the thing", which no parser can
+answer — and is told apart by carrying **no `--`**. The missing `--` is what keeps the
+two categories from being read as one
 another, so an adapter that validates this array with a pattern of its own must
 admit the `--`-less form; the published grammar is the `surface` pattern in
 `fixtures/schema/cli/probe.schema.json`.
 
-A capability token's **presence is a guarantee**: this target names the peer, so a
-negative membership answer from it is a real verdict rather than a missing capability
-in disguise. Its **absence withholds that guarantee rather than predicting failure** —
+There are two capability tokens, and they differ in *why* they might be absent:
+
+- **`attest:peer-identity` — a platform capability.** Published exactly where this
+  build can obtain a kernel-authenticated identity for a control-plane client, which is
+  what makes `attest` able to return a membership verdict at all (see
+  [`docs/control-plane.md`](control-plane.md) and
+  [`docs/integration.md`](integration.md), §1). A given target may lack it.
+- **`run:resource-summary` — a build capability.** Published by every build whose `run`
+  emits the terminal `resource_summary` event (see
+  [`docs/schema.md`](schema.md#resource_summary)). No platform removes it; only an
+  older binary lacks it. That is exactly why it needs a token: an event's presence is
+  otherwise undiscoverable until a run has already finished without it, which is after
+  the work the number was wanted for.
+
+A consumer requires either with the same `--require-surface` and does not need to know
+which kind it is holding.
+
+A capability token's **presence is a guarantee**, and it is worth being precise about
+*what* is guaranteed in each case. `attest:peer-identity` guarantees this target names
+the peer, so a negative membership answer from it is a real verdict rather than a
+missing capability in disguise. `run:resource-summary` guarantees the event will be in
+the stream — **not** that any particular measurement in it is populated: which axes
+carry numbers is a property of the containment mechanism (`run_started.mechanism`), and
+the normative matrix is in
+[`docs/resource-limits.md`](resource-limits.md#what-the-tree-consumed). A single token
+could not honestly carry five per-platform facts, and splitting it into five would
+publish as capabilities what are really documented properties of the mechanism.
+
+A capability's **absence withholds its guarantee rather than predicting failure** —
 `attest` on a build without the token still answers from whatever the kernel actually
 provides, and fails closed with `peer_identity_unsupported` when that is nothing.
 Requiring it therefore turns "this platform cannot prove membership" into an ordinary
@@ -125,8 +148,15 @@ Within one schema version, a reader must tolerate every one of the following.
 Removing a field, renaming it, or changing the meaning or type of an existing one
 is what requires a new schema version — nothing below does.
 
-1. **New event types.** Route by the `event` discriminator and ignore a type you
-   do not know, rather than failing on it or assuming the stream is corrupt.
+1. **New event types — including ones that appear in *every* run.** Route by the
+   `event` discriminator and ignore a type you
+   do not know, rather than failing on it or assuming the stream is corrupt. Note the
+   scope of this obligation carefully: a new type need not be gated behind a flag.
+   `resource_summary` (see [`docs/schema.md`](schema.md#resource_summary)) is the worked
+   example — it is emitted by every run that spawned a child, so a default `run`'s
+   stream is one line longer than an earlier v1 build's. Nothing existing changed, which
+   is what makes it additive; a reader that pinned the exact *set* of event types a run
+   emits, rather than routing by tag, is the only kind that notices.
 2. **More occurrences of an event type you already know**, including a type that
    previously occurred at most once. Within a version you may **not** assume any
    event type is unique, or that its position in the stream is fixed relative to
@@ -150,6 +180,16 @@ is what requires a new schema version — nothing below does.
    pre-spawn `limit_hit` path. Since no group exists on that path, it has no
    `limit_evidence` event; readers must not synthesize an `unknown` evidence
    record for it.
+
+   The `resource_summary` event carries the same obligation in a stronger form,
+   because *every* one of its measurements is nullable: a `null` means "this
+   mechanism does not account for it" and must not be read as, or replaced by, `0`.
+   Check its `read_error` flag before drawing any conclusion from a `null` — an
+   all-`null` summary is a correct reading on a mechanism with no whole-tree
+   accounting, and only that flag distinguishes it from a read that failed. The
+   per-axis platform matrix is in
+   [`docs/resource-limits.md`](resource-limits.md#what-the-tree-consumed), and its two
+   IO counters are explicitly **not** comparable across platforms.
 4. **New values in an open-ended descriptive string field** — a new `cancelled`
    `source`, a new `runner_exit` `source`, a new `hint` label. Treat an unrecognized
    value as "some other trigger" and keep routing by event type.

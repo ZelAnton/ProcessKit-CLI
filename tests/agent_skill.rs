@@ -88,7 +88,8 @@ fn skill_facts_match_the_built_compatibility_surface() {
 /// than from a list kept here: `probe --json`'s tokens are derived from the live
 /// clap tree (`src/probe.rs`, `surface_tokens`), and a token with no `:` in it is
 /// exactly a subcommand name — every flag token carries one (`run:--jsonl`), and so
-/// does the single capability token (`attest:peer-identity`), deliberately.
+/// does every capability token (`attest:peer-identity`, `run:resource-summary`),
+/// deliberately.
 fn built_subcommand_names() -> Vec<String> {
     let output = Command::new(common::bin())
         .args(["probe", "--json"])

@@ -518,13 +518,19 @@ file — not the control client — still sees that the run ended by an outside 
 
 - **`cancel`** writes a `cancelled` event with `source` **`control_cancel`** (told
   apart from the local stop signals, which are `ctrl_c` / `sigterm` / `sighup` (Unix)
-  / `ctrl_break` / `ctrl_close` / `ctrl_logoff` / `ctrl_shutdown` (Windows)), the
+  / `ctrl_break` / `ctrl_close` / `ctrl_logoff` / `ctrl_shutdown` (Windows)), a
+  `resource_summary`, the
   `cleanup_started` / `cleanup_finished`
   teardown pair, and a terminal `runner_exit` with `source` `control_cancel` and code
   `108`.
-- **`kill`** writes a dedicated `killed` event with `source` **`control_kill`**, the
+- **`kill`** writes a dedicated `killed` event with `source` **`control_kill`**, a
+  `resource_summary`, the
   cleanup pair (with `soft_terminate` `null` — no soft stop was attempted), and a
   terminal `runner_exit` with `source` `control_kill` and code `109`.
+
+An outside command therefore does not cost the observer the run's consumption figures:
+`resource_summary` is emitted on these endings exactly as on a natural exit, before the
+teardown that destroys the counters it reads.
 
 See [`docs/schema.md`](schema.md) for these events.
 

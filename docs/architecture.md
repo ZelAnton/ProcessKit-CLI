@@ -168,7 +168,11 @@ implemented in `run::execute` (`src/run/mod.rs`) and `run::launch::run_async`
    hard-kills the whole tree immediately via the same kill-on-drop mechanism —
    documented as immediate on purpose, not a shorter grace. A normal
    completion instead reaps via the same drop once the child's own exit is
-   observed (`root_exited`, then `cleanup_started`/`cleanup_finished`).
+   observed (`root_exited`, then `cleanup_started`/`cleanup_finished`). Every
+   ending, forced or natural, first reads the container's own accounting into a
+   `resource_summary` event — and, where a cap was requested, the `limit_evidence`
+   that precedes it — because both facts live in the container the teardown is
+   about to destroy.
 5. **`runner_exit`.** The terminal JSONL event closes the stream, always
    carrying the outcome — the child's own exit code on a normal completion,
    or the reserved code for whichever runner-imposed ending fired

@@ -45,12 +45,16 @@ The adapter-facing form of this rule is in the integration guide,
      reason. A *terminal* receipt carries terminal facts; the start-time facts exist
      only in the stream. To actually retire that reader the receipt would have to grow
      into a second, full serialization of the run.
-  2. *The read is six lines.* A foreground run emits six events, seven with
-     `--capture-dir`, and eight if a requested resource cap (`--max-memory` /
+  2. *The read is seven lines.* A foreground run emits seven events, eight with
+     `--capture-dir`, and nine if a requested resource cap (`--max-memory` /
      `--max-processes` / `--cpu-quota`) also contributes its post-run
-     `limit_evidence`. Every way the stream grows past those six is a caller opting
-     in — those two axes plus `--snapshot-interval`'s extra `members_snapshot`
-     samples — i.e. asking for more events on purpose. The full ordering rule is in
+     `limit_evidence`. It was six when this decision was taken; the seventh is the
+     unconditional `resource_summary` (T-317), the one growth that is **not** a caller
+     opting in — and one extra line does not change this argument, which turns on the
+     read being a bounded handful either way. Every other way the stream grows is a
+     caller asking for more events on purpose — those two axes plus
+     `--snapshot-interval`'s extra `members_snapshot`
+     samples. The full ordering rule is in
      [`docs/schema.md`](../schema.md#ordering), "Ordering".
   3. *A cheaper answer already exists.* The `--error-format json` envelope resolves
      exactly the ambiguity the proposal names, with no path to allocate, no artifact

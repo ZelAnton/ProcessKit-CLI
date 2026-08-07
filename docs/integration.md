@@ -54,8 +54,17 @@ The report (one line, shown reformatted here):
   `<subcommand>:--<long-flag>`) — this is how an adapter confirms a flag it
   depends on (for example `run:--capture-dir`) actually exists on this build
   before passing it.
+- Pin **`run:resource-summary`** if the adapter will read what a run consumed — peak
+  memory, CPU, IO bytes, peak process count. Like the token below it this is a
+  *capability*, not a spelling (note the missing `--`), and it says this build's `run`
+  emits the terminal `resource_summary` event. Requiring it is the only way to learn
+  that before a run: an older binary simply writes no such line, which an adapter would
+  otherwise discover by finding it missing from a stream it has already finished
+  collecting. The token guarantees the **event**, not any particular number in it —
+  which measurements are populated follows the containment mechanism, per
+  [`docs/resource-limits.md`](resource-limits.md#what-the-tree-consumed).
 - Pin **`attest:peer-identity`** if the adapter will gate anything on
-  containment membership (§4). It is the one token in `surface` that is a
+  containment membership (§4). It is the other
   *capability* rather than a spelling — note the missing `--` — and it says this
   build can obtain a kernel-authenticated identity for a control-plane client on
   this platform, which is what makes `attest` able to answer at all. Requiring it
@@ -335,11 +344,19 @@ emits, in order:
    `cleanup_finished`) or a runner-imposed ending's reason event (`timeout`,
    `cancelled`, or `killed`) followed by the same `cleanup_started` /
    `cleanup_finished` pair.
-4. `output_captured`, only when `--capture-dir` was set.
-5. `runner_exit` — always the **last line**, the terminal event of every run,
+4. `resource_summary` — what the tree consumed, inserted between the ending event of
+   step 3 and its `cleanup_started`. Exactly one, on **every** run that spawned the
+   child: no flag turns it on and no platform turns it off (a `limit_evidence`, when a
+   cap was requested, sits immediately before it). Every measurement is independently
+   nullable, `null` means "this mechanism does not account for it" rather than zero, and
+   `read_error` must be checked before concluding anything from a `null` — see
+   [`docs/schema.md`](schema.md#resource_summary) and the platform matrix in
+   [`docs/resource-limits.md`](resource-limits.md#what-the-tree-consumed).
+5. `output_captured`, only when `--capture-dir` was set.
+6. `runner_exit` — always the **last line**, the terminal event of every run,
    including a runner failure before the child ever started (in which case
    `spawn_failed` or `container_failed` precedes it instead, with no
-   `run_started`).
+   `run_started` and no `resource_summary` — there was no tree to measure).
 
 **Telling outcomes apart.** Two signals distinguish how a run ended, and an
 adapter should use both together: the process's own **exit code** (fastest to
@@ -775,12 +792,15 @@ is [ADR 0007](adr/0007-no-terminal-receipt-file.md).
   `output_captured` as a failure reason of its own. A *terminal* receipt carries
   terminal facts; the start-time facts exist only in the stream (§3). Such an adapter
   would gain a second artifact and keep the loop.
-- **The read is six lines.** A foreground run emits six events — seven with
+- **The read is seven lines.** A foreground run emits seven events — eight with
   `--capture-dir`, and one more again when a requested resource cap
   (`--max-memory` / `--max-processes` / `--cpu-quota`) adds its post-run
-  `limit_evidence`. Every way the stream grows past those six is a caller opting in,
-  `--snapshot-interval`'s extra `members_snapshot` samples included — that is, asking
-  for more events on purpose. [`docs/schema.md`](schema.md#ordering), "Ordering", is
+  `limit_evidence`. Six of the seven were the whole stream until
+  `resource_summary` joined them unconditionally; that one line is the sole growth a
+  caller did **not** opt into, and it is one line, once, at the end. Every other way
+  the stream grows is a caller asking for more events on purpose —
+  `--capture-dir`, a cap, and `--snapshot-interval`'s extra `members_snapshot`
+  samples. [`docs/schema.md`](schema.md#ordering), "Ordering", is
   the full rule.
 - **A cheaper answer already exists**, and it is the recipe in §3: the
   `--error-format json` envelope resolves exactly this ambiguity with no path to

@@ -12,6 +12,61 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- **`resource_summary`**: a new terminal JSONL event reporting what the contained tree
+  actually **consumed** — `peak_memory_bytes`, `total_cpu_ms`, `io_read_bytes`,
+  `io_write_bytes`, and `peak_process_count`. Until now the stream said *nothing* about
+  resource usage: `members_snapshot` carried only `pid`/`ppid`/`name`/`start_time`, so
+  peak memory and total CPU were neither readable nor reconstructible from it. The
+  runner reads the container's own kernel accounting once (`ProcessGroup::stats()`, via
+  the `processkit` `3.2` → `3.3` bump) after the ending is decided and before
+  `cleanup_finished` hard-kills the group — the same read point as `limit_evidence`, and
+  immediately after it, because both facts live *in* the container and vanish with it.
+  It is emitted by **every** run that spawned a child: no flag, no cap required, every
+  platform, every ending (natural exit, timeout, cancel, kill, and the `foreground`
+  container failure alike), exactly once. Choosing "always" over an opt-in flag is
+  deliberate and recorded in `docs/schema.md`: this is one synchronous read of
+  accumulators the kernel already keeps rather than a sampling cadence, so a flag would
+  save one syscall and one line while leaving the platform that needs the numbers most
+  — Windows, where `limit_evidence` can only ever answer `unknown` for a capped axis —
+  silent unless a caller knew to ask. The honest cost is that a default run's stream is
+  now **seven** lines rather than six, and this is the one growth a caller did not opt
+  into; the "six lines" arguments in `docs/integration.md` and ADR 0007 are updated
+  accordingly. Each measurement is **independently nullable**, and `null` always means
+  *this mechanism does not account for it* — never a stand-in `0`, and never a value
+  improved by taking a maximum over the runner's own periodic reads, which would
+  describe when the runner looked rather than what the tree did. Consequently
+  `peak_process_count` is **always** `null` on Windows (a Job Object keeps
+  `ActiveProcesses` and `TotalProcesses`; neither is a peak), both IO counters are
+  always `null` on macOS/the BSDs and the Linux process-group fallback, and on Linux
+  they need the cgroup v2 `io` controller — which this CLI never enables, since
+  `processkit` enables exactly the controllers a requested cap needs. The two
+  platforms' IO counters are explicitly **not comparable with each other** (a Job
+  Object counts all read/write traffic whatever the target; cgroup `io.stat` counts only
+  what crossed the block layer), and `total_cpu_ms` truncates, so a run using under a
+  millisecond of CPU reports a *measured* `0` — `null` remains the only value meaning
+  unknown. The normative platform matrix, and what this event does **not** prove about a
+  limit, are in `docs/resource-limits.md`, "What the tree consumed".
+  `active_process_count` is deliberately **not** on the event: it is a "how many right
+  now" reading taken after the ending is decided, so it would report the moment the
+  runner looked, and the tree size at teardown already has an honest home in
+  `cleanup_started.members_before`. A failed `stats()` read does **not** skip the event:
+  it is emitted with `read_error: true` and every measurement `null`, mirroring
+  `members_snapshot`/`cleanup_started`/`cleanup_finished`'s existing
+  honest-degradation flags — and here the flag is load-bearing rather than ceremonial,
+  because an all-`null` summary is *also* a correct success on a mechanism with no
+  whole-tree accounting, so nothing else could distinguish a gap from a platform fact.
+  The event is additive within `schema_version = 1`: no existing field was renamed,
+  retyped, or given a new meaning, and the golden fixture gained one appended line with
+  every prior line byte-for-byte unchanged. `events --validate` accepts a conforming
+  `resource_summary` (including the fully degraded shape) and rejects a corrupted one,
+  and `probe --json` publishes a new **non-flag capability token**,
+  `run:resource-summary`, so an adapter that will read the summary can pin the event at
+  preflight (`probe --json --require-surface run:resource-summary`) instead of
+  discovering an older binary's silence only after a run has finished without it. That
+  token's presence guarantees the *event*, not any particular measurement in it — which
+  axes carry numbers follows the mechanism named by `run_started.mechanism`. It is the
+  second token in the `--`-less capability form after `attest:peer-identity`, and the
+  first whose absence is a matter of build version rather than platform.
 - `doctor [--json]`: a **runtime qualification of the host**, and the side-effecting
   counterpart to `probe`. `probe` proves *this binary* exposes the surface a consumer
   needs — it reads compile-time constants and the in-memory CLI tree, spawns nothing,

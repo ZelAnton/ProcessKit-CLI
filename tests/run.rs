@@ -1218,6 +1218,236 @@ fn linux_cgroup_memory_limit_evidence_distinguishes_a_clean_cap() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Every field `resource_summary` declares, for the reader assertions below.
+const RESOURCE_SUMMARY_MEASUREMENTS: [&str; 5] = [
+    "peak_memory_bytes",
+    "total_cpu_ms",
+    "io_read_bytes",
+    "io_write_bytes",
+    "peak_process_count",
+];
+
+/// The mandated ordering proof, **through the built binary** rather than against the
+/// emitter in isolation: an ordinary successful run writes exactly one
+/// `resource_summary`, after the ending is known, before teardown consumes the
+/// container, and strictly before the terminal `runner_exit`.
+///
+/// The run requests **no cap and no flag** — that is the point. `limit_evidence` is
+/// asserted absent in the same breath, so this pins that the summary is unconditional
+/// rather than having quietly inherited its neighbour's `limits_requested` gate (which
+/// is the shape a regression here would most plausibly take, since the two are emitted
+/// from adjacent lines).
+#[test]
+fn a_normal_run_emits_one_resource_summary_before_the_terminal_event() {
+    let dir = scratch("resource-summary-order");
+    let out = run(&dir, &[], shell_inline("exit 0"));
+    assert_eq!(out.status.code(), Some(0), "the trivial child exits 0");
+
+    let events = read_run_events(&dir);
+    let kinds: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event["event"].as_str())
+        .collect();
+    assert_eq!(
+        kinds.iter().filter(|k| **k == "resource_summary").count(),
+        1,
+        "exactly one resource_summary per run: {kinds:?}"
+    );
+    assert!(
+        !kinds.contains(&"limit_evidence"),
+        "this run requested no cap, so the summary is not riding limit_evidence's \
+         condition: {kinds:?}"
+    );
+
+    let position = |tag: &str| {
+        kinds
+            .iter()
+            .position(|found| *found == tag)
+            .unwrap_or_else(|| panic!("the stream must contain a `{tag}` event: {kinds:?}"))
+    };
+    let summary_at = position("resource_summary");
+    assert!(
+        position("root_exited") < summary_at,
+        "the summary is read after the ending is decided: {kinds:?}"
+    );
+    assert!(
+        summary_at < position("cleanup_started"),
+        "the summary is read before teardown consumes the container: {kinds:?}"
+    );
+    assert!(
+        summary_at < position("runner_exit"),
+        "the summary precedes the terminal event: {kinds:?}"
+    );
+    assert_eq!(
+        kinds.last().copied(),
+        Some("runner_exit"),
+        "runner_exit is still the last line: {kinds:?}"
+    );
+
+    let summary = &events[summary_at];
+    assert!(
+        summary["read_error"].is_boolean(),
+        "the qualifier is always present: {summary}"
+    );
+    for field in RESOURCE_SUMMARY_MEASUREMENTS {
+        let value = summary
+            .get(field)
+            .unwrap_or_else(|| panic!("`{field}` is declared on every summary: {summary}"));
+        assert!(
+            value.is_null() || value.as_u64().is_some(),
+            "`{field}` is either an honest null or a non-negative integer, never anything \
+             else: {summary}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The platform-`null` half of the contract, asserted as the **exact** claim
+/// `docs/resource-limits.md` makes rather than as a tolerance: on Windows a Job Object
+/// keeps no peak-concurrency counter, so `peak_process_count` is `null` — always, on
+/// every run, on every Windows host.
+///
+/// This is deliberately an equality, not an "is null or a number": a future change that
+/// filled the field by taking a maximum over the runner's own `stats()` calls would
+/// pass a permissive check while breaking the documented promise that this runner does
+/// not manufacture a peak it never observed.
+#[cfg(windows)]
+#[test]
+fn windows_resource_summary_reports_no_peak_process_count() {
+    let dir = scratch("resource-summary-windows-null");
+    let out = run(&dir, &[], shell_inline("exit 0"));
+    assert_eq!(out.status.code(), Some(0), "the trivial child exits 0");
+
+    let events = read_run_events(&dir);
+    let summary = events
+        .iter()
+        .find(|event| event["event"] == "resource_summary")
+        .expect("every run emits a resource_summary");
+    assert_eq!(
+        summary["read_error"], false,
+        "a Windows Job Object can be read, so this is a confirmed reading: {summary}"
+    );
+    assert!(
+        summary["peak_process_count"].is_null(),
+        "a Job Object keeps no peak-concurrency counter, and the runner does not invent \
+         one from its own reads: {summary}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The Linux counterpart, and the one axis whose absence is *conditional* rather than
+/// absolute: the IO byte counters need the cgroup v2 `io` controller, which this CLI
+/// never enables itself. So either the controller is there and the counters are real
+/// numbers, or it is not and they are `null` — never a fabricated `0` standing in for
+/// the missing controller.
+///
+/// Written as a two-way case analysis rather than a skip, because both outcomes are
+/// documented behaviour and the host decides which one applies.
+///
+/// **Why there is no `> 0` lower bound here**, even though the child provably writes
+/// 1 MiB: it would be unsound against this project's own documented contract, not
+/// merely flaky. `io.stat`'s `wbytes` counts bytes that crossed the **block layer**,
+/// and a write reaches it when the kernel writes the page back — which can happen after
+/// the writing member exited, or not at all if the group is torn down while the page is
+/// still dirty (`docs/resource-limits.md`, "What the tree consumed", consequence 4). A
+/// short write-and-exit run legitimately reporting `0` is documented behaviour, so
+/// asserting non-zero would encode a promise the runner deliberately does not make. The
+/// `sync` in the workload makes a real number likely, and the assertions below pin what
+/// is actually guaranteed: never a fabricated stand-in, and never one half of a counter
+/// block without the other.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_resource_summary_reports_io_bytes_only_where_the_controller_exists() {
+    let dir = scratch("resource-summary-linux-io");
+    // A child that actually writes, so a host with the `io` controller has real
+    // traffic to report rather than a legitimately-zero counter.
+    let out = run(
+        &dir,
+        &[],
+        shell_inline("dd if=/dev/zero of=./io-probe.bin bs=64k count=16 2>/dev/null; sync"),
+    );
+    assert_eq!(out.status.code(), Some(0), "the writing child exits 0");
+
+    let events = read_run_events(&dir);
+    let summary = events
+        .iter()
+        .find(|event| event["event"] == "resource_summary")
+        .expect("every run emits a resource_summary");
+
+    for field in ["io_read_bytes", "io_write_bytes"] {
+        let value = &summary[field];
+        assert!(
+            value.is_null() || value.as_u64().is_some(),
+            "`{field}` is either absent (no `io` controller for this cgroup, or the \
+             process-group fallback) or a real counter — never a stand-in: {summary}"
+        );
+    }
+    // Whatever the controller situation, the two IO axes must agree about whether this
+    // mechanism accounts for IO at all: they are read from the same counter block, so
+    // one populated and the other null would mean the projection lost a value.
+    assert_eq!(
+        summary["io_read_bytes"].is_null(),
+        summary["io_write_bytes"].is_null(),
+        "both halves of one counter block are accounted for, or neither is: {summary}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The runner-imposed-ending path: a `--timeout` run must report consumption too, in
+/// the same position relative to its own reason event as a natural exit does relative
+/// to `root_exited`. A summary that only appeared on the happy path would leave the
+/// endings an operator most wants to explain — the ones that were killed — silent about
+/// what the tree was doing.
+#[test]
+fn a_timed_out_run_still_reports_what_the_tree_consumed() {
+    let dir = scratch("resource-summary-timeout");
+    let long_sleep = if cfg!(windows) {
+        shell_inline("ping -n 300 127.0.0.1 >nul")
+    } else {
+        shell_inline("sleep 300")
+    };
+    let out = run_with_flags(
+        &dir,
+        &[],
+        &["--timeout", "1s", "--grace", "200ms"],
+        long_sleep,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(106),
+        "a timeout takes the reserved TIMEOUT code; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let events = read_run_events(&dir);
+    let kinds: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event["event"].as_str())
+        .collect();
+    assert_eq!(
+        kinds.iter().filter(|k| **k == "resource_summary").count(),
+        1,
+        "a runner-imposed ending emits exactly one summary too: {kinds:?}"
+    );
+    let position = |tag: &str| {
+        kinds
+            .iter()
+            .position(|found| *found == tag)
+            .unwrap_or_else(|| panic!("the stream must contain a `{tag}` event: {kinds:?}"))
+    };
+    assert!(
+        position("timeout") < position("resource_summary")
+            && position("resource_summary") < position("cleanup_started"),
+        "the summary sits between the reason event and the teardown pair, exactly as it \
+         sits between root_exited and the pair on a natural exit: {kinds:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The headline guarantee: after `run` returns, a descendant the child leaked and
 /// abandoned does not survive. The child spawns a detached grandchild that
 /// appends to a heartbeat file on a ~1s cadence, then the child exits. Once `run`
@@ -1483,10 +1713,17 @@ fn capture_overflow_cancel_ends_a_run_with_a_distinct_outcome() {
     assert_eq!(overflow["stream"], "stdout");
     assert_eq!(overflow["max_bytes"], 64);
     assert_eq!(overflow["grace_ms"], 10);
+    // The shared graceful teardown, with the unconditional `resource_summary` read
+    // between the reason event and the pair — this run requested no cap, so no
+    // `limit_evidence` sits alongside it, and the window is contiguous.
     assert!(
-        kinds
-            .windows(3)
-            .any(|window| window == ["output_overflow", "cleanup_started", "cleanup_finished"]),
+        kinds.windows(4).any(|window| window
+            == [
+                "output_overflow",
+                "resource_summary",
+                "cleanup_started",
+                "cleanup_finished"
+            ]),
         "overflow must enter the shared graceful teardown: {kinds:?}"
     );
     let captured = events

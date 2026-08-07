@@ -203,6 +203,35 @@ fn probe_reports_a_consistent_compatible_surface() {
          the capability must be advertised: {surface:?}"
     );
 
+    // The second capability token (T-317), and the one that shows the `--`-less form is
+    // a *category* rather than a synonym for "platform-dependent":
+    // `run:resource-summary` says this build's `run` emits the terminal
+    // `resource_summary` event. Unlike its sibling above it has no platform condition
+    // at all — every build that has the event has the token — which is exactly why an
+    // adapter needs it: an event's presence is otherwise undiscoverable until a run has
+    // already finished without it.
+    assert!(
+        surface.contains(&"run:resource-summary"),
+        "every build that emits resource_summary advertises it: {surface:?}"
+    );
+    // The grammar rule, held from the consumer's side over the whole `run:` namespace
+    // (the production-side twin lives in `src/probe.rs`'s own tests): a `run:` token
+    // either names a long flag or is precisely this one capability. Nothing may appear
+    // in between, which is what stops a capability from being spelled like a flag.
+    let stray: Vec<&&str> = surface
+        .iter()
+        .filter(|token| {
+            token.starts_with("run:")
+                && !token.starts_with("run:--")
+                && **token != "run:resource-summary"
+        })
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "a `run:` token is a long flag or the one capability, never a third shape: \
+         {stray:?}"
+    );
+
     // No side effects: the probe spawned nothing and wrote nothing to its cwd.
     let leftovers: Vec<_> = std::fs::read_dir(&dir)
         .expect("read the probe cwd")
@@ -347,6 +376,42 @@ fn incompatible_band_and_surface_fail_closed_and_real_ones_pass() {
     let mistyped = probe(&dir, &["--require-surface", "attest:--peer-identity"]);
     assert_eq!(mistyped.status.code(), Some(PROBE_INCOMPATIBLE));
     assert_eq!(parse_report(&mistyped)["compatible"], false);
+
+    // The second capability token, round-tripped the way an adapter that will read the
+    // consumption summary actually preflights it — alongside the flags it will use, in
+    // one invocation, exactly like the flag tokens beside it.
+    let summary = probe(
+        &dir,
+        &[
+            "--require-surface",
+            "run",
+            "--require-surface",
+            "run:--jsonl",
+            "--require-surface",
+            "run:resource-summary",
+        ],
+    );
+    assert_eq!(
+        summary.status.code(),
+        Some(0),
+        "requiring the resource_summary capability passes on a build that has it; \
+         stderr: {}",
+        String::from_utf8_lossy(&summary.stderr)
+    );
+    assert_eq!(parse_report(&summary)["compatible"], true);
+
+    // And the same grammar trap on this token: spelled with `--` it is not the
+    // capability, it is an unknown flag, and it fails closed. Requiring it must not
+    // accidentally be satisfied by the real capability's presence.
+    let mistyped_summary = probe(&dir, &["--require-surface", "run:--resource-summary"]);
+    assert_eq!(
+        mistyped_summary.status.code(),
+        Some(PROBE_INCOMPATIBLE),
+        "a capability spelled as a flag is an unknown token, not a satisfied \
+         requirement; stdout: {}",
+        String::from_utf8_lossy(&mistyped_summary.stdout)
+    );
+    assert_eq!(parse_report(&mistyped_summary)["compatible"], false);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

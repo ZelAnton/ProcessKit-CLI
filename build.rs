@@ -10,9 +10,10 @@
 //! ## Why build-time generation, not a `generate-completions` subcommand
 //!
 //! `probe`'s surface tokens (`src/probe.rs::surface_tokens`) are derived from
-//! the **runtime** `Cli::command()` tree via `Command::get_subcommands()` (the one
-//! exception, the platform-capability token `attest:peer-identity`, names something
-//! no parser tree could know) — every
+//! the **runtime** `Cli::command()` tree via `Command::get_subcommands()` (the two
+//! exceptions, the capability tokens `attest:peer-identity` and
+//! `run:resource-summary`, name things no parser tree could know — a platform
+//! facility and an emitted event) — every
 //! subcommand in that tree, visible or `hide = true`, is part of what a
 //! consumer's fail-closed `--require-surface` preflight can observe growing or
 //! shrinking release to release. A visible `generate-completions` subcommand

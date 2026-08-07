@@ -1030,6 +1030,20 @@ that the ending was a resource limit (see [the exit-code
 contract](docs/exit-codes.md)). An adapter that *depends* on a cap should treat a
 `limit_hit` as a hard failure rather than a warning.
 
+**What the tree actually consumed is a separate event.** `limit_hit` and
+`limit_evidence` are both about a *cap* — whether it could be installed, and whether it
+fired. Neither says how much the tree used. Every run that spawned a child, capped or
+not, additionally emits a terminal `resource_summary` event carrying peak memory, total
+CPU, IO bytes read and written, and peak process count. There is no flag: it is one
+read of counters the kernel already keeps. Each measurement is independently `null`
+where the containment mechanism does not account for it — never `0`, and never a number
+this runner improved by sampling itself — so `peak_process_count` is always `null` on
+Windows, and the IO counters are `null` on macOS/BSD and need Linux cgroup v2's `io`
+controller. The two platforms' IO counters are **not** comparable with each other. See
+[Resource limits](docs/resource-limits.md), "What the tree consumed", for the normative
+matrix, and preflight the event with `probe --json --require-surface
+run:resource-summary`.
+
 **Linux `--max-processes` caveat.** On Linux the kernel checks the process-count
 cap only when a process forks *inside* the cgroup, so `--max-processes` reliably
 bounds the **descendants** a contained child spawns (its own fork bomb), but does
@@ -1052,6 +1066,9 @@ mechanism, working directory), `members_snapshot`, `root_exited`, the
 `cleanup_started` / `cleanup_finished` teardown pair, `timeout` / `cancelled`,
 launch and container errors (including a `limit_hit` when a `--max-memory` /
 `--max-processes` / `--cpu-quota` cap could not be applied — see "Resource
+limits"), a `resource_summary` recording what the contained tree consumed (peak
+memory, CPU, IO bytes, peak process count — on every run that spawned a child, with
+each measurement `null` where the mechanism does not account for it; see "Resource
 limits"), an `output_captured` event when `--capture-dir` is set (see "Bounded
 output capture"), and a terminal `runner_exit` that preserves the child's own code
 even when the runner itself fails — so a child's code is never lost or aliased.

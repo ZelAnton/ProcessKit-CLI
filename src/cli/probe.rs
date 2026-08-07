@@ -43,8 +43,9 @@ pub struct ProbeArgs {
 
     /// Require a CLI **surface token** to be present (repeatable). A token is a
     /// subcommand name (`run`, `probe`), a subcommand long flag
-    /// (`run:--capture-dir`, `inspect:--json`), or a platform capability, told apart
-    /// by carrying no `--` (`attest:peer-identity`). An absent token is a
+    /// (`run:--capture-dir`, `inspect:--json`), or a capability, told apart
+    /// by carrying no `--` (`attest:peer-identity`, `run:resource-summary`). An
+    /// absent token is a
     /// fail-closed incompatibility, so a consumer can assert that the exact flags —
     /// and capabilities — it will use exist.
     #[arg(long = "require-surface", value_name = "token")]

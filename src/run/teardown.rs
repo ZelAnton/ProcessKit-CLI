@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use processkit::{
     Error as PkError, ErrorReason as PkErrorReason, LimitVerdict, MemberInfo, Outcome,
-    ProcessGroup, SoftSignal,
+    ProcessGroup, ProcessGroupStats, SoftSignal,
 };
 
 use crate::capture::Capture;
@@ -88,7 +88,87 @@ fn limit_verdict_str(verdict: LimitVerdict) -> &'static str {
     verdict.name()
 }
 
-/// The shared **hard** teardown tail — mark cleanup started, hard-kill the
+/// The honest-degradation policy behind [`Event::ResourceSummary`], as a pure
+/// function over the `stats()` result: `Ok` projects the container's own counters,
+/// `Err` reports every axis as `None` under `read_error: true`.
+///
+/// **It returns an `Event`, not an `Option<Event>`.** That is the design, not an
+/// accident of signature: there is no value this function can return that tells
+/// [`emit_resource_summary`] to write nothing, so a failed measurement is
+/// *structurally* incapable of turning into a missing event. Skipping on error was
+/// the alternative this rejected — it would make a failed read look exactly like a
+/// run that never measured, which is the "silent omission" this project's
+/// honest-degradation convention exists to prevent (see [`Event::ResourceSummary`]
+/// and `docs/schema.md`, "resource_summary").
+///
+/// Note what the `Err` arm must *not* be confused with: an all-`None` summary is also
+/// a perfectly good **success** on a mechanism that keeps no whole-tree accounting
+/// (the POSIX process group, macOS/the BSDs). The numbers are therefore identical in
+/// both cases and `read_error` is the sole discriminator — the same relationship
+/// [`snapshot_members_or_unknown`]'s empty `members` has to its own flag.
+///
+/// Pulled out as a pure function for the K-059/[K-070] reason its three siblings in
+/// this module already are: `stats()`'s real `Err` is backend-internal plumbing, not
+/// deterministically forceable from a spawned test child, so the failure branch is
+/// exercised directly against a synthetic [`PkError`]. The `Ok` side additionally
+/// *cannot* be built here at all — `processkit::ProcessGroupStats` is
+/// `#[non_exhaustive]` with no public constructor (the same limitation `MemberInfo`
+/// imposes on [`snapshot_members_or_unknown`], K-043) — so the populated projection
+/// is pinned by the real through-the-binary run in `tests/run.rs` and by the wire-shape
+/// unit tests in [`crate::events`], not by a hand-built snapshot.
+fn resource_summary_event(stats: Result<ProcessGroupStats, PkError>) -> Event {
+    match stats {
+        Ok(stats) => Event::ResourceSummary {
+            read_error: false,
+            peak_memory_bytes: stats.peak_memory_bytes,
+            // Milliseconds, truncated toward zero: the unit every other duration on
+            // this wire uses. Sub-millisecond CPU therefore reports a *measured* `0`,
+            // which is not the same claim as `null` (see `Event::ResourceSummary`).
+            total_cpu_ms: stats.total_cpu_time.map(duration_ms),
+            io_read_bytes: stats.io_read_bytes,
+            io_write_bytes: stats.io_write_bytes,
+            // `usize` -> `u64` so the wire width does not depend on the host's
+            // pointer size; widening on every target this builds for, never lossy.
+            peak_process_count: stats.peak_process_count.map(|count| count as u64),
+        },
+        Err(_) => Event::ResourceSummary {
+            read_error: true,
+            peak_memory_bytes: None,
+            total_cpu_ms: None,
+            io_read_bytes: None,
+            io_write_bytes: None,
+            peak_process_count: None,
+        },
+    }
+}
+
+/// Emit what the contained tree actually consumed, while the owning group — and so
+/// the kernel accounting it holds — still exists.
+///
+/// **Unconditional**, unlike its neighbour [`emit_limit_evidence`]: every run that
+/// got as far as spawning the child emits exactly one of these, whether or not a
+/// `--max-*` cap was requested and whatever the mechanism can actually report. The
+/// recorded reason for choosing "always" over an opt-in flag is in
+/// `docs/schema.md`, "resource_summary"; the short form is that this is one
+/// synchronous read of accumulators the kernel already maintains, so an opt-in would
+/// save nothing measurable while leaving the platform that needs the numbers most —
+/// Windows, where `limit_evidence` can only ever answer `unknown` — silent unless a
+/// caller knew to ask.
+///
+/// A `stats()` failure is a diagnostics gap, not a run failure: it warns on stderr
+/// for a foreground operator and [`resource_summary_event`] records the gap **in the
+/// stream** as `read_error: true`, which is the only channel a detached run has (its
+/// stderr is `Stdio::null()` — see `super::detach`).
+pub(super) fn emit_resource_summary(emitter: &mut Emitter, group: &ProcessGroup) {
+    let stats = group.stats();
+    if let Err(err) = &stats {
+        eprintln!("processkit-cli: warning: could not read container resource usage: {err}");
+    }
+    emitter.emit(&resource_summary_event(stats));
+}
+
+/// The shared **hard** teardown tail — read the container's counters, mark cleanup
+/// started, hard-kill the
 /// container immediately (no soft stop), report the capture, and drop the
 /// registry entry, in that order — for every decided ending that has no
 /// soft-stop tier of its own: a clean natural exit, a wait failure (the
@@ -97,6 +177,11 @@ fn limit_verdict_str(verdict: LimitVerdict) -> &'static str {
 /// site makes it structurally impossible for one of them to again drift from
 /// the others, as the wait-failure branch once did (it used to return
 /// through the bare [`finish`] instead, skipping this whole tail).
+///
+/// Both container reads come first and in this fixed order — the conditional
+/// [`emit_limit_evidence`], then the unconditional [`emit_resource_summary`] — because
+/// both live in the group and [`emit_cleanup_finished`] hard-kills it. Neither may
+/// move into or past the `cleanup_started`/`cleanup_finished` pair.
 ///
 /// The three endings with a soft-stop tier (`timeout` / `cancel` /
 /// `control_cancel`, in [`super::launch::run_async`]'s `Ending` match) are not funneled
@@ -112,6 +197,7 @@ pub(super) fn emit_hard_teardown(
     limits_requested: bool,
 ) {
     emit_limit_evidence(emitter, group, limits_requested);
+    emit_resource_summary(emitter, group);
     emit_cleanup_started(emitter, group);
     emit_cleanup_finished(emitter, group, None);
     emit_output_captured(emitter, capture);
@@ -1091,13 +1177,21 @@ mod tests {
     /// [`emit_hard_teardown`], the exact shared tail both of those `Ending::Exited`
     /// error arms now run (see the `Err(err)` arm on the wait itself, and the
     /// `Err(error)` arm on `exit_code_for(outcome)`, in `run_async`), fires
-    /// `cleanup_started` → the hard kill via `cleanup_finished` (with no
+    /// `resource_summary` → `cleanup_started` → the hard kill via `cleanup_finished`
+    /// (with no
     /// soft-terminate tier) → `output_captured` → nothing else, in that order,
     /// for *any* caller — natural exit, control-kill, and both decode-failure
     /// paths alike. A future edit that special-cases one of those callers back
     /// out of this shared function (as the wait-failure path used to be) has
     /// nowhere to silently diverge: it would have to stop calling this helper,
     /// which is visible on review.
+    ///
+    /// The leading `resource_summary` is asserted here for the read-point property
+    /// rather than for its values: it must land **before** `cleanup_finished`'s
+    /// `kill_all()`, since that is what destroys the accounting it reads. `false` is
+    /// passed for `limits_requested`, so no `limit_evidence` precedes it and this
+    /// pins that the unconditional summary does not inherit the conditional event's
+    /// gating.
     #[tokio::test]
     async fn hard_teardown_tail_emits_the_shared_sequence_in_order() {
         let group = ProcessGroup::new().expect("create a ProcessGroup");
@@ -1143,15 +1237,30 @@ mod tests {
             .collect();
         assert_eq!(
             kinds,
-            vec!["cleanup_started", "cleanup_finished", "output_captured"],
-            "the shared hard-teardown tail must emit exactly these three events \
+            vec![
+                "resource_summary",
+                "cleanup_started",
+                "cleanup_finished",
+                "output_captured",
+            ],
+            "the shared hard-teardown tail must emit exactly these four events \
              in this order for every caller"
         );
         assert!(
-            lines[1]["soft_terminate"].is_null(),
+            lines[2]["soft_terminate"].is_null(),
             "the hard-teardown tail never soft-stops, so cleanup_finished's \
              soft_terminate must be null: {:?}",
-            lines[1]
+            lines[2]
+        );
+        // The summary is emitted whatever the read returned — the flag qualifies the
+        // numbers, and its presence is what proves the event is not skipped on
+        // failure. (Which arm this host takes is a platform fact, not this test's
+        // subject; `resource_summary_event_flags_a_failed_read_...` pins the `Err`
+        // projection directly.)
+        assert!(
+            lines[0]["read_error"].is_boolean(),
+            "resource_summary always carries its read_error qualifier: {:?}",
+            lines[0]
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1228,12 +1337,14 @@ mod tests {
             kinds,
             vec![
                 "container_failed",
+                "resource_summary",
                 "cleanup_started",
                 "cleanup_finished",
                 "runner_exit",
             ],
             "a terminal-handoff failure emits the describing container_failed first, \
-             then the hard-teardown pair, then the terminal runner_exit"
+             then the shared hard-teardown tail (whose leading resource_summary reads \
+             the container the child did spawn into), then the terminal runner_exit"
         );
 
         // The describing event carries the new `foreground` phase, the BACKEND code,
@@ -1352,6 +1463,66 @@ mod tests {
             remaining_pids_or_unknown(Err(simulated)),
             (Vec::new(), true),
             "a read failure must not be indistinguishable from a confirmed-clean teardown"
+        );
+    }
+
+    /// The [`resource_summary_event`] twin of the three tests above — same K-059
+    /// rationale (`stats()`'s real `Err` is backend-internal plumbing, not
+    /// deterministically forceable from a spawned test child), with the injected
+    /// failure being a real `PkError` rather than a stand-in.
+    ///
+    /// It proves the `Err` arm yields a **flagged, entirely empty** summary — an
+    /// `Event`, never a "skip this event" signal, which is what the return type
+    /// already makes structurally impossible and this pins as a value.
+    ///
+    /// Destructured rather than field-picked on purpose: a measurement added to this
+    /// event later is a compile error right here, so it cannot silently join the
+    /// failure path fabricating a `0`.
+    ///
+    /// Two things this test deliberately does **not** cover, each proven elsewhere so
+    /// it is not merely omitted:
+    ///
+    /// - The `Ok` arm is unreachable from here — `processkit::ProcessGroupStats` is
+    ///   `#[non_exhaustive]` with no public constructor, the same limitation
+    ///   `MemberInfo` imposes on [`snapshot_members_or_unknown`] (K-043). The
+    ///   populated projection is proven by the real run in `tests/run.rs`.
+    /// - That the flag is *load-bearing* — an all-`null` failure being
+    ///   distinguishable from an all-`null` success, which is what a mechanism with no
+    ///   whole-tree accounting legitimately reports — needs both variants side by
+    ///   side, so it lives in `crate::events`'
+    ///   `resource_summary_records_a_failed_read_as_a_flagged_gap`, where both can be
+    ///   constructed.
+    #[test]
+    fn resource_summary_event_flags_a_failed_read_instead_of_a_confirmed_platform_gap() {
+        let simulated = PkError::from(PkErrorReason::Io(std::io::Error::other(
+            "simulated stats() failure",
+        )));
+        let Event::ResourceSummary {
+            read_error,
+            peak_memory_bytes,
+            total_cpu_ms,
+            io_read_bytes,
+            io_write_bytes,
+            peak_process_count,
+        } = resource_summary_event(Err(simulated))
+        else {
+            panic!("a failed stats() read must still produce a resource_summary event");
+        };
+        assert!(
+            read_error,
+            "a failed stats() read is recorded as a flagged gap, never dropped"
+        );
+        assert_eq!(
+            (
+                peak_memory_bytes,
+                total_cpu_ms,
+                io_read_bytes,
+                io_write_bytes,
+                peak_process_count
+            ),
+            (None, None, None, None, None),
+            "a failed read fabricates no measurement — every axis stays explicitly \
+             absent rather than reporting a plausible 0"
         );
     }
 

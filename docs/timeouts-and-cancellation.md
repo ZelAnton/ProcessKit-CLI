@@ -161,10 +161,17 @@ A runner-imposed ending normally emits:
 
 ```text
 timeout | cancelled | killed
+resource_summary
 cleanup_started
 cleanup_finished
 runner_exit
 ```
+
+`resource_summary` — what the tree consumed — is part of the tail on **every** ending,
+not just a natural exit: the child ran, so it has consumption to report. It sits between
+the reason event and `cleanup_started` because the counters live in the container that
+`cleanup_finished` hard-kills. A run that also requested a resource cap emits
+`limit_evidence` immediately before it, from the same read point.
 
 `members_snapshot` is not part of that tail: one is emitted right after
 `run_started`, and — with the opt-in `--snapshot-interval <duration>` cadence —

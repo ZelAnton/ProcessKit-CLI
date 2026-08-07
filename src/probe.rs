@@ -117,11 +117,18 @@ pub struct ProbeReport {
     /// real parser. A consumer reads this to confirm the exact flags it will use
     /// exist.
     ///
-    /// One entry is a **capability** rather than a spelling, and is distinguishable
+    /// Two entries are **capabilities** rather than spellings, and are distinguishable
     /// by carrying no `--`: `attest:peer-identity` (see [`PEER_IDENTITY_TOKEN`]),
-    /// present only where this build can obtain a kernel-authenticated peer identity.
-    /// A consumer requires it exactly as it requires a flag, with
+    /// present only where this build can obtain a kernel-authenticated peer identity,
+    /// and `run:resource-summary` (see [`RESOURCE_SUMMARY_TOKEN`]), present on every
+    /// build that emits the terminal `resource_summary` event. A consumer requires
+    /// either exactly as it requires a flag, with
     /// `--require-surface`, and gets the same fail-closed verdict when it is missing.
+    ///
+    /// The two show that the `--`-less form is one category — "can this binary *do*
+    /// this", which no parser can answer — with two sources: a *platform* capability
+    /// the target may lack, and a *build* capability every copy of this version has.
+    /// A consumer pins them identically and does not need to know which it is holding.
     pub surface: Vec<String>,
     /// Whether every `--require-*` expectation the consumer asked for is satisfied.
     /// `true` when no expectation was requested (a healthy self-report).
@@ -257,6 +264,34 @@ fn evaluate(args: &ProbeArgs) -> Vec<String> {
 /// one target where the two differ, and why the claim is deliberately conservative.
 const PEER_IDENTITY_TOKEN: &str = "attest:peer-identity";
 
+/// The second **capability** token: this build's `run` emits the terminal
+/// `resource_summary` event — what the contained tree actually consumed, read from
+/// the container's own kernel accounting (`crate::events::Event::ResourceSummary`,
+/// `docs/schema.md`, "resource_summary").
+///
+/// **Why it needs a token at all**, when no flag turns it on and no platform turns it
+/// off: precisely *because* of that. There is nothing else for a consumer to pin. An
+/// event's presence is a property of the *build*, and an adapter that will read this
+/// summary — a scheduler attributing a batch's memory, a CI job charging CPU — would
+/// otherwise discover an older binary's silence only by finding no such line in a
+/// finished run's stream, i.e. after the work it wanted the number for. Publishing it
+/// here turns that into the same fail-closed `PROBE_INCOMPATIBLE` (110) at preflight
+/// as every other unmet expectation.
+///
+/// **Presence is not a promise of numbers.** It says the event will be there, not that
+/// any given axis will be populated: `peak_process_count` is `null` on all of Windows
+/// and the IO counters on all of macOS/BSD by mechanism, and a run may report
+/// `read_error`. Those are per-axis platform facts a *single* token could not honestly
+/// carry (`docs/resource-limits.md`, "What the tree consumed", is the matrix), and
+/// splitting them into five platform tokens would publish as capabilities what are
+/// really documented properties of the mechanism named by `run_started.mechanism`.
+/// This token is deliberately the weaker, checkable claim.
+///
+/// Unlike [`PEER_IDENTITY_TOKEN`] it is unconditional — hence no `if` at its push
+/// site. That is the honest form: this build always emits the event, so a condition
+/// would either be `true` (noise) or imply a platform variability that does not exist.
+const RESOURCE_SUMMARY_TOKEN: &str = "run:resource-summary";
+
 /// The binary's CLI surface tokens, derived from the **live** clap definition so the
 /// report can never drift from the real parser: for each subcommand, its name, plus
 /// `<name>:--<long>` for each of its long flags — its own, and the top-level
@@ -274,16 +309,19 @@ const PEER_IDENTITY_TOKEN: &str = "attest:peer-identity";
 /// `help` subcommand and would silently widen the published surface with tokens no
 /// task asked for.
 ///
-/// **One token is not clap-derived, and cannot be**: [`PEER_IDENTITY_TOKEN`]
-/// (`attest:peer-identity`, no `--`, because it is not a flag). Every other token
-/// answers "does this binary accept this spelling", which the parser knows; that one
-/// answers "can this binary *do* the thing that spelling asks for on this platform",
-/// which the parser cannot know and which is genuinely platform-dependent. Publishing
-/// it here rather than inventing a second discovery channel keeps a consumer's
+/// **Two tokens are not clap-derived, and cannot be**: [`PEER_IDENTITY_TOKEN`]
+/// (`attest:peer-identity`) and [`RESOURCE_SUMMARY_TOKEN`] (`run:resource-summary`) —
+/// neither carries `--`, because neither is a flag. Every other token
+/// answers "does this binary accept this spelling", which the parser knows; these
+/// answer "can this binary *do* the thing", which the parser cannot know: for the
+/// first because it is genuinely platform-dependent, for the second because emitting
+/// an event is not a spelling the parser has any view on at all. Publishing them
+/// here rather than inventing a second discovery channel keeps a consumer's
 /// preflight to one command and one mechanism (`--require-surface`), and the distinct
 /// grammar — no `--` — is what keeps the two categories from being confused for each
-/// other. A flag's presence is still never hand-maintained: only this capability is,
-/// and its condition is a single constant owned by the module that implements it.
+/// other. A flag's presence is still never hand-maintained: only these capabilities
+/// are, and each one's condition is owned by the module that implements it (a
+/// constant for the platform-dependent one; unconditional for the build-level one).
 fn surface_tokens() -> Vec<String> {
     use clap::CommandFactory;
 
@@ -308,6 +346,9 @@ fn surface_tokens() -> Vec<String> {
     if crate::control::PEER_IDENTITY_SUPPORTED {
         tokens.push(PEER_IDENTITY_TOKEN.to_string());
     }
+    // Unconditional: this build's `run` always emits `resource_summary`, so there is
+    // no platform condition to gate it on (see [`RESOURCE_SUMMARY_TOKEN`]).
+    tokens.push(RESOURCE_SUMMARY_TOKEN.to_string());
     tokens.sort();
     tokens.dedup();
     tokens
@@ -485,7 +526,7 @@ mod tests {
                 .any(|t| t.ends_with(":--help") || t.ends_with(":--version")),
             "clap's help/version flags are not part of the compatibility surface: {surface:?}"
         );
-        // The one deliberately non-clap-derived token: it tracks the platform
+        // The first deliberately non-clap-derived token: it tracks the platform
         // capability constant exactly, in both directions, so it can never advertise
         // a guarantee this build does not make (nor withhold one it does).
         assert_eq!(
@@ -493,6 +534,28 @@ mod tests {
             crate::control::PEER_IDENTITY_SUPPORTED,
             "`{PEER_IDENTITY_TOKEN}` is published exactly when this build can obtain a \
              kernel-authenticated peer identity: {surface:?}"
+        );
+        // The second: a *build* capability rather than a platform one, so it is
+        // published on every target this compiles for — asserted unconditionally,
+        // which is exactly the claim being made (every copy of this build emits the
+        // `resource_summary` event).
+        assert!(
+            surface.iter().any(|t| t == RESOURCE_SUMMARY_TOKEN),
+            "`{RESOURCE_SUMMARY_TOKEN}` is published by every build that emits the \
+             resource_summary event, on every platform: {surface:?}"
+        );
+        // Both capability tokens are held to the *same* grammar rule as the flags they
+        // sit beside: within the `run:` namespace, a token either names a long flag
+        // (`--`) or is precisely this one capability. That is what stops a future
+        // capability from being spelled `run:--resource-summary` and read as a flag the
+        // parser accepts (the mistake `tests/probe.rs` pins from the consumer side).
+        assert!(
+            surface
+                .iter()
+                .filter(|t| t.starts_with("run:"))
+                .all(|t| t.starts_with("run:--") || t.as_str() == RESOURCE_SUMMARY_TOKEN),
+            "a capability token is spelled without `--` so it is never mistaken for a flag: \
+             {surface:?}"
         );
         assert!(
             surface

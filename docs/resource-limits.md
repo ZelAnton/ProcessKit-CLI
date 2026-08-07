@@ -134,6 +134,100 @@ None of this changes what `limit_hit` means today: it stays the pre-spawn
 still treats it as a hard failure signal in that scope (see
 [`docs/schema.md`](schema.md#limit_hit)).
 
+## What the tree consumed
+
+`limit_hit` and `limit_evidence` are both about a **cap**: one says it could not be
+installed, the other whether it fired. Neither says how much the tree actually used.
+That is the separate `resource_summary` event, which every run that spawned a child
+emits exactly once — no flag, no cap required, every platform (normative field list:
+[`docs/schema.md`](schema.md#resource_summary)). With `processkit` 3.3.0 it reads the
+container's own accounting through `ProcessGroup::stats()`, at the same point in the
+teardown tail as `limit_evidence` and immediately after it.
+
+### What it does not prove
+
+- **It is not limit attribution.** A `peak_memory_bytes` at or near a requested
+  `--max-memory` is not evidence the cap engaged; only `limit_evidence`'s `tripped` is,
+  and only where that verdict is authoritative (Linux cgroup v2). Reading a high peak
+  as "it was capped" would invent an attribution the kernel never made.
+- **It is not a time series.** One reading at the end of the run, not a sample. It
+  cannot say *when* the peak occurred, or what the tree looked like at any earlier
+  moment. `run --snapshot-interval` is the event for that question, and it is opt-in
+  precisely because it has an ongoing cost.
+- **It is not a per-process breakdown.** Every number is whole-tree. A member's
+  individual share is not recoverable from it.
+- **It does not measure disk.** Bytes written to a capture file are
+  `output_captured.bytes` (see [`docs/io-and-capture.md`](io-and-capture.md)); the IO
+  counters here are the tree's own read/write traffic and are a different quantity that
+  happens to share a unit.
+
+### Platform matrix
+
+Every measurement is independently nullable, and `null` means **this mechanism does
+not account for it** — never zero, and never a number the runner improved by taking a
+maximum over its own periodic reads (that would report when the runner looked, not
+what the tree did). This matrix is normative; do not read completeness into the event's
+field list.
+
+| Mechanism | `peak_memory_bytes` | `total_cpu_ms` | `io_read_bytes` / `io_write_bytes` | `peak_process_count` |
+| --- | --- | --- | --- | --- |
+| Windows Job Object | Yes — peak *committed* memory (`PeakJobMemoryUsed`) | Yes — every process ever in the job, terminated ones included | Yes — `IO_COUNTERS`, **all** read/write traffic (file, pipe, device) | **Always `null`** |
+| Linux cgroup v2 | Yes — sum of currently-live members' `VmHWM` | Yes — currently-live members only | Only with the `io` controller enabled — `io.stat` `rbytes`/`wbytes`, **block layer only** | Only with the `pids` controller enabled — `pids.peak` |
+| Linux process-group fallback | `null` | `null` | `null` | `null` |
+| macOS / BSD process group | `null` | `null` | `null` | `null` |
+
+Four consequences that are easy to misread as bugs:
+
+1. **`peak_process_count` is always `null` on Windows.** A Job Object keeps
+   `ActiveProcesses` (how many are in it now) and `TotalProcesses` (how many were ever
+   assigned to it). Neither is a high-water mark of concurrency, and this runner will
+   not synthesize one from its own `stats()` calls.
+2. **IO bytes are always `null` on macOS, the BSDs, and the Linux process-group
+   fallback.** Those mechanisms contain a tree without accounting for it. On Linux
+   cgroup v2 they additionally require the **`io` controller** to be enabled for the
+   group's cgroup — which is what makes `io.stat` exist at all. This CLI does not
+   enable it: `processkit` enables exactly the controllers a requested `ResourceLimits`
+   needs (`memory`, `pids`, `cpu`) and no others, so `io` is on only if the environment
+   already delegated and enabled it. The same is true of `pids.peak`, which needs the
+   `pids` controller — in practice that means a run with `--max-processes`.
+3. **The IO counters are not comparable *across* platforms.** A Job Object counts bytes
+   moved by every read/write the job's processes issued, whatever the target. A cgroup's
+   `io.stat` counts only what crossed the **block layer**, so a read served from the
+   page cache, or any traffic over a pipe, socket, or tmpfs, is simply not in it. The
+   same workload legitimately reports very different numbers on the two, and neither is
+   wrong. Compare a series only against itself on one mechanism; read
+   `run_started.mechanism` to know which one produced it.
+4. **On Linux, `io_write_bytes` can undercount.** A write reaches the block layer when
+   the kernel writes the page back, which may be after the member that dirtied it
+   exited — or never, if the page is still dirty when the group is torn down. A short
+   write-and-exit run can report fewer bytes than it handed to `write(2)`.
+
+`peak_memory_bytes` and `total_cpu_ms` are likewise platform-specific in *meaning*
+(committed memory vs. resident high-water mark; whole-job history vs. live members
+only), so the same caution applies to them: comparable within a mechanism, not across.
+
+### A failed read is in the stream, not missing from it
+
+If `stats()` fails, the event is still emitted with `read_error: true` and every
+measurement `null`. Check that flag before drawing a conclusion from a `null`, because
+an all-`null` summary is *also* a correct success — it is exactly what row 3 and row 4
+of the matrix above report by design. `read_error` is the only thing that separates
+"this mechanism accounts for nothing" from "the read failed", and a foreground run's
+stderr warning does not help a `--detach` run, whose stderr is null.
+
+### Preflighting it
+
+`resource_summary` is present on every build that has it, so a consumer pins the
+**event**, not a platform:
+
+```sh
+processkit-cli probe --json --require-surface run:resource-summary
+```
+
+That token's presence guarantees the event will be in the stream. It does **not**
+promise any particular axis is populated — that is what the matrix above governs, and
+it follows from `run_started.mechanism`, not from a `probe` token.
+
 ## Limits and outer containers
 
 An outer Docker/Kubernetes/systemd limit and a ProcessKit CLI limit are separate
@@ -155,12 +249,17 @@ limit request attached to this specific run.
    attribution and preserve `unknown` as distinct from `not_tripped`. For a
    pre-spawn `limit_hit`, do not expect post-run evidence: the container did not
    exist to be queried.
-6. Keep a separate outer-runtime signal for limits imposed outside this run.
+6. For actual consumption, read `resource_summary` — present on every run that
+   spawned a child, capped or not. Check `read_error` first, then treat each `null`
+   as "this mechanism does not account for it" per the matrix in "What the tree
+   consumed", never as zero, and never compare its IO counters across platforms.
+7. Keep a separate outer-runtime signal for limits imposed outside this run.
 
 ## See also
 
 - [Platform support](platform-support.md) — mechanism selection.
 - [Running in containers](containers.md) — cgroup delegation in images and
   orchestrators.
-- [JSONL event schema](schema.md#limit_hit) — normative event fields.
+- [JSONL event schema](schema.md#limit_hit) — normative event fields; see also
+  [`resource_summary`](schema.md#resource_summary) for what the tree consumed.
 - [Exit-code contract](exit-codes.md#resource-limits-reuse-backend-102).

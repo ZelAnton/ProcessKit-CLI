@@ -31,8 +31,9 @@ use super::signals::{deadline, effective_grace_for, idle_deadline, wait_for_canc
 use super::teardown::{
     clear_registration, control_kill_error, duration_ms, emit_cleanup_finished,
     emit_cleanup_started, emit_hard_teardown, emit_limit_evidence, emit_members_snapshot,
-    emit_output_captured, exit_code_for, finish, finish_foreground_failure, graceful_teardown,
-    launch_failure_event, launch_failure_source, map_launch_error, termination_error,
+    emit_output_captured, emit_resource_summary, exit_code_for, finish, finish_foreground_failure,
+    graceful_teardown, launch_failure_event, launch_failure_source, map_launch_error,
+    termination_error,
 };
 use super::{Ending, SnapshotReason, Termination, TimeoutTrigger};
 
@@ -662,6 +663,7 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
                 reason: trigger.reason(),
             });
             emit_limit_evidence(&mut emitter, &group, limits_requested);
+            emit_resource_summary(&mut emitter, &group);
             // `cleanup_started` brackets the whole teardown — soft stop, grace, and
             // hard kill — so `members_before` is the full tree, not a post-soft remnant.
             emit_cleanup_started(&mut emitter, &group);
@@ -683,6 +685,7 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
                 grace_ms: grace.map(duration_ms),
             });
             emit_limit_evidence(&mut emitter, &group, limits_requested);
+            emit_resource_summary(&mut emitter, &group);
             emit_cleanup_started(&mut emitter, &group);
             let teardown = graceful_teardown(&group, grace).await;
             emit_cleanup_finished(&mut emitter, &group, Some(&teardown));
@@ -710,6 +713,7 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
                 grace_ms: grace.map(duration_ms),
             });
             emit_limit_evidence(&mut emitter, &group, limits_requested);
+            emit_resource_summary(&mut emitter, &group);
             emit_cleanup_started(&mut emitter, &group);
             let teardown = graceful_teardown(&group, grace).await;
             emit_cleanup_finished(&mut emitter, &group, Some(&teardown));
@@ -729,6 +733,7 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
                 grace_ms: grace.map(duration_ms),
             });
             emit_limit_evidence(&mut emitter, &group, limits_requested);
+            emit_resource_summary(&mut emitter, &group);
             emit_cleanup_started(&mut emitter, &group);
             let teardown = graceful_teardown(&group, grace).await;
             emit_cleanup_finished(&mut emitter, &group, Some(&teardown));

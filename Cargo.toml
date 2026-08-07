@@ -91,14 +91,20 @@ serde_json = "1"
 # the group through the plain `ProcessGroup::new()`, so a default run pulls none
 # of this at runtime.
 #
-# The requirement names 3.2, not a bare `3`: `src/run/teardown.rs` calls
-# `ProcessGroup::limit_evidence()` and matches on `LimitVerdict`, neither of which
-# exists before 3.2.0, so `^3` would let a resolver legitimately pick 3.1.x and
-# fail at compile time instead of at resolution. It also keeps the repository's
-# *second* committed lockfile (`fuzz/Cargo.lock`, for the deliberately
-# out-of-workspace fuzz crate — see `fuzz/Cargo.toml`) from silently holding an
-# older pin that satisfies the manifest but not the code.
-processkit = { version = "3.2", features = ["limits"] }
+# The requirement names 3.3, not a bare `3` (nor the 3.2 it used to name):
+# `src/run/teardown.rs` calls `ProcessGroup::limit_evidence()` and matches on
+# `LimitVerdict` (3.2.0), and `emit_resource_summary` reads `ProcessGroupStats`'
+# `io_read_bytes`/`io_write_bytes`/`peak_process_count` fields for the
+# `resource_summary` event, which 3.3.0 added to that struct — so `^3`
+# or `^3.2` would let a resolver legitimately pick an older patch line and fail at
+# compile time instead of at resolution. Naming the *requirement* (rather than only
+# refreshing the root lockfile) is also what keeps the repository's *second*
+# committed lockfile (`fuzz/Cargo.lock`, for the deliberately out-of-workspace fuzz
+# crate — see `fuzz/Cargo.toml`) from silently holding an older pin that satisfies
+# the manifest but not the code: Cargo has no reason to move a lockfile whose
+# requirement is already met, and the root verification commands never descend into
+# that crate.
+processkit = { version = "3.3", features = ["limits"] }
 # Async runtime that drives the tokio-based `processkit` API. A small
 # current-thread runtime hosts the run; `io-std` provides the async stdout/stderr
 # sinks the child's output is teed to. `time` arms the `--timeout` deadline timer

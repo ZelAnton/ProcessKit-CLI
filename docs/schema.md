@@ -346,6 +346,86 @@ groups fail before a capped group exists, so they emit `limit_hit` and no
 `limit_evidence`. The event is absent when no cap was requested. This is an
 additive event within `schema_version = 1`.
 
+### `resource_summary`
+
+What the contained tree actually **consumed**. The runner reads the container's own
+kernel accounting once (`ProcessGroup::stats()`) after the ending is decided and
+before `cleanup_finished` hard-kills the group — the same read point, and for the
+same reason, as `limit_evidence`: the counters live in the container, so they are
+gone with it.
+
+| Field | Type | Notes |
+|---|---|---|
+| `read_error` | boolean | `true` when the `stats()` read itself failed; every measurement below is then `null` as a **gap**. See "Honest degradation, and why the flag is load-bearing". |
+| `peak_memory_bytes` | integer, nullable | Peak whole-tree memory in bytes. |
+| `total_cpu_ms` | integer, nullable | Total CPU time (user + kernel) in **milliseconds**, truncated toward zero. |
+| `io_read_bytes` | integer, nullable | Bytes the tree read. |
+| `io_write_bytes` | integer, nullable | Bytes the tree wrote. |
+| `peak_process_count` | integer, nullable | High-water mark of processes held **at once** — not the count *now*. |
+
+**Emitted on every run that spawned the child.** Exactly once, no flag, no cap, every
+platform, every ending. A run whose child never started (`spawn_failed`, a
+`container_failed` with `phase` `create` or `attach`, a pre-spawn `limit_hit`) emits
+none: there was no tree, and on the `create` path no container to read.
+
+**Decision: always, not behind a flag.** This is deliberate and recorded here rather
+than left implicit. Three reasons:
+
+- It is **one synchronous read** of accumulators the kernel already maintains, not a
+  sampling cadence, so an opt-in would save one syscall's worth of work and one line
+  of output. Contrast `--snapshot-interval`, which *is* opt-in: that adds unbounded
+  volume on a timer, which is a real cost worth a flag.
+- The platform that needs these numbers most would be the one left silent. On Windows,
+  `limit_evidence` can only ever answer `unknown` for a capped axis (a Job Object
+  keeps no post-mortem record that a cap fired), and on the POSIX fallback there is no
+  `limit_evidence` at all. The measured `peak_memory_bytes` is the only honest resource
+  fact available there — and a caller who had to know to pass a flag would not get it.
+- An opt-in event costs *more* contract, not less: a flag, a `probe` token for the
+  flag, and a conditional in the ordering rule, all to gate a single line.
+
+The cost is paid honestly: this event does grow every run's stream by one line, so the
+"a foreground run emits six events" count in
+[`docs/integration.md`](integration.md) and
+[ADR 0007](adr/0007-no-terminal-receipt-file.md) is now **seven**, and it is the one
+growth that is *not* a caller opting in. A reader that routes by `event` type — which
+[`docs/compatibility.md`](compatibility.md#what-a-reader-must-tolerate-within-one-version)
+requires within a version — is unaffected.
+
+**Honest degradation, and why the flag is load-bearing.** A failed `stats()` does not
+skip the event: it is emitted with `read_error: true` and every measurement `null`.
+That flag is not ceremony. An all-`null` summary is *also* a perfectly correct
+**success** — it is exactly what a mechanism with no whole-tree accounting reports
+(macOS/the BSDs, the Linux process-group fallback) — so the numbers alone cannot
+distinguish "this platform measures nothing" from "we could not measure". Only
+`read_error` can. A consumer must check it before concluding anything from a `null`.
+A foreground run also gets a stderr warning, but that reaches nobody on a `--detach`
+run (whose stderr is `Stdio::null()`), which is why the fact is recorded in the stream.
+
+**Nothing here is improved, and `null` never means zero.** Each axis is independently
+nullable, and `null` always means *this mechanism does not account for it*. The runner
+does not substitute `0`, and does not take a maximum over its own periodic reads to
+fill a gap — that would describe **when the runner looked**, not what the tree did. A
+caller who wants a sampled series wants `--snapshot-interval`'s own event, knowingly.
+
+The normative platform matrix — which axis is `null` where, and why two platforms'
+IO counters are **not comparable with each other** — is in
+[`docs/resource-limits.md`](resource-limits.md#what-the-tree-consumed), together with
+what this event does **not** prove about a limit. Two consequences worth stating here
+because they are easy to misread as bugs:
+
+- `peak_process_count` is `null` on **all** of Windows. A Job Object counts how many
+  processes are in it *now* and how many were *ever* assigned to it; neither is a peak.
+- `total_cpu_ms` truncates, so a run using under a millisecond of CPU reports a
+  **measured** `0`. `null` is the only value that means unknown.
+
+`active_process_count` — which ProcessKit's snapshot does carry — is deliberately
+**not** on this event. It is a "how many right now" reading, and this read happens
+after the ending is decided, so it would report the moment the runner looked rather
+than anything about the run. The tree size at teardown already has an honest home in
+`cleanup_started.members_before`.
+
+This is an additive event within `schema_version = 1`.
+
 ### `timeout`
 
 A runner deadline elapsed while the child was still running: either the whole-run
@@ -574,16 +654,28 @@ before the teardown.
 A normal run emits, in order: `run_started`, `members_snapshot`
 (`reason: "spawn"`), then either
 
-- **natural exit** — `root_exited`, `cleanup_started`, `cleanup_finished`,
-  `runner_exit`; or
+- **natural exit** — `root_exited`, `resource_summary`, `cleanup_started`,
+  `cleanup_finished`, `runner_exit`; or
 - **runner-imposed ending** — the reason event (`timeout`, `cancelled`, or `killed`),
-  `cleanup_started`, `cleanup_finished`, `runner_exit`.
+  `resource_summary`, `cleanup_started`, `cleanup_finished`, `runner_exit`.
+
+`resource_summary` appears **exactly once in every run that spawned the child** —
+there is no flag and no platform that removes it — between the ending event and
+`cleanup_started`. A run whose child never started emits none (see
+"resource_summary").
 
 When any resource cap was requested and ProcessGroup creation succeeded, insert
-`limit_evidence` after the ending event and before `cleanup_started`. A run
+`limit_evidence` **immediately before** that `resource_summary`, i.e. still after the
+ending event and before `cleanup_started`. A run
 without a cap emits no `limit_evidence`; a pre-spawn `limit_hit` path also emits
-none because no group exists to query. The evidence read never moves inside or
-after the `cleanup_started`/`cleanup_finished` pair.
+none because no group exists to query.
+
+Neither container read ever moves inside or
+after the `cleanup_started`/`cleanup_finished` pair, and the reason is the same for
+both: `cleanup_finished` hard-kills the group, and both the limit evidence and the
+usage counters live *in* that group. Their fixed relative order (`limit_evidence`,
+then `resource_summary`) keeps the conditional event adjacent to the ending event
+whose caps it describes.
 
 The reason event names *which* ending it was: `timeout` (with `reason` `overall` or
 `idle`) for a `--timeout` or a `--idle-timeout`, `cancelled` (with `source` `ctrl_c`,
@@ -614,14 +706,17 @@ is absent.
 
 A failure before the child is spawned emits its error event (`container_failed`
 with `phase` `create` or `attach`, or `spawn_failed`) and then `runner_exit`, with
-no `run_started` (and no `output_captured` — the child never produced output). When
+no `run_started` (and no `output_captured` — the child never produced output, and no
+`resource_summary` — there was no tree to have consumed anything). When
 that pre-spawn failure is a resource limit that could not be applied, a `limit_hit`
 is emitted **first**, immediately before the `container_failed` (`phase` `create`) →
 `runner_exit` (`source` `container_error`) pair — the resource-specific record of
 why the container could not be created (see `limit_hit`). A
 `container_failed` with `phase` `foreground` comes later: the child had already
-spawned, so `cleanup_started`/`cleanup_finished` tear the container down before the
-terminal `runner_exit`. `run_started` is still never written (the handoff fails
+spawned, so the same `resource_summary` → `cleanup_started` → `cleanup_finished` tail
+tears the container down before the
+terminal `runner_exit` — the child ran, so it has consumption to report like any other
+ending. `run_started` is still never written (the handoff fails
 first), and the interactive mode this path only occurs in cannot set
 `--capture-dir`, so there is still no `output_captured`.
 
@@ -723,7 +818,18 @@ A future version lands under a new `fixtures/schema/vN/` directory. Additive,
 backward-compatible clarifications that do not change any existing shape do not bump
 the version. Adding a **new event type** (as `output_captured` was added) is
 likewise additive: it introduces no change to any existing event's shape, and a
-consumer that pins the events it knows simply ignores one it does not. Adding a **new
+consumer that pins the events it knows simply ignores one it does not.
+`resource_summary` is the case that makes the boundary of that rule explicit: it is an
+**unconditional** new type, so it appears in every run that spawned a child rather
+than only under a flag, and the stream a default `run` writes is therefore one line
+longer than an earlier v1 build's. That is still additive under the definition above —
+no existing event was renamed, retyped, or given a new meaning — and it is the same
+distinction `members_snapshot`'s new always-present fields draw below: "additive"
+bounds what may *change*, never what may *appear*. A reader that pinned the exact set
+of event types a run emits, instead of routing by the `event` tag and ignoring the
+rest, will notice; that reader was already outside the contract (see
+[Compatibility and upgrades](compatibility.md#what-a-reader-must-tolerate-within-one-version),
+obligation 1). Adding a **new
 field** to an existing event — always present, and leaving every other field's name,
 type, and meaning intact — is additive in the same way: a consumer that reads the
 fields it knows is unaffected and simply ignores the new one. The `output_captured`
