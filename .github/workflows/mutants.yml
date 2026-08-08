@@ -19,7 +19,7 @@ name: Mutants
 # library code touched, same reasoning as the `coverage`/`fuzz` tiers), so it
 # carries no CHANGELOG.md entry — see K-029.
 #
-# Sharded across 8 parallel legs (cargo-mutants' `--shard k/n`, matrix below)
+# Sharded across 16 parallel legs (cargo-mutants' `--shard k/n`, matrix below)
 # rather than one long job: a single-job full run does not fit inside a
 # GitHub-hosted runner's 360-minute hard job cap (see the job's own
 # `timeout-minutes` comment for the measurements behind this).
@@ -44,32 +44,31 @@ env:
 
 jobs:
   mutants:
-    name: mutants (shard ${{ matrix.shard }}/8)
+    name: mutants (shard ${{ matrix.shard }}/16)
     runs-on: ubuntu-latest
     # Single-OS (unlike coverage/perf's ubuntu+windows matrix): mutation
     # outcomes are about test *logic* coverage, not platform-specific runtime
     # behavior, so doubling the (already expensive) run for a second OS buys
-    # little — see .cargo/mutants.toml for how the Windows-only
-    # `src/win_security.rs` module is handled given that choice.
+    # little — see .cargo/mutants.toml for how Windows-only modules are handled
+    # given that choice.
     #
     # Sized from measurements taken while fixing T-202/R-02, on the machine
     # that authored this workflow: an unmutated baseline build+test took
     # 101.7s + 24.3s, and one incremental mutant (rebuild + relink + full
-    # `cargo test`) took 5.7s + 27.4s ≈ 27s marginal. At 738 mutants scoped by
-    # .cargo/mutants.toml, 8 shards average ~92 mutants each. Doubling that
-    # per-mutant cost for a slower/less-cached, shared `ubuntu-latest` runner
-    # (~54-80s/mutant) puts one shard's actual `cargo mutants` invocation at
-    # roughly 90-125 minutes; the step-level timeout below gives that ~150
-    # minutes. The job-level timeout adds ~30 minutes on top of the step's for
-    # checkout/toolchain/cache-restore, `cargo install cargo-mutants` and the
-    # report/upload steps that must still run after the main step ends (see
-    # "Run cargo-mutants" below) — comfortably inside the 360-minute cap, not
-    # a "generous headroom over a full run" guess.
+    # `cargo test`) took 5.7s + 27.4s ≈ 27s marginal. The scoped tree has since
+    # grown beyond 1,700 mutants: the former 8-way split assigned about 225 to
+    # each shard, and the slowest shards exhausted the 150-minute step budget
+    # before finishing. Sixteen shards keep the current load near 107 mutants
+    # per leg while retaining the measured timeout headroom. The job-level
+    # timeout adds ~30 minutes on top of the step's for checkout/toolchain/
+    # cache-restore, `cargo install cargo-mutants` and the report/upload steps
+    # that must still run after the main step ends (see "Run cargo-mutants"
+    # below) — comfortably inside the 360-minute cap.
     timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -96,7 +95,7 @@ jobs:
         timeout-minutes: 150
         shell: bash
         run: |
-          args=(--shard "${{ matrix.shard }}/8")
+          args=(--shard "${{ matrix.shard }}/16")
           if [ -n "${{ github.event.inputs.file }}" ]; then
             args+=(--file "${{ github.event.inputs.file }}")
           fi
@@ -113,7 +112,7 @@ jobs:
         shell: bash
         run: |
           {
-            echo "### cargo-mutants (shard ${{ matrix.shard }}/8): ${{ steps.mutants.outcome }}"
+            echo "### cargo-mutants (shard ${{ matrix.shard }}/16): ${{ steps.mutants.outcome }}"
             echo
             if [ -d mutants.out ]; then
               caught=$(wc -l < mutants.out/caught.txt 2>/dev/null || echo 0)
