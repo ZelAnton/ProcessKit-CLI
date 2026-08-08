@@ -164,6 +164,16 @@ fn ensure_parser_progress(
     Ok(())
 }
 
+fn advance_parser(index: &mut usize, input_len: usize, pattern: &str) -> Result<(), String> {
+    let current = *index;
+    let next = current
+        .checked_add(1)
+        .ok_or_else(|| format!("pattern `{pattern}` parser cursor overflowed"))?;
+    ensure_parser_progress(current, next, input_len, pattern)?;
+    *index = next;
+    Ok(())
+}
+
 fn is_escaped_punctuation(character: char) -> bool {
     matches!(
         character,
@@ -187,13 +197,13 @@ fn is_escaped_punctuation(character: char) -> bool {
 
 fn parse_atom(characters: &[char], index: &mut usize, pattern: &str) -> Result<Atom, String> {
     let character = characters[*index];
-    *index += 1;
+    advance_parser(index, characters.len(), pattern)?;
     match character {
         '\\' => {
             let Some(escaped) = characters.get(*index).copied() else {
                 return Err(format!("pattern `{pattern}` ends with a dangling escape"));
             };
-            *index += 1;
+            advance_parser(index, characters.len(), pattern)?;
             match escaped {
                 'd' => Ok(Atom::Digit),
                 // Escaped punctuation stands for itself. Restricted to the
@@ -219,14 +229,16 @@ fn parse_atom(characters: &[char], index: &mut usize, pattern: &str) -> Result<A
 fn parse_class(characters: &[char], index: &mut usize, pattern: &str) -> Result<Atom, String> {
     let negated = characters.get(*index) == Some(&'^');
     if negated {
-        *index += 1;
+        advance_parser(index, characters.len(), pattern)?;
     }
     let mut items = Vec::new();
-    loop {
+    // The independent iteration budget keeps this parser bounded even if a
+    // cursor-advance regression slips past its local invariant.
+    for _ in 0..=characters.len() {
         let Some(character) = characters.get(*index).copied() else {
             return Err(format!("pattern `{pattern}` has an unterminated `[` class"));
         };
-        *index += 1;
+        advance_parser(index, characters.len(), pattern)?;
         if character == ']' {
             if items.is_empty() {
                 return Err(format!("pattern `{pattern}` has an empty `[]` class"));
@@ -237,7 +249,7 @@ fn parse_class(characters: &[char], index: &mut usize, pattern: &str) -> Result<
             let Some(escaped) = characters.get(*index).copied() else {
                 return Err(format!("pattern `{pattern}` ends with a dangling escape"));
             };
-            *index += 1;
+            advance_parser(index, characters.len(), pattern)?;
             if !is_escaped_punctuation(escaped) {
                 return Err(format!(
                     "pattern `{pattern}` uses the unsupported escape `\\{escaped}`"
@@ -255,11 +267,11 @@ fn parse_class(characters: &[char], index: &mut usize, pattern: &str) -> Result<
                     "pattern `{pattern}` uses an escaped range endpoint"
                 ));
             }
-            *index += 1;
+            advance_parser(index, characters.len(), pattern)?;
             let Some(high) = characters.get(*index).copied() else {
                 return Err(format!("pattern `{pattern}` has an unterminated range"));
             };
-            *index += 1;
+            advance_parser(index, characters.len(), pattern)?;
             if high < low {
                 return Err(format!(
                     "pattern `{pattern}` has an inverted range `{low}-{high}`"
@@ -270,6 +282,9 @@ fn parse_class(characters: &[char], index: &mut usize, pattern: &str) -> Result<
             items.push(ClassItem::Char(low));
         }
     }
+    Err(format!(
+        "pattern `{pattern}` class parser made no bounded forward progress"
+    ))
 }
 
 /// The `{n}` / `{n,m}` bound following an atom, or `(1, 1)` when there is none.
@@ -289,18 +304,24 @@ fn parse_quantifier(
         }
         return Ok((1, 1));
     }
-    *index += 1;
+    advance_parser(index, characters.len(), pattern)?;
 
     let mut bounds: Vec<String> = vec![String::new()];
-    loop {
+    let mut closed = false;
+    // Keep termination independent of cursor movement for the same reason as
+    // the character-class parser above.
+    for _ in 0..=characters.len() {
         let Some(character) = characters.get(*index).copied() else {
             return Err(format!(
                 "pattern `{pattern}` has an unterminated `{{` bound"
             ));
         };
-        *index += 1;
+        advance_parser(index, characters.len(), pattern)?;
         match character {
-            '}' => break,
+            '}' => {
+                closed = true;
+                break;
+            }
             ',' if bounds.len() == 1 => bounds.push(String::new()),
             digit if digit.is_ascii_digit() => {
                 bounds
@@ -314,6 +335,11 @@ fn parse_quantifier(
                 ));
             }
         }
+    }
+    if !closed {
+        return Err(format!(
+            "pattern `{pattern}` quantifier parser made no bounded forward progress"
+        ));
     }
 
     let parse = |raw: &String| -> Result<usize, String> {
@@ -426,6 +452,8 @@ mod tests {
     fn negated_classes_and_exact_counts_work() {
         let negated = compiled("^[^abc]{2}$");
         assert!(negated.matches("xy"));
+        assert!(negated.matches("^x"), "the negation marker is not an item");
+        assert!(negated.matches("[x"), "the opening bracket is not an item");
         assert!(!negated.matches("ax"));
         assert!(!negated.matches("x"));
     }
