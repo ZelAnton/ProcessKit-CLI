@@ -54,7 +54,8 @@ for `members_snapshot`/`inspect` enrichment (see
 
 Whole-tree cleanup after an abrupt runner death is also a core dependency on
 Unix. The current public primitive kills only the direct child on Linux and is a
-no-op on macOS/BSD; cgroups and process groups do not disappear with their owner.
+no-op on FreeBSD, macOS, and other BSDs; cgroups, process reapers, and process
+groups do not disappear with their owner.
 Until ProcessKit exposes an additive, identity-safe whole-tree owner-death
 primitive, the CLI reports `direct_child_only` or `none` in `run_started` and
 does not claim the Windows guarantee on those platforms. Any stronger contract
@@ -66,8 +67,8 @@ The existing `limit_hit` event still covers only the pre-spawn "could not be
 applied" branch. Runs with a requested cap additionally emit the additive
 `limit_evidence` event with `tripped`, `not_tripped`, or `unknown` per axis,
 read before teardown consumes the group. The evidence is authoritative on
-Linux cgroup v2 only: Windows Job Objects and POSIX process groups (macOS, the
-BSDs, and the Linux process-group fallback) do not provide the same successful
+Linux cgroup v2 only: Windows Job Objects, the FreeBSD process reaper, and POSIX
+process groups (macOS, other BSDs, and the Linux process-group fallback) do not provide the same successful
 Linux path. A successfully created Windows Job Object reports `unknown` for
 capped axes; a POSIX limit request fails before a capped group exists and
 therefore emits the existing pre-spawn `limit_hit` with no `limit_evidence`.
@@ -86,7 +87,8 @@ the paragraph above leaves open **on Windows**: post-run limit attribution there
 accounting block is now available as an honest substitute, which is the reason this was
 worth taking. The closure is specific to that mechanism and no wider. Axes stay
 unavailable by mechanism rather than by omission — `peak_process_count` on Windows (a Job
-Object keeps no peak-concurrency counter), both IO counters on macOS/BSD and the Linux
+Object keeps no peak-concurrency counter), both IO counters on FreeBSD, macOS, other BSDs,
+and the Linux
 process-group fallback, and on Linux the IO counters additionally need the cgroup v2 `io`
 controller, which this CLI does not enable. **On Linux cgroup v2 memory and CPU are also
 bounded by the read point** rather than by the controller set: `stats()` sums them from

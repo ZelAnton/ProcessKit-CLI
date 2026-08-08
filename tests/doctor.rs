@@ -214,7 +214,14 @@ fn a_healthy_host_qualifies_and_leaves_nothing_behind() {
     let containment = &report["containment"];
     let mechanism = containment["mechanism"].as_str().expect("a mechanism");
     assert!(
-        ["job_object", "cgroup_v2", "process_group"].contains(&mechanism),
+        [
+            "job_object",
+            "cgroup_v2",
+            "process_group",
+            "process_reaper",
+            "unknown",
+        ]
+        .contains(&mechanism),
         "the mechanism is one this project publishes: {report}"
     );
     let abrupt = containment["abrupt_cleanup"].as_str().expect("a level");

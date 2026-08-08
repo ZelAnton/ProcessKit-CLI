@@ -197,7 +197,16 @@ is what requires a new schema version — nothing below does.
 4. **New values in an open-ended descriptive string field** — a new `cancelled`
    `source`, a new `runner_exit` `source`, a new `hint` label. Treat an unrecognized
    value as "some other trigger" and keep routing by event type.
-5. **Unknown fields anywhere in the envelope or event body.**
+5. **New values in the growing `mechanism` vocabulary.** `process_reaper` is an
+   additive value within schema v1: no existing mechanism changed meaning, and
+   readers must treat an unfamiliar mechanism as an unsupported containment choice
+   rather than reject the complete event or machine-output record. `unknown` is an
+   intentional contract value emitted by the CLI's conservative fallback for a
+   future `processkit::Mechanism` variant, not a projection error. The published
+   schemas enumerate the current vocabulary, so an older frozen schema may reject a
+   newer value; strict validation must use the producer-matching schema, and an
+   adapter's runtime parser must not treat the old enum as exhaustive.
+6. **Unknown fields anywhere in the envelope or event body.**
 
 **The normative source is [`docs/schema.md`](schema.md)**, not this page: its
 "Ordering" section (and specifically "Multiplicity of `members_snapshot`") states

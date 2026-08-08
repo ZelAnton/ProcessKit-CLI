@@ -100,7 +100,10 @@ const SAMPLE_ENDPOINT: &str = "/samples/pkc-0123456789abcdef/c.sock";
 const SAMPLE_SOCKET_DIR: &str = "/samples/pkc-0123456789abcdef";
 const SAMPLE_ARGV_SHA256: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const SAMPLE_VERSION: &str = "0.0.0";
-const SAMPLE_MECHANISM: &str = "job_object";
+// Use the newly published mechanism in the stable sample so every machine-output
+// family proves its schema and fixture accept the FreeBSD projection, even when the
+// test host is Windows or Linux.
+const SAMPLE_MECHANISM: &str = "process_reaper";
 
 // ---------------------------------------------------------------------------
 // `doctor --json`'s samples.
@@ -111,7 +114,7 @@ const SAMPLE_MECHANISM: &str = "job_object";
 //
 // The samples below are therefore per-field fixed values, not a portrait of one
 // plausible machine: two of the fields this family carries reuse samples the other
-// families already fixed (`mechanism`'s `job_object` and `endpoint`'s unix socket
+// families already fixed (`mechanism`'s `process_reaper` and `endpoint`'s unix socket
 // path), which no single host would report together. That is deliberate — sharing a
 // sample keeps one normalizer entry per field name across every family, and the
 // fixture's job is to pin **shapes**: which facts are present, which are null, which
@@ -331,7 +334,7 @@ fn normalize_doctor_field(key: &str, value: &Value) -> Option<Value> {
         "remaining_pids" => json!([]),
         "confirmed_empty" | "teardown_snapshot_conclusive" => json!(true),
         // Both diagnostic arrays name values read off the host that produced the
-        // report ("this host selected `job_object`"), so their *text* is as
+        // report ("this host selected `process_reaper`"), so their *text* is as
         // platform-bound as the facts it quotes. Emptiness is preserved because that
         // is shape — the schema conditions on it — while the strings themselves are
         // replaced, for the same reason `error.jsonl`'s `message` is: they are

@@ -106,7 +106,7 @@ implemented in `run::execute` (`src/run/mod.rs`) and `run::launch::run_async`
 1. **Spawn.** The child is built from `processkit::Command` and spawned into a
    `ProcessGroup` this process owns — not a shared or global one — so the
    group's kernel-backed kill-on-drop (Windows Job Object, Linux
-   cgroup/POSIX-group, macOS process group) reaps the whole tree on every exit
+   cgroup/POSIX-group, FreeBSD process reaper, macOS process group) reaps the whole tree on every exit
    path *this process lives to observe* (normal completion, timeout, a local
    stop signal — `Ctrl-C`, on Unix `SIGTERM`/`SIGHUP`, or on Windows
    `Ctrl-Break`/console close/logoff/system shutdown — and a
@@ -116,7 +116,7 @@ implemented in `run::execute` (`src/run/mod.rs`) and `run::launch::run_async`
    dies abruptly is a platform-derived tri-state — `whole_tree` on Windows (Job
    Object survives the owner's abrupt death), `direct_child_only` on Linux
    (`kill_on_parent_death`/`PR_SET_PDEATHSIG`, direct child only), `none` on
-   macOS/BSD — surfaced per run as `run_started`'s `abrupt_cleanup` field (see
+   FreeBSD, macOS, and other BSDs — surfaced per run as `run_started`'s `abrupt_cleanup` field (see
    K-005). A `run_started` event (run id, root PID, containment mechanism,
    abrupt-cleanup tri-state, working directory) opens the JSONL stream.
 2. **Select the I/O path.** By default, `processkit`'s line pump concurrently

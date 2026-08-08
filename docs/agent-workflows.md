@@ -213,8 +213,12 @@ to state the boundary precisely:
   without terminating it, the run may continue until its own deadline or child
   completion.
 - If the runner itself is killed before normal teardown, the `abrupt_cleanup`
-  field reports the real platform guarantee: `whole_tree` on Windows,
-  `direct_child_only` on Linux, and `none` on macOS/other Unix.
+  field reports the real platform guarantee: `whole_tree` for the Windows Job
+  Object; `direct_child_only` on Linux, whether the mechanism is `cgroup_v2` or
+  the `process_group` fallback; `none` for FreeBSD's `process_reaper`; and
+  `none` for the macOS/other-Unix `process_group` fallback. FreeBSD's reaper
+  still covers the whole tree during normal teardown; `none` describes only
+  cleanup after an abrupt runner death.
 - A detached run deliberately outlives the launching call. It requires a durable
   JSONL path, a stable run id, deadlines, and a separate supervisor or recovery
   policy.

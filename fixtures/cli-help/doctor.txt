@@ -28,7 +28,7 @@ Options:
           Isolated on purpose: its failure never masks the mandatory phases, which have already completed against their own scratch run by the time this one starts.
 
       --require-mechanism <name>
-          Require the containment mechanism this host selects to be exactly `<name>` (`job_object` / `cgroup_v2` / `process_group`, the same vocabulary the JSONL `run_started` event publishes — `docs/schema.md`). Compared for exact equality; a host that reports anything else is unqualified (`HOST_UNQUALIFIED`, 116) with a mismatch naming both the required and the observed value. The report still carries the observed mechanism either way
+          Require the containment mechanism this host selects to be exactly `<name>` (`job_object` / `cgroup_v2` / `process_group` / `process_reaper` / `unknown`, the same vocabulary the JSONL `run_started` event publishes — `docs/schema.md`). Compared for exact equality; a host that reports anything else is unqualified (`HOST_UNQUALIFIED`, 116) with a mismatch naming both the required and the observed value. The report still carries the observed mechanism either way
 
       --require-abrupt-cleanup <level>
           Require the abrupt-cleanup guarantee this host offers to be exactly `<level>` (`whole_tree` / `direct_child_only` / `none`, the same vocabulary the JSONL `run_started` event publishes — `docs/schema.md`). This is what survives a runner killed without destructors, so an adapter that depends on whole-tree reaping pins it here.

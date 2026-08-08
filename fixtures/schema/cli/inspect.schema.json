@@ -50,8 +50,8 @@
         },
         "mechanism": {
           "type": "string",
-          "enum": ["job_object", "cgroup_v2", "process_group"],
-          "description": "Containment mechanism, in the same vocabulary as the JSONL `run_started`."
+          "enum": ["job_object", "cgroup_v2", "process_group", "process_reaper", "unknown"],
+          "description": "Containment mechanism, in the same vocabulary as the JSONL `run_started`; `unknown` is the conservative fallback for a future mechanism this build does not recognize."
         },
         "root_pid": { "$ref": "#/$defs/u32OrNull", "description": "The root child's PID; null if the backend exposed none." },
         "started_at": { "$ref": "#/$defs/rfc3339Millis", "description": "Run start time." },

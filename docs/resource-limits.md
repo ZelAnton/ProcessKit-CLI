@@ -40,7 +40,8 @@ failures.
 | Windows Job Object | Yes | Yes | Yes | Whole-job enforcement. |
 | Linux cgroup v2 with usable controllers | Yes | Yes | Yes | Requires controller delegation at the effective root. |
 | Linux process-group fallback | No | No | No | Fails before spawn. |
-| macOS / BSD process group | No | No | No | Fails before spawn. |
+| FreeBSD process reaper | No | No | No | ProcessKit 3.3 reports unsupported before spawn. |
+| macOS / non-FreeBSD BSD process group | No | No | No | Fails before spawn. |
 
 The `run_started.mechanism` field tells an observer what was actually obtained.
 
@@ -95,8 +96,9 @@ the teardown pair. It carries one verdict for each axis (`memory`, `processes`,
 and `cpu`):
 
 This event exists only when `ProcessGroup::with_options` successfully creates a
-container. On macOS, the BSDs, and the Linux process-group fallback, ProcessKit
-returns `ResourceLimit` during group creation because that mechanism has no
+container. On FreeBSD's process reaper, on macOS and other BSD process groups,
+and on the Linux process-group fallback, ProcessKit returns `ResourceLimit`
+during group creation because that mechanism has no
 whole-tree limit primitive. The runner therefore emits the existing pre-spawn
 `limit_hit` event and its backend-error tail, but there is no group from which to
 read `limit_evidence`; the event is not emitted on that path. `unknown` is
@@ -180,7 +182,8 @@ the event's field list.
 | Windows Job Object | Yes — peak *committed* memory (`PeakJobMemoryUsed`) | Yes — every process ever in the job, terminated ones included | Yes — `IO_COUNTERS`, **all** read/write traffic (file, pipe, device) | **Always `null`** |
 | Linux cgroup v2 | Only for members **live at the read point** — the sum of their `VmHWM`; `null` once the tree has exited, which is the natural-exit case (consequence 5) | Only for members **live at the read point**; `null` once the tree has exited (consequence 5) | Only with the `io` controller enabled — `io.stat` `rbytes`/`wbytes`, **block layer only** | Only with the `pids` controller enabled — `pids.peak` |
 | Linux process-group fallback | `null` | `null` | `null` | `null` |
-| macOS / BSD process group | `null` | `null` | `null` | `null` |
+| FreeBSD process reaper | `null` | `null` | `null` | `null` |
+| macOS / non-FreeBSD BSD process group | `null` | `null` | `null` | `null` |
 
 Five consequences that are easy to misread as bugs:
 
@@ -188,8 +191,9 @@ Five consequences that are easy to misread as bugs:
    `ActiveProcesses` (how many are in it now) and `TotalProcesses` (how many were ever
    assigned to it). Neither is a high-water mark of concurrency, and this runner will
    not synthesize one from its own `stats()` calls.
-2. **IO bytes are always `null` on macOS, the BSDs, and the Linux process-group
-   fallback.** Those mechanisms contain a tree without accounting for it. On Linux
+2. **IO bytes are always `null` on FreeBSD, macOS, non-FreeBSD BSDs, and the Linux
+   process-group fallback.** Those mechanisms contain a tree without accounting for
+   it. On Linux
    cgroup v2 they additionally require the **`io` controller** to be enabled for the
    group's cgroup — which is what makes `io.stat` exist at all. This CLI does not
    enable it: `processkit` enables exactly the controllers a requested `ResourceLimits`

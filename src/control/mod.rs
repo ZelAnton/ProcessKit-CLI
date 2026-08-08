@@ -579,8 +579,9 @@ pub struct Snapshot {
     pub snapshot_version: u32,
     /// The run's identifier — the key the client matched in the registry. Not a PID.
     pub run_id: String,
-    /// Containment mechanism: `job_object` | `cgroup_v2` | `process_group` (same
-    /// vocabulary as the JSONL `run_started`, see [`events::mechanism_str`]).
+    /// Containment mechanism: `job_object` | `cgroup_v2` | `process_group` |
+    /// `process_reaper` | `unknown` (same vocabulary as the JSONL `run_started`,
+    /// see [`events::mechanism_str`]).
     pub mechanism: String,
     /// The root child's PID, or `null` if the backend exposed none.
     pub root_pid: Option<u32>,
@@ -1494,16 +1495,18 @@ pub struct Attestation {
     /// decided in.
     pub peer_pid: Option<u32>,
     /// The containment mechanism the verdict is *about* — `job_object` | `cgroup_v2` |
-    /// `process_group` (the same vocabulary as the JSONL `run_started` and the
-    /// `inspect` snapshot, [`events::mechanism_str`]).
+    /// `process_group` | `process_reaper` | `unknown` (the same vocabulary as the
+    /// JSONL `run_started` and the `inspect` snapshot, [`events::mechanism_str`]).
     ///
     /// Present because it is what fixes the **scope** of the fact, and that scope
-    /// genuinely differs by mechanism: a Job Object or a cgroup enumerates the whole
-    /// tree, while the POSIX process-group fallback contains a tree but enumerates
-    /// only the group leaders — which is exactly why membership is decided against
-    /// the process group there rather than against the leader list alone (see
-    /// [`peer_is_member`]). A consumer that needs to know how strong the containment
-    /// behind a `member` answer is reads this rather than guessing from the platform.
+    /// genuinely differs by mechanism: a Job Object, cgroup, or FreeBSD
+    /// `process_reaper` enumerates the whole tree, while the POSIX process-group
+    /// fallback contains a tree but enumerates only the group leaders — which is
+    /// exactly why membership is decided against the process group there rather than
+    /// against the leader list alone (see [`peer_is_member`]). A consumer that needs
+    /// to know how strong the containment behind a `member` answer is reads this
+    /// rather than guessing from the platform. `unknown` is the conservative
+    /// forward-compatible spelling for a mechanism this build does not recognize.
     pub mechanism: String,
     /// When the runner decided this, RFC 3339 UTC with millisecond precision (the
     /// same formatter as the JSONL events and the registry record).

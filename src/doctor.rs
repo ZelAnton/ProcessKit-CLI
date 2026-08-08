@@ -210,8 +210,9 @@ pub struct RegistryFacts {
 /// run, and what that mechanism still guarantees if the runner is killed outright.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ContainmentFacts {
-    /// `job_object` / `cgroup_v2` / `process_group` — the same vocabulary the JSONL
-    /// `run_started` event publishes (`docs/schema.md`), read from that very event.
+    /// `job_object` / `cgroup_v2` / `process_group` / `process_reaper` / `unknown` —
+    /// the same vocabulary the JSONL `run_started` event publishes
+    /// (`docs/schema.md`), read from that very event.
     pub mechanism: String,
     /// `whole_tree` / `direct_child_only` / `none`: what still reaps the tree if the
     /// runner dies without running destructors. An OS-derived property of the

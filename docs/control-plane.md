@@ -180,7 +180,7 @@ from the JSONL event `schema_version` and the `registry_version`.
 |--------------------|-------------------|-----------------------------------------------------------------------|
 | `snapshot_version` | integer           | Snapshot format version this build writes (`2`), and the version the **runner** declared when reading. The client acts on it: a version newer than it implements is refused rather than rendered, an older one down to `1` is read — see "Snapshot version: a newer runner's reply is refused, an older one is read" below. |
 | `run_id`           | string            | The run's identifier — the key matched in the registry. Not a PID.    |
-| `mechanism`        | string            | Containment mechanism: `job_object`, `cgroup_v2`, or `process_group` (same vocabulary as the JSONL `run_started`). |
+| `mechanism`        | string            | Containment mechanism: `job_object`, `cgroup_v2`, `process_group`, `process_reaper`, or `unknown` (same vocabulary as the JSONL `run_started`). |
 | `root_pid`         | integer, nullable | The root child's PID; `null` if the backend exposed none.             |
 | `started_at`       | string            | Run start time, RFC 3339 UTC, millisecond precision.                  |
 | `jsonl`            | string, nullable  | Absolute path to the JSONL lifecycle stream; `null` only when reading a version-1 snapshot, which had no such field. A runner of `snapshot_version` 2 always publishes a path — the nullability is what makes the older contract readable (below), not a caveat about this one. |
@@ -330,7 +330,7 @@ The reply (`--json`; the default is the same fields rendered for a terminal):
 | `run_id` | The run that answered, echoed and checked by the client, so a reply describing another run is refused rather than printed. |
 | `verdict` | `member` \| `not_a_member` \| `peer_identity_unsupported` — see below. |
 | `peer_pid` | The pid the kernel reported for the caller, as the runner sees it; `null` only for `peer_identity_unsupported`. Output, never input. |
-| `mechanism` | The containment the verdict is about (`job_object` \| `cgroup_v2` \| `process_group`), which fixes its scope — see "What `member` means, per mechanism". |
+| `mechanism` | The containment the verdict is about (`job_object` \| `cgroup_v2` \| `process_group` \| `process_reaper` \| `unknown`), which fixes its scope — see "What `member` means, per mechanism". |
 | `checked_at` | When the runner decided, RFC 3339 UTC with millisecond precision. |
 
 The three verdicts are three outcomes, deliberately not a boolean:
@@ -396,9 +396,10 @@ its members.** Since that is the same enumeration `inspect` and `members_snapsho
 publish, what a `member` answer covers follows the mechanism the run obtained
 (`run_started.mechanism`, and the `mechanism` field of the attestation itself):
 
-- **`job_object` (Windows) and `cgroup_v2` (Linux)** enumerate the *whole contained
-  tree*, so any process in the tree — a grandchild, a great-grandchild — attests as a
-  member.
+- **`job_object` (Windows), `cgroup_v2` (Linux), and `process_reaper` (FreeBSD)**
+  enumerate the *whole contained tree*, so any process in the tree — a grandchild,
+  a great-grandchild — attests as a member. The FreeBSD reaper keeps descendants
+  that call `setsid` in its subtree, unlike the POSIX process-group fallback.
 - **`process_group`** (the POSIX fallback: macOS and the non-FreeBSD BSDs, and Linux
   with no usable cgroup) *contains* a whole tree but *enumerates* only the tracked
   group leaders. Membership there is therefore decided against the caller's own
@@ -406,6 +407,11 @@ publish, what a `member` answer covers follows the mechanism the run obtained
   teardown (`killpg`) reaches — so a contained grandchild attests as a member on this
   mechanism too, and a process that escaped the group with `setsid` (and so escaped
   this mechanism's containment) correctly does not.
+
+An `unknown` mechanism is the conservative forward-compatible fallback for a
+ProcessKit mechanism this CLI does not recognize. It is not evidence that the
+runner selected a fourth current backend, and consumers that require a specific
+containment guarantee must fail closed on it.
 
 **Nested runs.** A run started *inside* another run is an ordinary run: a client
 inside it attests against it exactly as a client inside a top-level run does, on every

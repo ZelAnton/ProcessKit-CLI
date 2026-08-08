@@ -107,7 +107,8 @@ pub enum Event {
         labels: std::collections::BTreeMap<String, String>,
         /// The root child's PID. `null` if the backend did not expose one.
         root_pid: Option<u32>,
-        /// `job_object` | `cgroup_v2` | `process_group` (see [`mechanism_str`]).
+        /// `job_object` | `cgroup_v2` | `process_group` | `process_reaper` |
+        /// `unknown` (see [`mechanism_str`]).
         mechanism: &'static str,
         /// `whole_tree` | `direct_child_only` | `none`: the cleanup guarantee that
         /// remains if the runner itself dies without running destructors.
@@ -191,7 +192,8 @@ pub enum Event {
     /// `run` given `--max-memory`/`--max-processes`/`--cpu-quota` asks for a cap the
     /// active mechanism cannot honor: it fires **pre-spawn** (the child never
     /// started) and covers only the *"could not be applied"* branch of this event's
-    /// contract — a whole-tree container that is `Unsupported` (macOS/BSD, the Linux
+    /// contract — a whole-tree container that is `Unsupported` (FreeBSD's process
+    /// reaper, macOS/other BSDs, the Linux
     /// process-group fallback) or `Unenforceable` (a Linux cgroup v2 whose
     /// controllers can't be enabled). It precedes the same `container_failed{create}`
     /// → `runner_exit` tail every group-creation failure takes (see `src/run/launch.rs`,
@@ -249,7 +251,7 @@ pub enum Event {
     /// never a value this runner improved by taking a maximum over its own periodic
     /// reads (that would describe when we looked, not what the tree did). Per the
     /// normative matrix: `peak_process_count` is always `null` on Windows, the IO byte
-    /// counters are always `null` on macOS/BSD and the POSIX fallback and need Linux
+    /// counters are always `null` on FreeBSD, macOS/other BSDs, and the POSIX fallback and need Linux
     /// cgroup v2's `io` controller enabled, memory and CPU are `null` on a Linux cgroup
     /// v2 natural exit as described above, and neither IO counter is comparable *across*
     /// platforms (a Job Object counts all read/write traffic; cgroup `io.stat` counts
@@ -782,6 +784,7 @@ pub fn mechanism_str(mechanism: Mechanism) -> &'static str {
         Mechanism::JobObject => "job_object",
         Mechanism::CgroupV2 => "cgroup_v2",
         Mechanism::ProcessGroup => "process_group",
+        Mechanism::ProcessReaper => "process_reaper",
         _ => "unknown",
     }
 }
@@ -1480,9 +1483,10 @@ mod tests {
 
     #[test]
     fn mechanism_maps_to_the_documented_strings() {
-        assert_eq!(mechanism_str(Mechanism::JobObject), "job_object");
-        assert_eq!(mechanism_str(Mechanism::CgroupV2), "cgroup_v2");
-        assert_eq!(mechanism_str(Mechanism::ProcessGroup), "process_group");
+        for name in ["job_object", "cgroup_v2", "process_group", "process_reaper"] {
+            let mechanism = Mechanism::from_name(name).expect("ProcessKit knows the name");
+            assert_eq!(mechanism_str(mechanism), name);
+        }
     }
 
     #[test]

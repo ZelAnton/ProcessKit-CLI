@@ -119,9 +119,23 @@ The detached copy starts a new session with `setsid`, so terminal hang-up and
 exits, the system's init process adopts the detached runner.
 
 This changes session ownership, not ProcessKit's containment mechanism. The
-run still reports `cgroup_v2` or `process_group`, and the platform-specific
-`abrupt_cleanup` value still applies if the detached runner itself is killed
-before it can perform teardown.
+detached run reports the mechanism it actually obtained:
+
+| Platform / obtained mechanism | `mechanism` | `abrupt_cleanup` if the runner dies before teardown |
+| --- | --- | --- |
+| Windows Job Object | `job_object` | `whole_tree` |
+| Linux cgroup v2 | `cgroup_v2` | `direct_child_only` |
+| Linux process-group fallback | `process_group` | `direct_child_only` |
+| FreeBSD process reaper | `process_reaper` | `none` |
+| macOS / non-FreeBSD Unix process group | `process_group` | `none` |
+
+FreeBSD is distinct from the POSIX process-group fallback: its
+`process_reaper` covers the whole reaper tree during normal teardown, including
+descendants that call `setsid` or double-fork. It has no owner-death cleanup
+primitive, so `abrupt_cleanup` remains `none` if the detached runner is killed
+before it can perform teardown. The table's Linux value is `direct_child_only`
+for both the cgroup and process-group cases; the last column applies only when
+an abrupt death prevents the runner from reaching its cleanup code.
 
 ## Supervision pattern
 
