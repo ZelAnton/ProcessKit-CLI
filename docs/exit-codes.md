@@ -288,7 +288,10 @@ with **`BACKEND` (102)** and a `runner_exit` `source` of `container_error` — t
 same code as any other container-creation failure — **not** a new code from the
 reserved band's free slots. This is a deliberate choice: the failure is genuinely
 that a *whole-tree container capable of the requested cap could not be established*
-here (macOS/BSD and the Linux process-group fallback have no such container at all;
+here (FreeBSD's process reaper provides whole-tree normal containment, membership,
+and kill/teardown semantics but no memory, CPU, or process-count cap primitive;
+macOS/non-FreeBSD BSD process groups and the Linux process-group fallback have no
+whole-tree cap container at all;
 a Linux cgroup v2 whose controllers can't be enabled — under systemd, an ordinary
 container, or typical CI — can't carry it either), which is the same class as the
 existing container-creation error. The failure is always **pre-spawn**, so no child

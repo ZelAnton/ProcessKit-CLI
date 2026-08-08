@@ -300,8 +300,11 @@ The emission is deliberately narrow:
   reaps an offender itself — a Job Object/cgroup OOM or CPU throttle — without the
   crate translating that into an event). So `limit_hit` covers the *unenforceable /
   unsupported* case, not a live overrun: `memory`/`cpu`/`processes` where the
-  platform has no whole-tree container at all (macOS/the BSDs, the Linux
-  process-group fallback), or a Linux cgroup v2 whose controllers can't be enabled
+  platform cannot provide the requested whole-tree cap (macOS and non-FreeBSD BSD
+  process groups, plus the Linux process-group fallback, have no whole-tree cap
+  container; FreeBSD's process reaper provides whole-tree normal containment,
+  membership, and kill/teardown semantics but no memory, CPU, or process-count
+  resource-limit support), or a Linux cgroup v2 whose controllers can't be enabled
   (not the real hierarchy root — under systemd, an ordinary container, or typical
   CI; see `README.md`, "Resource limits"). This is the pre-spawn admission
   failure only; post-run evidence for successfully applied caps is carried by
@@ -341,8 +344,10 @@ engaged; `not_tripped` is authoritative evidence that it did not engage (and is
 also ProcessKit's result for an uncapped axis); `unknown` means a successfully
 created group's mechanism cannot provide a post-run answer. Linux cgroup v2 can
 report all three states. A successfully created Windows Job Object reports
-`unknown` for capped axes. FreeBSD's process reaper, the POSIX process-group
-fallback, and macOS/other BSD process groups fail before a capped group exists,
+`unknown` for capped axes. FreeBSD's process reaper provides whole-tree normal
+membership and kill/teardown semantics but no resource-limit primitive, so a cap
+request fails before a capped group exists. The POSIX process-group fallback and
+macOS/non-FreeBSD BSD process groups likewise fail before a capped group exists,
 so they emit `limit_hit` and no
 `limit_evidence`. The event is absent when no cap was requested. This is an
 additive event within `schema_version = 1`.
@@ -395,8 +400,9 @@ requires within a version — is unaffected.
 **Honest degradation, and why the flag is load-bearing.** A failed `stats()` does not
 skip the event: it is emitted with `read_error: true` and every measurement `null`.
 That flag is not ceremony. An all-`null` summary is *also* a perfectly correct
-**success**: it is what a mechanism with no whole-tree accounting reports (macOS/the
-BSDs, the Linux process-group fallback), and it is equally what a plain flagless run on
+**success**: it is what a mechanism with no whole-tree accounting reports (FreeBSD's
+process reaper, macOS/non-FreeBSD BSD process groups, and the Linux process-group
+fallback), and it is equally what a plain flagless run on
 **Linux cgroup v2** reports when its child exited on its own — memory and CPU have no
 live member left to sum at the read point, and no `io`/`pids` controller is enabled to
 answer for the rest. So the numbers alone cannot distinguish "this mechanism measured

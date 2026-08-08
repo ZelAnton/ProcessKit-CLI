@@ -1025,7 +1025,8 @@ no-op.** A whole-tree cap needs a real container:
 | --- | --- |
 | Windows — Job Object | **Enforced** (memory, CPU, and active-process count). |
 | Linux — cgroup v2 **at the real hierarchy root** | **Enforced.** Requires the runner to be a direct member of the real cgroup-v2 root (a minimal, non-systemd init). **Not** under a systemd session/scope/service, and **not** in an ordinary container (incl. Docker/Kubernetes and **typical CI such as GitHub Actions**) — there the controllers can't be enabled and the request is *unenforceable*. |
-| macOS, the BSDs, Linux process-group fallback | **Unsupported** — no whole-tree container exists, so any cap request fails fast. |
+| FreeBSD — process reaper | **Unsupported for resource caps.** The reaper still provides whole-tree normal containment, membership, and kill/teardown semantics, but memory, CPU, and process-count caps are unavailable, so any cap request fails fast. |
+| macOS and non-FreeBSD BSD — process group; Linux process-group fallback | **Unsupported** — no whole-tree resource-limit container exists, so any cap request fails fast. |
 
 Where a cap **cannot** be applied, the run does not silently continue unbounded:
 it fails fast **before the child is spawned**, emits a `limit_hit` JSONL event
@@ -1043,9 +1044,10 @@ total CPU, IO bytes read and written, and peak process count. There is no flag: 
 read of counters the kernel already keeps. **Which slots carry a number is a property of
 the mechanism, not a promise of the event**, and each measurement is independently `null`
 where the mechanism does not account for it — never `0`, and never a number this runner
-improved by sampling itself. So `peak_process_count` is always `null` on Windows; the IO
-counters are `null` on FreeBSD, macOS, other BSDs, and the Linux process-group fallback,
-and need Linux cgroup v2's `io` controller otherwise; and on Linux
+improved by sampling itself. So `peak_process_count` is always `null` on Windows. FreeBSD's
+process reaper has no `resource_summary` accounting, so all five measurement fields are
+`null`; macOS, non-FreeBSD BSDs, and the Linux process-group fallback likewise report no
+measurements. Linux cgroup v2 needs the `io` controller for IO values, and on Linux
 cgroup v2 memory and CPU are summed over the members still live when the read happens, so
 a run whose child exited on its own reports both as `null` while a `--timeout`/cancel/kill
 ending, read while the tree still runs, reports them. The two platforms' IO counters are

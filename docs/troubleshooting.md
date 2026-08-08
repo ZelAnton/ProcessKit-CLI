@@ -94,10 +94,15 @@ means cgroup v2 **at the real hierarchy root** — a minimal, non-systemd init.
 It does **not** work under a systemd session/scope/service, inside an
 ordinary container (Docker/Kubernetes), or under typical hosted CI (including
 GitHub Actions' `ubuntu-latest`), because the controllers cannot be enabled
-there; the run fails fast rather than silently running unbounded. macOS, the
-BSDs, and the Linux process-group fallback have no whole-tree container at
-all, so any cap request fails the same way there too. See `README.md`,
-"Resource limits", for the full platform matrix, and
+there; the run fails fast rather than silently running unbounded. FreeBSD's
+process reaper still provides whole-tree normal containment, membership, and
+kill/teardown semantics, but it has no memory, CPU, or process-count cap support,
+so any cap request fails there too. macOS and non-FreeBSD BSD process groups,
+along with the Linux process-group fallback, have no whole-tree cap container at
+all, so any cap request fails the same way there too. See the
+[resource-limit platform matrix](resource-limits.md#platform-matrix) for the
+separate FreeBSD process-reaper row and the distinct macOS/non-FreeBSD BSD
+process-group row, and
 [`docs/exit-codes.md`](exit-codes.md#resource-limits-reuse-backend-102) for
 why this reuses `BACKEND` (102) instead of a dedicated code.
 

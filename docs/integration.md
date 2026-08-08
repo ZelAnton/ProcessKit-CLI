@@ -247,9 +247,12 @@ processkit-cli run \
   environment can't apply a cap the run fails **fast** with a `limit_hit` event
   (§3) and `BACKEND` (102) rather than running silently unbounded — so an adapter
   that *depends* on a cap must treat a `limit_hit` as a hard failure, not a
-  warning. See `README.md`, "Resource limits", for the platform matrix (macOS/BSD
-  and the Linux process-group fallback are unsupported; cgroup v2 is often
-  unenforceable under systemd/containers/typical CI) and the Linux
+  warning. See the [resource-limit platform matrix](resource-limits.md#platform-matrix),
+  which has a separate FreeBSD process-reaper row — normal whole-tree containment,
+  membership, and kill/teardown, but no memory/process/CPU caps or
+  `resource_summary` accounting — and the distinct macOS/non-FreeBSD BSD
+  process-group row; cgroup v2 is often unenforceable under systemd/containers/typical CI,
+  and the Linux
   `--max-processes` caveat.
 - **Command-line redaction.** `run_started`'s `command` field is redacted by
   default: the raw argv is *not* recorded, only a one-way SHA-256
