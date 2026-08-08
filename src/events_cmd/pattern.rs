@@ -97,8 +97,10 @@ impl Anchored {
         let mut elements = Vec::new();
         let mut index = 0;
         while index < characters.len() {
+            let element_start = index;
             let atom = parse_atom(&characters, &mut index, pattern)?;
             let (min, max) = parse_quantifier(&characters, &mut index, pattern)?;
+            ensure_parser_progress(element_start, index, characters.len(), pattern)?;
             elements.push(Element { atom, min, max });
         }
         Ok(Self { elements })
@@ -143,6 +145,23 @@ impl Anchored {
             count -= 1;
         }
     }
+}
+
+fn ensure_parser_progress(
+    element_start: usize,
+    next_index: usize,
+    input_len: usize,
+    pattern: &str,
+) -> Result<(), String> {
+    // This is a denial-of-service boundary: every compiled element must consume
+    // input. A helper regression must fail closed instead of letting the compile
+    // loop grow `elements` without bound.
+    if next_index <= element_start || next_index > input_len {
+        return Err(format!(
+            "pattern `{pattern}` parser made no bounded forward progress"
+        ));
+    }
+    Ok(())
 }
 
 fn is_escaped_punctuation(character: char) -> bool {
@@ -331,6 +350,16 @@ mod tests {
 
     fn compiled(pattern: &str) -> Anchored {
         Anchored::compile(pattern).unwrap_or_else(|err| panic!("compile `{pattern}`: {err}"))
+    }
+
+    #[test]
+    fn parser_progress_invariant_rejects_stalls_regressions_and_overshoot() {
+        assert!(ensure_parser_progress(1, 2, 3, "^a$").is_ok());
+        for (next_index, input_len) in [(1, 3), (0, 3), (4, 3)] {
+            let error = ensure_parser_progress(1, next_index, input_len, "^a$")
+                .expect_err("a non-forward cursor must fail closed");
+            assert!(error.contains("no bounded forward progress"), "{error}");
+        }
     }
 
     /// The event schema's own timestamp pattern, against the shape the emitter
