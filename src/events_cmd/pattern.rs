@@ -123,27 +123,25 @@ impl Anchored {
             return position == characters.len();
         };
 
-        let mut available = 0;
-        while available < current.max
-            && position + available < characters.len()
-            && current.atom.matches(characters[position + available])
-        {
-            available += 1;
-        }
+        // Iterator bounds make termination independent of an incrementing
+        // counter, so a counter regression cannot turn matching into a denial
+        // of service.
+        let available = characters
+            .iter()
+            .skip(position)
+            .take(current.max)
+            .take_while(|character| current.atom.matches(**character))
+            .count();
         if available < current.min {
             return false;
         }
 
-        let mut count = available;
-        loop {
+        for count in (current.min..=available).rev() {
             if self.match_from(characters, element + 1, position + count) {
                 return true;
             }
-            if count == current.min {
-                return false;
-            }
-            count -= 1;
         }
+        false
     }
 }
 
@@ -322,8 +320,15 @@ fn parse_quantifier(
                 closed = true;
                 break;
             }
-            ',' if bounds.len() == 1 => bounds.push(String::new()),
-            digit if digit.is_ascii_digit() => {
+            ',' => {
+                if bounds.len() != 1 {
+                    return Err(format!(
+                        "pattern `{pattern}` has more than one comma in a `{{` bound"
+                    ));
+                }
+                bounds.push(String::new());
+            }
+            digit @ '0'..='9' => {
                 bounds
                     .last_mut()
                     .expect("the bound list is never empty")
@@ -351,11 +356,18 @@ fn parse_quantifier(
             let exact = parse(only)?;
             (exact, exact)
         }
-        [low, high] if !high.is_empty() => (parse(low)?, parse(high)?),
-        // `{n,}` is unbounded, which this matcher does not implement.
+        [low, high] => match high.as_str() {
+            // `{n,}` is unbounded, which this matcher does not implement.
+            "" => {
+                return Err(format!(
+                    "pattern `{pattern}` uses an open-ended `{{n,}}` bound, which is not supported"
+                ));
+            }
+            _ => (parse(low)?, parse(high)?),
+        },
         _ => {
             return Err(format!(
-                "pattern `{pattern}` uses an open-ended `{{n,}}` bound, which is not supported"
+                "pattern `{pattern}` has an unsupported number of `{{` bounds"
             ));
         }
     };
@@ -421,6 +433,9 @@ mod tests {
             !digest.matches(&format!("{}A", "a".repeat(63))),
             "uppercase is outside the class"
         );
+
+        let maximum = compiled("^a{1024}$");
+        assert!(maximum.matches(&"a".repeat(MAX_REPETITIONS)));
     }
 
     /// The label-key pattern exercises the two remaining features: a `{0,n}`
@@ -456,6 +471,13 @@ mod tests {
         assert!(negated.matches("[x"), "the opening bracket is not an item");
         assert!(!negated.matches("ax"));
         assert!(!negated.matches("x"));
+
+        let equal_range = compiled("^[a-a]$");
+        assert!(
+            equal_range.matches("a"),
+            "an equal range contains its endpoint"
+        );
+        assert!(!equal_range.matches("b"));
     }
 
     /// Backtracking: a greedy element that swallowed too much gives characters
@@ -477,35 +499,40 @@ mod tests {
     #[test]
     fn unsupported_constructs_are_refused_at_compile_time() {
         for unsupported in [
-            "[0-9]+",    // unanchored
-            "^[0-9]+$",  // unbounded quantifier
-            "^a*$",      // unbounded quantifier
-            "^a?$",      // optional
-            "^(ab)$",    // group
-            "^a|b$",     // alternation
-            "^.$",       // any-character
-            r"^\w$",     // class escape
-            r"^\s{2}$",  // class escape
-            r"^[\d]$",   // class escape
-            r"^[\w]$",   // class escape
-            r"^[\b]$",   // unsupported non-punctuation class escape
-            r"^[\x]$",   // unsupported non-punctuation class escape
-            r"^[a-\d]$", // escaped upper range endpoint
-            r"^[\d-a]$", // escaped lower range endpoint
-            r"^[!-\]]$", // escaped punctuation range endpoint
-            "^a{2,}$",   // open-ended bound
-            "^a{3,1}$",  // inverted bound
-            "^a{2000}$", // beyond the repetition cap
-            "^[a-$",     // unterminated class
-            "^[]$",      // empty class
-            "^[z-a]$",   // inverted range
-            r"^a\$",     // dangling escape (the `$` is consumed as anchor)
-            "^a{x}$",    // non-numeric bound
+            "[0-9]+",     // unanchored
+            "^[0-9]+$",   // unbounded quantifier
+            "^a*$",       // unbounded quantifier
+            "^a?$",       // optional
+            "^(ab)$",     // group
+            "^a|b$",      // alternation
+            "^.$",        // any-character
+            r"^\w$",      // class escape
+            r"^\s{2}$",   // class escape
+            r"^[\d]$",    // class escape
+            r"^[\w]$",    // class escape
+            r"^[\b]$",    // unsupported non-punctuation class escape
+            r"^[\x]$",    // unsupported non-punctuation class escape
+            r"^[a-\d]$",  // escaped upper range endpoint
+            r"^[\d-a]$",  // escaped lower range endpoint
+            r"^[!-\]]$",  // escaped punctuation range endpoint
+            "^a{2,}$",    // open-ended bound
+            "^a{1,2,3}$", // more than one comma
+            "^a{3,1}$",   // inverted bound
+            "^a{2000}$",  // beyond the repetition cap
+            "^[a-$",      // unterminated class
+            "^[]$",       // empty class
+            "^[z-a]$",    // inverted range
+            r"^a\$",      // dangling escape (the `$` is consumed as anchor)
+            "^a{x}$",     // non-numeric bound
         ] {
             assert!(
                 Anchored::compile(unsupported).is_err(),
                 "`{unsupported}` must be refused, not guessed at"
             );
         }
+
+        let open_ended = Anchored::compile("^a{2,}$")
+            .expect_err("an open-ended repetition must be refused explicitly");
+        assert!(open_ended.contains("open-ended"), "{open_ended}");
     }
 }
