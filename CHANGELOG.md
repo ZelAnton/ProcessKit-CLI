@@ -436,8 +436,14 @@ to a dated version section.
   An element that cannot be written into a JSON string verbatim is recorded
   losslessly in a reversible escaped form, opened by U+0000 (a character no real
   argv element can contain, so a verbatim element is never mistaken for an escaped
-  one); `docs/schema.md` states the encoding and the escape grammar normatively,
-  including what this does and does not oblige an existing reader to change.
+  one); `docs/schema.md` states the encoding and the escape grammar normatively.
+  That escaped element is the only string value in the schema that can carry
+  U+0000, so it obliges an existing reader in two ways — decode it before
+  reconstructing an argv, and check that a sink accepts U+0000 before storing or
+  forwarding a *decoded* element (PostgreSQL refuses a `jsonb` document containing
+  it, a C-string API truncates the element away). Readers that display, log, or
+  store the JSONL *line* are unaffected: the wire form is the ordinary
+  six-character JSON escape, so the line stays NUL-free text.
 - `--capture-dir` setup is now all-or-nothing. Previously the runner created and
   emptied `stdout.log` before it tried `stderr.log`, so a second stream that could
   not be opened (a path that already named a directory, an unwritable file) left

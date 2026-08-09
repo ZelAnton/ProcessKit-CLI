@@ -211,14 +211,29 @@ is what requires a new schema version — nothing below does.
    the argument verbatim, but an argument the platform accepts and Unicode cannot
    express — ill-formed bytes on Unix, an unpaired surrogate on Windows — is now
    recorded losslessly in an escaped form opened by U+0000, instead of the
-   U+FFFD-mangled reconstruction earlier v1 builds wrote. A reader that displays,
-   logs, or stores `argv` needs no change. A reader that *reconstructs* an argv
-   from it (to re-run, compare, or match against one it holds) must decode that
-   form — the grammar is in [`docs/schema.md`](schema.md#command-redaction), "Raw
-   argv that is not valid Unicode" — and must not take an escaped element
-   literally. This is the one reader obligation the same correction adds;
-   `argv_sha256` adds none, since every digest an earlier build produced for an
-   ordinary command line is unchanged.
+   U+FFFD-mangled reconstruction earlier v1 builds wrote. A reader that displays or
+   logs `argv` needs no change, and neither does one that stores or relays the JSONL
+   *line*: U+0000 goes on the wire as the ordinary six-character JSON escape, so the
+   line stays NUL-free text. The correction adds two reader obligations, both
+   confined to that one element shape:
+
+   - A reader that *reconstructs* an argv (to re-run, compare, or match against one
+     it holds) must decode that form — the grammar is in
+     [`docs/schema.md`](schema.md#command-redaction), "Raw argv that is not valid
+     Unicode" — and must not take an escaped element literally.
+   - A reader that **stores or forwards a decoded element** must check that its sink
+     accepts U+0000; this is the only place in the schema where a string value can
+     carry that code point, so a sink that rejects it will have accepted every
+     stream earlier builds produced. PostgreSQL refuses a `jsonb` document
+     containing it (an adapter that ingests whole event lines into `jsonb` loses the
+     entire `run_started` event, not just the field), a C-string API truncates the
+     element at its leading NUL and is left with nothing, and some YAML and log
+     transports refuse a NUL in a scalar. Such a reader decodes the escape and
+     re-renders it for its sink — or escapes or drops the marker itself — instead of
+     passing the decoded string through.
+
+   `argv_sha256` adds no obligation at all, since every digest an earlier build
+   produced for an ordinary command line is unchanged.
 7. **Unknown fields anywhere in the envelope or event body.**
 
 **The normative source is [`docs/schema.md`](schema.md)**, not this page: its

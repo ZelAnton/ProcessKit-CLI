@@ -269,8 +269,14 @@ processkit-cli run \
   UTF-8-decoded string instead will agree on every ordinary command line and
   disagree on exactly those. The same case is the one where `--argv-raw`'s `argv`
   array carries an escaped element rather than the argument verbatim; an adapter
-  that re-runs or compares a recorded argv must decode it (both rules are in
-  `docs/schema.md`).
+  that re-runs or compares a recorded argv must decode it. An adapter that *stores*
+  what it read must also check its sink: an escaped element is the only string value
+  in this schema that can contain U+0000, and while the JSONL line itself stays
+  NUL-free text (the wire form is the ordinary six-character escape), a decoded value
+  handed to a sink that forbids NUL is rejected or truncated — PostgreSQL refuses a
+  `jsonb` document containing it, so an adapter ingesting whole event lines into
+  `jsonb` loses the entire event rather than one field. All three rules are in
+  `docs/schema.md`.
 
 `run` is not shell-free by accident — everything after `--` is the literal
 `<program> <args...>`, with no shell to expand or reinterpret it; an adapter

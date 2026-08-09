@@ -823,13 +823,43 @@ the single byte `0xE9` (an ISO-8859-1 `é` in a UTF-8 world) is therefore record
 as the JSON string `"\u0000--path=/tmp/logs\\xe9"`, while the well-formed
 `--path=/tmp/logsé` is recorded as `"--path=/tmp/logsé"`, exactly as it always was.
 
-A reader that does not care about this case needs no change: an escaped element is
-a well-formed JSON string like any other, and only argv the local platform accepts
-but Unicode cannot express ever takes that form. A reader that reconstructs an
-argv to re-run or compare it must decode as above rather than take an escaped
-element literally. The escaped text is a *rendering*, not the fingerprint's input:
-`argv_sha256` hashes the canonical bytes themselves, so escaping never perturbs a
-digest.
+An escaped element is a well-formed JSON string like any other, and only argv the
+local platform accepts but Unicode cannot express ever takes that form, so a reader
+that merely displays or logs `argv` needs no change. Two kinds of reader do:
+
+- One that **reconstructs** an argv to re-run or compare it must decode as above
+  rather than take an escaped element literally.
+- One that **stores or forwards a decoded element** must check that its sink accepts
+  U+0000. This is the only place in this schema where a string value can carry that
+  code point — every other string is either produced by the runner itself or a
+  rendering of an OS string, and an OS string cannot contain a NUL on any supported
+  platform — so a sink that rejects it will have accepted every stream this runner
+  produced until now.
+
+The emitted line itself is unaffected, and the distinction matters: U+0000 is
+written as the ordinary six-character JSON escape `\u0000`, so the JSONL line is
+NUL-free text and storing, archiving, copying, or re-serving *the line* is exactly
+as it was. The obligation begins where the escape is decoded into a string:
+
+- PostgreSQL rejects a `jsonb` document containing the escape outright
+  (`unsupported Unicode escape sequence`) and errors on text extraction (`->>`) from
+  a `json` one — so an adapter that ingests whole event lines into `jsonb` loses the
+  entire `run_started` event, not merely the `argv` field.
+- A C-string API (or any layer that passes the decoded value into one) truncates the
+  element at the first NUL. The marker is the element's *first* character, so the
+  whole argument disappears rather than arriving mangled — strictly less than the
+  U+FFFD reconstruction earlier builds wrote, which at least kept a readable prefix.
+- Some YAML and log transports refuse a NUL in a scalar when re-encoding.
+
+Such a reader must decode the escape and re-render the element in a form its sink
+accepts — or escape or drop the marker itself — rather than pass the decoded string
+through untouched. Note that the marker cannot be moved to a printable character to
+avoid this: any printable marker would itself need escaping in *verbatim* elements,
+changing how every ordinary command line is recorded (a Windows path's `\` most
+visibly), which is a far wider break than the one case above.
+
+The escaped text is a *rendering*, not the fingerprint's input: `argv_sha256` hashes
+the canonical bytes themselves, so escaping never perturbs a digest.
 
 ### Hint classifier
 
@@ -972,9 +1002,12 @@ change at all. The raw `argv` array keeps its type (`array of string`) and every
 representable element's rendering, but a reader may now encounter one element shape
 it could not before — the escaped form, and only for argv the local platform allows
 but Unicode cannot express. A reader that only displays or logs `argv` is
-unaffected; one that *reconstructs* an argv from it must decode that form (the
-rules are in "Raw argv that is not valid Unicode"), where before it would have
-reconstructed a U+FFFD-mangled argv and could not have detected that it had.
+unaffected; one that *reconstructs* an argv from it must decode that form, where
+before it would have reconstructed a U+FFFD-mangled argv and could not have detected
+that it had; and one that stores or forwards a *decoded* element must first check
+that its sink accepts U+0000, which no stream this runner produced before could
+contain. Both obligations, and why the emitted line itself is unchanged, are stated
+in "Raw argv that is not valid Unicode".
 
 The `mechanism` field is the deliberate exception to the usual closed-enum reading of
 the JSON Schema. Its vocabulary grows additively within `schema_version = 1`: adding

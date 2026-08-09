@@ -546,7 +546,12 @@ impl CaptureInfo {
 /// upstream tooling mangled) and would make two different mangled argvs
 /// indistinguishable a second time, in the very field that opted out of
 /// redaction. Encoding also keeps the field's `array of string` type, so no
-/// existing v1 consumer's parse changes (`docs/schema.md`, "Command redaction").
+/// existing v1 consumer's *parse* changes (`docs/schema.md`, "Command redaction").
+/// Parsing is not the whole of a consumer's job, though: an escaped element is the
+/// only string in this schema that can carry U+0000, so one that stores or forwards
+/// the *decoded* value must check that its sink accepts it (see
+/// [`ARGV_ESCAPE_MARKER`]). That obligation is documented, not implicit — the same
+/// section states it, alongside the fact that the emitted line itself stays NUL-free.
 #[derive(Debug, Serialize)]
 pub struct CommandInfo {
     redacted: bool,
@@ -788,6 +793,22 @@ fn push_utf8_code_point(out: &mut Vec<u8>, code: u32) {
 /// platform — the same invariant that lets [`argv_sha256_hex`] join elements with
 /// a NUL. An element rendered verbatim can therefore never be mistaken for an
 /// escaped one, and vice versa, with no in-band flag or extra field.
+///
+/// **Why it cannot be a printable character.** A printable marker would be a
+/// character a real argument may also start with, so every *verbatim* element
+/// beginning with it would have to be escaped too — changing how ordinary command
+/// lines are recorded (most visibly a Windows path's `\`) for every reader, to
+/// spare the one element shape that is not representable anyway. U+0000 confines
+/// the new shape to exactly the arguments that forced it.
+///
+/// The cost of that choice is real but bounded, and `docs/schema.md` ("Raw argv
+/// that is not valid Unicode") states it normatively rather than leaving a reader
+/// to discover it: an escaped element is the only string value in the schema that
+/// can carry U+0000, so a consumer that decodes the JSON and then hands the value
+/// to a sink which forbids NUL (PostgreSQL `jsonb`, a C-string API, some YAML/log
+/// transports) must re-render or strip it. The emitted line is unaffected — serde
+/// writes U+0000 as the ordinary six-character JSON escape, so the JSONL stays
+/// NUL-free text (pinned by `escaped_elements_reach_the_wire_as_an_ascii_escape`).
 const ARGV_ESCAPE_MARKER: char = '\0';
 
 /// Render one argv element's canonical bytes to the JSON string `--argv-raw`
@@ -1787,6 +1808,34 @@ mod tests {
             render_element_text(b"a\\b\xff"),
             "\u{0}a\\\\b\\xff",
             "a real backslash is doubled so it cannot be read as an escape"
+        );
+    }
+
+    /// The escape reaches the wire as **text**, never as a raw NUL byte: the same
+    /// serializer that writes every event line renders U+0000 as the ordinary
+    /// six-character JSON escape, so a line carrying an escaped element is still
+    /// NUL-free UTF-8. This is the executable statement of the half of
+    /// `docs/schema.md`'s reader contract ("Raw argv that is not valid Unicode")
+    /// that says storing or relaying the *line* needs no change; the obligation that
+    /// section does state falls on a reader which stores the *decoded* string, and
+    /// no rendering here can discharge it (see [`ARGV_ESCAPE_MARKER`]).
+    /// Byte-level by construction, so it holds identically on both platforms.
+    #[test]
+    fn escaped_elements_reach_the_wire_as_an_ascii_escape() {
+        let text = render_element_text(b"logs\xe9");
+        assert!(
+            text.starts_with(ARGV_ESCAPE_MARKER),
+            "the element under test is the escaped form: {text:?}"
+        );
+
+        let wire = serde_json::to_string(&text).expect("serializing a string cannot fail");
+        assert_eq!(
+            wire, r#""\u0000logs\\xe9""#,
+            "the marker is written as an escape, not as a NUL byte"
+        );
+        assert!(
+            !wire.as_bytes().contains(&0),
+            "no NUL byte reaches the stream: {wire:?}"
         );
     }
 
