@@ -14,7 +14,7 @@ use std::io;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Absolute path to the freshly built `processkit-cli` binary under
 /// benchmark — the same binary the through-the-binary integration tests
@@ -156,26 +156,45 @@ pub fn measure_startup_latency(scratch: &Scratch) -> Duration {
     Duration::from_millis(latency_millis as u64)
 }
 
-/// Spawn `bench_emit --bytes 0` directly (no runner in between) and wait for
-/// it to exit. `bytes = 0` keeps the child's own runtime past spawn
-/// negligible, matching [`measure_startup_latency`]'s `--bytes 0` child, so
-/// this is effectively the OS's bare process-creation cost for the same
-/// command. The "same child process, launched directly" control arm: timed
-/// by criterion's own default closure timing (see
-/// `startup_latency_bench.rs`), so it is directly comparable, on the same
-/// host, to `measure_startup_latency`'s `iter_custom` timing. Absolute
-/// startup-latency numbers are not comparable across hosts (antivirus, CPU,
-/// and OS-scheduler noise dominate); the *delta* between the two arms on the
-/// same host is: it isolates what the runner itself adds over the OS's own
-/// process-creation cost for the exact same child, rather than folding both
-/// into one absolute figure (see `README.md`, "Benchmarks"; upstream raised
-/// the same attribution point in thread
-/// `msg-send-ba9dc66e1b832e104c35c9a1e75a6588`).
-pub fn run_direct_startup_child() {
-    let status = direct_command(0)
-        .status()
+/// Spawn `bench_emit --bytes 0` directly (no runner in between), timing only
+/// the `Command::spawn` call itself — the OS work to create the child
+/// process — and reaping it (`wait`) *outside* the timed window. That
+/// boundary, "process created, not yet exited", is deliberately the same one
+/// [`measure_startup_latency`] stops at: the runner stamps `run_started` as
+/// soon as its own child has been created, before the runner itself waits
+/// for that child to exit. An earlier version of this arm timed
+/// spawn-through-exit-through-reap with criterion's default closure timing,
+/// which folded the child's own runtime, exit, and teardown into a window
+/// [`measure_startup_latency`] never reaches, biasing the delta between the
+/// two arms toward *understating* what the runner adds (the residue in the
+/// subtrahend inflated it). `bytes = 0` still keeps the (now excluded)
+/// child-runtime residue negligible regardless. Timed with
+/// [`criterion::Bencher::iter_custom`] (see `startup_latency_bench.rs`), like
+/// [`measure_startup_latency`], precisely so criterion's own default closure
+/// timing cannot re-introduce the exit/reap tail. Absolute startup-latency
+/// numbers are not comparable across hosts (antivirus, CPU, and
+/// OS-scheduler noise dominate); the *delta* between the two arms on the
+/// same host is what going through `run` costs beyond launching the same
+/// child directly — the whole price of the wrapper, including the OS's own
+/// cost of creating the *runner* process itself, not only what
+/// `ProcessGroup::start` does once the runner is already running, so it is
+/// not a breakdown attributable to any one sub-phase in isolation (see
+/// `README.md`, "Benchmarks"; upstream raised the boundary-asymmetry point in
+/// thread `msg-send-ba9dc66e1b832e104c35c9a1e75a6588`).
+pub fn run_direct_startup_child() -> Duration {
+    let start = Instant::now();
+    let mut child = direct_command(0)
+        .spawn()
         .expect("spawn bench_emit for direct startup-latency baseline");
+    let elapsed = start.elapsed();
+    // Reaped after the timed window closes — see the boundary rationale
+    // above. bench_emit exits immediately with `--bytes 0`, so this wait
+    // never blocks the sample loop for long.
+    let status = child
+        .wait()
+        .expect("wait for bench_emit (direct startup-latency baseline)");
     assert!(status.success(), "bench_emit exited with {status:?}");
+    elapsed
 }
 
 /// Milliseconds since the Unix epoch, matching the precision (and the same

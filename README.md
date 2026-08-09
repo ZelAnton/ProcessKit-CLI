@@ -1251,7 +1251,7 @@ tracked trend.
 | Hint classifier, no match / MSBuild match | ~520 ns / ~830 ns |
 | Echo overhead, 4MiB payload: direct vs. under `run` (no capture) | ~19 ms vs. ~224 ms |
 | Echo overhead, 4MiB payload: under `run` with `--capture-dir` | ~801 ms |
-| Startup latency, call to `run_started`: direct vs. under `run` | ~25 ms vs. ~115 ms |
+| Startup latency: direct child creation vs. `run`'s call to `run_started` | ~22 ms vs. ~150 ms |
 | Owner-only registry open, 0 / 64 / 256 / 1024 entries | ~0.10 ms, flat |
 | The same open when it must write the permissions | ~0.75 ms / ~20 ms / ~96 ms / ~443 ms |
 
@@ -1262,10 +1262,13 @@ no-capture median by about 96% while preserving the runner's byte-for-byte
 passthrough contract. Capture deliberately remains on its established decoded
 sink so its counters, hashes, and truncation boundary do not change.
 
-A release-build phase trace of short Windows runs attributed less than 1 ms to
-opening JSONL plus creating the container, about 36-41 ms to re-asserting the
-registry directory's owner-only ACL, and another 166-228 ms to
-`ProcessGroup::start`.
+A release-build phase trace of short Windows runs against `processkit` 3.1 —
+predating both the registry-ACL fix below and this task's re-measurement, and
+now superseded by both — attributed less than 1 ms to opening JSONL plus
+creating the container, about 36-41 ms to re-asserting the registry
+directory's owner-only ACL, and another 166-228 ms to `ProcessGroup::start`.
+Neither of the latter two figures is current; the paragraphs below cover what
+replaced each one.
 
 The middle phase has since been attributed properly and reduced. It was never a
 constant metadata write: the Windows ACE is inheritable and applied to a
@@ -1278,9 +1281,11 @@ directly (see the two rows above: ~0.15 ms per file, ~443 ms at 1024 entries).
 match, which makes the phase flat at ~0.1 ms whatever the registry holds; the
 security guarantee is unchanged, and a directory whose permissions were widened
 out of band is still repaired (see [`docs/registry.md`](docs/registry.md),
-"Permissions"). The remaining `ProcessGroup::start` phase is inside ProcessKit's
-public API, and the earlier trace attributed the whole 166-228 ms of it to the
-crate. Upstream disputed that reading (thread
+"Permissions").
+
+The remaining `ProcessGroup::start` phase is inside ProcessKit's public API.
+The 3.1-era trace above attributed the whole 166-228 ms of it to the crate;
+upstream disputed that reading (thread
 `msg-send-ba9dc66e1b832e104c35c9a1e75a6588`), correctly: part of it is the OS's
 own process creation happening inside `start` — on a Windows host with a
 real-time antivirus, routinely the same order of magnitude — not a fixed cost
@@ -1289,14 +1294,24 @@ dominant share of their measured crate-owned time was an all-threads
 `CreateToolhelp32Snapshot` walk of the host to find a just-spawned child's
 primary thread; that is fixed as of `processkit` 3.2 (direct `NtGetNextThread`
 resolution, falling back to the old walk only where the export is
-unavailable), and this crate already depends on 3.3, so the numbers above
-already include that fix. `benches/startup_latency_bench.rs` now measures both
-sides of the OS-creation boundary on the same host instead of reporting one
-absolute: a `direct` control arm spawns the exact same child with no runner at
-all, paying that OS cost on its own (~25 ms, see the table above), so the
-~90 ms delta between it and the call-to-`run_started` figure is what `run`
-adds **on top of** the OS's own process creation, not instead of it. Treat all
-figures as host snapshots and the CI history as the regression signal.
+unavailable), and this crate already depends on 3.3.
+
+`benches/startup_latency_bench.rs` replaces that 3.1-era absolute with a
+same-host delta, re-measured against `processkit` 3.3: a `direct` control arm
+spawns the exact same child with no runner at all, timed only up to the point
+the OS reports it created — the same "process created, not yet exited"
+boundary `run_started` is stamped at, so both arms stop at the same kind of
+event rather than one of them also folding in the child's own runtime, exit,
+and reap. On the numbers above (~22 ms direct, ~150 ms under `run`), the
+~128 ms delta is what going through `run` costs beyond launching the same
+child directly on this host — the whole price of the wrapper, including the
+OS's own cost of creating the *runner* process itself, not only what
+`ProcessGroup::start` does once the runner is already running. It is
+therefore not a breakdown of `ProcessGroup::start` in isolation, and the
+superseded 166-228 ms trace above should not be read as a stand-in for one;
+the crate does not currently instrument that phase separately from the
+runner's own startup. Treat all figures as host snapshots and the CI history
+as the regression signal.
 
 [criterion]: https://github.com/bheisler/criterion.rs
 
