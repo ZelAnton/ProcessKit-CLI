@@ -156,6 +156,28 @@ pub fn measure_startup_latency(scratch: &Scratch) -> Duration {
     Duration::from_millis(latency_millis as u64)
 }
 
+/// Spawn `bench_emit --bytes 0` directly (no runner in between) and wait for
+/// it to exit. `bytes = 0` keeps the child's own runtime past spawn
+/// negligible, matching [`measure_startup_latency`]'s `--bytes 0` child, so
+/// this is effectively the OS's bare process-creation cost for the same
+/// command. The "same child process, launched directly" control arm: timed
+/// by criterion's own default closure timing (see
+/// `startup_latency_bench.rs`), so it is directly comparable, on the same
+/// host, to `measure_startup_latency`'s `iter_custom` timing. Absolute
+/// startup-latency numbers are not comparable across hosts (antivirus, CPU,
+/// and OS-scheduler noise dominate); the *delta* between the two arms on the
+/// same host is: it isolates what the runner itself adds over the OS's own
+/// process-creation cost for the exact same child, rather than folding both
+/// into one absolute figure (see `README.md`, "Benchmarks"; upstream raised
+/// the same attribution point in thread
+/// `msg-send-ba9dc66e1b832e104c35c9a1e75a6588`).
+pub fn run_direct_startup_child() {
+    let status = direct_command(0)
+        .status()
+        .expect("spawn bench_emit for direct startup-latency baseline");
+    assert!(status.success(), "bench_emit exited with {status:?}");
+}
+
 /// Milliseconds since the Unix epoch, matching the precision (and the same
 /// `SystemTime`-since-`UNIX_EPOCH` basis) `src/events.rs`'s
 /// `format_rfc3339_utc` stamps every JSONL event with.

@@ -1209,7 +1209,10 @@ covers two things:
   run under `run` (plain echo, and echo plus `--capture-dir`) at a couple of
   payload sizes; `benches/startup_latency_bench.rs` measures the latency from
   just before `run` is invoked to the `time` the runner itself stamps on its
-  `run_started` JSONL event, over a short series of invocations.
+  `run_started` JSONL event, over a short series of invocations, against a
+  `direct` control arm that spawns the exact same child with no runner at all
+  — the same-host delta between the two is the publishable number, since
+  either arm's absolute figure alone is not comparable across hosts.
 - **Phase attribution inside that startup window**:
   `benches/registry_open_bench.rs` isolates the mutating "owner-only registry
   open" `run` performs before it can publish a record, against a bare
@@ -1248,7 +1251,7 @@ tracked trend.
 | Hint classifier, no match / MSBuild match | ~520 ns / ~830 ns |
 | Echo overhead, 4MiB payload: direct vs. under `run` (no capture) | ~19 ms vs. ~224 ms |
 | Echo overhead, 4MiB payload: under `run` with `--capture-dir` | ~801 ms |
-| Startup latency, call to `run_started` | ~181 ms (median) |
+| Startup latency, call to `run_started`: direct vs. under `run` | ~25 ms vs. ~115 ms |
 | Owner-only registry open, 0 / 64 / 256 / 1024 entries | ~0.10 ms, flat |
 | The same open when it must write the permissions | ~0.75 ms / ~20 ms / ~96 ms / ~443 ms |
 
@@ -1276,10 +1279,24 @@ match, which makes the phase flat at ~0.1 ms whatever the registry holds; the
 security guarantee is unchanged, and a directory whose permissions were widened
 out of band is still repaired (see [`docs/registry.md`](docs/registry.md),
 "Permissions"). The remaining `ProcessGroup::start` phase is inside ProcessKit's
-public API; it has been reported upstream for profiling rather than worked
-around here, and re-measuring the whole window against a published ProcessKit
-release is a separate exercise from this one. Treat all figures as host
-snapshots and the CI history as the regression signal.
+public API, and the earlier trace attributed the whole 166-228 ms of it to the
+crate. Upstream disputed that reading (thread
+`msg-send-ba9dc66e1b832e104c35c9a1e75a6588`), correctly: part of it is the OS's
+own process creation happening inside `start` — on a Windows host with a
+real-time antivirus, routinely the same order of magnitude — not a fixed cost
+`run` adds on top of nothing. Separately, upstream's own profiling found the
+dominant share of their measured crate-owned time was an all-threads
+`CreateToolhelp32Snapshot` walk of the host to find a just-spawned child's
+primary thread; that is fixed as of `processkit` 3.2 (direct `NtGetNextThread`
+resolution, falling back to the old walk only where the export is
+unavailable), and this crate already depends on 3.3, so the numbers above
+already include that fix. `benches/startup_latency_bench.rs` now measures both
+sides of the OS-creation boundary on the same host instead of reporting one
+absolute: a `direct` control arm spawns the exact same child with no runner at
+all, paying that OS cost on its own (~25 ms, see the table above), so the
+~90 ms delta between it and the call-to-`run_started` figure is what `run`
+adds **on top of** the OS's own process creation, not instead of it. Treat all
+figures as host snapshots and the CI history as the regression signal.
 
 [criterion]: https://github.com/bheisler/criterion.rs
 

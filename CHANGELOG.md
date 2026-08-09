@@ -420,6 +420,17 @@ to a dated version section.
   and scratch-path factory across unit and through-binary tests.
 - Default live output now uses ProcessKit's chunk-based raw tee, preserving exact
   child bytes while substantially reducing per-line echo overhead.
+- `benches/startup_latency_bench.rs` gained a `direct` control arm that spawns the
+  same child with no runner at all, so the published startup-latency number is a
+  same-host delta (runner vs. direct) instead of a single absolute — cross-host
+  absolutes were never comparable. README.md's "Benchmarks" section is updated with
+  a re-measurement against `processkit` 3.3 (~25 ms direct vs. ~115 ms under `run`,
+  a ~90 ms delta) and no longer attributes the OS's own process-creation cost inside
+  `ProcessGroup::start` to the crate, per upstream's rebuttal of the previous
+  166-228 ms figure (thread `msg-send-ba9dc66e1b832e104c35c9a1e75a6588`); upstream's
+  own fix for the dominant share it had profiled (an all-threads
+  `CreateToolhelp32Snapshot` walk, replaced by direct `NtGetNextThread` resolution
+  in `processkit` 3.2) is also already included, since this crate depends on 3.3.
 
 ### Fixed
 - `--capture-dir` setup is now all-or-nothing. Previously the runner created and
