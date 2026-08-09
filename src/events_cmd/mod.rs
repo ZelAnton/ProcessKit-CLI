@@ -972,6 +972,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A **valid, renderable** JSON object of exactly `total_bytes` bytes, built by
+    /// padding a single string field.
+    ///
+    /// The two regression tests below deliberately do *not* use an oversized run of
+    /// `b'x'` bytes: that is not valid JSON, so it already hits `emit`'s pre-existing
+    /// "not valid JSON" error path regardless of whether the size guard runs at all,
+    /// which makes such a test pass on both the fixed and the pre-fix code (R-01) —
+    /// it proves nothing about the guard-ordering bug this task fixes. A line that
+    /// *would* parse and render fine if it reached that far is the only payload that
+    /// can tell the two apart.
+    fn oversized_json_object(total_bytes: usize) -> String {
+        let prefix = r#"{"a":""#;
+        let suffix = r#""}"#;
+        let fixed = prefix.len() + suffix.len();
+        assert!(
+            total_bytes >= fixed,
+            "total_bytes too small for a JSON object of this shape"
+        );
+        let filler = "x".repeat(total_bytes - fixed);
+        let object = format!("{prefix}{filler}{suffix}");
+        assert_eq!(
+            object.len(),
+            total_bytes,
+            "the constructed object must be exactly the requested size"
+        );
+        object
+    }
+
+    /// A **schema-conforming** `run_started` event of exactly `total_bytes` bytes,
+    /// inflated through `run_id` — the one field `run_started` requires that the
+    /// embedded schema places no length limit on (unlike `labels`' values, bounded by
+    /// `maxLength`; see `schema::tests::label_keys_and_values_are_checked`) — so the
+    /// padding does not itself make the event non-conforming. The rest of the shape
+    /// mirrors that same test's known-conforming `run_started` fixture.
+    fn run_started_of_size(total_bytes: usize) -> String {
+        let prefix = r#"{"schema_version":1,"time":"2026-07-22T09:00:00.000Z","event":"run_started","run_id":""#;
+        let suffix = r#"","labels":{},"root_pid":1,"mechanism":"job_object","abrupt_cleanup":"whole_tree","cwd":null,"command":{"redacted":true,"argv":null,"argv_sha256":null,"hint":null}}"#;
+        let fixed = prefix.len() + suffix.len();
+        assert!(
+            total_bytes >= fixed,
+            "total_bytes too small to hold the fixed run_started shape"
+        );
+        let padding = "r".repeat(total_bytes - fixed);
+        let event = format!("{prefix}{padding}{suffix}");
+        assert_eq!(
+            event.len(),
+            total_bytes,
+            "the constructed event must be exactly the requested size"
+        );
+        event
+    }
+
     /// A line whose payload is exactly `MAX_LINE_BYTES + 1` bytes, terminated by a
     /// `\n` that only arrives once the buffer already sits above the limit — the
     /// regression for the guard-ordering bug this task fixes.
@@ -984,6 +1036,9 @@ mod tests {
     /// byte past the limit, with its newline present — rather than the many-times-
     /// over-the-limit line the older overrun test uses, because the bug is specific
     /// to a line landing exactly on this boundary with a newline already in hand.
+    /// The overrun's payload is a valid, otherwise-renderable JSON object
+    /// ([`oversized_json_object`]) so `session.emitted` growing to 3 on the pre-fix
+    /// code is a meaningful regression signal, not an artifact of bad JSON.
     #[test]
     fn a_line_of_exactly_max_plus_one_bytes_with_a_trailing_newline_is_rejected() {
         let dir = scratch("events-exact-overrun");
@@ -993,7 +1048,7 @@ mod tests {
         let mut stream = Vec::new();
         stream.extend_from_slice(RUN_STARTED.as_bytes());
         stream.push(b'\n');
-        stream.extend(std::iter::repeat_n(b'x', MAX_LINE_BYTES + 1));
+        stream.extend_from_slice(oversized_json_object(MAX_LINE_BYTES + 1).as_bytes());
         stream.push(b'\n');
         stream.extend_from_slice(RUNNER_EXIT.as_bytes());
         stream.push(b'\n');
@@ -1008,7 +1063,9 @@ mod tests {
 
         assert_eq!(
             session.emitted, 2,
-            "the two real events are rendered, the exact-boundary overrun is not"
+            "the two real events are rendered; the exact-boundary overrun — despite \
+             being valid, renderable JSON — is not, because the byte guard must reject \
+             it before rendering ever sees it"
         );
         assert!(
             session.terminal_seen,
@@ -1034,14 +1091,17 @@ mod tests {
     /// line is counted and reported as invalid rather than silently passing (or
     /// silently vanishing without being checked at all).
     ///
-    /// Only the overrun line and the (schema-conforming, per
-    /// [`only_a_schema_conforming_runner_exit_ends_the_stream`]) terminal event are
-    /// in this stream, deliberately without `RUN_STARTED` — its shape does not
-    /// itself conform to the embedded schema, which would make the invalid tally
-    /// this test asserts about something other than the overrun.
+    /// The overrun's payload is a **schema-conforming** `run_started` event
+    /// ([`run_started_of_size`]), not merely oversized or merely invalid JSON: a
+    /// non-conforming payload would be tallied as invalid by schema validation alone,
+    /// on both the fixed and the pre-fix code, and so would not distinguish them
+    /// (R-01). Only a payload the schema itself would accept makes the invalid tally
+    /// mean the byte guard actually ran. Deliberately without `RUN_STARTED` — its
+    /// shape does not itself conform to the embedded schema, which would make the
+    /// invalid tally this test asserts about something other than the overrun.
     #[test]
     fn a_line_of_exactly_max_plus_one_bytes_fails_validation_as_one_invalid_line() {
-        let mut stream = std::iter::repeat_n(b'x', MAX_LINE_BYTES + 1).collect::<Vec<u8>>();
+        let mut stream = run_started_of_size(MAX_LINE_BYTES + 1).into_bytes();
         stream.push(b'\n');
         stream.extend_from_slice(RUNNER_EXIT.as_bytes());
         stream.push(b'\n');
@@ -1054,9 +1114,10 @@ mod tests {
         );
         match session.output {
             Output::Validate(report) => {
-                let err = report
-                    .finish()
-                    .expect_err("the oversized line must not be accepted as valid");
+                let err = report.finish().expect_err(
+                    "the oversized line is schema-conforming and must be rejected by the \
+                     byte guard — not accepted because it happens to pass schema checks",
+                );
                 assert_eq!(err.code(), exit::EVENTS_INVALID);
                 let message = err.to_string();
                 assert!(
