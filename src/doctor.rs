@@ -120,6 +120,17 @@ const MIN_SCRATCH_BUDGET: Duration = Duration::from_millis(100);
 /// that a slow one is not hammered.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+/// The window [`ScratchRun::cleanup_best_effort`] gives a runner whose control-plane
+/// cancel already landed (or might have) to finish its own soft-stop -> grace ->
+/// hard-kill teardown -- releasing its container, removing its registry record and
+/// control socket -- before this resorts to `Child::kill`. Scratch runs are spawned
+/// with no `--grace` of their own (`Session::spawn_run`), so that teardown is local
+/// process/filesystem work, not a wait on a child that ignored a soft stop; long
+/// enough to absorb that work under a loaded host, nowhere near the five-second
+/// `--timeout` margin ([`SCRATCH_RUN_MARGIN`]) a runner left alive would otherwise
+/// still owe.
+const CLEANUP_GRACE_BUDGET: Duration = Duration::from_secs(2);
+
 // ---------------------------------------------------------------------------
 // The report
 // ---------------------------------------------------------------------------
@@ -598,16 +609,17 @@ impl Session {
                                 self.evidence_hint()
                             ),
                         );
-                        // A run that never became discoverable cannot be reached over
-                        // the control plane to be cancelled properly (`doctor` never
-                        // kills by PID otherwise — `AGENTS.md`, "Never clean up by
-                        // process name" — but this is the one exception: the same
-                        // best-effort `Child::kill` every other post-spawn failure
-                        // path uses, addressed at the exact handle this call spawned,
-                        // not by name or PID lookup). Best-effort: it must not leave
-                        // this run alive until its own `--timeout`, independent of
-                        // whatever `doctor` does next.
-                        run.cleanup_best_effort(self);
+                        // A run that never became discoverable was never registered
+                        // where a control-plane cancel could reach it, so a cancel
+                        // here would only pay a round-trip for nothing (`doctor`
+                        // never kills by PID otherwise — `AGENTS.md`, "Never clean up
+                        // by process name" — but this is the one exception: the same
+                        // best-effort `Child::kill` every cancel-is-pointless
+                        // post-spawn failure path uses, addressed at the exact handle
+                        // this call spawned, not by name or PID lookup). Best-effort:
+                        // it must not leave this run alive until its own `--timeout`,
+                        // independent of whatever `doctor` does next.
+                        run.kill_and_reap();
                         return None;
                     }
                     std::thread::sleep(POLL_INTERVAL);
@@ -904,10 +916,14 @@ impl Session {
             Ok(code) => code,
             Err(detail) => {
                 // The wait itself failed or ran out of budget, so the run's own
-                // ending was never observed and it may still be live: same
-                // best-effort cleanup as every other post-spawn failure path, not
-                // left to its own `--timeout`.
-                run.cleanup_best_effort(self);
+                // ending was never observed and it may still be live: kill and reap
+                // it by the exact handle this call spawned, not left to its own
+                // `--timeout`. No cancel here — the run either is not answering the
+                // control plane or has already died, so a cancel round-trip cannot
+                // help and could itself add up to ten seconds (`CONNECT_DEADLINE` +
+                // `CONVERSATION_DEADLINE`) on top of a budget that has already run
+                // out.
+                run.kill_and_reap();
                 self.fail("resource_controller", started, detail);
                 return;
             }
@@ -921,11 +937,12 @@ impl Session {
             ResourceOutcome::Installed => (true, None),
             ResourceOutcome::Refused(detail) => (false, Some(detail)),
             ResourceOutcome::Undecided(detail) => {
-                // The run already exited (`wait_for_exit` above succeeded), so this is
-                // a no-op reap in practice — kept here anyway so every path out of
-                // this phase, decided or not, goes through the one cleanup call rather
-                // than only the ones known to still be live.
-                run.cleanup_best_effort(self);
+                // The run already exited (`wait_for_exit` above succeeded), so a
+                // cancel would reach nothing and this is a no-op reap in practice —
+                // kept here anyway so every path out of this phase, decided or not,
+                // goes through a reap rather than only the ones known to still be
+                // live.
+                run.kill_and_reap();
                 self.fail("resource_controller", started, detail);
                 return;
             }
@@ -1213,11 +1230,11 @@ impl ScratchRun {
                 }
             }
             if Instant::now() >= deadline {
-                return Err(
-                    "the scratch run had not ended when the budget ran out; its own `--timeout` \
-                     will end it"
-                        .to_string(),
-                );
+                // Deliberately silent on what happens to the run next: callers differ
+                // (`Session::phase_resource_controller` kills it outright,
+                // `ScratchRun::finish` gives an in-progress teardown a grace window
+                // first), and neither leaves it to its own `--timeout` any more.
+                return Err("the scratch run had not ended when the budget ran out".to_string());
             }
             std::thread::sleep(POLL_INTERVAL);
         }
@@ -1229,37 +1246,77 @@ impl ScratchRun {
         if reached_terminal {
             session.phase_cleanup(&self);
         } else {
-            // A failed round-trip leaves the run live: clean it up the same
-            // best-effort way every other post-spawn failure path does, so a failed
-            // `doctor` never leaves a container running.
+            // A failed round-trip leaves the run live, and it may already be
+            // mid-teardown: `phase_cancel` can have landed and acknowledged before
+            // `phase_terminal_wait` failed to observe the exit in time (budget ran
+            // out while the runner's own soft-stop -> grace -> hard-kill was still
+            // under way), or the round-trip can have failed before ever reaching
+            // `phase_cancel`. Either way, route through the cancel-then-grace
+            // cleanup rather than `kill_and_reap`, so a `cancel` already in flight
+            // is not cut short by an immediate kill.
             self.cleanup_best_effort(session);
         }
     }
 
-    /// The one best-effort cancel/kill-and-wait cleanup every post-spawn failure path
-    /// routes through: `phase_launch`'s deadline path, `phase_resource_controller`'s
-    /// `wait_for_exit` error and undecided-outcome paths, and this type's own
-    /// `finish` for a round-trip that never reached its terminal phase.
+    /// Cancel/grace/kill cleanup for a run that may already be tearing down on its
+    /// own: only [`ScratchRun::finish`] calls this, for a round-trip that never
+    /// reached its terminal phase. Every other post-spawn failure path — where a
+    /// cancel is known to help nothing, because the run never registered or has
+    /// already exited or is not answering the control plane — calls
+    /// [`ScratchRun::kill_and_reap`] directly instead.
     ///
-    /// Two layers, both best-effort and both discarded — this is recovery from a
+    /// Three steps, all best-effort and all discarded — this is recovery from a
     /// control plane or a runner that has already misbehaved once, not a check with
     /// its own verdict:
     /// - ask the control plane to cancel, in case the run is still reachable that
-    ///   way (the clean shutdown a successful qualification gets);
-    /// - unconditionally kill the process by the exact handle this call spawned
-    ///   (never by name or PID lookup — `AGENTS.md`, "Never clean up by process
-    ///   name") and wait to reap it, so the runner is never left to its own
-    ///   `--timeout` regardless of whether the cancel above landed.
+    ///   way (the clean shutdown a successful qualification gets) and has not
+    ///   already been asked;
+    /// - give the runner [`CLEANUP_GRACE_BUDGET`] to finish tearing down on its own
+    ///   — releasing its container, removing its registry record and control
+    ///   socket — polling [`ScratchRun::exited`] rather than assuming; a teardown
+    ///   already in progress from an earlier successful cancel must be allowed to
+    ///   finish, not killed out from under itself;
+    /// - only once that window has passed with the process still alive,
+    ///   unconditionally kill it by the exact handle this call spawned (never by
+    ///   name or PID lookup — `AGENTS.md`, "Never clean up by process name") and
+    ///   wait to reap it.
     ///
     /// Never called for a run that reached its terminal phase normally — that path
-    /// already exited on its own and goes through [`Session::phase_cleanup`] instead,
-    /// so this does not race a teardown already in progress. `Child::kill`/`wait` on
-    /// an already-exited child are themselves no-ops (or a harmless "already exited"
-    /// error), so a call here after the process has already ended costs nothing.
+    /// already exited on its own and goes through [`Session::phase_cleanup`]
+    /// instead. `Child::kill`/`wait` on an already-exited child are themselves
+    /// no-ops (or a harmless "already exited" error), so the final step costs
+    /// nothing when the grace window already saw the process end.
     fn cleanup_best_effort(&mut self, session: &mut Session) {
         let _ = session
             .runtime
             .block_on(control::mutate_one(&self.run_id, ControlCommand::Cancel));
+        let grace_deadline = Instant::now() + CLEANUP_GRACE_BUDGET;
+        loop {
+            if self.exited().is_some() {
+                let _ = self.child.wait();
+                return;
+            }
+            if Instant::now() >= grace_deadline {
+                break;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    /// Unconditional kill-and-reap for a post-spawn failure path where a
+    /// control-plane cancel is known to help nothing: the run either never
+    /// registered where a cancel could reach it (`phase_launch`'s deadline path),
+    /// has already exited (`phase_resource_controller`'s undecided outcome), or is
+    /// not answering the control plane anyway (`phase_resource_controller`'s
+    /// `wait_for_exit` error, where a cancel round-trip could itself add up to ten
+    /// seconds on top of a budget that already ran out). Kills by the exact handle
+    /// this call spawned (never by name or PID lookup — `AGENTS.md`, "Never clean
+    /// up by process name") and waits to reap it. `Child::kill`/`wait` on an
+    /// already-exited child are themselves no-ops (or a harmless "already exited"
+    /// error), so calling this after the process has already ended costs nothing.
+    fn kill_and_reap(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
