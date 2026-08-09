@@ -412,6 +412,84 @@ fn argv_raw_records_the_raw_command() {
     );
 }
 
+/// Through the shipped binary, on Unix: an argument the OS accepts but Unicode
+/// cannot express keeps its identity end to end. Two runs whose command lines
+/// differ *only* in which invalid byte the last argument carries must produce two
+/// different `argv_sha256` values and two different recorded `argv` arrays — before
+/// T-324 both arguments were rendered `to_string_lossy()` into the same
+/// replacement-character string, so both runs published one fingerprint and one
+/// argv array and this test fails on that implementation.
+///
+/// The mangled bytes ride as the shell's own `$0` (the operand after the `-c`
+/// script), so the child still exits 0 while the runner records them verbatim. The
+/// recorded element is pinned against its exact documented escape (`docs/schema.md`,
+/// "Raw argv that is not valid Unicode") rather than merely "something different",
+/// and the resulting stream is validated against the published JSON Schema, so an
+/// escaped element also stays a conforming `run_started` line.
+#[cfg(unix)]
+#[test]
+fn argv_raw_preserves_a_non_utf8_argument_through_the_binary() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    /// Run `sh -c 'exit 0' <argv0>` under `--argv-raw` and return the run's
+    /// `run_started` command object, having validated the whole stream.
+    fn run_with_argv0(tag: &str, argv0: &[u8]) -> Value {
+        let dir = scratch(tag);
+        let command_line: Vec<OsString> = vec![
+            OsString::from("/bin/sh"),
+            OsString::from("-c"),
+            OsString::from("exit 0"),
+            OsString::from_vec(argv0.to_vec()),
+        ];
+        let out = run_with_flags(&dir, &[], &["--argv-raw"], command_line);
+        assert_eq!(out.status.code(), Some(0), "the no-op child exits cleanly");
+        assert_events_match_schema(&read_events(&dir));
+        run_started_command(&dir)
+    }
+
+    let first = run_with_argv0("argv-raw-nonutf8-e9", b"logs\xe9-argv0");
+    let second = run_with_argv0("argv-raw-nonutf8-ff", b"logs\xff-argv0");
+
+    assert!(is_sha256_hex(&first["argv_sha256"]));
+    assert_ne!(
+        first["argv_sha256"], second["argv_sha256"],
+        "two different command lines must not share one fingerprint: \
+         {first} vs {second}"
+    );
+    assert_ne!(
+        first["argv"], second["argv"],
+        "nor one recorded argv array: {first} vs {second}"
+    );
+
+    for (command, expected) in [
+        (&first, "\u{0}logs\\xe9-argv0"),
+        (&second, "\u{0}logs\\xff-argv0"),
+    ] {
+        let argv = command["argv"].as_array().expect("raw argv array");
+        let last = argv
+            .last()
+            .and_then(Value::as_str)
+            .expect("the mangled argument is the last element");
+        assert_eq!(
+            last, expected,
+            "the element is recorded in its documented lossless escape: {command}"
+        );
+        assert!(
+            !last.contains('\u{fffd}'),
+            "no byte is replaced with U+FFFD: {command}"
+        );
+        // Every other element is an ordinary argument, recorded verbatim.
+        for element in &argv[..argv.len() - 1] {
+            let element = element.as_str().expect("argv elements are strings");
+            assert!(
+                !element.starts_with('\u{0}'),
+                "a well-formed argument is never escaped: {element:?}"
+            );
+        }
+    }
+}
+
 /// The `run_started` command `hint` classifies a recognized worker shape (an
 /// MSBuild reusable-worker argv) and leaves an ordinary command unclassified, while
 /// `argv_sha256` is filled in both cases. The marker tokens ride along as inert

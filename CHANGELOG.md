@@ -422,6 +422,22 @@ to a dated version section.
   child bytes while substantially reducing per-line echo overhead.
 
 ### Fixed
+- An argv element that is not valid Unicode no longer loses its identity in the
+  command diagnostics. `argv_sha256` and `--argv-raw`'s recorded `argv` were both
+  derived after every element went through `to_string_lossy()`, so on Unix two
+  arguments differing only in their ill-formed bytes (and on Windows two differing
+  only in an unpaired surrogate) became the same U+FFFD string: two distinct live
+  commands shared one fingerprint in the JSONL stream and in the registry, and
+  `--argv-raw` handed back a reconstruction instead of the raw argv it promises.
+  Both are now derived from each element's canonical bytes — the argument's own
+  bytes on Unix, the WTF-8 encoding of its UTF-16 code units on Windows — which,
+  for an element that *is* valid Unicode, are exactly its UTF-8 bytes: every
+  ordinary command line fingerprints exactly as it did before, on both platforms.
+  An element that cannot be written into a JSON string verbatim is recorded
+  losslessly in a reversible escaped form, opened by U+0000 (a character no real
+  argv element can contain, so a verbatim element is never mistaken for an escaped
+  one); `docs/schema.md` states the encoding and the escape grammar normatively,
+  including what this does and does not oblige an existing reader to change.
 - `--capture-dir` setup is now all-or-nothing. Previously the runner created and
   emptied `stdout.log` before it tried `stderr.log`, so a second stream that could
   not be opened (a path that already named a directory, an unwritable file) left

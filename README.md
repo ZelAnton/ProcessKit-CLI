@@ -1089,7 +1089,12 @@ even when the runner itself fails — so a child's code is never lost or aliased
 The command line is **redacted by default** (`argv` is recorded only under
 `--argv-raw`); in its place a one-way SHA-256 fingerprint of argv (`argv_sha256`)
 and, for recognized worker shapes, a categorical `hint` are recorded on every run —
-neither can reveal the command line. Member snapshots carry each member's `ppid`,
+neither can reveal the command line. Both the fingerprint and `--argv-raw`'s
+recorded `argv` are derived from each argument's exact bytes, so an argument the
+platform accepts but Unicode cannot express (ill-formed bytes on Unix, an unpaired
+surrogate on Windows) keeps its own identity instead of collapsing onto every other
+such argument — see [`docs/schema.md`](docs/schema.md) ("Command redaction") for
+the encoding and for how such an element is written into JSON. Member snapshots carry each member's `ppid`,
 executable `name`, and start-time token wherever ProcessKit's `members_info()` can
 report them (nullable per-field on platforms/members it can't).
 

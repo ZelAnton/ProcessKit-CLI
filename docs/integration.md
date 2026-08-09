@@ -262,7 +262,15 @@ processkit-cli run \
   storage for the resulting JSONL is at least as trusted as the command line
   itself; do not default to it. See [`docs/schema.md`](schema.md#command-redaction)
   ("Command redaction") for the exact fingerprint encoding, which an adapter
-  reproducing the digest independently must match byte for byte.
+  reproducing the digest independently must match byte for byte. That encoding is
+  defined over each element's *canonical bytes*, which are platform-specific for
+  an argument that is not valid Unicode (Unix: the argument's own bytes; Windows:
+  the WTF-8 encoding of its UTF-16 code units) — an adapter that hashes a
+  UTF-8-decoded string instead will agree on every ordinary command line and
+  disagree on exactly those. The same case is the one where `--argv-raw`'s `argv`
+  array carries an escaped element rather than the argument verbatim; an adapter
+  that re-runs or compares a recorded argv must decode it (both rules are in
+  `docs/schema.md`).
 
 `run` is not shell-free by accident — everything after `--` is the literal
 `<program> <args...>`, with no shell to expand or reinterpret it; an adapter

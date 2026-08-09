@@ -83,12 +83,12 @@
         "argv": {
           "type": ["array", "null"],
           "items": { "type": "string" },
-          "description": "The raw argv, present only when redacted is false; null otherwise."
+          "description": "The raw argv, present only when redacted is false; null otherwise. An element that is not valid Unicode is recorded losslessly in an escaped form opened by U+0000 (docs/schema.md, 'Raw argv that is not valid Unicode'); every other element is the argument verbatim."
         },
         "argv_sha256": {
           "type": ["string", "null"],
           "pattern": "^[0-9a-f]{64}$",
-          "description": "Lowercase-hex SHA-256 fingerprint of argv; filled on every run regardless of redaction (docs/schema.md, 'Fingerprint')."
+          "description": "Lowercase-hex SHA-256 fingerprint of argv - the NUL-joined canonical bytes of its elements, platform-specific for an element that is not valid Unicode; filled on every run regardless of redaction (docs/schema.md, 'Fingerprint')."
         },
         "hint": {
           "type": ["string", "null"],

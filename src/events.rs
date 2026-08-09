@@ -33,7 +33,10 @@
 //!   worker shapes, a categorical `hint` (see [`HINT_RULES`]). Neither can reveal
 //!   the command line, so both are filled on **every** run; `--argv-raw` only adds
 //!   the raw `argv` array on top. Populating these once-reserved fields does not
-//!   change the event's wire shape.
+//!   change the event's wire shape. Both are derived from argv's *canonical bytes*
+//!   (see [`CommandInfo`] and [`canonical_argv_bytes`]) rather than a lossy Unicode
+//!   rendering, so an argument the local platform allows but Unicode cannot express
+//!   keeps its own identity instead of collapsing onto every other such argument.
 //! - **Whole-tree resource measurements (shipped in T-317).**
 //!   [`Event::ResourceSummary`]'s five measurements are each declared `Option` for the
 //!   same reason as the enriched member fields above: the containment mechanism, not
@@ -511,6 +514,39 @@ impl CaptureInfo {
 /// every run — they never expose the command line — so redaction never blinds a
 /// consumer to *which* run it is looking at (see [`argv_sha256_hex`],
 /// [`classify_hint`], and `docs/schema.md`, "Command redaction").
+///
+/// # Argv that is not valid Unicode
+///
+/// An argv element is an *OS string*, not a Unicode string: on Unix it is an
+/// arbitrary NUL-free byte sequence, and on Windows an arbitrary sequence of
+/// UTF-16 code units that may contain unpaired surrogates. Neither is
+/// representable in JSON verbatim, and this type used to resolve that by rendering
+/// every element with `to_string_lossy()` *before* both the recorded `argv` and
+/// the fingerprint were derived — replacing each ill-formed sequence with U+FFFD.
+/// That silently destroyed identity: the Unix argvs `[b"\xff"]` and `[b"\xfe"]`
+/// both became `"\u{fffd}"`, so two genuinely different live commands shared one
+/// `argv_sha256` in the JSONL stream and in the registry (`list`/`inspect`)
+/// diagnostics, and `--argv-raw` handed back a reconstruction rather than the raw
+/// argv it promises.
+///
+/// Both fields are now derived from one [`RenderedArgv`] — each element's exact
+/// canonical bytes — and differ only in how those bytes reach the wire:
+///
+/// - `argv_sha256` hashes the canonical bytes themselves (see
+///   [`argv_sha256_hex`]), so two distinct argvs cannot collide into one
+///   fingerprint.
+/// - `argv` records each element through [`render_element_text`], which is
+///   **lossless**: an element that is valid Unicode is the JSON string it always
+///   was, and one that is not is written in a reversible, NUL-marked byte escape.
+///
+/// Of the two admissible answers for the raw field — encode losslessly, or refuse
+/// / report the element as unrepresentable — this takes the first, deliberately.
+/// `--argv-raw` exists so an operator can see *what actually ran*; refusing would
+/// withhold exactly the case where argv is hardest to guess (an argument some
+/// upstream tooling mangled) and would make two different mangled argvs
+/// indistinguishable a second time, in the very field that opted out of
+/// redaction. Encoding also keeps the field's `array of string` type, so no
+/// existing v1 consumer's parse changes (`docs/schema.md`, "Command redaction").
 #[derive(Debug, Serialize)]
 pub struct CommandInfo {
     redacted: bool,
@@ -523,24 +559,25 @@ impl CommandInfo {
     /// Build the command field for `argv`. The one-way `argv_sha256` fingerprint
     /// and the worker-shape `hint` are always computed — neither can leak the
     /// command line — so they are present whether or not the raw argv is recorded.
-    /// `argv_raw` additionally records the raw argv array verbatim; without it the
-    /// argv is omitted (redacted) and only the fingerprint and hint remain.
+    /// `argv_raw` additionally records the raw argv array (losslessly, see this
+    /// type's docs); without it the argv is omitted (redacted) and only the
+    /// fingerprint and hint remain.
     pub fn for_argv<I, S>(argv: I, argv_raw: bool) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        // Render argv once to the lossy-UTF-8 strings that `--argv-raw` would
-        // record and the classifier inspects, then derive the fingerprint and hint
-        // from that single rendering — through the very same
-        // [`CommandFingerprint`] the registry record publishes, so the two can
+        // Render argv once — to the canonical bytes the fingerprint hashes and the
+        // text form `--argv-raw` records and the classifier inspects — then derive
+        // the fingerprint and hint from that single rendering, through the very
+        // same [`CommandFingerprint`] the registry record publishes, so the two can
         // never disagree about one run. Only the raw array is gated behind the
         // flag; the redaction-safe fields are computed unconditionally.
-        let strings = render_argv(argv);
-        let fingerprint = CommandFingerprint::for_rendered_argv(&strings);
+        let rendered = RenderedArgv::render(argv);
+        let fingerprint = CommandFingerprint::for_rendered_argv(&rendered);
         Self {
             redacted: !argv_raw,
-            argv: argv_raw.then_some(strings),
+            argv: argv_raw.then(|| rendered.into_text()),
             argv_sha256: Some(fingerprint.argv_sha256),
             hint: fingerprint.hint.map(str::to_string),
         }
@@ -587,42 +624,278 @@ impl CommandFingerprint {
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        Self::for_rendered_argv(&render_argv(argv))
+        Self::for_rendered_argv(&RenderedArgv::render(argv))
     }
 
-    /// The same fingerprint from an argv already rendered to lossy-UTF-8 strings —
-    /// how [`CommandInfo::for_argv`] reuses this without rendering argv twice.
-    fn for_rendered_argv(argv: &[String]) -> Self {
+    /// The same fingerprint from an already-rendered argv — how
+    /// [`CommandInfo::for_argv`] reuses this without rendering argv twice.
+    fn for_rendered_argv(argv: &RenderedArgv) -> Self {
         Self {
-            argv_sha256: argv_sha256_hex(argv),
-            hint: classify_hint(argv),
+            argv_sha256: argv_sha256_hex(&argv.bytes),
+            hint: classify_hint(&argv.text),
         }
     }
 }
 
-/// Render argv to the lossy-UTF-8 strings both the fingerprint and the classifier
-/// (and `--argv-raw`'s recorded array) work on — one rendering, one place, so a
-/// platform's non-UTF-8 argument is lossily replaced identically everywhere.
-fn render_argv<I, S>(argv: I) -> Vec<String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
-{
-    argv.into_iter()
-        .map(|a| a.as_ref().to_string_lossy().into_owned())
-        .collect()
+/// A run's argv rendered **once**, in the two forms this module publishes it in —
+/// the single point every argv-derived value is taken from, so the fingerprint,
+/// the `--argv-raw` array, and the worker-shape classifier can never disagree
+/// about the same command (three independent encodings is exactly the drift
+/// [`CommandFingerprint`] exists to prevent).
+///
+/// `bytes` is the identity-bearing form and `text` is its wire rendering; `text`
+/// is derived from `bytes`, never independently from the `OsStr`, so the JSON a
+/// consumer reads and the digest it joins on describe the same argv by
+/// construction.
+struct RenderedArgv {
+    /// Each element's canonical bytes — [`canonical_argv_bytes`]' exact,
+    /// non-lossy encoding of the OS string. What [`argv_sha256_hex`] hashes.
+    bytes: Vec<Vec<u8>>,
+    /// Each element rendered to the JSON string form ([`render_element_text`]):
+    /// the element verbatim when it is valid Unicode, its NUL-marked escape when
+    /// it is not. What `--argv-raw` records and [`classify_hint`] reads.
+    text: Vec<String>,
 }
 
-/// The hex SHA-256 fingerprint of a run's argv: the lossy-UTF-8 argv elements
-/// joined by a single NUL byte — a byte that cannot occur inside a real argv
-/// element on any platform, so element boundaries stay unambiguous — then hashed.
-/// This canonical encoding is documented in `docs/schema.md` ("Command redaction")
-/// so an adapter that re-emits the schema reproduces the exact digest. The hash is
-/// one-way, so it fingerprints a command without disclosing it. The digest itself
-/// is [`crate::hash::sha256_hex`], the same primitive the bounded output capture
-/// hashes with (`docs/schema.md`, "Fingerprint").
-fn argv_sha256_hex(argv: &[String]) -> String {
-    crate::hash::sha256_hex(argv.join("\0").as_bytes())
+impl RenderedArgv {
+    /// Render `argv` into both forms.
+    fn render<I, S>(argv: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let bytes: Vec<Vec<u8>> = argv
+            .into_iter()
+            .map(|arg| canonical_argv_bytes(arg.as_ref()))
+            .collect();
+        let text = bytes
+            .iter()
+            .map(|element| render_element_text(element))
+            .collect();
+        Self { bytes, text }
+    }
+
+    /// Take the wire (JSON) rendering, for the `--argv-raw` array.
+    fn into_text(self) -> Vec<String> {
+        self.text
+    }
+}
+
+/// One argv element's **canonical bytes**: the exact, unambiguous encoding of the
+/// OS string, chosen per platform so that two different OS strings can never
+/// render to the same bytes.
+///
+/// - **Unix** — the element's own bytes, verbatim
+///   (`std::os::unix::ffi::OsStrExt::as_bytes`). A Unix argument is an arbitrary
+///   NUL-free byte sequence with no encoding attached; its bytes *are* its
+///   identity.
+/// - **Windows** — the WTF-8 encoding of the element's UTF-16 code units
+///   (`std::os::windows::ffi::OsStrExt::encode_wide`, re-encoded by
+///   `wtf8_from_wide`). Windows has no byte view of an `OsStr`, and its argv is
+///   a UTF-16 sequence that may contain unpaired surrogates; WTF-8 is the standard
+///   generalization of UTF-8 that can carry those, which
+///   `std`'s own Windows `OsString` is internally stored in.
+///
+/// Both branches agree on the case that matters for compatibility: for an element
+/// that *is* valid Unicode, the canonical bytes are exactly its UTF-8 bytes on
+/// every platform, so this preserves — byte for byte — the fingerprint every run
+/// with an ordinary command line produced before non-UTF-8 argv was handled at all
+/// (`docs/schema.md`, "Fingerprint"). Only argv that no encoding could have
+/// represented faithfully changes.
+///
+/// There is deliberately no third, portable-fallback branch: this crate already
+/// builds only for Unix and Windows (`crate::control`'s transport `imp` module has
+/// the same two arms and no other), and a `to_string_lossy()` fallback here would
+/// quietly reintroduce the very collision this function exists to close.
+///
+/// This is the Windows counterpart of the same discipline
+/// `crate::win_security::to_wide_path` follows for paths: reach for the OS's own
+/// representation, never `to_string_lossy()`.
+#[cfg(unix)]
+fn canonical_argv_bytes(arg: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    arg.as_bytes().to_vec()
+}
+
+/// Windows arm of [`canonical_argv_bytes`] (documented there).
+#[cfg(windows)]
+fn canonical_argv_bytes(arg: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+    wtf8_from_wide(arg.encode_wide())
+}
+
+/// Encode a Windows UTF-16 (really WTF-16) code-unit sequence as WTF-8.
+///
+/// A surrogate pair is combined into the supplementary scalar it denotes and
+/// encoded as ordinary 4-byte UTF-8; any code unit that is *not* part of a pair —
+/// including an unpaired surrogate, which `String` cannot hold and
+/// `to_string_lossy()` would replace with U+FFFD — is encoded in place by the same
+/// UTF-8 bit layout, giving the 3-byte form WTF-8 reserves for it. A sequence with
+/// no unpaired surrogate is therefore byte-identical to its UTF-8 encoding, which
+/// is what keeps ordinary Windows argv fingerprinting exactly as it did before.
+#[cfg(windows)]
+fn wtf8_from_wide<I>(units: I) -> Vec<u8>
+where
+    I: Iterator<Item = u16>,
+{
+    let mut out = Vec::new();
+    let mut units = units.peekable();
+    while let Some(unit) = units.next() {
+        // Binding the low half out of the *peeked* value (rather than re-reading
+        // it after the test) keeps the pair arithmetic unreachable for any input
+        // that is not actually a pair — there is no fallback value to get wrong.
+        let code = match (unit, units.peek().copied()) {
+            (0xD800..=0xDBFF, Some(low @ 0xDC00..=0xDFFF)) => {
+                units.next();
+                0x1_0000 + ((u32::from(unit) - 0xD800) << 10) + (u32::from(low) - 0xDC00)
+            }
+            _ => u32::from(unit),
+        };
+        push_utf8_code_point(&mut out, code);
+    }
+    out
+}
+
+/// Append one code point to `out` in the UTF-8 bit layout. Accepts the surrogate
+/// range too (that is what makes the output WTF-8 rather than strict UTF-8); see
+/// `wtf8_from_wide`, its only caller.
+#[cfg(windows)]
+fn push_utf8_code_point(out: &mut Vec<u8>, code: u32) {
+    // Every shifted value below is masked to at most 6 bits before the cast, so no
+    // truncation is possible; `code` itself is at most 0x10FFFF.
+    #[allow(clippy::cast_possible_truncation)]
+    match code {
+        0x0000..=0x007F => out.push(code as u8),
+        0x0080..=0x07FF => {
+            out.extend_from_slice(&[0xC0 | (code >> 6) as u8, 0x80 | (code & 0x3F) as u8])
+        }
+        0x0800..=0xFFFF => out.extend_from_slice(&[
+            0xE0 | (code >> 12) as u8,
+            0x80 | ((code >> 6) & 0x3F) as u8,
+            0x80 | (code & 0x3F) as u8,
+        ]),
+        _ => out.extend_from_slice(&[
+            0xF0 | (code >> 18) as u8,
+            0x80 | ((code >> 12) & 0x3F) as u8,
+            0x80 | ((code >> 6) & 0x3F) as u8,
+            0x80 | (code & 0x3F) as u8,
+        ]),
+    }
+}
+
+/// The marker that opens the escaped form of an argv element: U+0000, the one
+/// character that cannot occur inside a real argv element on any supported
+/// platform — the same invariant that lets [`argv_sha256_hex`] join elements with
+/// a NUL. An element rendered verbatim can therefore never be mistaken for an
+/// escaped one, and vice versa, with no in-band flag or extra field.
+const ARGV_ESCAPE_MARKER: char = '\0';
+
+/// Render one argv element's canonical bytes to the JSON string `--argv-raw`
+/// records — losslessly, in one of two mutually distinguishable forms:
+///
+/// - **Verbatim** — when the bytes are valid UTF-8 and contain no NUL: the element
+///   as-is. This is every ordinary command line, rendered exactly as it always
+///   was.
+/// - **Escaped** — otherwise: [`ARGV_ESCAPE_MARKER`] (U+0000) followed by the
+///   element with `\` written `\\` and every byte that is not part of a
+///   well-formed UTF-8 sequence (and any NUL) written `\xNN`, two lowercase hex
+///   digits. Nothing else is transformed, so the readable part of a mangled
+///   argument stays readable next to the bytes that broke it.
+///
+/// The escape is total and reversible: a reader that strips the leading U+0000 and
+/// then maps `\\` → `\`, `\xNN` → that byte, and everything else to its UTF-8
+/// bytes recovers the element's canonical bytes exactly. The grammar is normative
+/// and mirrored in `docs/schema.md` ("Raw argv that is not valid Unicode"); the
+/// in-tree round-trip
+/// test `escaped_elements_decode_back_to_their_exact_bytes` is its executable
+/// statement.
+///
+/// Note that this text form is *not* what the fingerprint hashes — that is the
+/// canonical bytes themselves ([`argv_sha256_hex`]) — so the escape can never
+/// perturb a digest.
+fn render_element_text(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) if !text.contains(ARGV_ESCAPE_MARKER) => text.to_owned(),
+        _ => escape_element_text(bytes),
+    }
+}
+
+/// The escaped branch of [`render_element_text`] (grammar documented there).
+fn escape_element_text(bytes: &[u8]) -> String {
+    let mut out = String::from(ARGV_ESCAPE_MARKER);
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(text) => {
+                push_escaped_run(&mut out, text);
+                return out;
+            }
+            Err(error) => {
+                let (valid, invalid) = rest.split_at(error.valid_up_to());
+                match std::str::from_utf8(valid) {
+                    Ok(text) => push_escaped_run(&mut out, text),
+                    // Unreachable by `valid_up_to`'s own contract. Escaping the
+                    // prefix byte-wise rather than trusting it keeps even an
+                    // impossible case lossless instead of dropping bytes.
+                    Err(_) => valid
+                        .iter()
+                        .for_each(|byte| push_byte_escape(&mut out, *byte)),
+                }
+                // `error_len() == None` means "unexpected end of input": the rest
+                // of the element is a truncated sequence, all of it ill-formed.
+                let invalid_len = error.error_len().unwrap_or(invalid.len());
+                invalid[..invalid_len]
+                    .iter()
+                    .for_each(|byte| push_byte_escape(&mut out, *byte));
+                rest = &invalid[invalid_len..];
+            }
+        }
+    }
+}
+
+/// Append a well-formed run of an escaped element: only `\` (the escape
+/// introducer) and NUL (the marker character) are rewritten, so the rest of the
+/// argument survives readably.
+fn push_escaped_run(out: &mut String, text: &str) {
+    for character in text.chars() {
+        match character {
+            '\\' => out.push_str("\\\\"),
+            ARGV_ESCAPE_MARKER => push_byte_escape(out, 0),
+            _ => out.push(character),
+        }
+    }
+}
+
+/// Append one byte as `\xNN`, two lowercase hex digits.
+fn push_byte_escape(out: &mut String, byte: u8) {
+    use std::fmt::Write;
+    // Writing to a `String` is infallible; the result is discarded deliberately.
+    let _ = write!(out, "\\x{byte:02x}");
+}
+
+/// The hex SHA-256 fingerprint of a run's argv: each element's **canonical bytes**
+/// (see [`canonical_argv_bytes`] — the platform's own exact encoding, not a lossy
+/// Unicode rendering) joined by a single NUL byte — a byte that cannot occur
+/// inside a real argv element on any platform, so element boundaries stay
+/// unambiguous — then hashed. This canonical encoding is documented in
+/// `docs/schema.md` ("Fingerprint") so an adapter that re-emits the schema
+/// reproduces the exact digest. The hash is one-way, so it fingerprints a command
+/// without disclosing it. The digest itself is [`crate::hash::sha256_hex`], the
+/// same primitive the bounded output capture hashes with (`docs/schema.md`,
+/// "Fingerprint").
+///
+/// Generic over the element type only so a test can state an expectation in the
+/// obvious `&["abc".to_string()]` form; production callers pass the canonical
+/// bytes [`RenderedArgv`] rendered.
+fn argv_sha256_hex<E: AsRef<[u8]>>(argv: &[E]) -> String {
+    let mut encoded = Vec::new();
+    for (index, element) in argv.iter().enumerate() {
+        if index > 0 {
+            encoded.push(b'\0');
+        }
+        encoded.extend_from_slice(element.as_ref());
+    }
+    crate::hash::sha256_hex(&encoded)
 }
 
 /// One worker-shape classifier rule: the `hint` it emits and the set of substrings
@@ -669,6 +942,16 @@ pub(crate) fn hint_labels() -> impl Iterator<Item = &'static str> {
 /// found whether it is a whole argument or embedded in one (e.g. a full
 /// `…/MSBuild.dll` path). The hint is a fixed category label — never argv content —
 /// so emitting it does not weaken redaction.
+///
+/// The input is the *text* rendering of argv ([`RenderedArgv::text`]), not the
+/// canonical bytes the fingerprint hashes, and that is deliberate: this classifier
+/// is a heuristic over readable substrings and makes **no identity claim** about a
+/// command, so it neither needs nor promises the unambiguity `argv_sha256` does.
+/// Two different argvs may legitimately classify alike — that is what a *category*
+/// is. Every documented marker is ASCII, so an element that carries bytes no
+/// encoding can read still matches on whatever of it remains readable; only the
+/// escaped bytes themselves (and a doubled `\`) differ from the raw argument, and
+/// no marker spans them.
 ///
 /// `pub` so `benches/hint_classifier_bench.rs` (T-187) can measure the classifier
 /// in isolation, without the argv-fingerprint SHA-256 that its only other caller,
@@ -1369,6 +1652,276 @@ mod tests {
         assert_ne!(
             argv_sha256_hex(&["a".to_string(), "b".to_string()]),
             argv_sha256_hex(&["ab".to_string()])
+        );
+        // Independently computed (`printf 'a\0b' | sha256sum`): the join is the
+        // separator itself, not a rendering of one.
+        assert_eq!(
+            argv_sha256_hex(&["a".to_string(), "b".to_string()]),
+            "59b271ae1bbcb1d31d41929817f4b16fb439eb4f31520b5ad1d5ce98920a7138"
+        );
+    }
+
+    /// The compatibility half of T-324's canonical-encoding change: for argv that
+    /// *is* valid Unicode — every ordinary command line, and every argv any earlier
+    /// release could fingerprint faithfully — the digest is byte-for-byte the one
+    /// those releases produced, on **both** platforms. Pinned against digests
+    /// computed outside this crate (`printf 'cmd\0/c\0build' | sha256sum`), so this
+    /// cannot pass by agreeing with a mistake in our own encoder, and driven through
+    /// the public `for_argv` entry points rather than the hash helper, so it covers
+    /// the platform-specific [`canonical_argv_bytes`] step that produces its input.
+    #[test]
+    fn valid_unicode_argv_fingerprints_exactly_as_it_always_did() {
+        assert_eq!(
+            CommandFingerprint::for_argv(["cmd", "/c", "build"]).argv_sha256,
+            "b55217a654fd9b43f80366fdb5193d3f48afd15385637da02a1db95de0a75390"
+        );
+        assert_eq!(
+            CommandInfo::for_argv(["abc"], true).argv_sha256.as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        // Non-ASCII, still valid Unicode: the canonical bytes are its UTF-8 bytes,
+        // so the element is recorded verbatim and nothing is escaped.
+        let accented = CommandInfo::for_argv(["--path=/tmp/logsé"], true);
+        assert_eq!(
+            accented.argv.as_deref(),
+            Some(["--path=/tmp/logsé".to_string()].as_slice()),
+            "a well-formed element is recorded exactly as it was passed"
+        );
+    }
+
+    /// Decode the escaped form of an argv element back to the canonical bytes it
+    /// was rendered from — the reader side of the grammar
+    /// [`render_element_text`] documents and `docs/schema.md` publishes ("Raw argv
+    /// that is not valid Unicode"). Written as an adapter would write it, from the
+    /// documented rules alone rather than by mirroring the encoder's internals, so
+    /// the round-trip below tests the *contract* and not a shared helper.
+    fn decode_element_text(text: &str) -> Vec<u8> {
+        let Some(body) = text.strip_prefix(ARGV_ESCAPE_MARKER) else {
+            // Not escaped: the element is the argument itself.
+            return text.as_bytes().to_vec();
+        };
+        let mut out = Vec::new();
+        let mut characters = body.chars();
+        while let Some(character) = characters.next() {
+            if character != '\\' {
+                let mut buffer = [0u8; 4];
+                out.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+                continue;
+            }
+            match characters.next() {
+                Some('\\') => out.push(b'\\'),
+                Some('x') => {
+                    let digits: String = characters.by_ref().take(2).collect();
+                    assert_eq!(digits.len(), 2, "\\x takes exactly two hex digits");
+                    out.push(u8::from_str_radix(&digits, 16).expect("two lowercase hex digits"));
+                }
+                other => panic!("the grammar has no escape \\{other:?} in {text:?}"),
+            }
+        }
+        out
+    }
+
+    /// The `--argv-raw` rendering is **lossless**: every element — well-formed or
+    /// not — decodes back to the exact canonical bytes it was rendered from, and
+    /// the two forms are told apart by the U+0000 marker alone. Covers the shapes
+    /// that break naive escapers: a lone continuation byte, a truncated multi-byte
+    /// sequence (the `error_len() == None` arm), a WTF-8-encoded unpaired
+    /// surrogate, a backslash that must not be confused with an escape introducer,
+    /// an embedded NUL, and the empty element. Platform-independent by
+    /// construction: it starts from bytes, so both platforms exercise it.
+    #[test]
+    fn escaped_elements_decode_back_to_their_exact_bytes() {
+        let well_formed: &[&[u8]] = &[
+            b"",
+            b"plain",
+            b"a\\b",
+            b"--path=/tmp/logs\xc3\xa9",
+            "🎺 --flag".as_bytes(),
+        ];
+        let ill_formed: &[&[u8]] = &[
+            b"logs\xe9",
+            b"\xff",
+            b"\xfe",
+            b"a\\b\xff",
+            b"\xf0\x9f\x92",            // truncated 4-byte sequence
+            b"\xed\xa0\x80",            // WTF-8 unpaired high surrogate
+            b"ok\x00mid",               // NUL: impossible in a real argv, still exact
+            b"\xffMSBuild.dll\xfe/end", // readable text between ill-formed bytes
+        ];
+
+        for bytes in well_formed {
+            let text = render_element_text(bytes);
+            assert!(
+                !text.starts_with(ARGV_ESCAPE_MARKER),
+                "a well-formed element is recorded verbatim: {bytes:?} -> {text:?}"
+            );
+            assert_eq!(text.as_bytes(), *bytes, "verbatim means byte-identical");
+            assert_eq!(decode_element_text(&text), *bytes);
+        }
+
+        for bytes in ill_formed {
+            let text = render_element_text(bytes);
+            assert!(
+                text.starts_with(ARGV_ESCAPE_MARKER),
+                "an element that is not valid Unicode is marked as escaped: {bytes:?} -> {text:?}"
+            );
+            assert!(
+                !text.contains('\u{fffd}'),
+                "no byte is replaced, so no U+FFFD can appear: {bytes:?} -> {text:?}"
+            );
+            assert_eq!(
+                decode_element_text(&text),
+                *bytes,
+                "the escape must round-trip exactly: {bytes:?} -> {text:?}"
+            );
+        }
+
+        // Readable text survives the escape, so a mangled argument stays
+        // diagnosable instead of becoming an opaque blob.
+        assert_eq!(
+            render_element_text(b"logs\xe9"),
+            "\u{0}logs\\xe9",
+            "only the offending byte is rewritten"
+        );
+        assert_eq!(
+            render_element_text(b"a\\b\xff"),
+            "\u{0}a\\\\b\\xff",
+            "a real backslash is doubled so it cannot be read as an escape"
+        );
+    }
+
+    /// The T-324 regression itself, on Unix: two argvs that differ **only** in
+    /// which invalid byte they carry are two different commands, and every
+    /// argv-derived value must say so. Before this change both elements went
+    /// through `to_string_lossy()` and became the same `"--path=/tmp/logs\u{fffd}"`,
+    /// giving the two runs one shared `argv_sha256` (in the JSONL stream *and* in
+    /// the registry record `list`/`inspect` read back) and one shared `--argv-raw`
+    /// array — so this test fails on the pre-change implementation on both counts.
+    /// The digests are pinned against independently computed values
+    /// (`printf -- '--path=/tmp/logs\xe9' | sha256sum`), which is what an adapter
+    /// implementing `docs/schema.md`'s per-platform encoding must reproduce.
+    #[cfg(unix)]
+    #[test]
+    fn distinct_non_utf8_unix_argv_stay_distinct_everywhere() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let first: &[u8] = b"--path=/tmp/logs\xe9";
+        let second: &[u8] = b"--path=/tmp/logs\xff";
+        assert_eq!(
+            OsStr::from_bytes(first).to_string_lossy(),
+            OsStr::from_bytes(second).to_string_lossy(),
+            "premise: the lossy rendering these used to be fingerprinted through \
+             cannot tell the two apart"
+        );
+
+        let first_info = CommandInfo::for_argv([OsStr::from_bytes(first)], true);
+        let second_info = CommandInfo::for_argv([OsStr::from_bytes(second)], true);
+
+        assert_eq!(
+            first_info.argv_sha256.as_deref(),
+            Some("db18bdea48ee18c5e9d70e214c4e2f41ac5edf2f0adcad03c0673411d641980e")
+        );
+        assert_eq!(
+            second_info.argv_sha256.as_deref(),
+            Some("93e9c0d6b5ec96bf03ab951072aa4074764a78730eeee1bd287241a7a1d578e0")
+        );
+        assert_ne!(
+            first_info.argv_sha256, second_info.argv_sha256,
+            "two different commands must not share one fingerprint"
+        );
+
+        // The registry record is handed the same fingerprint, so the two artifacts
+        // still agree — and disagree with each other's argv for the right reason.
+        assert_eq!(
+            first_info.argv_sha256.as_deref(),
+            Some(
+                CommandFingerprint::for_argv([OsStr::from_bytes(first)])
+                    .argv_sha256
+                    .as_str()
+            )
+        );
+
+        let first_argv = first_info.argv.expect("--argv-raw records argv");
+        let second_argv = second_info.argv.expect("--argv-raw records argv");
+        assert_ne!(
+            first_argv, second_argv,
+            "the raw argv array must not collapse two arguments into one string"
+        );
+        for (element, expected) in [(&first_argv[0], first), (&second_argv[0], second)] {
+            assert!(
+                !element.contains('\u{fffd}'),
+                "no byte is replaced with U+FFFD any more: {element:?}"
+            );
+            assert_eq!(
+                decode_element_text(element),
+                expected,
+                "the recorded element decodes back to the argument's own bytes"
+            );
+        }
+    }
+
+    /// The Windows half of the same regression: an argv element there is a UTF-16
+    /// sequence that may carry an **unpaired surrogate**, which `to_string_lossy()`
+    /// replaced with U+FFFD exactly as it did an ill-formed Unix byte — so a lone
+    /// high surrogate and a lone low surrogate used to fingerprint alike. The
+    /// canonical bytes are WTF-8, pinned against independently computed digests
+    /// (`printf '\x41\xed\xa0\x80\x42' | sha256sum`), and a well-formed surrogate
+    /// *pair* must still encode as ordinary 4-byte UTF-8 — the property that keeps
+    /// every ordinary Windows command line fingerprinting as it always did.
+    #[cfg(windows)]
+    #[test]
+    fn unpaired_surrogates_stay_distinct_on_windows() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        let high = OsString::from_wide(&[0x0041, 0xD800, 0x0042]);
+        let low = OsString::from_wide(&[0x0041, 0xDC00, 0x0042]);
+        assert_eq!(
+            high.to_string_lossy(),
+            low.to_string_lossy(),
+            "premise: the lossy rendering these used to be fingerprinted through \
+             cannot tell the two apart"
+        );
+
+        let high_info = CommandInfo::for_argv([&high], true);
+        let low_info = CommandInfo::for_argv([&low], true);
+        assert_eq!(
+            high_info.argv_sha256.as_deref(),
+            Some("f3e57f50ebb6053f306cdd12723f01cdf462d0164c3987d39ba99271fbb849a6")
+        );
+        assert_eq!(
+            low_info.argv_sha256.as_deref(),
+            Some("510f63a9b9aa414924816548f5d873eb5cad8049fe6c7f7e713fae783174bd4e")
+        );
+        assert_ne!(high_info.argv_sha256, low_info.argv_sha256);
+
+        let high_argv = high_info.argv.expect("--argv-raw records argv");
+        let low_argv = low_info.argv.expect("--argv-raw records argv");
+        assert_ne!(high_argv, low_argv);
+        assert_eq!(decode_element_text(&high_argv[0]), b"\x41\xed\xa0\x80\x42");
+        assert_eq!(decode_element_text(&low_argv[0]), b"\x41\xed\xb0\x80\x42");
+        for element in [&high_argv[0], &low_argv[0]] {
+            assert!(!element.contains('\u{fffd}'), "{element:?}");
+        }
+
+        // A well-formed surrogate pair is one scalar, encoded as 4-byte UTF-8 —
+        // so an OS string and the `&str` spelling of the same text are one command.
+        let pair = OsString::from_wide(&[0xD834, 0xDD1E]);
+        assert_eq!(
+            CommandFingerprint::for_argv([&pair]).argv_sha256,
+            CommandFingerprint::for_argv(["\u{1D11E}"]).argv_sha256,
+            "a paired surrogate is not a special case: it is ordinary UTF-8"
+        );
+        assert_eq!(
+            wtf8_from_wide([0xD834u16, 0xDD1E].into_iter()),
+            "\u{1D11E}".as_bytes(),
+            "the pair encodes as the 4-byte form of the scalar it denotes"
+        );
+        assert_eq!(
+            wtf8_from_wide([0xD800u16].into_iter()),
+            b"\xed\xa0\x80",
+            "an unpaired surrogate encodes as its own 3-byte form"
         );
     }
 

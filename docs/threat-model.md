@@ -136,7 +136,12 @@ code/docs it is implemented and described in.
   `hint` from a static classifier table, both derived from argv but unable to
   reveal it (`src/events.rs`, `argv_sha256_hex`, `classify_hint`/
   `HINT_RULES`). Recording the raw argv requires an explicit opt-in
-  (`--argv-raw`); it is never the default. The per-user registry record
+  (`--argv-raw`); it is never the default. The fingerprint is computed over
+  argv's canonical bytes rather than a lossy Unicode rendering of it
+  (`docs/schema.md`, "Fingerprint"), so two commands that differ only in bytes
+  Unicode cannot express are two fingerprints, not one — a correctness property
+  of the diagnostic, not a disclosure one: the digest stays one-way either way.
+  The per-user registry record
   publishes that same one-way pair (and only it) so `list` can tell several
   live runs apart — the raw argv is not even an input to the registry's
   `register`, which takes an `events::CommandFingerprint`, so no flag

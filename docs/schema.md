@@ -748,7 +748,7 @@ by default (`AGENTS.md`, "Argv is redacted by default"):
 | Field         | Type                     | Notes                                                                 |
 |---------------|--------------------------|-----------------------------------------------------------------------|
 | `redacted`    | boolean                  | `true` by default; `false` only under `--argv-raw`.                   |
-| `argv`        | array of string, nullable| The raw argv, present only when `redacted` is `false`; `null` otherwise. |
+| `argv`        | array of string, nullable| The raw argv, present only when `redacted` is `false`; `null` otherwise. Losslessly encoded — see "Raw argv that is not valid Unicode". |
 | `argv_sha256` | string, nullable         | Lowercase-hex SHA-256 fingerprint of argv — see "Fingerprint". Filled on every run. |
 | `hint`        | string, nullable         | Worker-shape hint for a recognized argv, else `null` — see "Hint classifier". |
 
@@ -770,13 +770,66 @@ metadata and do not copy them into public logs. See
 ### Fingerprint (`argv_sha256`)
 
 `argv_sha256` is the SHA-256 of a canonical encoding of argv, rendered as
-lowercase hex (64 characters). The canonical encoding is **the argv elements
-joined by a single NUL byte (`0x00`)** — each element as its UTF-8 bytes, with no
-leading or trailing separator and no terminator. A NUL cannot occur inside a real
-argv element on any supported platform, so element boundaries are unambiguous:
+lowercase hex (64 characters). The canonical encoding is **each argv element's
+canonical bytes, joined by a single NUL byte (`0x00`)** — with no leading or
+trailing separator and no terminator. A NUL cannot occur inside a real argv
+element on any supported platform, so element boundaries are unambiguous:
 `["ab", "c"]` and `["a", "bc"]` fingerprint differently. An adapter that re-emits
 this schema reproduces the exact digest by hashing the same encoding. (The
 reference implementation is `events::argv_sha256_hex`.)
+
+An argv element is an *OS string*, not a Unicode string, so "its canonical bytes"
+is defined per platform — the platform's own exact representation, never a lossy
+Unicode rendering:
+
+| Platform | An argv element is | Canonical bytes |
+|----------|--------------------|-----------------|
+| Unix (Linux, macOS, BSD) | an arbitrary NUL-free byte sequence, with no encoding attached | those bytes, verbatim |
+| Windows | an arbitrary sequence of UTF-16 code units, which may include unpaired surrogates | the [WTF-8](https://simonsapin.github.io/wtf-8/) encoding of those code units: a surrogate pair is encoded as the 4-byte UTF-8 form of the scalar it denotes, and any unpaired surrogate as the 3-byte form of that code unit |
+
+For an element that *is* valid Unicode — every ordinary command line — both rows
+yield exactly its UTF-8 bytes, so the digest is identical on both platforms and
+identical to what earlier releases produced. The rows differ only for an argument
+Unicode cannot express, which earlier releases could not fingerprint faithfully at
+all (see "Versioning"). Two such arguments that differ in their ill-formed bytes
+fingerprint differently, as two different commands must.
+
+### Raw argv that is not valid Unicode
+
+`--argv-raw`'s `argv` array is JSON, and a JSON string is Unicode text, so an
+element whose canonical bytes are not valid UTF-8 cannot be written verbatim. It
+is written in an escaped form instead — the raw argv is **encoded, never lossily
+approximated and never silently dropped** — so two arguments that differ only in
+their ill-formed bytes stay distinguishable in the field that exists to disclose
+them. The type is unchanged: every element is still a JSON string.
+
+The two forms are mutually distinguishable with no extra field or in-band flag,
+because U+0000 cannot occur inside a real argv element (the same invariant the
+fingerprint's NUL join rests on):
+
+- An element **not** beginning with U+0000 is verbatim — the argument itself. This
+  is every element of every ordinary command line, unchanged from earlier
+  releases.
+- An element beginning with U+0000 is **escaped**. Strip that marker; in what
+  remains, `\\` denotes a single `\`, `\xNN` (exactly two lowercase hex digits)
+  denotes the byte `0xNN`, and every other character denotes its own UTF-8 bytes.
+  Concatenating those in order recovers the element's canonical bytes exactly.
+
+The producer escapes as little as possible: only `\` (the escape introducer), a
+NUL byte, and each byte that is not part of a well-formed UTF-8 sequence are
+rewritten, so the readable part of a mangled argument stays readable beside the
+bytes that broke it. A Unix argument whose bytes are `--path=/tmp/logs` followed by
+the single byte `0xE9` (an ISO-8859-1 `é` in a UTF-8 world) is therefore recorded
+as the JSON string `"\u0000--path=/tmp/logs\\xe9"`, while the well-formed
+`--path=/tmp/logsé` is recorded as `"--path=/tmp/logsé"`, exactly as it always was.
+
+A reader that does not care about this case needs no change: an escaped element is
+a well-formed JSON string like any other, and only argv the local platform accepts
+but Unicode cannot express ever takes that form. A reader that reconstructs an
+argv to re-run or compare it must decode as above rather than take an escaped
+element literally. The escaped text is a *rendering*, not the fingerprint's input:
+`argv_sha256` hashes the canonical bytes themselves, so escaping never perturbs a
+digest.
 
 ### Hint classifier
 
@@ -785,7 +838,13 @@ example a build worker left running after a build) without disclosing its comman
 line. It is one of a small, documented catalog of category labels, or `null` when
 the argv matches no known shape (the common case). A rule matches when **all** of
 its marker substrings appear somewhere in the argv, compared case-insensitively;
-the first matching rule in catalog order wins.
+the first matching rule in catalog order wins. Matching runs over the same text
+rendering `--argv-raw` would record (see "Raw argv that is not valid Unicode"),
+whether or not that flag was given. Unlike `argv_sha256`, the hint makes no
+identity claim — it is a *category*, and two different commands may legitimately
+share one — so nothing about it depends on that rendering being unambiguous; every
+marker in the catalog is ASCII, so an escaped element still matches on whatever of
+it is readable.
 
 | `hint`               | Markers (all must be present)                    | Shape |
 |----------------------|--------------------------------------------------|-------|
@@ -889,6 +948,33 @@ filled the same way once ProcessKit shipped `members_info()`. Adding a new `hint
 catalog is likewise additive, but renaming or removing an existing `hint` label, or
 changing the fingerprint's canonical encoding, changes the meaning of a value and
 so is a breaking change.
+
+Defining the canonical encoding for an input it never covered is *not* such a
+change, and the per-platform "canonical bytes" table in "Fingerprint" is that case.
+The encoding this document previously specified — "each element as its UTF-8
+bytes" — defines a digest only for an argv element that *is* valid Unicode, and for
+every one of those the bytes hashed today are exactly the bytes hashed before, on
+both platforms: no value that this document ever gave a meaning to changed meaning.
+What changed is an element that has no UTF-8 bytes at all (a Unix argument with
+ill-formed bytes, a Windows argument with an unpaired surrogate). An adapter
+implementing the old wording could not reproduce those digests, because the runner
+was not implementing that wording either — it silently substituted U+FFFD, which
+gave *different* commands the *same* fingerprint. The same reasoning covers the raw
+`argv` array's escaped form (see "Raw argv that is not valid Unicode"): the element
+type and every representable element's rendering are unchanged, and the one case
+that changed was previously specified as "the raw argv" while in fact delivering a
+lossy reconstruction of it. Both are corrections within `schema_version = 1`.
+
+They are not free of reader obligations, and the two differ in exactly that.
+`argv_sha256` keeps its type, its shape, and every digest a reader could already
+have recorded, so a reader that treats it as an opaque correlation token needs no
+change at all. The raw `argv` array keeps its type (`array of string`) and every
+representable element's rendering, but a reader may now encounter one element shape
+it could not before — the escaped form, and only for argv the local platform allows
+but Unicode cannot express. A reader that only displays or logs `argv` is
+unaffected; one that *reconstructs* an argv from it must decode that form (the
+rules are in "Raw argv that is not valid Unicode"), where before it would have
+reconstructed a U+FFFD-mangled argv and could not have detected that it had.
 
 The `mechanism` field is the deliberate exception to the usual closed-enum reading of
 the JSON Schema. Its vocabulary grows additively within `schema_version = 1`: adding

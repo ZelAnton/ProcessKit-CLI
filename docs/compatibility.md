@@ -206,7 +206,20 @@ is what requires a new schema version — nothing below does.
    schemas enumerate the current vocabulary, so an older frozen schema may reject a
    newer value; strict validation must use the producer-matching schema, and an
    adapter's runtime parser must not treat the old enum as exhaustive.
-6. **Unknown fields anywhere in the envelope or event body.**
+6. **An escaped element in `--argv-raw`'s `argv` array.** The field's type is
+   unchanged (`array of string`) and every element that is valid Unicode is still
+   the argument verbatim, but an argument the platform accepts and Unicode cannot
+   express — ill-formed bytes on Unix, an unpaired surrogate on Windows — is now
+   recorded losslessly in an escaped form opened by U+0000, instead of the
+   U+FFFD-mangled reconstruction earlier v1 builds wrote. A reader that displays,
+   logs, or stores `argv` needs no change. A reader that *reconstructs* an argv
+   from it (to re-run, compare, or match against one it holds) must decode that
+   form — the grammar is in [`docs/schema.md`](schema.md#command-redaction), "Raw
+   argv that is not valid Unicode" — and must not take an escaped element
+   literally. This is the one reader obligation the same correction adds;
+   `argv_sha256` adds none, since every digest an earlier build produced for an
+   ordinary command line is unchanged.
+7. **Unknown fields anywhere in the envelope or event body.**
 
 **The normative source is [`docs/schema.md`](schema.md)**, not this page: its
 "Ordering" section (and specifically "Multiplicity of `members_snapshot`") states
