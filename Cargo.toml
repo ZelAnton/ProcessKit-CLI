@@ -149,6 +149,20 @@ e2e = []
 # itself, driven through `CARGO_BIN_EXE_processkit-cli`.
 stress = []
 
+# Opt-in upstream identifier drift gate (`tests/spec_drift.rs`). Off by default for
+# two reasons, both about what the tier *needs* rather than how long it takes: it
+# shells out to `cargo metadata` to locate the resolved `processkit` package on
+# disk and then reads that package's shipped `spec/identifiers.json`, so it demands
+# a working cargo plus an unpacked dependency source — a requirement a plain
+# `cargo test` in a vendored, offline, or downstream build has no reason to carry.
+# Its verdict is also host-independent (every projection it drives is a pure
+# function over an upstream enum), so running it on each leg of the `test` matrix
+# would repeat one answer five times. The gating CI `spec-drift` job enables it on
+# one runner, and the non-gating `canary.yml` workflow enables it against
+# ProcessKit's git main. Empty feature set, same pattern as `e2e`/`stress`/`bench` —
+# it only gates which targets build (see the `[[test]]` `required-features` below).
+spec-drift = []
+
 # Opt-in criterion benchmark tier (`benches/`) plus its `bench_emit` worker. Off
 # by default so a plain `cargo build`/`cargo test`/`cargo publish` never builds
 # it — benchmarks are dev-only tooling, never shipped. The dedicated,
@@ -310,6 +324,15 @@ required-features = ["e2e"]
 name = "stress"
 path = "tests/stress.rs"
 required-features = ["stress"]
+
+# The upstream identifier drift gate, gated behind the `spec-drift` feature for the
+# same target-skipping reason as the two tiers above. It spawns no processes of its
+# own beyond one `cargo metadata`, and needs no worker binary: its subjects are this
+# crate's own projection functions and its published schema fixtures.
+[[test]]
+name = "spec_drift"
+path = "tests/spec_drift.rs"
+required-features = ["spec-drift"]
 
 # Test-support worker for the `bench`-gated through-the-binary scenarios
 # (benches/echo_overhead_bench.rs, benches/startup_latency_bench.rs): writes an

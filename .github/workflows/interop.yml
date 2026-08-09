@@ -2,9 +2,10 @@ name: Cross-version interop
 
 # Cross-version interop tier (`scripts/cross_version_interop.py`, T-300): the only
 # place anything in this repository runs TWO different versions of the binary
-# against each other. Every other tier — unit, integration, e2e, stress — is
-# same-binary, so the mixed-version promises the project documents (the registry
-# record's own version axis, the control plane's `snapshot_version`, the JSONL
+# against each other. Every other tier — unit, integration, e2e, stress, spec
+# drift — exercises a single version, so the mixed-version promises the project
+# documents (the registry record's own version axis, the control plane's
+# `snapshot_version`, the JSONL
 # stream's `schema_version`, and `probe`'s surface pinning) were reasoned about
 # and written down but never executed. This lane downloads the latest published
 # release binary and drives `docs/compatibility.md`'s own rolling-upgrade and
