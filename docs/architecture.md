@@ -323,6 +323,21 @@ rung of it — each re-examines code the tiers above already cover, from a
 different angle. They are documented in `CONTRIBUTING.md` ("Fuzzing", "Mutation
 testing") and `README.md` ("Benchmarks").
 
+One further tier sits outside the ladder altogether, because its subject is not
+this runner's behaviour but its **agreement with the library underneath it**.
+Several of the vocabularies this CLI publishes (`mechanism`, `abrupt_cleanup`,
+the `limit_evidence` verdicts, `soft_stop_scope`, `soft_signal`, `outcome`) are
+projections of closed `processkit` enums, each ending in a conservative fallback
+for a value the build predates — a safe answer that is also a silent one. The
+upstream identifier drift gate (`tests/spec_drift.rs`, gated behind the
+`spec-drift` Cargo feature) holds every one of those projections, and every
+published schema `enum` that carries them, against the stable-identifier
+dictionary `processkit` ships inside its own package, for the exact version
+`Cargo.lock` resolves. A new upstream value fails the build instead of reaching a
+wire as a fallback string. CI runs it as a separate gating job, and the scheduled
+upstream canary runs the same tier against `processkit`'s main branch. See
+`CONTRIBUTING.md`, "Upstream identifier drift".
+
 ## Normative documents
 
 Each area of the compatibility surface has its own normative document; this

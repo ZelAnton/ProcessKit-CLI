@@ -2,9 +2,10 @@ name: ProcessKit upstream canary
 
 # NON-GATING: schedule/manual only, with no push or pull_request trigger, so this
 # workflow is never a required change check. A red run is intentionally visible:
-# it means ProcessKit's current main no longer builds or passes this runner's
-# default binary-contract tests and should be investigated before the next
-# crates.io dependency update.
+# it means ProcessKit's current main no longer builds, no longer passes this
+# runner's default binary-contract tests, or has grown a stable identifier this
+# runner's projections do not represent (the drift gate step below) — any of which
+# should be investigated before the next crates.io dependency update.
 
 on:
   schedule:
@@ -57,6 +58,18 @@ jobs:
 
       - name: Run the default test tier
         run: cargo test
+
+      # The earliest possible warning that upstream grew a vocabulary. The gate
+      # (tests/spec_drift.rs) locates the dictionary through `cargo metadata`'s
+      # resolve graph rather than a registry-layout guess, so with the
+      # `[patch.crates-io]` above in place it reads `spec/identifiers.json` straight
+      # out of the git checkout of ProcessKit main. A new identifier therefore fails
+      # here — naming the enum and the value — on the schedule below, rather than
+      # waiting for the release that would otherwise deliver it as a silent fallback
+      # string. ci.yml's gating
+      # `spec-drift` job runs the same tier against the version Cargo.lock pins.
+      - name: Run the upstream identifier drift gate
+        run: cargo test --features spec-drift --test spec_drift -- --nocapture
 
       - name: Report outcome
         if: always()

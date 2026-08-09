@@ -802,7 +802,24 @@ pub fn mechanism_str(mechanism: Mechanism) -> &'static str {
 /// conservative choice, since this string is a reaping *guarantee*, not a mere
 /// capability label, and must never overclaim.
 pub fn abrupt_cleanup_str() -> &'static str {
-    match PkCommand::kill_on_parent_death_scope() {
+    abrupt_cleanup_scope_str(PkCommand::kill_on_parent_death_scope())
+}
+
+/// The projection [`abrupt_cleanup_str`] applies to whatever scope this host
+/// reports, as a pure function of the scope.
+///
+/// Split out from its host-reading caller for the same reason `soft_stop_mechanism`
+/// in `src/run/teardown.rs` takes an explicit `windows` flag instead of reading
+/// `cfg!` itself (K-059): a projection that reads the host inside itself can only
+/// ever be exercised for *this* machine's answer, so every other arm — and any
+/// arm a future ProcessKit variant would land in — is untestable and unauditable
+/// off that platform. As a pure function it can be driven over every variant on
+/// any host, which is exactly what the upstream identifier drift gate
+/// (`tests/spec_drift.rs`) does: it resolves each identifier in ProcessKit's
+/// shipped `spec/identifiers.json` back to its variant and requires this
+/// function to render it deliberately rather than fall into the `_` arm.
+pub fn abrupt_cleanup_scope_str(scope: ParentDeathCleanup) -> &'static str {
+    match scope {
         ParentDeathCleanup::WholeTree => "whole_tree",
         ParentDeathCleanup::DirectChildOnly => "direct_child_only",
         ParentDeathCleanup::Unsupported => "none",
@@ -1487,6 +1504,26 @@ mod tests {
             let mechanism = Mechanism::from_name(name).expect("ProcessKit knows the name");
             assert_eq!(mechanism_str(mechanism), name);
         }
+    }
+
+    /// Every abrupt-cleanup scope ProcessKit can report is rendered deliberately —
+    /// on every host, not only the one this machine happens to be. Before
+    /// [`abrupt_cleanup_scope_str`] was split out of its host-reading caller, two of
+    /// these three arms were unreachable from a test on any given platform, so a
+    /// misspelled `direct_child_only` could only be caught by running the suite on
+    /// Linux. The identifiers are ProcessKit's own, so the round trip through
+    /// `from_name` is what makes this a check against upstream rather than against a
+    /// copy of the same table.
+    #[test]
+    fn abrupt_cleanup_scope_maps_to_the_documented_strings() {
+        for name in ["whole_tree", "direct_child_only", "none"] {
+            let scope = ParentDeathCleanup::from_name(name).expect("ProcessKit knows the name");
+            assert_eq!(abrupt_cleanup_scope_str(scope), name);
+        }
+        assert!(
+            ["whole_tree", "direct_child_only", "none"].contains(&abrupt_cleanup_str()),
+            "this host's reported scope must be one of the three published values",
+        );
     }
 
     #[test]

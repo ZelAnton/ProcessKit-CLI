@@ -284,6 +284,90 @@ can never block an unrelated PR.
 
 [`tests/stress.rs`]: tests/stress.rs
 
+## Upstream identifier drift
+
+Every ProcessKit enum this runner republishes — the containment mechanism, the
+abrupt-cleanup guarantee, the limit kind and per-axis verdict, the soft-stop
+scope and soft-signal fate, the run outcome — is `#[non_exhaustive]` upstream.
+Each projection therefore ends in a conservative fallback arm (`unknown`,
+`none`, `failed`), which is correct behaviour: a build that meets a value it
+predates must degrade honestly rather than guess. What that arm is *not* is a
+notification. When ProcessKit 3.3 added `Mechanism::ProcessReaper` this crate
+compiled unchanged and every test stayed green while the new mechanism reported
+itself as `unknown` — visible only to whoever eventually built the binary on
+FreeBSD.
+
+[`tests/spec_drift.rs`] closes that gap. ProcessKit publishes
+`spec/identifiers.json` — one stable identifier per variant of each closed enum,
+generated from a compile-time-exhaustive match inside that crate — and ships it
+**inside the published package**, so the dictionary belonging to exactly the
+version `Cargo.lock` resolved is already on disk after an ordinary build. The
+gate locates it through `cargo metadata`'s resolve graph (no network, no
+vendored copy) and requires each identifier to be *deliberately* represented.
+
+For the seven enums this CLI projects it checks two surfaces per identifier:
+
+- the **Rust projection** that renders it (`events::mechanism_str`,
+  `events::abrupt_cleanup_scope_str`, `events::outcome_fields`,
+  `run::limit_kind_str`, `run::limit_verdict_str`, `run::soft_stop_scope_str`,
+  `run::soft_signal_str`) — driven with the real variant, so a value landing in
+  the fallback arm is a failure rather than a pass;
+- every **published JSON Schema `enum`** that carries the vocabulary, located by
+  property name across `fixtures/schema/v1/schema.json` and
+  `fixtures/schema/cli/*.schema.json` — so a value added to the event schema but
+  forgotten in the `inspect`/`attest`/`doctor` mirrors of it is caught too.
+
+It also requires every enum in the dictionary to be classified: either projected
+(with the function and schema that publish it) or listed in `NOT_PROJECTED` with
+the reason it reaches no machine contract. An enum ProcessKit adds later cannot
+land in neither list.
+
+The tier is gated behind the `spec-drift` Cargo feature, so it is **off** in the
+default `cargo test` — it shells out to `cargo metadata` and reads the
+dependency's unpacked source, and its verdict is host-independent. Run it
+explicitly:
+
+```sh
+cargo test --features spec-drift --test spec_drift -- --nocapture
+```
+
+or `just spec-drift`. CI runs it in the gating `spec-drift` job on every pull
+request and every push to `main`, and the scheduled `canary.yml` workflow runs
+the same tier against ProcessKit's git main — where a new identifier shows up
+before the release that would deliver it.
+
+### When it fails
+
+The panic names the enum, the identifier, and each surface that does not carry
+it. It never fixes anything itself: what a new upstream value *means* for a
+published contract is a decision, not a mechanical edit. Work through it:
+
+1. Read what the new variant actually is upstream (its doc comment, and whether
+   this runner can reach it at all — several ProcessKit vocabularies belong to
+   APIs this CLI never calls).
+2. Decide the contract change: a new value in the published enum, an existing
+   bucket it honestly joins, or a case that cannot occur here.
+3. If it earns a value, sweep *all* the echo sites, not only the two the gate can
+   see: `docs/schema.md` is normative for the JSONL contract, and the same
+   vocabulary is usually restated in `docs/compatibility.md`, `docs/integration.md`,
+   `README.md`, the golden fixtures, and doc comments. The gate reads the schema
+   JSON and the projections; keeping the prose in step is the author's job.
+4. If it genuinely cannot reach this CLI, add an entry to `ACKNOWLEDGED_GAPS` in
+   the test with the reason and what would change the answer. Acknowledgements are
+   checked in both directions — one that stops describing reality (the identifier
+   became represented, or left the dictionary) fails as a stale acknowledgement —
+   so the list cannot quietly become where drift goes to be forgotten.
+5. Add the `CHANGELOG.md` entry, as with any other contract change.
+
+A failure caused by the dictionary being *missing* (a patched, vendored, or path
+dependency whose tree omits `spec/`) is reported the same loud way, deliberately:
+the gate has no skip mode, because a green "no drift found" that actually means
+"nothing was checked" is the exact blindness it exists to remove. Such a build
+should not enable the `spec-drift` feature at all — declining the tier is a
+visible line in a workflow file; a silent skip is not.
+
+[`tests/spec_drift.rs`]: tests/spec_drift.rs
+
 ## Fuzzing
 
 Beyond the grammar-shaped generators the [proptest] property tier drives,
