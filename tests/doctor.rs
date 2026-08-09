@@ -34,9 +34,10 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use common::{bin, scratch};
+use processkit_cli::registry::{Health, Registry};
 use serde_json::Value;
 
 /// The reserved exit code for a host that did not qualify (`docs/exit-codes.md`).
@@ -534,6 +535,64 @@ fn a_host_that_cannot_create_its_registry_keeps_the_named_evidence() {
     assert!(
         stderr.contains("diagnostics kept in"),
         "the failure line names the kept evidence: {stderr}"
+    );
+
+    workspace.cleanup();
+}
+
+/// A qualification whose own budget runs out before the scratch run becomes
+/// discoverable does not leave that runner alive: `phase_launch`'s deadline path
+/// kills and reaps it through the same best-effort cleanup every other post-spawn
+/// failure path uses, rather than leaving it to its own independent five-second
+/// `--timeout` (T-323).
+///
+/// `--timeout 1ms` reliably exhausts the whole qualification's budget before the
+/// first control-plane poll can return — spawning a process and scanning a registry
+/// each cost more than a millisecond on every platform this project supports — so
+/// this deterministically drives the deadline branch rather than racing a healthy
+/// host. What is checked is not the report (the deadline path already covers its own
+/// `detail`) but the registry, read from *outside* the process under test: by the
+/// time `doctor` has returned, `.output()` has already waited for it, which means
+/// the best-effort `kill`-then-`wait` inside it has already completed too. No entry
+/// left behind may read `Health::Live` — the one property a killed runner (its lock
+/// released, since the OS reclaims a terminated process's open handles
+/// unconditionally) and a merely-leaked one (its lock still held for up to five
+/// more seconds) disagree on.
+#[test]
+fn a_deadline_on_launch_kills_the_scratch_runner_rather_than_leaking_it() {
+    let workspace = Workspace::new("doctor-launch-deadline");
+    let out = workspace.doctor(&["--json", "--timeout", "1ms"]);
+    let report = report(
+        &out,
+        HOST_UNQUALIFIED,
+        "`doctor` whose own budget is exhausted before launch",
+    );
+
+    assert_eq!(report["qualified"], false, "{report}");
+    assert_eq!(phase_names(&report), ["registry", "launch"], "{report}");
+    assert_eq!(report["phases"][1]["ok"], false, "{report}");
+    assert!(
+        report["phases"][1]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("budget")),
+        "the failed phase names the exhausted budget: {report}"
+    );
+
+    // A generous margin over the near-instant window the fix actually needs: a
+    // leaked (unfixed) runner would still be genuinely live here, well short of the
+    // five seconds its own `--timeout` would otherwise still owe it.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let entries = Registry::open_read_only_in(workspace.registry())
+        .entries()
+        .unwrap_or_default();
+    assert!(
+        entries.iter().all(|entry| entry.health != Health::Live),
+        "the scratch runner from a deadline-failed launch must not still be live: {:?}",
+        entries
+            .iter()
+            .map(|entry| (entry.record.run_id.clone(), entry.health))
+            .collect::<Vec<_>>()
     );
 
     workspace.cleanup();

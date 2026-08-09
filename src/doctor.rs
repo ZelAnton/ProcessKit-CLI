@@ -598,11 +598,16 @@ impl Session {
                                 self.evidence_hint()
                             ),
                         );
-                        // The runner is left to its own `--timeout`, which is exactly
-                        // why it has one: `doctor` never kills by PID (`AGENTS.md`,
-                        // "Never clean up by process name"), and a run that never
-                        // became discoverable cannot be reached over the control
-                        // plane to be cancelled properly either.
+                        // A run that never became discoverable cannot be reached over
+                        // the control plane to be cancelled properly (`doctor` never
+                        // kills by PID otherwise — `AGENTS.md`, "Never clean up by
+                        // process name" — but this is the one exception: the same
+                        // best-effort `Child::kill` every other post-spawn failure
+                        // path uses, addressed at the exact handle this call spawned,
+                        // not by name or PID lookup). Best-effort: it must not leave
+                        // this run alive until its own `--timeout`, independent of
+                        // whatever `doctor` does next.
+                        run.cleanup_best_effort(self);
                         return None;
                     }
                     std::thread::sleep(POLL_INTERVAL);
@@ -898,6 +903,11 @@ impl Session {
         let code = match run.wait_for_exit(self.deadline) {
             Ok(code) => code,
             Err(detail) => {
+                // The wait itself failed or ran out of budget, so the run's own
+                // ending was never observed and it may still be live: same
+                // best-effort cleanup as every other post-spawn failure path, not
+                // left to its own `--timeout`.
+                run.cleanup_best_effort(self);
                 self.fail("resource_controller", started, detail);
                 return;
             }
@@ -911,6 +921,11 @@ impl Session {
             ResourceOutcome::Installed => (true, None),
             ResourceOutcome::Refused(detail) => (false, Some(detail)),
             ResourceOutcome::Undecided(detail) => {
+                // The run already exited (`wait_for_exit` above succeeded), so this is
+                // a no-op reap in practice — kept here anyway so every path out of
+                // this phase, decided or not, goes through the one cleanup call rather
+                // than only the ones known to still be live.
+                run.cleanup_best_effort(self);
                 self.fail("resource_controller", started, detail);
                 return;
             }
@@ -1214,16 +1229,39 @@ impl ScratchRun {
         if reached_terminal {
             session.phase_cleanup(&self);
         } else {
-            // A failed round-trip leaves the run live: cancel it the same way a
-            // successful qualification would, so a failed `doctor` never leaves a
-            // container running. Best-effort by construction — this is the recovery
-            // path for a control plane that already misbehaved once — and the run's
-            // own `--timeout` is the backstop underneath it.
-            let _ = session
-                .runtime
-                .block_on(control::mutate_one(&self.run_id, ControlCommand::Cancel));
-            let _ = self.child.wait();
+            // A failed round-trip leaves the run live: clean it up the same
+            // best-effort way every other post-spawn failure path does, so a failed
+            // `doctor` never leaves a container running.
+            self.cleanup_best_effort(session);
         }
+    }
+
+    /// The one best-effort cancel/kill-and-wait cleanup every post-spawn failure path
+    /// routes through: `phase_launch`'s deadline path, `phase_resource_controller`'s
+    /// `wait_for_exit` error and undecided-outcome paths, and this type's own
+    /// `finish` for a round-trip that never reached its terminal phase.
+    ///
+    /// Two layers, both best-effort and both discarded — this is recovery from a
+    /// control plane or a runner that has already misbehaved once, not a check with
+    /// its own verdict:
+    /// - ask the control plane to cancel, in case the run is still reachable that
+    ///   way (the clean shutdown a successful qualification gets);
+    /// - unconditionally kill the process by the exact handle this call spawned
+    ///   (never by name or PID lookup — `AGENTS.md`, "Never clean up by process
+    ///   name") and wait to reap it, so the runner is never left to its own
+    ///   `--timeout` regardless of whether the cancel above landed.
+    ///
+    /// Never called for a run that reached its terminal phase normally — that path
+    /// already exited on its own and goes through [`Session::phase_cleanup`] instead,
+    /// so this does not race a teardown already in progress. `Child::kill`/`wait` on
+    /// an already-exited child are themselves no-ops (or a harmless "already exited"
+    /// error), so a call here after the process has already ended costs nothing.
+    fn cleanup_best_effort(&mut self, session: &mut Session) {
+        let _ = session
+            .runtime
+            .block_on(control::mutate_one(&self.run_id, ControlCommand::Cancel));
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
