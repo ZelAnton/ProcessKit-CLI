@@ -363,6 +363,57 @@ to a dated version section.
 
 ### Changed
 
+- **`processkit` 3.3.1** is now the version both committed lockfiles resolve — the
+  root `Cargo.lock` and `fuzz/Cargo.lock`, the second belonging to the deliberately
+  out-of-workspace fuzz crate that the root verification commands never descend
+  into and that Cargo has no reason to move on its own, since 3.3.0 already
+  satisfied the requirement. The manifest requirement is deliberately **unchanged**
+  at `"3.3"`: this is a patch inside the line that requirement already admits, and
+  the comment beside the dependency names `3.3` for a lower bound
+  (`limit_evidence()`/`LimitVerdict`, and `ProcessGroupStats`' `io_*`/
+  `peak_process_count` fields) that 3.3.1 does not move. Of the release's three
+  fixes, two provably do not reach this crate: ConPTY appears nowhere in `src/`, and
+  the upstream `Pipeline` API is unused (every "pipeline" in the tree is the label
+  *value* `pipeline=ci`/`pipeline=local` in tests, or one doc-comment mention of a
+  shell pipeline). The upstream stable-identifier dictionary
+  (`spec/identifiers.json`) is byte-identical between 3.3.0 and 3.3.1, so no
+  projected vocabulary — `Mechanism`, `ParentDeathCleanup`, `Outcome`, the limit
+  verdicts — drifted.
+- **A hard kill that reports a failure is no longer discarded** in
+  `cleanup_finished`. This is the one behavioural consequence of adopting
+  `processkit` 3.3.1, and tracing it corrected the expectation it was adopted
+  under. The release makes the Linux legacy/restricted-cgroup teardown report a
+  **refused thaw** — the per-pid `SIGKILL` sweep freezes the subtree so a fork bomb
+  cannot out-spawn it, and if the freeze cannot be cleared afterwards the tree is
+  dead but the cgroup is left frozen and unusable for further spawns — where it
+  previously returned `Ok(())` on the strength of an empty `cgroup.procs`. The
+  concern was that this new failure would slide through `map_launch_error`'s
+  wildcard arm and turn runs that used to exit `0` into `BACKEND` (102) on such
+  hosts. **It cannot**: `map_launch_error` is reached only from
+  `ProcessGroup::start`, so it maps *launch* failures, and no teardown-path error
+  reaches the exit code at all. `kill_all`'s result was discarded outright
+  (`let _ =`), and `stop`'s `Err` is already downgraded to a stderr warning plus
+  `soft_signal: "failed"` while the code stays `TIMEOUT`/`CANCELLED`/etc. **No exit
+  code, event, flag, or schema changes here, and `docs/exit-codes.md` is
+  deliberately untouched** — its `BACKEND` (102) wording, which describes a
+  container or registry that "could not be established", remains accurate, because
+  all four sites that mint 102 (`create`, `attach`, and the two `foreground` ones)
+  still sit before `run_started`. What the trace *did* expose is a diagnostics gap:
+  with the error dropped, `cleanup_finished` reported `remaining: 0,
+  read_error: false` — a **confirmed**-clean teardown — over precisely the state
+  upstream had just refused to call one, since the group's own drop hits the same
+  refused write and the post-kill member read cannot see a freezer at all. The kill
+  result is now projected through a pure `hard_kill_warning` and, when it reports a
+  failure, warned on stderr carrying upstream's message verbatim — that text, naming
+  the cgroup "left FROZEN" with the refusal's errno and remedy, is what tells this
+  case apart from the pre-existing undrained-tree one. It stays non-fatal on
+  purpose: both classes are properties of the host's teardown rather than of the
+  child's work, and forwarding the child's exit code faithfully is this runner's
+  central promise. The projection is unit-tested on every host; the end-to-end
+  condition is **not reproducible in CI** and is not claimed to be — it needs a
+  Linux host refusing both `cgroup.kill` and `cgroup.freeze` (a pre-5.14 kernel or a
+  revoked delegation), which upstream itself reaches only through crate-internal
+  fault injection unavailable to dependents.
 - The threat model now enumerates the events file read back by `events` as a
   fourth untrusted-input surface — naming `events --file`'s arbitrary
   caller-specified path, the hand-rolled line reader, schema interpreter, and

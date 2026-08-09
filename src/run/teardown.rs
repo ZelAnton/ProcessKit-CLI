@@ -444,13 +444,58 @@ fn remaining_pids_or_unknown(members: Result<Vec<u32>, PkError>) -> (Vec<u32>, b
     }
 }
 
+/// The operator warning for a hard kill that did not report a clean teardown, or
+/// `None` when it did — the honest-degradation policy behind
+/// [`emit_cleanup_finished`]'s [`ProcessGroup::kill_all`] call.
+///
+/// **Why this stopped being a discarded `let _ =` (T-327).** `kill_all`'s `Err` set
+/// used to mean one thing — the tree would not drain (a fork bomb still
+/// out-spawning, un-reapable `D`-state zombies, a uid-changed member rejecting
+/// `SIGKILL` with `EPERM`) — for which the group's own drop really is a backstop
+/// that runs the same kernel teardown again. ProcessKit 3.3.1 added a second,
+/// materially different member to that set: on the Linux legacy/restricted-cgroup
+/// per-pid fallback the tree *did* drain, but the freeze that guarded the sweep
+/// could not be cleared, so the cgroup is left frozen. Drop is no backstop for that
+/// one — it reaches the identical refused write and is refused identically — and
+/// the post-kill `group.members()` read cannot see it either, because an empty
+/// `cgroup.procs` says nothing about the freezer. Discarding the error therefore
+/// let `cleanup_finished` report `remaining: 0, read_error: false` — a *confirmed*
+/// clean teardown — over exactly the state upstream had just refused to call one,
+/// which is the fabrication this module's honest-degradation contract exists to
+/// prevent (see the module docs).
+///
+/// It stays **non-fatal**: the run's exit code is unchanged, deliberately. Both
+/// failure classes are properties of the host's teardown, not of the child's work,
+/// and the child's faithfully forwarded exit code is this runner's central promise.
+/// The upstream message is carried verbatim because it — not this framing — is what
+/// distinguishes the two classes ("the cgroup at … is left FROZEN", with the
+/// refusal's own errno and the remedy, versus an undrained member list).
+///
+/// Pure over a synthetic `Result` for the K-059 reason its four siblings in this
+/// module already are, and more sharply so: the refused-thaw arm needs a Linux host
+/// whose `cgroup.kill` *and* `cgroup.freeze` writes are both refused (a pre-5.14
+/// kernel or a revoked delegation), which upstream itself can only reach through
+/// crate-internal fault injection. No CI runner this project has can produce it, so
+/// the branch is exercised here directly rather than left to a host that never
+/// appears.
+fn hard_kill_warning(killed: Result<(), PkError>) -> Option<String> {
+    killed.err().map(|err| {
+        format!(
+            "processkit-cli: warning: the container hard kill did not report a clean \
+             teardown: {err}"
+        )
+    })
+}
+
 /// Hard-kill the container and mark teardown finished with a post-kill member
 /// snapshot. The hard kill is [`ProcessGroup::kill_all`] — the group's own kernel
 /// teardown, the same mechanism its drop would run — invoked explicitly so
-/// `remaining_pids` reflects the post-kill state rather than a pre-drop guess. Any
-/// kill error is best-effort: the group's drop is still a backstop. `soft` labels
-/// the soft-stop tier of a runner-imposed ending, or `None` on the natural-exit
-/// path where no soft stop was attempted.
+/// `remaining_pids` reflects the post-kill state rather than a pre-drop guess. A
+/// kill that reports a failure is non-fatal but no longer silent: it warns on
+/// stderr via [`hard_kill_warning`], which carries the reason the group's drop and
+/// the member read below can both miss. `soft` labels the soft-stop tier of a
+/// runner-imposed ending, or `None` on the natural-exit path where no soft stop was
+/// attempted.
 ///
 /// A post-kill `group.members()` read failure is not silently fabricated as "0
 /// remaining, confirmed clean": it warns on stderr, matching the honest
@@ -462,7 +507,9 @@ pub(super) fn emit_cleanup_finished(
     group: &ProcessGroup,
     teardown: Option<&GracefulTeardown>,
 ) {
-    let _ = group.kill_all();
+    if let Some(warning) = hard_kill_warning(group.kill_all()) {
+        eprintln!("{warning}");
+    }
     let members = group.members();
     if let Err(err) = &members {
         eprintln!("processkit-cli: warning: could not read container members after cleanup: {err}");
@@ -1645,6 +1692,57 @@ mod tests {
             (None, None, None, None, None),
             "a failed read fabricates no measurement — every axis stays explicitly \
              absent rather than reporting a plausible 0"
+        );
+    }
+
+    /// The [`hard_kill_warning`] twin of the four tests above (T-327): a hard kill
+    /// that reports a failure must not be indistinguishable from one that succeeded.
+    ///
+    /// The arm that motivated it is ProcessKit 3.3.1's refused thaw — the tree
+    /// drained, but the legacy/restricted-cgroup fallback could not clear the freeze
+    /// guarding its sweep, so the group is left frozen. It is stood in for by a real
+    /// `PkError` carrying upstream's own wording rather than reached through a real
+    /// cgroup, for the reason spelled out on the function: producing it needs a Linux
+    /// host that refuses both `cgroup.kill` and `cgroup.freeze`, which upstream
+    /// itself only reaches via crate-internal fault injection and no runner here can
+    /// provide. What this pins is the half that *is* ours — that the error becomes an
+    /// operator-visible warning instead of a discarded `let _ =`, and that upstream's
+    /// text survives into it intact, since that text is what tells a frozen-cgroup
+    /// teardown apart from an undrained one.
+    #[test]
+    fn hard_kill_warning_reports_a_failed_kill_instead_of_a_silent_clean_teardown() {
+        assert_eq!(
+            hard_kill_warning(Ok(())),
+            None,
+            "a kill that reported success warns about nothing"
+        );
+
+        // Upstream's refused-thaw wording, abridged to the load-bearing part: the
+        // state the caller is left holding, which no member read can observe.
+        let frozen = PkError::from(PkErrorReason::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "the cgroup at /sys/fs/cgroup/processkit is left FROZEN",
+        )));
+        let warning = hard_kill_warning(Err(frozen)).expect("a failed kill must produce a warning");
+        assert!(
+            warning.starts_with("processkit-cli: warning: "),
+            "the warning wears this runner's stderr prefix, as its siblings do: {warning}"
+        );
+        assert!(
+            warning.contains("left FROZEN"),
+            "upstream's own reason — the only thing that distinguishes a frozen-cgroup \
+             teardown from an undrained tree — must reach the operator verbatim: {warning}"
+        );
+
+        // The other, pre-existing failure class stays reported too: this is one
+        // warning for every unclean kill, not a refused-thaw special case.
+        let undrained = PkError::from(PkErrorReason::Io(std::io::Error::other(
+            "simulated undrained tree",
+        )));
+        assert!(
+            hard_kill_warning(Err(undrained))
+                .is_some_and(|warning| warning.contains("simulated undrained tree")),
+            "an undrained tree is reported by the same path, with its own reason"
         );
     }
 
