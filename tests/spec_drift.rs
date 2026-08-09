@@ -41,9 +41,10 @@
 //! # The three recorded decisions
 //!
 //! **1. Locating the dictionary: `cargo metadata`, no network, no vendored copy.**
-//! [`dictionary_path`] runs `cargo metadata --format-version 1 --locked --offline`
-//! and walks the resolve graph from this package to its own `processkit` dependency,
-//! then reads `spec/identifiers.json` next to that package's manifest. Resolving via
+//! [`dictionary_path`] runs `cargo metadata --format-version 1 --locked --offline
+//! --filter-platform <this build's target triple>` and walks the resolve graph from
+//! this package to its own `processkit` dependency, then reads
+//! `spec/identifiers.json` next to that package's manifest. Resolving via
 //! the graph rather than by "the package named processkit" keeps the answer correct
 //! if a transitive second major version is ever in the tree; `--locked` pins it to
 //! the version `Cargo.lock` actually resolves rather than whatever a fresh
@@ -52,6 +53,20 @@
 //! follows a `[patch.crates-io]` git checkout automatically — which is what lets
 //! `canary.yml` run it against ProcessKit's main branch and see a new identifier
 //! *before* it is released.
+//!
+//! `--filter-platform` ([`TARGET`], handed over by `build.rs`) is what makes
+//! `--offline` answerable rather than a coin flip on which host runs the gate.
+//! Without it `cargo metadata` resolves the graph for **every** platform
+//! `Cargo.lock` mentions, including the cfg-gated dependencies this platform's build
+//! never had a reason to download — and resolving a package whose source was never
+//! fetched is exactly what `--offline` refuses to do. A Linux run failed on the
+//! Windows-only `anstyle-wincon`; a Windows one would fail the mirror image. Scoping
+//! the resolve to the triple this test was built for asks for precisely the graph an
+//! ordinary build of it already materialized, and narrows nothing this gate reads:
+//! `processkit` is an unconditional dependency, so it is in every platform's graph
+//! (a hypothetical future `[target.'cfg(…)'.dependencies]` edge to it would be
+//! absent on the platforms it is not declared for, and this gate would say so loudly
+//! rather than silently read some other package's dictionary).
 //!
 //! **2. A missing dictionary fails, and is never skipped.** If the file is not where
 //! the resolved package says it should be — a patched, vendored, or path dependency
@@ -91,6 +106,14 @@ use serde_json::Value;
 /// restructured the file, and the parser below has to be re-read against it rather
 /// than silently interpreting a document it no longer understands.
 const SUPPORTED_DICTIONARY_SCHEMA_VERSION: u64 = 1;
+
+/// The target triple this test binary was compiled for, handed over by `build.rs`
+/// from Cargo's own `TARGET` (which Cargo sets for a build script and nowhere else —
+/// there is no such variable in a test binary's own environment, at compile time or
+/// at run time). It scopes [`dictionary_path`]'s `cargo metadata` resolve to this
+/// platform; see decision 1 in this module's header for why an unscoped one cannot
+/// be answered offline.
+const TARGET: &str = env!("PROCESSKIT_CLI_TARGET");
 
 /// How a dictionary identifier is checked against this crate's Rust projection.
 ///
@@ -631,7 +654,15 @@ fn dictionary_path() -> (String, PathBuf) {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 
     let output = Command::new(&cargo)
-        .args(["metadata", "--format-version", "1", "--locked", "--offline"])
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--locked",
+            "--offline",
+            "--filter-platform",
+            TARGET,
+        ])
         .current_dir(manifest_dir)
         .output()
         .unwrap_or_else(|err| {
@@ -643,9 +674,11 @@ fn dictionary_path() -> (String, PathBuf) {
         });
     assert!(
         output.status.success(),
-        "`{cargo} metadata --locked --offline` failed ({}). `--locked` requires Cargo.lock to be \
-         current and `--offline` requires the dependency to be already fetched; both hold after \
-         an ordinary build of this crate.\n\nstderr:\n{}",
+        "`{cargo} metadata --locked --offline --filter-platform {TARGET}` failed ({}). \
+         `--locked` requires Cargo.lock to be current, `--offline` requires the dependency to be \
+         already fetched, and `--filter-platform` scopes the resolve to the packages this \
+         platform's build fetched; all three hold after an ordinary build of this crate.\
+         \n\nstderr:\n{}",
         output.status,
         String::from_utf8_lossy(&output.stderr),
     );

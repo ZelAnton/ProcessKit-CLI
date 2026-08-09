@@ -552,6 +552,31 @@ impl Session {
     /// live registry record publishing a control endpoint. That is the same
     /// resolution every control client performs, so reaching it proves the run is
     /// reachable *by the ordinary path*, not just alive.
+    ///
+    /// **The budget bounds the phase, not just the polling.** The deadline is checked
+    /// at the top of the loop — before *every* resolution attempt, and in particular
+    /// after every [`POLL_INTERVAL`] sleep — so a run that only becomes discoverable
+    /// while this phase was waiting past its deadline fails the phase instead of
+    /// passing it.
+    ///
+    /// The check used to sit after a *failed* resolution and before the sleep, which
+    /// left the loop able to sleep straight past the deadline and then accept the
+    /// next attempt's success. That made which phase reports an exhausted budget a
+    /// race with how fast the host publishes a registry record, and the two answers
+    /// are not equally good: on a host that lost the race, `launch` passed with an
+    /// expired budget, `inspect` and `cancel` each spent a round-trip — up to
+    /// `CONNECT_DEADLINE` + `CONVERSATION_DEADLINE` (`src/control/mod.rs`) — against a
+    /// budget that no longer existed, and the failure landed on `terminal_wait`,
+    /// which cannot succeed on that same budget either. `--timeout`'s contract is that
+    /// the per-phase timings name the phase that ran out of time
+    /// (`src/cli/doctor.rs`), and the phase that did was this one. It also left the
+    /// cleanup this phase owes (below) exercised only on the hosts that won the race,
+    /// which is the half of the fix a regression test can see (`tests/doctor.rs`,
+    /// `a_deadline_on_launch_kills_the_scratch_runner_rather_than_leaking_it`).
+    ///
+    /// Nothing is given up by failing here: every later phase is bounded by the same
+    /// deadline, so a qualification that reaches this point with none of it left has
+    /// nothing to spend on them.
     fn phase_launch(&mut self) -> Option<ScratchRun> {
         let started = Instant::now();
         let run_id = scratch_run_id();
@@ -576,7 +601,38 @@ impl Session {
             endpoint: None,
         };
 
+        // The last resolution failure, so the deadline branch can say what the run
+        // still looked like when the budget ran out. `None` when the budget was
+        // already gone before the first attempt, which is a different sentence rather
+        // than an invented one.
+        let mut last_error: Option<String> = None;
         loop {
+            if Instant::now() >= self.deadline {
+                let detail = match &last_error {
+                    Some(err) => format!(
+                        "the scratch run did not become discoverable within the budget: {err}{}",
+                        self.evidence_hint()
+                    ),
+                    None => format!(
+                        "the qualification budget ran out before the scratch run could be looked \
+                         for at all, so nothing was established about whether it became \
+                         discoverable{}",
+                        self.evidence_hint()
+                    ),
+                };
+                self.fail("launch", started, detail);
+                // A run that is not yet resolvable is not yet registered where a
+                // control-plane cancel could reach it, so a cancel here would only
+                // pay a round-trip for nothing (`doctor` never kills by PID
+                // otherwise — `AGENTS.md`, "Never clean up by process name" — but
+                // this is the one exception: the same best-effort `Child::kill` every
+                // cancel-is-pointless post-spawn failure path uses, addressed at the
+                // exact handle this call spawned, not by name or PID lookup).
+                // Best-effort: it must not leave this run alive until its own
+                // `--timeout`, independent of whatever `doctor` does next.
+                run.kill_and_reap();
+                return None;
+            }
             match self
                 .runtime
                 .block_on(control::resolve_live_endpoint("doctor", &run.run_id))
@@ -599,29 +655,7 @@ impl Session {
                         );
                         return None;
                     }
-                    if Instant::now() >= self.deadline {
-                        self.fail(
-                            "launch",
-                            started,
-                            format!(
-                                "the scratch run did not become discoverable within the budget: \
-                                 {err}{}",
-                                self.evidence_hint()
-                            ),
-                        );
-                        // A run that never became discoverable was never registered
-                        // where a control-plane cancel could reach it, so a cancel
-                        // here would only pay a round-trip for nothing (`doctor`
-                        // never kills by PID otherwise — `AGENTS.md`, "Never clean up
-                        // by process name" — but this is the one exception: the same
-                        // best-effort `Child::kill` every cancel-is-pointless
-                        // post-spawn failure path uses, addressed at the exact handle
-                        // this call spawned, not by name or PID lookup). Best-effort:
-                        // it must not leave this run alive until its own `--timeout`,
-                        // independent of whatever `doctor` does next.
-                        run.kill_and_reap();
-                        return None;
-                    }
+                    last_error = Some(err.to_string());
                     std::thread::sleep(POLL_INTERVAL);
                 }
             }

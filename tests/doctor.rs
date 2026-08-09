@@ -545,11 +545,30 @@ fn a_host_that_cannot_create_its_registry_keeps_the_named_evidence() {
 /// kills and reaps it (`ScratchRun::kill_and_reap`) rather than leaving it to its
 /// own independent `--timeout` (T-323).
 ///
-/// `--timeout 1ms` reliably exhausts the whole qualification's budget before the
-/// first control-plane poll can return — spawning a process and scanning a registry
-/// each cost more than a millisecond on every platform this project supports — so
-/// this deterministically drives the deadline branch rather than racing a healthy
-/// host. What is checked is not the report (the deadline path already covers its own
+/// `--timeout 1ms` drives that branch on every host rather than racing one. The phase
+/// re-checks its deadline at the top of every polling iteration, and every iteration
+/// after the first is preceded by a full `POLL_INTERVAL` sleep — 25ms against a budget
+/// of one (`src/doctor.rs`). So a budget this small covers at most the *first*
+/// resolution attempt, whatever the host manages in the meantime: a host slow enough
+/// that spawning the run already outran the budget fails the phase without looking at
+/// all, a host fast enough to look once fails it on the next iteration, and neither
+/// can pass it. The two differ only in which sentence the `detail` carries; both are
+/// the deadline branch, and both reach the `kill_and_reap` this test is about.
+///
+/// That the phase re-checks the deadline *after* the sleep is the half that used to
+/// be missing. The check sat after a failed resolution and before the sleep, so a
+/// loop that slept straight past the deadline and then found the run discoverable
+/// passed a launch phase whose budget had already expired, spent an `inspect` and a
+/// `cancel` against it, and failed two phases later at `terminal_wait` — which is
+/// exactly what this assertion caught as `["registry", "launch", "inspect", "cancel",
+/// "terminal_wait"]` on Linux, where a scratch runner does finish registering inside
+/// that first 25ms sleep. On Windows it never got that far: creating the registry
+/// directory and spawning a process already cost more than the whole budget there, so
+/// the first check found it exhausted and the two-phase sequence held. That asymmetry
+/// is the only reason the gap read as a platform difference rather than as the timing
+/// bug it is.
+///
+/// What is checked is not the report alone (the deadline path already covers its own
 /// `detail`) but the registry, read from *outside* the process under test.
 ///
 /// This invocation deliberately does **not** use [`Workspace::doctor`] /

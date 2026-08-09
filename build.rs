@@ -76,6 +76,27 @@ fn main() {
     println!("cargo:rerun-if-changed=src/text.rs");
     println!("cargo:rerun-if-changed=build.rs");
 
+    // The target triple this package is being compiled *for*, republished as a
+    // compile-time env so any of its compilation units can name its own platform.
+    // `TARGET` is a build-script-only variable: Cargo sets it here and nowhere else
+    // — not for the crate's own compilation, and not in a test binary's environment
+    // at run time — so a consumer that needs it has to be handed it from this
+    // script. The one consumer is the `spec-drift` tier
+    // (`tests/spec_drift.rs`), whose `cargo metadata` invocation must scope its
+    // resolve to this platform: an unscoped resolve walks *every* platform
+    // `Cargo.lock` mentions, and under `--offline` fails on the packages this
+    // platform's build never fetched (the Windows-only `anstyle-wincon` on a Linux
+    // host, and the mirror-image case on Windows).
+    //
+    // Taken from Cargo rather than parsed out of `rustc -vV` at run time, so it
+    // names the triple the test binary was *built* for even when that differs from
+    // the machine building it (a cross-compiled test run under a runner), which is
+    // the graph the build actually fetched.
+    println!(
+        "cargo:rustc-env=PROCESSKIT_CLI_TARGET={}",
+        env::var("TARGET").expect("TARGET is always set for a build script")
+    );
+
     let manifest_dir = PathBuf::from(
         env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is always set for build.rs"),
     );
