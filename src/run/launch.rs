@@ -96,6 +96,11 @@ pub(super) async fn run_async(args: RunArgs) -> Result<i32, RunnerError> {
     // here, applied as both streams' per-stream ceiling — omitted, it falls back to
     // `CAPTURE_MAX_BYTES` (the prior hard-coded 8 MiB), so a bare
     // `--capture-dir` without `--capture-max-bytes` is byte-for-byte unchanged too.
+    // The setup is all-or-nothing (see `Capture::create`): the failure handled
+    // below rolls back what that attempt created and leaves a pre-existing file of
+    // the same name alone, so the operator can fix the cause and re-run without
+    // first clearing debris — and a `stdout.log` found afterwards was not left
+    // there by this failed attempt.
     let capture_max_bytes = args.capture_max_bytes.unwrap_or(CAPTURE_MAX_BYTES);
     let capture = match args.capture_dir.as_deref() {
         Some(dir) => match Capture::create(dir, capture_max_bytes) {

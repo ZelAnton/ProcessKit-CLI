@@ -153,6 +153,22 @@ Do not infer completeness from file size. Use `truncated`; a file whose length
 equals the cap may still be complete when the stream ended at exactly that
 boundary.
 
+## Capture setup is all-or-nothing
+
+Both transcripts are opened before either one is emptied, and a setup that fails
+part-way — for example a `stderr.log` path that already names a directory, or a
+transcript the runner may not write — rolls back the files and directories that
+attempt created. Such a run exits `SETUP` (111) before the child spawns, and
+without leaving an empty `stdout.log` behind to be mistaken for a real, silent
+transcript.
+
+Paths the runner found rather than created are not rollback candidates: the
+rollback neither removes nor empties them, so a setup that cannot open one of the
+two transcripts leaves an existing file at either path as it was, contents
+included, and leaves an existing capture directory in place. A *successful* setup
+still starts both transcripts empty — a run owns its capture files — so keep
+anything worth retaining out of the capture directory.
+
 ## Two independent bounds
 
 `--capture-max-bytes` limits retained disk bytes per stream. The ProcessKit

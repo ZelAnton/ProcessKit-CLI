@@ -30,6 +30,13 @@
 //! "cut short by a disk write error" on the flags alone, and can verify the file it
 //! holds against the recorded digest (which always covers exactly the bytes that
 //! reached disk).
+//!
+//! Setting the capture up is all-or-nothing ([`Capture::create`]): every stream is
+//! opened before any of them is emptied, and a setup that fails rolls back the
+//! files and directories *that attempt* created — never a path it merely found,
+//! which the rollback neither removes nor empties, even when it already carries a
+//! capture artifact's name. A `run` whose capture setup failed therefore exits
+//! `SETUP` (111) without a half-initialized transcript to mistake for a real one.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -191,9 +198,23 @@ pub struct StreamCapture {
 impl StreamCapture {
     /// `max_bytes` is this stream's per-stream ceiling — `CAPTURE_MAX_BYTES`
     /// unless `--capture-max-bytes` (T-181) overrode it.
+    ///
+    /// Creates (or truncates) `path` itself, which is what a standalone caller —
+    /// the microbenchmark and this module's own unit tests — wants. A run's own
+    /// capture does *not* come through here: [`Capture::create`] opens both
+    /// streams first and only then empties them, so a second stream that cannot
+    /// be opened never costs the first one's file (see that constructor).
     pub fn new(path: PathBuf, max_bytes: u64) -> std::io::Result<Self> {
         let file = std::fs::File::create(&path)?;
-        Ok(Self {
+        Ok(Self::from_file(file, path, max_bytes))
+    }
+
+    /// Wrap an already-open, already-emptied capture file. Splitting this out of
+    /// [`new`](Self::new) is what lets [`Capture::create`] separate *opening* a
+    /// stream (the step that can fail, and must fail before anything on disk is
+    /// discarded) from *taking it over* (the step that empties it).
+    fn from_file(file: std::fs::File, path: PathBuf, max_bytes: u64) -> Self {
+        Self {
             file,
             path,
             max_bytes,
@@ -203,7 +224,7 @@ impl StreamCapture {
             truncated: false,
             write_error: false,
             overflow_signal: None,
-        })
+        }
     }
 
     fn with_overflow_signal(mut self, signal: Arc<OverflowSignal>, stream: u8) -> Self {
@@ -308,8 +329,127 @@ pub struct Capture {
     overflow: Arc<OverflowSignal>,
 }
 
+/// The filesystem artifacts one [`Capture::create`] attempt made, so a failure
+/// later in that same attempt can undo exactly them — and nothing else.
+///
+/// Provenance is recorded while the artifacts are being made rather than
+/// reconstructed from the filesystem afterwards, because after the fact the two
+/// cases are indistinguishable: an empty `stdout.log` this attempt created and an
+/// empty `stdout.log` the operator left there yesterday look identical. Only an
+/// artifact whose creation this attempt itself won — `create_new` for a file,
+/// an `Ok` from this attempt's own `create_dir` for a directory — is ever
+/// recorded here, so nothing the operator owns can become a rollback candidate.
+#[derive(Default)]
+struct SetupRollback {
+    /// Capture files this attempt created, in creation order.
+    files: Vec<PathBuf>,
+    /// Directory levels this attempt created, shallowest first — the order
+    /// [`create_dir_all_tracked`] makes them in.
+    dirs: Vec<PathBuf>,
+}
+
+impl SetupRollback {
+    /// Undo this attempt's artifacts: the capture files first, then the
+    /// directories that held them, deepest first.
+    ///
+    /// Best-effort throughout. The caller is already returning the setup error
+    /// that triggered the rollback — a cleanup that cannot finish must not
+    /// replace that error with its own, and the surviving artifact is at worst
+    /// the one the un-rolled-back code would have left anyway.
+    ///
+    /// Directories go through `remove_dir`, which refuses a non-empty directory
+    /// outright: a capture directory this attempt created but that already holds
+    /// something else (a file another process put there in between) stays, with
+    /// its content. Since the recorded levels are nested, a level that will not
+    /// go stops the walk — every level above it still contains that one, so no
+    /// ancestor can be empty either.
+    fn undo(self) {
+        for path in self.files.iter().rev() {
+            let _ = std::fs::remove_file(path);
+        }
+        for path in self.dirs.iter().rev() {
+            if std::fs::remove_dir(path).is_err() {
+                break;
+            }
+        }
+    }
+}
+
+/// `std::fs::create_dir_all` for `dir`, recording in `rollback` every level this
+/// attempt actually created.
+///
+/// Deliberately mirrors the standard library's own create-then-recurse-into-the-
+/// parent shape, including its treatment of a level that already exists (or that
+/// another process created concurrently) as plain success: the behavior on the
+/// success path — and the error surfaced on the failing one — should stay what
+/// `create_dir_all` gave, since the only thing missing was the bookkeeping.
+/// `create_dir_all` reports nothing about which levels it had to make, and a
+/// before-and-after `exists()` comparison would be exactly the racy, non-atomic
+/// provenance check [`SetupRollback`] avoids.
+fn create_dir_all_tracked(dir: &Path, rollback: &mut SetupRollback) -> std::io::Result<()> {
+    if dir == Path::new("") {
+        return Ok(());
+    }
+    match std::fs::create_dir(dir) {
+        Ok(()) => {
+            rollback.dirs.push(dir.to_path_buf());
+            return Ok(());
+        }
+        // The parent is missing: make it first, then retry this level below.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        // Already a directory — this attempt created nothing here, so this level
+        // is not a rollback candidate.
+        Err(_) if dir.is_dir() => return Ok(()),
+        Err(err) => return Err(err),
+    }
+    match dir.parent() {
+        Some(parent) => create_dir_all_tracked(parent, rollback)?,
+        None => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "failed to create the capture directory tree",
+            ));
+        }
+    }
+    match std::fs::create_dir(dir) {
+        Ok(()) => {
+            rollback.dirs.push(dir.to_path_buf());
+            Ok(())
+        }
+        Err(_) if dir.is_dir() => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Open one stream's capture file for writing **without** emptying it, recording
+/// it in `rollback` only when this attempt created it.
+///
+/// `create_new` (`O_EXCL` / `CREATE_NEW`) is what makes "this attempt created
+/// the file" an atomic fact rather than a guess: an `exists()` check followed by
+/// an ordinary create would leave a window in which another process — or the
+/// operator — puts a file there, which the rollback would then delete as if this
+/// run had written it. When the file is already there, it is opened as it is:
+/// no `truncate`, so the decision to discard its contents is deferred to
+/// [`Capture::create`], which takes it only once every stream is open.
+fn open_stream_file(path: &Path, rollback: &mut SetupRollback) -> std::io::Result<std::fs::File> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => {
+            rollback.files.push(path.to_path_buf());
+            Ok(file)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::OpenOptions::new().write(true).open(path)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 impl Capture {
-    /// Open (creating the directory and truncating the two files) the capture for
+    /// Open (creating the directory and emptying the two files) the capture for
     /// `dir`, applying `max_bytes` as **both** streams' per-stream ceiling.
     /// Fails closed — like the `--jsonl` file, a capture the operator asked for
     /// but that cannot be created is reported *before* the child is spawned, never
@@ -318,15 +458,76 @@ impl Capture {
     /// Callers pass [`CAPTURE_MAX_BYTES`] unless `run`'s `--capture-max-bytes`
     /// overrode it (see `src/run/launch.rs`), so a bare `run --capture-dir` (no
     /// `--capture-max-bytes`) is byte-for-byte the same ceiling as before T-181.
+    ///
+    /// **All-or-nothing setup.** Setting a capture up touches the filesystem
+    /// several times — the directory tree, then one file per stream — and any of
+    /// those steps can fail on its own (a target path that already names a
+    /// directory, an unwritable file, a vanished parent). Two rules keep a failed
+    /// attempt from leaving a dent:
+    ///
+    /// * *Nothing is emptied until every stream is open.* Opening is the step
+    ///   that can still fail, so both files are opened **without** truncation
+    ///   first and emptied (`set_len(0)`) only once both handles exist. A
+    ///   `stderr.log` that cannot be opened therefore costs `stdout.log` nothing,
+    ///   not even its contents. (What this ordering cannot cover is the residual
+    ///   case of the *emptying* itself failing on an already-open handle, which
+    ///   leaves the stream emptied before it — the setup still fails closed, and
+    ///   the rollback still removes only what this attempt created.)
+    /// * *A failure removes exactly what this attempt created, and only that.*
+    ///   Provenance is recorded as the artifacts are made — a file counts as this
+    ///   attempt's only when `create_new` atomically proved it, a directory only
+    ///   when this attempt's own `create_dir` returned `Ok` (see
+    ///   [`SetupRollback`]) — so a pre-existing file or directory of the operator's
+    ///   is never a rollback candidate, however the attempt failed.
+    ///
+    /// The success path is unchanged: both files exist, are empty, and are ready
+    /// to be written from offset zero, exactly as when each was created with
+    /// `File::create` — including when one of them already existed, whose
+    /// contents a successful setup still discards (a run owns its transcript
+    /// files).
     pub fn create(dir: &Path, max_bytes: u64) -> std::io::Result<Self> {
-        std::fs::create_dir_all(dir)?;
+        let mut rollback = SetupRollback::default();
+        // The rollback runs *here* rather than inside the helper so the helper's
+        // own file handles have already been dropped by the time it does: Windows
+        // refuses to unlink a file that is still open, so an inline cleanup would
+        // silently fail to remove the very stream it just opened.
+        match Self::create_tracked(dir, max_bytes, &mut rollback) {
+            Ok(capture) => Ok(capture),
+            Err(err) => {
+                rollback.undo();
+                Err(err)
+            }
+        }
+    }
+
+    /// The body of [`create`](Self::create), recording each artifact it makes in
+    /// `rollback` so its caller can undo them all on any failure below.
+    fn create_tracked(
+        dir: &Path,
+        max_bytes: u64,
+        rollback: &mut SetupRollback,
+    ) -> std::io::Result<Self> {
+        create_dir_all_tracked(dir, rollback)?;
+        let stdout_path = dir.join("stdout.log");
+        let stderr_path = dir.join("stderr.log");
+        // Open every stream before emptying any of them (see the type-level note
+        // above): until the last stream is known to be openable, no byte on disk
+        // may be discarded.
+        let stdout_file = open_stream_file(&stdout_path, rollback)?;
+        let stderr_file = open_stream_file(&stderr_path, rollback)?;
+        // Both handles are in hand, so the run can take the two files over and
+        // start them empty — the state the byte counters, digests, and the
+        // `truncated` flag are all measured from.
+        stdout_file.set_len(0)?;
+        stderr_file.set_len(0)?;
+
         let overflow = Arc::new(OverflowSignal::new(max_bytes));
         let stdout = Arc::new(Mutex::new(
-            StreamCapture::new(dir.join("stdout.log"), max_bytes)?
+            StreamCapture::from_file(stdout_file, stdout_path, max_bytes)
                 .with_overflow_signal(overflow.clone(), 1),
         ));
         let stderr = Arc::new(Mutex::new(
-            StreamCapture::new(dir.join("stderr.log"), max_bytes)?
+            StreamCapture::from_file(stderr_file, stderr_path, max_bytes)
                 .with_overflow_signal(overflow.clone(), 2),
         ));
         Ok(Self {
@@ -667,6 +868,256 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir.join(format!("{name}.log"))
+    }
+
+    /// A fresh, **empty** scratch directory standing in for an operator-owned
+    /// location the capture is asked to live in. Unique per (process, call) — a
+    /// tag alone would collide between parallel `cargo test` threads sharing one
+    /// pid and temp parent — and cleared on entry, so a leftover from an earlier
+    /// aborted run cannot make a rollback assertion pass for the wrong reason.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::AtomicU32;
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "processkit-cli-capture-setup-{}-{tag}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// Make `path` a directory, which is the portable way to make opening it for
+    /// writing fail: every platform this crate targets refuses that open (EISDIR
+    /// on Unix, `ERROR_ACCESS_DENIED` on Windows), for any user including root —
+    /// unlike mode bits, which `CAP_DAC_OVERRIDE`/root bypass in CI containers.
+    fn block_with_a_directory(path: &Path) {
+        std::fs::create_dir(path)
+            .unwrap_or_else(|err| panic!("block {} with a directory: {err}", path.display()));
+    }
+
+    /// A capture setup that fails on its **second** stream rolls back what this
+    /// attempt created: no `stdout.log` is left behind for an operator (or a
+    /// later run) to mistake for a real, empty transcript. The pre-existing
+    /// directory and the blocking `stderr.log` are untouched — and once the cause
+    /// is cleared, a retry sets both streams up and captures normally.
+    #[test]
+    fn a_failed_second_stream_rolls_back_and_a_retry_then_succeeds() {
+        let root = scratch_dir("second-stream-fails");
+        let dir = root.join("cap");
+        std::fs::create_dir(&dir).expect("an operator-owned capture directory");
+        block_with_a_directory(&dir.join("stderr.log"));
+
+        let err = Capture::create(&dir, CAPTURE_MAX_BYTES)
+            .err()
+            .expect("a stderr.log that is a directory cannot be opened for writing");
+
+        assert!(
+            !dir.join("stdout.log").exists(),
+            "the first stream's file was created by this attempt, so the failed setup \
+             ({err}) must not leave it behind"
+        );
+        assert!(
+            dir.join("stderr.log").is_dir(),
+            "the operator's own directory is not what the rollback removes"
+        );
+        assert!(
+            dir.is_dir(),
+            "a capture directory that predates the attempt survives its failure"
+        );
+
+        // Clear the cause and retry into the same directory: both streams come up
+        // and capture independently.
+        std::fs::remove_dir(dir.join("stderr.log")).expect("clear the blocking directory");
+        let capture = Capture::create(&dir, CAPTURE_MAX_BYTES)
+            .expect("a retry after the rollback sets both streams up");
+        capture.stdout.lock().expect("stdout lock").absorb(b"out");
+        capture.stderr.lock().expect("stderr lock").absorb(b"err");
+        let (stdout, stderr) = capture.finalize();
+
+        assert_eq!(stdout.bytes(), 3);
+        assert!(
+            !stdout.write_error(),
+            "the retried stdout stream is writable"
+        );
+        assert_eq!(stderr.bytes(), 3);
+        assert!(
+            !stderr.write_error(),
+            "the retried stderr stream is writable"
+        );
+        assert_eq!(std::fs::read(dir.join("stdout.log")).unwrap(), b"out");
+        assert_eq!(std::fs::read(dir.join("stderr.log")).unwrap(), b"err");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The rollback never touches a file the operator already owned, even one
+    /// named exactly like a capture artifact: a failed setup leaves such a file
+    /// with its bytes, neither deleted nor emptied. This is why the two streams
+    /// are opened before either is emptied — the truncation that a successful
+    /// setup performs must not happen on an attempt that is going to fail.
+    #[test]
+    fn a_failed_setup_neither_deletes_nor_empties_a_pre_existing_file() {
+        let root = scratch_dir("preexisting-stdout");
+        let dir = root.join("cap");
+        std::fs::create_dir(&dir).expect("an operator-owned capture directory");
+        let notes = b"operator's own notes";
+        std::fs::write(dir.join("stdout.log"), notes).expect("the operator's own stdout.log");
+        block_with_a_directory(&dir.join("stderr.log"));
+
+        let err = Capture::create(&dir, CAPTURE_MAX_BYTES)
+            .err()
+            .expect("the second stream still cannot be opened");
+
+        assert_eq!(
+            std::fs::read(dir.join("stdout.log")).unwrap(),
+            notes,
+            "a pre-existing file is neither removed nor emptied by a failed setup ({err})"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The deferred truncation is exactly that — deferred, not dropped. A
+    /// *successful* setup still starts both files empty and writes from offset
+    /// zero, including over a file that already existed: a run owns its transcript
+    /// files, so a stale one is discarded rather than appended to (which would
+    /// leave `bytes`/`sha256` describing only part of the file).
+    #[test]
+    fn a_successful_setup_empties_a_pre_existing_capture_file() {
+        let root = scratch_dir("successful-truncation");
+        let dir = root.join("cap");
+        std::fs::create_dir(&dir).expect("an operator-owned capture directory");
+        std::fs::write(dir.join("stdout.log"), b"stale stdout transcript").expect("stale stdout");
+        std::fs::write(dir.join("stderr.log"), b"stale stderr transcript").expect("stale stderr");
+
+        let capture = Capture::create(&dir, CAPTURE_MAX_BYTES).expect("both streams open");
+        assert_eq!(
+            std::fs::metadata(dir.join("stdout.log")).unwrap().len(),
+            0,
+            "a successful setup starts the stdout transcript empty"
+        );
+        assert_eq!(
+            std::fs::metadata(dir.join("stderr.log")).unwrap().len(),
+            0,
+            "a successful setup starts the stderr transcript empty"
+        );
+
+        capture.stdout.lock().expect("stdout lock").absorb(b"fresh");
+        let (stdout, _) = capture.finalize();
+        assert_eq!(
+            std::fs::read(dir.join("stdout.log")).unwrap(),
+            b"fresh",
+            "capture writes from offset zero, not past the discarded content"
+        );
+        assert_eq!(stdout.bytes(), 5);
+        assert_eq!(stdout.sha256(), crate::hash::sha256_hex(b"fresh"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Directory provenance: `create_dir_all_tracked` records every level it
+    /// creates, shallowest first, and no level that was already there — so the
+    /// rollback takes the created tree down without ever reaching into a
+    /// pre-existing ancestor.
+    #[test]
+    fn only_the_directory_levels_this_attempt_created_are_rolled_back() {
+        let root = scratch_dir("dir-provenance");
+        let first = root.join("a");
+        let second = first.join("b");
+        let dir = second.join("cap");
+
+        let mut rollback = SetupRollback::default();
+        create_dir_all_tracked(&dir, &mut rollback).expect("create the capture directory tree");
+
+        assert_eq!(
+            rollback.dirs,
+            vec![first.clone(), second, dir.clone()],
+            "every level this attempt made is recorded shallowest-first, and the \
+             pre-existing root is not among them"
+        );
+        assert!(
+            dir.is_dir(),
+            "the tree is really created, not just recorded"
+        );
+
+        rollback.undo();
+
+        assert!(
+            !first.exists(),
+            "the whole created tree is removed, deepest level first"
+        );
+        assert!(
+            root.is_dir(),
+            "the pre-existing directory the tree was rooted in survives"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A directory this attempt created but that has since acquired someone
+    /// else's content stays, with that content: the rollback removes the files it
+    /// created and then relies on `remove_dir` refusing a non-empty directory,
+    /// rather than on a recursive delete that could not tell the two apart.
+    #[test]
+    fn the_rollback_keeps_a_created_directory_that_holds_someone_elses_file() {
+        let root = scratch_dir("foreign-content");
+        let dir = root.join("cap");
+
+        let mut rollback = SetupRollback::default();
+        create_dir_all_tracked(&dir, &mut rollback).expect("create the capture directory");
+        let ours = dir.join("stdout.log");
+        // Dropped immediately: the real setup path likewise closes its handles
+        // before the rollback runs, which is what lets Windows unlink the file.
+        drop(open_stream_file(&ours, &mut rollback).expect("create the first stream's file"));
+        let theirs = dir.join("operator.txt");
+        std::fs::write(&theirs, b"not ours").expect("someone else's file lands in the directory");
+
+        rollback.undo();
+
+        assert!(
+            !ours.exists(),
+            "the capture file this attempt created is removed"
+        );
+        assert!(
+            dir.is_dir(),
+            "the directory is kept because it is no longer empty"
+        );
+        assert_eq!(
+            std::fs::read(&theirs).unwrap(),
+            b"not ours",
+            "someone else's file is neither removed nor emptied"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Provenance is per-artifact, not per-attempt: opening a file that was
+    /// already there records nothing, so a rollback leaves it alone even though
+    /// the same attempt did create other artifacts.
+    #[test]
+    fn opening_a_pre_existing_stream_file_records_nothing_to_roll_back() {
+        let root = scratch_dir("file-provenance");
+        let existing = root.join("stdout.log");
+        std::fs::write(&existing, b"already here").expect("a pre-existing capture file");
+
+        let mut rollback = SetupRollback::default();
+        drop(open_stream_file(&existing, &mut rollback).expect("open the existing file"));
+        assert!(
+            rollback.files.is_empty(),
+            "a file this attempt did not create is not a rollback candidate: {:?}",
+            rollback.files
+        );
+
+        rollback.undo();
+        assert_eq!(
+            std::fs::read(&existing).unwrap(),
+            b"already here",
+            "and it keeps its bytes through the rollback"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "current_thread")]

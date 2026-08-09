@@ -385,6 +385,19 @@ to a dated version section.
   child bytes while substantially reducing per-line echo overhead.
 
 ### Fixed
+- `--capture-dir` setup is now all-or-nothing. Previously the runner created and
+  emptied `stdout.log` before it tried `stderr.log`, so a second stream that could
+  not be opened (a path that already named a directory, an unwritable file) left
+  the run exiting `SETUP` (111) with a stray empty `stdout.log` — indistinguishable
+  from a real transcript of a silent child — and, when that file already existed,
+  with its contents already discarded. Both transcripts are now opened before
+  either is emptied, and a failed setup rolls back the files and directories that
+  attempt created. Paths the runner found rather than created are never rollback
+  candidates — the rollback removes and empties nothing it did not create — so a
+  setup that cannot open one of the two transcripts leaves an existing file at
+  either path with its contents, and leaves an existing capture directory in
+  place. A successful setup is unchanged, including its truncation of a stale
+  transcript file.
 - The cookbook's own JSONL reader recipe told readers to dispatch on a `type`
   field; the event stream has always named that field `event`.
 - The detached-supervision examples now hold their child behind an explicit

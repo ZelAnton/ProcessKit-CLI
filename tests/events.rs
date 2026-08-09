@@ -644,6 +644,111 @@ fn an_uncreatable_capture_dir_is_a_setup_failure_with_a_null_child_code() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A capture setup that fails on its **second** stream is the same fail-closed
+/// SETUP failure as an uncreatable `--capture-dir` above — and, unlike before
+/// T-326, it leaves nothing of its own behind: the `stdout.log` the attempt had
+/// already created is rolled back, so no empty transcript survives to be mistaken
+/// for a real one, and no `output_captured` event claims a transcript that was
+/// never taken. Once the cause is cleared, a retry into the same directory runs
+/// the child and captures both streams normally.
+#[test]
+fn a_failed_second_capture_stream_rolls_back_and_a_retry_captures() {
+    let dir = scratch("capture-second-stream-fails");
+    let capture_dir = dir.join("cap");
+    std::fs::create_dir(&capture_dir).expect("create the capture directory");
+    // A directory cannot be opened for writing on any platform (EISDIR /
+    // ERROR_ACCESS_DENIED), so this fails the *second* stream's setup after the
+    // first one has already been opened — the ordering this test is about.
+    std::fs::create_dir(capture_dir.join("stderr.log")).expect("block stderr.log with a directory");
+    let capture_flag = capture_dir.to_string_lossy().into_owned();
+
+    let out = run_with_flags(
+        &dir,
+        &[],
+        &["--capture-dir", &capture_flag],
+        shell_inline("echo should-not-run"),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(111),
+        "an unopenable capture stream is a fail-closed SETUP failure: stderr {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "the child never ran, so nothing reaches its stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !capture_dir.join("stdout.log").exists(),
+        "the failed attempt rolls back the stdout.log it created"
+    );
+    assert!(
+        capture_dir.join("stderr.log").is_dir(),
+        "the pre-existing directory that blocked the setup is not what gets removed"
+    );
+
+    let events = read_events(&dir);
+    assert_events_match_schema(&events);
+    let types = event_types(&events);
+    assert!(
+        !types.iter().any(|t| t == "output_captured"),
+        "no transcript was taken, so no output_captured is emitted: {types:?}"
+    );
+    let runner_exit = events.last().expect("a terminal event");
+    assert_eq!(runner_exit["event"], "runner_exit");
+    assert_eq!(
+        runner_exit["source"], "setup",
+        "the terminal event names the setup source: {runner_exit}"
+    );
+    assert_eq!(runner_exit["code"], 111);
+    assert!(
+        runner_exit["child_code"].is_null(),
+        "no child code is fabricated for a child that never ran: {runner_exit}"
+    );
+
+    // Clear the cause and retry into the same capture directory. The retry writes
+    // its own `--jsonl` file (a fresh scratch dir), so the two runs' event streams
+    // stay separate; only this run's own invariants are asserted, never a
+    // comparison of per-run facts across the two invocations.
+    std::fs::remove_dir(capture_dir.join("stderr.log")).expect("clear the blocking directory");
+    let retry = scratch("capture-second-stream-retry");
+    let out = run_with_flags(
+        &retry,
+        &[],
+        &["--capture-dir", &capture_flag],
+        shell_inline("echo captured-after-retry"),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the retry runs the child normally: stderr {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let retry_events = read_events(&retry);
+    assert_events_match_schema(&retry_events);
+    let retry_types = event_types(&retry_events);
+    assert!(
+        retry_types.iter().any(|t| t == "output_captured"),
+        "the retry captures, so it emits output_captured: {retry_types:?}"
+    );
+    assert_eq!(retry_types.last().map(String::as_str), Some("runner_exit"));
+    let stdout_log = std::fs::read_to_string(capture_dir.join("stdout.log"))
+        .expect("the retry creates the stdout transcript");
+    assert!(
+        stdout_log.contains("captured-after-retry"),
+        "the retry's transcript holds the child's output: {stdout_log:?}"
+    );
+    assert!(
+        capture_dir.join("stderr.log").is_file(),
+        "the retry creates the second stream's file where the blocking directory was"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&retry);
+}
+
 /// `members_snapshot` reports the enriched per-member fields (`ppid`, `name`,
 /// `start_time`) ProcessKit's `members_info()` fills, on every platform this
 /// crate's CI runs (Windows, Linux, macOS all report them per the platform matrix

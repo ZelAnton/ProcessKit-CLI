@@ -1801,6 +1801,75 @@ fn custom_capture_max_bytes_clips_the_stream_at_the_configured_ceiling() {
     );
 }
 
+/// A capture setup that fails on its second stream must not cost the operator
+/// the file it found at the *first* stream's path. `--capture-dir` empties both
+/// transcripts on a successful setup, but a setup that cannot open `stderr.log`
+/// never gets that far: the pre-existing `stdout.log` keeps its bytes, is not
+/// removed by the rollback either, and the run still fails closed with `SETUP`
+/// (111) before the child spawns.
+///
+/// The differential half matters as much as the assertion: the same directory,
+/// with the blocker cleared, is then run again through the same binary and the
+/// same flags, and *does* empty that file — so the "untouched" result above is
+/// the failure path's doing, not a capture that never truncates anything.
+#[test]
+fn a_failed_capture_setup_leaves_a_pre_existing_transcript_untouched() {
+    let dir = scratch("capture-setup-preexisting");
+    let capture_dir = dir.join("capture");
+    std::fs::create_dir(&capture_dir).expect("create the capture directory");
+    let notes = "operator's own stdout.log\n";
+    std::fs::write(capture_dir.join("stdout.log"), notes).expect("the operator's own transcript");
+    // A directory is unopenable for writing on every platform, so the second
+    // stream's setup fails after the first stream's file has been opened.
+    std::fs::create_dir(capture_dir.join("stderr.log")).expect("block stderr.log");
+
+    let capture_flag = path_arg(&capture_dir);
+    let out = run_with_flags(
+        &dir,
+        &[],
+        &["--capture-dir", &capture_flag],
+        shell_inline("echo should-not-run"),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(111),
+        "the unopenable second stream is a fail-closed SETUP failure: stderr {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(capture_dir.join("stdout.log")).expect("the file still exists"),
+        notes,
+        "a failed capture setup neither removes nor empties the operator's file"
+    );
+
+    // Same directory, same flags, blocker cleared: now the setup succeeds and the
+    // stale content really is discarded, proving the run above skipped a
+    // truncation it would otherwise have performed.
+    std::fs::remove_dir(capture_dir.join("stderr.log")).expect("clear the blocking directory");
+    let retry = scratch("capture-setup-preexisting-retry");
+    let out = run_with_flags(
+        &retry,
+        &[],
+        &["--capture-dir", &capture_flag],
+        shell_inline("echo fresh-transcript"),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the retry runs the child: stderr {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let transcript =
+        std::fs::read_to_string(capture_dir.join("stdout.log")).expect("the transcript exists");
+    assert!(
+        transcript.contains("fresh-transcript") && !transcript.contains("operator's own"),
+        "a successful setup starts the transcript from empty: {transcript:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&retry);
+}
+
 /// The opt-in overflow policy turns a noisy, non-idle child into a distinct
 /// runner-owned ending. It must use the shared graceful teardown, preserve the
 /// bounded capture metadata, and never alias a child exit or a time deadline.
