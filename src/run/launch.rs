@@ -1120,7 +1120,12 @@ fn build_limit_options(args: &RunArgs) -> Option<ProcessGroupOptions> {
 /// rather than a guess — mirroring [`events::mechanism_str`]'s treatment of an
 /// unrecognized `Mechanism`. The three known strings match the golden fixture and
 /// `docs/schema.md` (`"memory"` / `"processes"` / `"cpu"`).
-fn limit_kind_str(kind: LimitKind) -> &'static str {
+///
+/// `pub` (re-exported by [`crate::run`]) only so the upstream identifier drift gate
+/// (`tests/spec_drift.rs`) can drive the real projection over every `LimitKind`
+/// ProcessKit's shipped dictionary names, rather than re-deriving a lookalike table
+/// of its own.
+pub fn limit_kind_str(kind: LimitKind) -> &'static str {
     match kind {
         LimitKind::Memory => "memory",
         LimitKind::Processes => "processes",

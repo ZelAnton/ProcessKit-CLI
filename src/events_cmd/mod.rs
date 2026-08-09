@@ -602,8 +602,28 @@ impl StreamReader {
         }
     }
 
+    /// Hand out every complete (newline-terminated) line currently in `pending` —
+    /// **enforcing [`MAX_LINE_BYTES`] on each one as it is found**, not only on
+    /// whatever is left unterminated afterwards. A line whose terminating `\n`
+    /// arrives in the same read that pushes it past the limit is still an overrun:
+    /// nothing about finding the newline first is allowed to let it slip past the
+    /// guard as an ordinary line (that gap is exactly what let an oversized record
+    /// through until this check existed — [`StreamReader::guard_line_length`] alone
+    /// only ever saw an *empty* buffer for such a line, since this method had
+    /// already drained it out from under it).
     fn emit_complete_lines(&mut self, session: &mut Session) {
         while let Some(index) = self.pending.iter().position(|byte| *byte == b'\n') {
+            if !self.skipping && index > MAX_LINE_BYTES {
+                // The payload before this newline already overruns the limit —
+                // report and discard it exactly as `guard_line_length` would for an
+                // unterminated overrun, then keep going: this newline resolves the
+                // line's boundary, so there is nothing left to skip afterwards.
+                let echo_len = OVERRUN_ECHO_BYTES.min(index);
+                let echo_source = self.pending[..echo_len].to_vec();
+                self.pending.drain(..=index);
+                self.report_overrun(session, &echo_source);
+                continue;
+            }
             let mut raw: Vec<u8> = self.pending.drain(..=index).collect();
             raw.pop();
             if raw.last() == Some(&b'\r') {
@@ -624,11 +644,13 @@ impl StreamReader {
     /// than letting an untrusted file decide this process's memory use.
     ///
     /// Called after [`StreamReader::emit_complete_lines`] has already taken every
-    /// newline out of `pending`, so what is left is by definition an unterminated
-    /// line and discarding it cannot lose a line boundary. Both the reporting pass
-    /// and every later pass over the *same* over-long line must clear the buffer —
-    /// only the report is once. (Skipping the clear on the later passes would leave
-    /// exactly the unbounded growth this guard exists to prevent.)
+    /// newline out of `pending` — including reporting, in that same pass, any
+    /// newline-terminated line that itself overran the limit — so what is left here
+    /// is by definition an unterminated line and discarding it cannot lose a line
+    /// boundary. Both the reporting pass and every later pass over the *same*
+    /// over-long line must clear the buffer — only the report is once. (Skipping the
+    /// clear on the later passes would leave exactly the unbounded growth this guard
+    /// exists to prevent.)
     fn guard_line_length(&mut self, session: &mut Session) {
         if self.pending.len() <= MAX_LINE_BYTES {
             return;
@@ -638,11 +660,21 @@ impl StreamReader {
             self.pending.clear();
             return;
         }
-        let echo =
-            String::from_utf8_lossy(&self.pending[..OVERRUN_ECHO_BYTES.min(self.pending.len())])
-                .into_owned();
-        self.pending.clear();
+        let echo_source = std::mem::take(&mut self.pending);
         self.skipping = true;
+        self.report_overrun(session, &echo_source);
+    }
+
+    /// Report an over-long line's overrun exactly once — echoing up to
+    /// [`OVERRUN_ECHO_BYTES`] of its own bytes — and advance the line number so a
+    /// later report's numbering still matches the file. Shared by both places a line
+    /// can be found to overrun [`MAX_LINE_BYTES`]: one still unterminated in
+    /// `pending` ([`StreamReader::guard_line_length`]), the other already resolved by
+    /// an arriving newline ([`StreamReader::emit_complete_lines`]).
+    fn report_overrun(&mut self, session: &mut Session, echo_source: &[u8]) {
+        let echo =
+            String::from_utf8_lossy(&echo_source[..OVERRUN_ECHO_BYTES.min(echo_source.len())])
+                .into_owned();
         self.number += 1;
         session.absorb(&StreamLine {
             number: self.number,
@@ -938,6 +970,163 @@ mod tests {
         assert_eq!(session.emitted, 1, "only the one real event was rendered");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A **valid, renderable** JSON object of exactly `total_bytes` bytes, built by
+    /// padding a single string field.
+    ///
+    /// The two regression tests below deliberately do *not* use an oversized run of
+    /// `b'x'` bytes: that is not valid JSON, so it already hits `emit`'s pre-existing
+    /// "not valid JSON" error path regardless of whether the size guard runs at all,
+    /// which makes such a test pass on both the fixed and the pre-fix code (R-01) —
+    /// it proves nothing about the guard-ordering bug this task fixes. A line that
+    /// *would* parse and render fine if it reached that far is the only payload that
+    /// can tell the two apart.
+    fn oversized_json_object(total_bytes: usize) -> String {
+        let prefix = r#"{"a":""#;
+        let suffix = r#""}"#;
+        let fixed = prefix.len() + suffix.len();
+        assert!(
+            total_bytes >= fixed,
+            "total_bytes too small for a JSON object of this shape"
+        );
+        let filler = "x".repeat(total_bytes - fixed);
+        let object = format!("{prefix}{filler}{suffix}");
+        assert_eq!(
+            object.len(),
+            total_bytes,
+            "the constructed object must be exactly the requested size"
+        );
+        object
+    }
+
+    /// A **schema-conforming** `run_started` event of exactly `total_bytes` bytes,
+    /// inflated through `run_id` — the one field `run_started` requires that the
+    /// embedded schema places no length limit on (unlike `labels`' values, bounded by
+    /// `maxLength`; see `schema::tests::label_keys_and_values_are_checked`) — so the
+    /// padding does not itself make the event non-conforming. The rest of the shape
+    /// mirrors that same test's known-conforming `run_started` fixture.
+    fn run_started_of_size(total_bytes: usize) -> String {
+        let prefix = r#"{"schema_version":1,"time":"2026-07-22T09:00:00.000Z","event":"run_started","run_id":""#;
+        let suffix = r#"","labels":{},"root_pid":1,"mechanism":"job_object","abrupt_cleanup":"whole_tree","cwd":null,"command":{"redacted":true,"argv":null,"argv_sha256":null,"hint":null}}"#;
+        let fixed = prefix.len() + suffix.len();
+        assert!(
+            total_bytes >= fixed,
+            "total_bytes too small to hold the fixed run_started shape"
+        );
+        let padding = "r".repeat(total_bytes - fixed);
+        let event = format!("{prefix}{padding}{suffix}");
+        assert_eq!(
+            event.len(),
+            total_bytes,
+            "the constructed event must be exactly the requested size"
+        );
+        event
+    }
+
+    /// A line whose payload is exactly `MAX_LINE_BYTES + 1` bytes, terminated by a
+    /// `\n` that only arrives once the buffer already sits above the limit — the
+    /// regression for the guard-ordering bug this task fixes.
+    ///
+    /// `emit_complete_lines` used to drain and render this as an ordinary line the
+    /// instant its terminating newline arrived, because `guard_line_length` runs
+    /// only *after* it and by then found nothing but an empty buffer to check: the
+    /// oversized record had already been handed to rendering/validation instead of
+    /// being rejected. This is deliberately the tightest possible overrun — one
+    /// byte past the limit, with its newline present — rather than the many-times-
+    /// over-the-limit line the older overrun test uses, because the bug is specific
+    /// to a line landing exactly on this boundary with a newline already in hand.
+    /// The overrun's payload is a valid, otherwise-renderable JSON object
+    /// ([`oversized_json_object`]) so `session.emitted` growing to 3 on the pre-fix
+    /// code is a meaningful regression signal, not an artifact of bad JSON.
+    #[test]
+    fn a_line_of_exactly_max_plus_one_bytes_with_a_trailing_newline_is_rejected() {
+        let dir = scratch("events-exact-overrun");
+        std::fs::create_dir_all(&dir).expect("create the fixture directory");
+        let path = dir.join("events.jsonl");
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(RUN_STARTED.as_bytes());
+        stream.push(b'\n');
+        stream.extend_from_slice(oversized_json_object(MAX_LINE_BYTES + 1).as_bytes());
+        stream.push(b'\n');
+        stream.extend_from_slice(RUNNER_EXIT.as_bytes());
+        stream.push(b'\n');
+        std::fs::write(&path, &stream).expect("write the fixture stream");
+
+        let mut session = Session::new(&args(&["--file", "x"])).expect("the session builds");
+        let mut reader = StreamReader::open(&path).expect("open the fixture stream");
+        reader
+            .drain(&mut session)
+            .expect("drain the fixture stream");
+        reader.flush_partial(&mut session);
+
+        assert_eq!(
+            session.emitted, 2,
+            "the two real events are rendered; the exact-boundary overrun — despite \
+             being valid, renderable JSON — is not, because the byte guard must reject \
+             it before rendering ever sees it"
+        );
+        assert!(
+            session.terminal_seen,
+            "the stream is still read, and ended, past the overrun"
+        );
+        assert!(
+            !reader.skipping,
+            "the overrun's own newline already resolves its boundary; nothing is left to skip"
+        );
+        assert!(
+            reader.pending.is_empty(),
+            "nothing from the overrun line is left buffered"
+        );
+        assert_eq!(
+            reader.number, 3,
+            "all three lines are counted, including the overrun's own report"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same exact-boundary overrun, checked under `--validate`: the oversized
+    /// line is counted and reported as invalid rather than silently passing (or
+    /// silently vanishing without being checked at all).
+    ///
+    /// The overrun's payload is a **schema-conforming** `run_started` event
+    /// ([`run_started_of_size`]), not merely oversized or merely invalid JSON: a
+    /// non-conforming payload would be tallied as invalid by schema validation alone,
+    /// on both the fixed and the pre-fix code, and so would not distinguish them
+    /// (R-01). Only a payload the schema itself would accept makes the invalid tally
+    /// mean the byte guard actually ran. Deliberately without `RUN_STARTED` — its
+    /// shape does not itself conform to the embedded schema, which would make the
+    /// invalid tally this test asserts about something other than the overrun.
+    #[test]
+    fn a_line_of_exactly_max_plus_one_bytes_fails_validation_as_one_invalid_line() {
+        let mut stream = run_started_of_size(MAX_LINE_BYTES + 1).into_bytes();
+        stream.push(b'\n');
+        stream.extend_from_slice(RUNNER_EXIT.as_bytes());
+        stream.push(b'\n');
+
+        let (session, lines) = read_all(&stream, &["--file", "x", "--validate"]);
+        assert_eq!(lines, 2, "both lines are counted, including the overrun");
+        assert!(
+            session.terminal_seen,
+            "the valid terminal is still consumed after the overrun"
+        );
+        match session.output {
+            Output::Validate(report) => {
+                let err = report.finish().expect_err(
+                    "the oversized line is schema-conforming and must be rejected by the \
+                     byte guard — not accepted because it happens to pass schema checks",
+                );
+                assert_eq!(err.code(), exit::EVENTS_INVALID);
+                let message = err.to_string();
+                assert!(
+                    message.contains("1 of 2"),
+                    "exactly the one overrun line is invalid, not the terminal event: {message}"
+                );
+            }
+            _ => panic!("the test must use validation output"),
+        }
     }
 
     /// Invalid UTF-8 is replaced, not fatal: the line is reported as unreadable and

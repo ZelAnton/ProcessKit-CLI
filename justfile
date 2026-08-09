@@ -1,5 +1,5 @@
-# Local dev-lane entry points covering the main dev-lanes (test, e2e, lint,
-# fmt-check, deny, coverage, bench, fuzz-smoke, mutants, docs-checks). Each
+# Local dev-lane entry points covering the main dev-lanes (test, e2e, spec-drift,
+# lint, fmt-check, deny, coverage, bench, fuzz-smoke, mutants, docs-checks). Each
 # target below mirrors the exact command its corresponding CI job in
 # `.github/workflows/{ci,fuzz,mutants}.yml` runs, so it never drifts from what
 # CI actually does — but coverage is not complete: three gating ci.yml jobs
@@ -40,6 +40,16 @@ test:
 # Opt-in end-to-end containment tier — mirrors ci.yml's `e2e` job.
 e2e:
     cargo test --features e2e --test e2e -- --nocapture
+
+# Needs a working cargo and the dependency's unpacked source (it reads the
+# `spec/identifiers.json` ProcessKit ships, located via `cargo metadata`), which
+# is why it is not in the default tier. On failure, read the panic: it names the
+# upstream enum and the exact identifier that has no representation here. See
+# CONTRIBUTING.md, "Upstream identifier drift".
+
+# Upstream identifier drift gate — mirrors ci.yml's gating `spec-drift` job.
+spec-drift:
+    cargo test --features spec-drift --test spec_drift -- --nocapture
 
 # `--all-features` so the `e2e`-gated tier and its helper worker are linted too.
 

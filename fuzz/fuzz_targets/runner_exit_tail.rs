@@ -74,5 +74,9 @@ fuzz_target!(|data: &[u8]| {
 
     let tail_start = len.saturating_sub(OUTCOME_TAIL_MAX_BYTES) as usize;
     let tail = &data[tail_start..];
-    let _ = scan_runner_exit_tail(tail, tail_start == 0);
+    // Mirror `read_terminal_outcome`'s own boundary check (T-322): the window's
+    // first line is complete not only when the window is the whole stream, but
+    // also when the seek that produced it happened to land exactly after a `\n`.
+    let tail_starts_at_line_boundary = tail_start == 0 || data[tail_start - 1] == b'\n';
+    let _ = scan_runner_exit_tail(tail, tail_starts_at_line_boundary);
 });

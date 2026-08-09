@@ -12,6 +12,43 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+- **Upstream identifier drift gate**: a new opt-in test tier (`tests/spec_drift.rs`,
+  the `spec-drift` Cargo feature) holds every projection of a ProcessKit closed enum
+  against the stable-identifier dictionary ProcessKit ships inside its own package
+  (`spec/identifiers.json`), for the exact version `Cargo.lock` resolves. It exists
+  because the previous entry was found the slow way: `Mechanism::ProcessReaper` was
+  added upstream, this crate compiled unchanged, every test stayed green, and the new
+  mechanism reported itself as the projection's `unknown` fallback — a gap between
+  "upstream grew a value" and "we noticed" that was bounded by nothing. The gate
+  covers the seven vocabularies this CLI republishes (`Mechanism`,
+  `ParentDeathCleanup`, `LimitKind`, `LimitVerdict`, `SoftStopScope`, `SoftSignal`,
+  `Outcome`) and checks each identifier on two surfaces: the Rust projection that
+  renders it — driven with the real variant, so a value falling into the conservative
+  fallback arm fails rather than passes — and every published JSON Schema `enum` that
+  carries it, located by property name across `fixtures/schema/v1/schema.json` and
+  `fixtures/schema/cli/*.schema.json` so a value added to the event schema but
+  forgotten in the `inspect`/`attest`/`doctor` mirrors is caught too. Every remaining
+  dictionary enum must be recorded as not projected, with the reason, so one added
+  later cannot go unclassified. A failure names the enum and the identifier and
+  changes nothing on its own: what a new upstream value means for a published
+  contract is a decision, and this gate's whole job is to make sure it gets made.
+  The dictionary is located through `cargo metadata`'s resolve graph — no network, no
+  vendored copy — which also means the gate follows a `[patch.crates-io]` git
+  checkout, so the scheduled upstream canary now sees a new identifier on ProcessKit's
+  main branch rather than waiting for the release that would deliver it. A missing dictionary (a patched, vendored, or
+  path dependency whose tree omits `spec/`) fails loudly and is never skipped: a green
+  "no drift found" that actually means "nothing was checked" would reproduce exactly
+  the blindness the tier removes. The tier is off in the default `cargo test` — it
+  needs a working cargo and the dependency's unpacked source, and its verdict is
+  host-independent — and runs in the new gating `spec-drift` CI job, in `canary.yml`
+  against ProcessKit's main branch, and as `just spec-drift` locally. Documented in
+  CONTRIBUTING.md, "Upstream identifier drift" (including what to do when it fails),
+  and for adapter authors in `docs/compatibility.md`. No wire, flag, exit-code, or
+  schema change: `events::abrupt_cleanup_str` gained a pure
+  `abrupt_cleanup_scope_str(scope)` inner projection (so every arm can be driven on
+  any host, not only the one the machine happens to report), the soft-signal fate and
+  soft-stop scope projections became named functions instead of an inline match and an
+  inline `.name()`, and four `run` projections are re-exported for the gate to drive.
 - **`process_reaper` containment vocabulary**: project ProcessKit 3.3's FreeBSD
   process-reaper mechanism into `run_started`, `inspect`, `attest`, and `doctor`,
   with schema-v1 fixtures and validators accepting `process_reaper` plus the
