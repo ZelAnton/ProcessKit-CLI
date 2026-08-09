@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [0.3.2] - 2026-08-09
+
+### Added
 - **Upstream identifier drift gate**: a new opt-in test tier (`tests/spec_drift.rs`,
   the `spec-drift` Cargo feature) holds every projection of a ProcessKit closed enum
   against the stable-identifier dictionary ProcessKit ships inside its own package
@@ -1280,7 +1291,8 @@ to a dated version section.
   inheriting the registry's full path, so deeply nested macOS CI/workspace paths
   cannot exceed `sockaddr_un::sun_path` and silently disable `inspect`.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.2.1...v0.2.2
