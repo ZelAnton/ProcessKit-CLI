@@ -487,10 +487,14 @@ impl Capture {
     /// files).
     pub fn create(dir: &Path, max_bytes: u64) -> std::io::Result<Self> {
         let mut rollback = SetupRollback::default();
-        // The rollback runs *here* rather than inside the helper so the helper's
-        // own file handles have already been dropped by the time it does: Windows
-        // refuses to unlink a file that is still open, so an inline cleanup would
-        // silently fail to remove the very stream it just opened.
+        // The rollback runs *here*, in the caller, rather than inside the helper:
+        // one place undoes the attempt however it failed, so every `?` in
+        // `create_tracked` is covered without the helper carrying a cleanup branch
+        // of its own to keep in step with it. Running after the helper returned
+        // also means the handles it opened were dropped with its locals, so each
+        // removal is an ordinary unlink of a file this process no longer holds
+        // open — whatever a given platform makes of removing one that is still
+        // open, this rollback never depends on it.
         match Self::create_tracked(dir, max_bytes, &mut rollback) {
             Ok(capture) => Ok(capture),
             Err(err) => {
@@ -1068,8 +1072,9 @@ mod tests {
         let mut rollback = SetupRollback::default();
         create_dir_all_tracked(&dir, &mut rollback).expect("create the capture directory");
         let ours = dir.join("stdout.log");
-        // Dropped immediately: the real setup path likewise closes its handles
-        // before the rollback runs, which is what lets Windows unlink the file.
+        // Dropped immediately, to exercise the state the real rollback runs in:
+        // `Capture::create` undoes the attempt only after `create_tracked` has
+        // returned, so by then the stream handles have gone with its locals.
         drop(open_stream_file(&ours, &mut rollback).expect("create the first stream's file"));
         let theirs = dir.join("operator.txt");
         std::fs::write(&theirs, b"not ours").expect("someone else's file lands in the directory");
