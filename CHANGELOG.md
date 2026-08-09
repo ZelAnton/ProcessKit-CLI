@@ -420,6 +420,22 @@ to a dated version section.
   and scratch-path factory across unit and through-binary tests.
 - Default live output now uses ProcessKit's chunk-based raw tee, preserving exact
   child bytes while substantially reducing per-line echo overhead.
+- `benches/startup_latency_bench.rs` gained a `direct` control arm timed only up to
+  the point the OS reports the child process created (reaped outside the timed
+  window), matching the "process created, not yet exited" boundary the runner arm
+  already stopped at, so the published startup-latency number is a same-host delta
+  (runner vs. direct) between two like-for-like measurements instead of a single
+  absolute — cross-host absolutes were never comparable. README.md's "Benchmarks"
+  section is updated with a re-measurement against `processkit` 3.3 (~22 ms direct
+  vs. ~150 ms under `run`, a ~128 ms delta — what going through `run` costs beyond a
+  direct launch, not a breakdown of any one sub-phase) and no longer presents the
+  pre-3.2 `ProcessGroup::start` phase-trace figure (166-228 ms) as a current number;
+  upstream disputed the *attribution* of that figure to the crate alone — part of
+  it is the OS's own process creation happening inside `start`, not its magnitude
+  (thread `msg-send-ba9dc66e1b832e104c35c9a1e75a6588`); upstream's own fix for the
+  dominant share it had profiled (an all-threads `CreateToolhelp32Snapshot` walk,
+  replaced by direct `NtGetNextThread` resolution in `processkit` 3.2) is also
+  already included, since this crate depends on 3.3.
 
 ### Fixed
 - An argv element that is not valid Unicode no longer loses its identity in the
