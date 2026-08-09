@@ -370,11 +370,27 @@ fn read_terminal_outcome(
     }
 
     let start = len.saturating_sub(OUTCOME_TAIL_MAX_BYTES);
-    file.seek(SeekFrom::Start(start))?;
+    // `start == 0` is the easy case: the tail window *is* the whole stream, so its
+    // first byte is trivially the start of a line. But `start != 0` does not by
+    // itself mean the window's first line is partial — the seek offset can still
+    // land exactly on a line boundary (the byte at `start - 1` is `\n`), in which
+    // case the tail's first byte begins a complete JSONL record too. Peeking at
+    // that one byte is what lets `scan_runner_exit_tail` be told the truth instead
+    // of unconditionally dropping the tail's first line whenever the window did
+    // not start at byte 0 of the file.
+    let tail_starts_at_line_boundary = if start == 0 {
+        true
+    } else {
+        file.seek(SeekFrom::Start(start - 1))?;
+        let mut boundary_byte = [0u8; 1];
+        file.read_exact(&mut boundary_byte)?;
+        boundary_byte[0] == b'\n'
+    };
 
+    file.seek(SeekFrom::Start(start))?;
     let mut tail = Vec::with_capacity((len - start).min(OUTCOME_TAIL_MAX_BYTES) as usize);
     file.take(OUTCOME_TAIL_MAX_BYTES).read_to_end(&mut tail)?;
-    Ok(scan_runner_exit_tail(&tail, start == 0))
+    Ok(scan_runner_exit_tail(&tail, tail_starts_at_line_boundary))
 }
 
 /// Whether the stream's head window contains a `run_started` line naming
@@ -418,17 +434,24 @@ pub fn head_matches_run_id(head: &[u8], expected_run_id: &str) -> bool {
 /// [`read_terminal_outcome`] once [`head_matches_run_id`] has already confirmed
 /// the stream. `tail` is the stream's last `min(len, OUTCOME_TAIL_MAX_BYTES)`
 /// bytes — exactly what [`read_terminal_outcome`] itself reads into its own
-/// `tail`. `tail_is_file_start` is whether that window's first byte is byte 0 of
-/// the real stream: `true` means the window's first line is complete; `false`
-/// means the window was sought into the middle of a larger stream, so its first
-/// line is necessarily partial (its own start was truncated by the seek) and
-/// must be dropped before scanning — the same distinction
-/// [`read_terminal_outcome`]'s own `start == 0` check makes. Pure — no I/O — see
-/// [`head_matches_run_id`] for why that is what lets both double as the fuzz
-/// tier's `runner_exit_tail` target primitives.
+/// `tail`. `tail_starts_at_line_boundary` is whether that window's first byte
+/// begins a complete line of the real stream: `true` means the window's first
+/// line is complete, either because the window's first byte is byte 0 of the
+/// real stream *or* because the seek that produced this window happened to land
+/// exactly after a `\n` in the larger stream; `false` means the window was
+/// sought into the middle of a line, so its first line is necessarily partial
+/// (its own start was truncated by the seek) and must be dropped before
+/// scanning. This is a strictly broader condition than "the window is the whole
+/// stream" — [`read_terminal_outcome`] computes it by checking `start == 0` and,
+/// when it is not, peeking at the one byte immediately before the seek offset.
+/// Pure — no I/O — see [`head_matches_run_id`] for why that is what lets both
+/// double as the fuzz tier's `runner_exit_tail` target primitives.
 #[doc(hidden)]
-pub fn scan_runner_exit_tail(tail: &[u8], tail_is_file_start: bool) -> Option<TerminalOutcome> {
-    let usable = if tail_is_file_start {
+pub fn scan_runner_exit_tail(
+    tail: &[u8],
+    tail_starts_at_line_boundary: bool,
+) -> Option<TerminalOutcome> {
+    let usable = if tail_starts_at_line_boundary {
         tail
     } else {
         let index = tail.iter().position(|byte| *byte == b'\n')?;
@@ -826,6 +849,82 @@ mod tests {
                 .expect("read the malformed stream")
                 .is_none(),
             "invalid terminal field types must yield unknown, never reported"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression fixture for T-322: the tail window's seek offset
+    /// (`len - OUTCOME_TAIL_MAX_BYTES`) can land *exactly* after a `\n`, in which
+    /// case the tail's first byte begins a complete JSONL record rather than a
+    /// truncated one. This builds a file whose `runner_exit` line is padded to be
+    /// exactly `OUTCOME_TAIL_MAX_BYTES` bytes long (including its own trailing
+    /// `\n`) and is everything after the `run_started` header — so the tail
+    /// window's first byte is deterministically the first byte of that
+    /// `runner_exit` record, at the precise 64 KiB boundary the bug lived at.
+    /// Before the fix, `scan_runner_exit_tail` unconditionally treated a
+    /// `start != 0` tail as sought into the middle of a line and dropped this
+    /// exact record, so `read_terminal_outcome` (and therefore
+    /// `wait --report-outcome`) returned an unknown outcome instead of the real
+    /// one.
+    #[test]
+    fn terminal_outcome_reader_keeps_a_runner_exit_that_begins_exactly_at_the_tail_boundary() {
+        const RUN_ID: &str = "run-boundary";
+        let dir = scratch("wait-outcome-tail-boundary");
+        let path = dir.join("events.jsonl");
+        std::fs::create_dir_all(&dir).expect("create the fixture directory");
+
+        let head_line =
+            format!("{{\"schema_version\":1,\"event\":\"run_started\",\"run_id\":\"{RUN_ID}\"}}\n");
+
+        let prefix = "{\"schema_version\":1,\"event\":\"runner_exit\",\"code\":9,\
+                       \"source\":\"child_exit\",\"child_code\":9,\"padding\":\""
+            .to_string();
+        let suffix = "\"}\n";
+        let target_len = OUTCOME_TAIL_MAX_BYTES as usize;
+        let fixed_len = prefix.len() + suffix.len();
+        assert!(
+            fixed_len <= target_len,
+            "the runner_exit scaffolding must fit inside one tail window"
+        );
+        let mut runner_exit_line = String::with_capacity(target_len);
+        runner_exit_line.push_str(&prefix);
+        runner_exit_line.extend(std::iter::repeat_n('x', target_len - fixed_len));
+        runner_exit_line.push_str(suffix);
+        assert_eq!(
+            runner_exit_line.len(),
+            target_len,
+            "the runner_exit line must fill exactly one tail window"
+        );
+
+        let mut contents = head_line.into_bytes();
+        contents.extend_from_slice(runner_exit_line.as_bytes());
+        std::fs::write(&path, &contents).expect("write the boundary fixture");
+
+        let len = contents.len() as u64;
+        let start = len - OUTCOME_TAIL_MAX_BYTES;
+        assert!(
+            start > 0,
+            "the tail window must be sought into a larger stream, not treated as the whole file"
+        );
+        assert_eq!(
+            contents[start as usize - 1],
+            b'\n',
+            "the seek offset must land exactly on a line boundary — the case this fixture covers"
+        );
+
+        let outcome = read_terminal_outcome(&path, RUN_ID)
+            .expect("read the bounded tail")
+            .expect(
+                "a runner_exit record that begins exactly at the tail window boundary must \
+                 still be found, not dropped as if it were partial",
+            );
+        assert_eq!(
+            outcome,
+            TerminalOutcome {
+                code: 9,
+                source: "child_exit".to_string(),
+                child_code: Some(9),
+            }
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

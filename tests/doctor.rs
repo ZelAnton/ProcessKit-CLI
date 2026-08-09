@@ -34,9 +34,10 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use common::{bin, scratch};
+use processkit_cli::registry::{Health, Registry};
 use serde_json::Value;
 
 /// The reserved exit code for a host that did not qualify (`docs/exit-codes.md`).
@@ -534,6 +535,114 @@ fn a_host_that_cannot_create_its_registry_keeps_the_named_evidence() {
     assert!(
         stderr.contains("diagnostics kept in"),
         "the failure line names the kept evidence: {stderr}"
+    );
+
+    workspace.cleanup();
+}
+
+/// A qualification whose own budget runs out before the scratch run becomes
+/// discoverable does not leave that runner alive: `phase_launch`'s deadline path
+/// kills and reaps it (`ScratchRun::kill_and_reap`) rather than leaving it to its
+/// own independent `--timeout` (T-323).
+///
+/// `--timeout 1ms` reliably exhausts the whole qualification's budget before the
+/// first control-plane poll can return — spawning a process and scanning a registry
+/// each cost more than a millisecond on every platform this project supports — so
+/// this deterministically drives the deadline branch rather than racing a healthy
+/// host. What is checked is not the report (the deadline path already covers its own
+/// `detail`) but the registry, read from *outside* the process under test.
+///
+/// This invocation deliberately does **not** use [`Workspace::doctor`] /
+/// `Command::output`: capturing stdout/stderr through anonymous pipes makes
+/// reading them to EOF wait for *every* handle to the write end to close, and on
+/// Windows a grandchild process can inherit one without ever using it as its own
+/// stdio. On unfixed code, where the whole point of this test is that a scratch
+/// runner (and *its own* spawned scratch child) outlives `doctor`, that turns
+/// `.output()`'s return into a hidden wait for the entire leaked tree to finish on
+/// its own — which defeats this test by construction, since polling only starts
+/// once `.output()` returns, by which point an unfixed run this short-lived has
+/// often already finished and self-cleaned. Routing `doctor`'s own stdout/stderr
+/// to real files and waiting only for its exit (`Command::status`) is the same
+/// workaround `Session::spawn_run` already uses for its scratch runs, for the same
+/// reason, and it is what makes this test observe `doctor`'s real return time
+/// rather than the leaked tree's.
+///
+/// The check polls the registry rather than sleeping a fixed duration and looking
+/// once: a leaked (unfixed) runner does not publish its record the instant it is
+/// spawned, and does not remove it the instant it is *observed* live either, so a
+/// single look taken at the wrong moment could miss the window from either side
+/// and pass on unfixed code just as vacuously as on fixed code (that was exactly
+/// this test's original bug — both a too-early single sample and, unlike this
+/// version, an `.output()`-masked one). Polling for up to `POLL_WINDOW` instead
+/// asks the question the fix is actually about: does a `Health::Live` entry for
+/// this runner ever appear at all. On fixed code it never does, because
+/// `kill_and_reap` ends the runner well before it would have finished registering
+/// itself (`--timeout 1ms` leaves it no time to). On unfixed code it reliably
+/// does, however the exact timing shifts with host speed and load.
+#[test]
+fn a_deadline_on_launch_kills_the_scratch_runner_rather_than_leaking_it() {
+    /// Generous relative to this project's own measurements of how long an
+    /// unfixed, short-lived leaked runner takes to register and then reap itself
+    /// (well under a second), so a slow or loaded (debug-build) CI host does not
+    /// turn this into a false pass.
+    const POLL_WINDOW: Duration = Duration::from_secs(3);
+
+    let workspace = Workspace::new("doctor-launch-deadline");
+    let tmp = workspace.tmp();
+    let stdout_path = workspace.root.join("doctor.stdout.log");
+    let stderr_path = workspace.root.join("doctor.stderr.log");
+    let status = Command::new(bin())
+        .args(["doctor", "--json", "--timeout", "1ms"])
+        .env("PROCESSKIT_CLI_REGISTRY_DIR", workspace.registry())
+        .env("TMPDIR", &tmp)
+        .env("TMP", &tmp)
+        .env("TEMP", &tmp)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::fs::File::create(&stdout_path).expect("create the stdout capture file"))
+        .stderr(std::fs::File::create(&stderr_path).expect("create the stderr capture file"))
+        .status()
+        .expect("spawn the doctor");
+    let out = Output {
+        status,
+        stdout: std::fs::read(&stdout_path).expect("read the captured stdout"),
+        stderr: std::fs::read(&stderr_path).expect("read the captured stderr"),
+    };
+    let report = report(
+        &out,
+        HOST_UNQUALIFIED,
+        "`doctor` whose own budget is exhausted before launch",
+    );
+
+    assert_eq!(report["qualified"], false, "{report}");
+    assert_eq!(phase_names(&report), ["registry", "launch"], "{report}");
+    assert_eq!(report["phases"][1]["ok"], false, "{report}");
+    assert!(
+        report["phases"][1]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("budget")),
+        "the failed phase names the exhausted budget: {report}"
+    );
+
+    let poll_deadline = Instant::now() + POLL_WINDOW;
+    let ever_live: Vec<_> = loop {
+        let live: Vec<_> = Registry::open_read_only_in(workspace.registry())
+            .entries()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| entry.health == Health::Live)
+            .collect();
+        if !live.is_empty() || Instant::now() >= poll_deadline {
+            break live;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(
+        ever_live.is_empty(),
+        "the scratch runner from a deadline-failed launch must never be observed live: {:?}",
+        ever_live
+            .iter()
+            .map(|entry| (entry.record.run_id.clone(), entry.health))
+            .collect::<Vec<_>>()
     );
 
     workspace.cleanup();
