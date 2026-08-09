@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use processkit::{
     Error as PkError, ErrorReason as PkErrorReason, LimitVerdict, MemberInfo, Outcome,
-    ProcessGroup, ProcessGroupStats, SoftSignal,
+    ProcessGroup, ProcessGroupStats, SoftSignal, SoftStopScope,
 };
 
 use crate::capture::Capture;
@@ -84,8 +84,60 @@ pub(super) fn emit_limit_evidence(
 /// The stable lowercase identifiers ProcessKit uses for its tri-state verdicts.
 /// Keeping this mapping at the serialization boundary prevents the upstream
 /// report type from becoming the CLI's public schema.
-fn limit_verdict_str(verdict: LimitVerdict) -> &'static str {
+///
+/// It is a deliberate **pass-through** of the upstream identifier rather than a
+/// hand-written match: the vocabulary is ProcessKit's, and re-spelling it here
+/// would only add a second place for it to go stale. The consequence is that a
+/// verdict this build predates would reach the wire verbatim and violate the CLI's
+/// *own* published `limit_evidence` enum — which is precisely what the upstream
+/// identifier drift gate (`tests/spec_drift.rs`) checks, against
+/// `fixtures/schema/v1/schema.json` rather than against this function. `pub` (via
+/// [`crate::run`]) so that gate drives this exact function, so a future rewrite
+/// from pass-through to a fallible match is covered without editing the gate.
+pub fn limit_verdict_str(verdict: LimitVerdict) -> &'static str {
     verdict.name()
+}
+
+/// The stable lowercase identifier for the soft-stop capability scope ProcessKit
+/// reports, carried on `cleanup_finished.shutdown.soft_stop_scope`.
+///
+/// A pass-through for the same reason [`limit_verdict_str`] is, with the same
+/// consequence: the closed contract a new upstream scope would break is the CLI's
+/// own published enum, which the drift gate checks. Named as a function (rather
+/// than an inline `.name()` at the call site) so both the projection and the gate
+/// have one addressable point.
+pub fn soft_stop_scope_str(scope: SoftStopScope) -> &'static str {
+    scope.name()
+}
+
+/// The `cleanup_finished.shutdown.soft_signal` identifier and the internal
+/// soft-terminate tier for a [`SoftSignal`] fate, as one pure function over the
+/// fate — so the wire string and the tier can never be decided by two matches that
+/// disagree.
+///
+/// `SoftSignal` is `#[non_exhaustive]` and — unlike the `configurable` half of
+/// ProcessKit's dictionary — has no `from_name` inverse, since it is a fate the
+/// library *reports* and is never handed back to it. A variant this build predates
+/// is therefore reported as the most conservative fate available, `failed`: it must
+/// never claim a soft stop was delivered. The upstream identifier drift gate
+/// (`tests/spec_drift.rs`) runs every fate this build can name through this
+/// function and holds the resulting identifier set against the dictionary's, so a
+/// new upstream fate silently collapsing into that `_` arm is a build failure
+/// rather than a wire lie nobody noticed.
+fn soft_signal_fate(signal: &SoftSignal) -> (SoftTerminate, &'static str) {
+    match signal {
+        SoftSignal::Sent(_) => (SoftTerminate::Signalled, "sent"),
+        SoftSignal::Unsupported => (SoftTerminate::Unsupported, "unsupported"),
+        SoftSignal::Failed(_) => (SoftTerminate::Failed, "failed"),
+        _ => (SoftTerminate::Failed, "failed"),
+    }
+}
+
+/// The wire half of [`soft_signal_fate`], exposed via [`crate::run`] for the drift
+/// gate. The tier half stays internal: it is this module's own control flow, not a
+/// published vocabulary.
+pub fn soft_signal_str(signal: &SoftSignal) -> &'static str {
+    soft_signal_fate(signal).1
 }
 
 /// The honest-degradation policy behind [`Event::ResourceSummary`], as a pure
@@ -486,15 +538,10 @@ pub(super) async fn graceful_teardown(
     group: &ProcessGroup,
     grace: Option<Duration>,
 ) -> GracefulTeardown {
-    let soft_stop_scope = group.soft_stop_scope().name();
+    let soft_stop_scope = soft_stop_scope_str(group.soft_stop_scope());
     match group.stop(grace.unwrap_or_default(), true).await {
         Ok(report) => {
-            let (soft, soft_signal) = match report.soft_signal() {
-                SoftSignal::Sent(_) => (SoftTerminate::Signalled, "sent"),
-                SoftSignal::Unsupported => (SoftTerminate::Unsupported, "unsupported"),
-                SoftSignal::Failed(_) => (SoftTerminate::Failed, "failed"),
-                _ => (SoftTerminate::Failed, "failed"),
-            };
+            let (soft, soft_signal) = soft_signal_fate(&report.soft_signal());
             GracefulTeardown {
                 soft,
                 shutdown: ShutdownInfo {
@@ -788,6 +835,65 @@ mod tests {
             std::io::ErrorKind::AddrInUse,
         ))));
         assert_eq!(io.code(), exit::BACKEND);
+    }
+
+    /// The soft-stop fate projection: one function decides both the wire identifier
+    /// and the internal tier, so `cleanup_finished.shutdown.soft_signal` and the
+    /// teardown wording it is paired with cannot be decided by two matches that
+    /// disagree. Each identifier is checked against ProcessKit's own `name()` rather
+    /// than a literal, so a rename upstream shows up here as well as in the drift
+    /// gate.
+    #[test]
+    fn soft_signal_fate_names_every_reported_fate() {
+        let cases = [
+            (SoftSignal::Sent(processkit::Signal::Term), "sent"),
+            (SoftSignal::Unsupported, "unsupported"),
+            (SoftSignal::Failed(processkit::Signal::Term), "failed"),
+        ];
+        for (fate, identifier) in cases {
+            let (_, projected) = soft_signal_fate(&fate);
+            assert_eq!(projected, identifier);
+            assert_eq!(
+                projected,
+                fate.name(),
+                "the wire identifier is ProcessKit's own, never a re-spelling",
+            );
+            assert_eq!(soft_signal_str(&fate), projected);
+        }
+
+        // A delivered soft stop is the only fate that may claim one; both other
+        // fates must report a tier that does not.
+        assert!(matches!(
+            soft_signal_fate(&SoftSignal::Sent(processkit::Signal::Term)).0,
+            SoftTerminate::Signalled
+        ));
+        assert!(matches!(
+            soft_signal_fate(&SoftSignal::Unsupported).0,
+            SoftTerminate::Unsupported
+        ));
+        assert!(matches!(
+            soft_signal_fate(&SoftSignal::Failed(processkit::Signal::Term)).0,
+            SoftTerminate::Failed
+        ));
+    }
+
+    /// The soft-stop capability scope reaches the wire as ProcessKit's own
+    /// identifier, unaltered — the pass-through this projection deliberately is.
+    #[test]
+    fn soft_stop_scope_is_published_as_the_upstream_identifier() {
+        for name in ["whole_tree", "opt_in_members", "none"] {
+            let scope = SoftStopScope::from_name(name).expect("ProcessKit knows the name");
+            assert_eq!(soft_stop_scope_str(scope), name);
+        }
+    }
+
+    /// The same pass-through property for the per-axis limit verdicts.
+    #[test]
+    fn limit_verdicts_are_published_as_the_upstream_identifiers() {
+        for name in ["tripped", "not_tripped", "unknown"] {
+            let verdict = LimitVerdict::from_name(name).expect("ProcessKit knows the name");
+            assert_eq!(limit_verdict_str(verdict), name);
+        }
     }
 
     #[test]

@@ -149,7 +149,8 @@ jobs:
       # `--all-features` so every feature-gated tier is linted here too, including
       # its cfg(unix) paths on this Linux runner: the `e2e` tier and its helper
       # worker (tests/e2e.rs, src/bin/e2e_helper.rs), the `bench` tier (benches/,
-      # src/bin/bench_emit.rs), and the `stress` tier (tests/stress.rs). Those tiers
+      # src/bin/bench_emit.rs), the `stress` tier (tests/stress.rs), and the
+      # `spec-drift` tier (tests/spec_drift.rs). Those tiers
       # each run in their own job or workflow, so this is the one place their code
       # is lint-gated on every PR.
       - run: cargo clippy --all-targets --all-features -- -D warnings
@@ -186,6 +187,31 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo build --all-targets
       - run: cargo test
+
+  spec-drift:
+    name: spec drift
+    runs-on: ubuntu-latest
+    # GATING, and single-runner on purpose. The tier (tests/spec_drift.rs, the
+    # `spec-drift` Cargo feature) holds this crate's projections of ProcessKit's
+    # closed enums against the stable-identifier dictionary ProcessKit ships inside
+    # its own package (`spec/identifiers.json`), so an upstream vocabulary that grew
+    # a value fails here — naming the enum and the identifier — instead of quietly
+    # reaching a wire as the projection's conservative fallback. Every check it runs
+    # is a pure function of the resolved dependency plus this repo's committed schema
+    # fixtures, so its verdict is identical on every OS: repeating it across the
+    # `test` matrix would buy nothing. It is out of the default `cargo test` because
+    # it shells out to `cargo metadata` and reads the dependency's unpacked source
+    # (see the feature's comment in Cargo.toml).
+    #
+    # The scheduled `canary.yml` workflow runs the same tier against ProcessKit's git
+    # main, which is where a new identifier is seen *before* it is released; this job
+    # is the released-version counterpart, on this workflow's own triggers (every
+    # pull request and every push to `main`).
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@stable # rolling toolchain selector — intentionally unpinned
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo test --features spec-drift --test spec_drift -- --nocapture
 
   coverage:
     name: coverage (${{ matrix.os }})

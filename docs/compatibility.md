@@ -215,6 +215,33 @@ defines exactly which changes are additive and which are breaking. This section
 restates those obligations for an adapter author; where the two ever disagree,
 `docs/schema.md` wins and the disagreement is a bug in this page.
 
+### How the borrowed vocabularies are kept in step
+
+Several of the enumerations above are not this project's own inventions: the
+`mechanism`, `abrupt_cleanup`, `limit_evidence` verdict, `soft_stop_scope`,
+`soft_signal`, and `outcome` values are projections of closed enums in the
+`processkit` library this runner is built on. Those enums grow — `process_reaper`
+above is one such growth — and every projection here ends in a deliberate
+fallback (`unknown`, `none`, `failed`) so that a build which meets a value it
+predates degrades honestly instead of guessing.
+
+A fallback is a safe answer, not a good one, so the project does not rely on
+noticing upstream growth by hand. `processkit` publishes a machine-readable
+dictionary of its stable identifiers inside its own package, and a gating test
+tier (`tests/spec_drift.rs`; see `CONTRIBUTING.md`, "Upstream identifier drift")
+holds every projection and every published schema `enum` against the dictionary
+belonging to the exact library version this binary is built with. A value that
+would land in a fallback arm fails the build, naming the enum and the identifier.
+
+What that means for an adapter is narrow and worth stating exactly. It is a
+promise about *this project's* process — that a borrowed vocabulary cannot grow
+without someone deciding what the new value means here — and not a promise that
+your pinned schema copy stays complete: a decision may still add a value in a
+later release. Points 4 and 5 above are unchanged obligations. It also covers
+only the vocabularies borrowed from `processkit`; the ones this CLI mints itself
+(a `cancelled` `source`, a `runner_exit` `source`, a `hint` label) have no
+upstream dictionary to be checked against and remain open-ended by design.
+
 ## Machine-output schemas
 
 The JSONL stream is not the only machine-readable output. The discovery and

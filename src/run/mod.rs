@@ -67,6 +67,19 @@ mod teardown;
 #[doc(hidden)]
 pub use launch::parse_env_file_contents;
 
+// The four ProcessKit vocabularies this module projects onto the JSONL wire,
+// re-exported so one caller can reach every projection point by name: the upstream
+// identifier drift gate (`tests/spec_drift.rs`, the `spec-drift` feature tier),
+// which resolves each identifier in ProcessKit's shipped `spec/identifiers.json`
+// back to its variant and runs it through these exact functions instead of a
+// re-derived lookalike table of its own. `events::mechanism_str`,
+// `events::abrupt_cleanup_scope_str`, and `events::outcome_fields` are the same
+// surface for the vocabularies that module owns.
+#[doc(hidden)]
+pub use launch::limit_kind_str;
+#[doc(hidden)]
+pub use teardown::{limit_verdict_str, soft_signal_str, soft_stop_scope_str};
+
 use std::process::ExitCode;
 use std::time::Duration;
 
