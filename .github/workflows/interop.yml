@@ -112,7 +112,7 @@ jobs:
         run: python -m unittest scripts/tests/test_cross_version_interop.py -v
 
       - uses: dtolnay/rust-toolchain@stable # rolling toolchain selector — intentionally unpinned
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       # `--locked` asserts the committed Cargo.lock is authoritative; `--release`
       # because that is the shape a user actually installs, and it is what the
