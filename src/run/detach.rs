@@ -19,6 +19,8 @@
 //! in `src/events.rs` untouched by this feature.
 
 use std::ffi::{OsStr, OsString};
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use std::process::{Child, ExitStatus, Stdio};
 use std::thread::sleep;
@@ -60,6 +62,16 @@ const DETACH_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// that a heavily loaded host is not mistaken for a wedged runner, finite so that
 /// `run --detach` cannot hang an orchestrator forever.
 const DETACH_START_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The largest complete JSONL record the startup handshake will inspect.
+///
+/// This is the same 1 MiB record ceiling as the built-in `events` reader. It is
+/// deliberately generous for `run_started` (including opt-in raw argv), while still
+/// making every startup poll constant in both I/O and memory after the stream starts
+/// accumulating snapshots. One extra byte is read below so a record whose payload is
+/// exactly this size can still carry its terminating LF.
+const DETACH_START_MARKER_MAX_LINE_BYTES: usize = 1024 * 1024;
+const DETACH_START_MARKER_PREFIX_BYTES: usize = DETACH_START_MARKER_MAX_LINE_BYTES + 1;
 
 /// Hand this run to a detached copy of this binary and return once it has provably
 /// started — the whole of `--detach`.
@@ -399,19 +411,30 @@ fn await_started(detached: &mut Child, jsonl: &Path, run_id: &str) -> Result<(),
 
 /// Whether the run's `run_started` event is readable in the events file yet.
 ///
-/// Reads the whole (still tiny) file and looks for the one line that names this run:
-/// the stream is written line-by-line with a flush per event, so a partially written
-/// last line is possible and is simply not valid JSON yet — such a line is skipped and
-/// re-read on the next poll rather than treated as an answer. A missing or unreadable
-/// file is "not yet", never an error: the detached copy truncates and reopens the same
-/// path as it starts.
+/// Reads only the fixed prefix that can contain one supported event record. The stream
+/// can grow quickly after `run_started` (notably with millisecond member snapshots),
+/// so rereading its later events would make startup polling scale with the lifetime of
+/// the run. A line is considered only when its terminating LF is present inside the
+/// prefix: a partially written final line, or a record larger than the supported
+/// boundary, is "not yet" rather than a matching JSON prefix. A missing or unreadable
+/// file is likewise "not yet": the detached copy truncates and reopens the same path
+/// as it starts.
 fn run_started_recorded(jsonl: &Path, run_id: &str) -> bool {
-    let Ok(stream) = std::fs::read_to_string(jsonl) else {
+    let Ok(file) = File::open(jsonl) else {
         return false;
     };
-    stream
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+    let mut prefix = Vec::with_capacity(DETACH_START_MARKER_PREFIX_BYTES);
+    if file
+        .take(DETACH_START_MARKER_PREFIX_BYTES as u64)
+        .read_to_end(&mut prefix)
+        .is_err()
+    {
+        return false;
+    }
+    prefix
+        .split_inclusive(|byte| *byte == b'\n')
+        .filter_map(|line| line.strip_suffix(b"\n"))
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
         .any(|event| event["event"] == "run_started" && event["run_id"] == run_id)
 }
 
@@ -561,6 +584,37 @@ mod tests {
         argv.iter()
             .map(|token| token.to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// Build a schema-conforming `run_started` payload at an exact byte size. An
+    /// ASCII `cwd` is the adjustable field, so increasing it by one character always
+    /// increases the serialized record by exactly one byte.
+    fn run_started_line_of_size(run_id: &str, size: usize) -> Vec<u8> {
+        let mut event = serde_json::json!({
+            "schema_version": 1,
+            "time": "2026-08-20T18:00:00.000Z",
+            "event": "run_started",
+            "run_id": run_id,
+            "labels": {},
+            "root_pid": 4242,
+            "mechanism": "job_object",
+            "abrupt_cleanup": "whole_tree",
+            "cwd": "",
+            "command": {
+                "redacted": true,
+                "argv": null,
+                "argv_sha256": null,
+                "hint": null
+            }
+        });
+        let base = serde_json::to_vec(&event).expect("serialize the base run_started record");
+        let padding = size
+            .checked_sub(base.len())
+            .expect("the requested record size fits the fixed fields");
+        event["cwd"] = serde_json::Value::String("x".repeat(padding));
+        let line = serde_json::to_vec(&event).expect("serialize the padded run_started record");
+        assert_eq!(line.len(), size, "the test fixture has an exact boundary");
+        line
     }
 
     /// The rewrite is exactly three edits: drop `--detach`, add the resolved
@@ -905,6 +959,90 @@ mod tests {
         assert!(
             !run_started_recorded(&partial, "run-1"),
             "an incomplete line is not an answer"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The supported boundary includes the complete JSON payload *and* its LF. A
+    /// one-byte-larger record cannot place that LF inside the bounded prefix and must
+    /// therefore fail closed even though the prefix itself begins with valid-looking
+    /// `run_started` JSON.
+    #[test]
+    fn run_started_boundary_requires_the_complete_newline_terminated_record() {
+        let dir = std::env::temp_dir().join(format!(
+            "processkit-cli-run-unit-detach-boundary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the epoch")
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).expect("create the scratch dir");
+        let jsonl = dir.join("events.jsonl");
+
+        let mut at_boundary =
+            run_started_line_of_size("run-boundary", DETACH_START_MARKER_MAX_LINE_BYTES);
+        at_boundary.push(b'\n');
+        std::fs::write(&jsonl, &at_boundary).expect("write the boundary record");
+        assert!(
+            run_started_recorded(&jsonl, "run-boundary"),
+            "a complete matching record at the supported boundary is recognized"
+        );
+        assert!(
+            !run_started_recorded(&jsonl, "another-run"),
+            "the boundary record still has to name the requested run"
+        );
+
+        let partial = run_started_line_of_size("run-boundary", DETACH_START_MARKER_MAX_LINE_BYTES);
+        std::fs::write(&jsonl, partial).expect("write a partial boundary record");
+        assert!(
+            !run_started_recorded(&jsonl, "run-boundary"),
+            "a complete JSON value without its line terminator is still a partial line"
+        );
+
+        let mut too_large =
+            run_started_line_of_size("run-boundary", DETACH_START_MARKER_MAX_LINE_BYTES + 1);
+        too_large.push(b'\n');
+        std::fs::write(&jsonl, too_large).expect("write the over-boundary record");
+        assert!(
+            !run_started_recorded(&jsonl, "run-boundary"),
+            "a record whose LF is outside the prefix is not accepted by prefix coincidence"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Later lifecycle traffic is outside the startup observation. Growing the file
+    /// by several complete prefixes leaves both the matching and run-id decisions
+    /// unchanged, exercising the fixed read independently of the stream's total size.
+    #[test]
+    fn run_started_scan_is_independent_of_later_event_stream_growth() {
+        let dir = std::env::temp_dir().join(format!(
+            "processkit-cli-run-unit-detach-grown-stream-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the epoch")
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).expect("create the scratch dir");
+        let jsonl = dir.join("events.jsonl");
+
+        let mut stream = run_started_line_of_size("run-grown", 512);
+        stream.push(b'\n');
+        let snapshot = b"{\"schema_version\":1,\"event\":\"members_snapshot\",\"reason\":\"interval\",\"read_error\":false,\"members\":[]}\n";
+        while stream.len() <= DETACH_START_MARKER_PREFIX_BYTES * 3 {
+            stream.extend_from_slice(snapshot);
+        }
+        std::fs::write(&jsonl, &stream).expect("write the grown event stream");
+        assert!(
+            run_started_recorded(&jsonl, "run-grown"),
+            "later snapshots do not change the startup marker"
+        );
+        assert!(
+            !run_started_recorded(&jsonl, "another-run"),
+            "later snapshots cannot weaken the requested run-id match"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

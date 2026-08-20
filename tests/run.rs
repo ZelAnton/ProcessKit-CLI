@@ -2762,6 +2762,97 @@ fn detach_returns_once_the_run_has_started_while_a_foreground_run_waits_for_the_
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A real detached runner can append interval snapshots far faster than its caller
+/// consumes anything from the JSONL file. Exercise that path through the built
+/// binary, grow the live stream well beyond a startup record, and prove that the run
+/// which passed the startup handshake remains the same controllable run afterwards.
+/// The exact-boundary unit test in `run::detach` supplies the deterministic
+/// before-confirmation file shape; this scenario supplies the real producer.
+#[test]
+fn detached_start_remains_valid_while_rapid_snapshots_grow_the_live_stream() {
+    const GROWN_STREAM_BYTES: u64 = 64 * 1024;
+
+    let dir = scratch("detach-rapid-snapshots");
+    let registry = detach_registry(&dir);
+    let long_lived = if cfg!(windows) {
+        shell_inline("ping -n 300 127.0.0.1 >nul")
+    } else {
+        shell_inline("sleep 300")
+    };
+    let out = run_with_flags(
+        &dir,
+        &[("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path())],
+        &[
+            "--run-id",
+            "detach-rapid-snapshots",
+            "--detach",
+            "--snapshot-interval",
+            "1ms",
+        ],
+        long_lived,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the detached run started; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let at_return = read_events_so_far(&dir);
+    assert!(
+        at_return.iter().any(|event| {
+            event["event"] == "run_started" && event["run_id"] == "detach-rapid-snapshots"
+        }),
+        "the built binary returned only after its own startup marker: {at_return:?}"
+    );
+
+    wait_until(
+        || {
+            std::fs::metadata(events_path(&dir))
+                .map(|metadata| metadata.len() >= GROWN_STREAM_BYTES)
+                .unwrap_or(false)
+        },
+        DETACH_OBSERVE_TIMEOUT,
+    );
+    let grown = read_events_so_far(&dir);
+    assert!(
+        interval_snapshot_count(&grown) >= 100,
+        "a 1ms cadence produced a substantial live stream: {} events, {} bytes",
+        grown.len(),
+        std::fs::metadata(events_path(&dir))
+            .expect("the event stream exists")
+            .len()
+    );
+    assert!(
+        grown.iter().any(|event| {
+            event["event"] == "run_started" && event["run_id"] == "detach-rapid-snapshots"
+        }),
+        "stream growth cannot displace or change the startup marker"
+    );
+
+    let inspected = cli_against(
+        &registry,
+        &["inspect", "--run-id", "detach-rapid-snapshots", "--json"],
+    );
+    assert_eq!(
+        inspected.status.code(),
+        Some(0),
+        "the grown-stream run remains live and inspectable; stderr: {}",
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+
+    let cancelled = cli_against(&registry, &["cancel", "--run-id", "detach-rapid-snapshots"]);
+    assert_eq!(
+        cancelled.status.code(),
+        Some(0),
+        "the grown-stream run accepts cancellation; stderr: {}",
+        String::from_utf8_lossy(&cancelled.stderr)
+    );
+    wait_until(|| run_is_over(&dir), DETACH_OBSERVE_TIMEOUT);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A detached run is an ordinary run to everything that supervises runs: it is
 /// registered (so `list` finds it and `inspect` reaches it over the control plane)
 /// and it is steerable (so `cancel` ends it), and its stream closes with the terminal
