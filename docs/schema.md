@@ -228,7 +228,8 @@ Container teardown finished (after the hard kill).
 | `remaining_pids` | array of integer  | Post-kill member snapshot; normally empty.                             |
 | `soft_terminate` | string, nullable  | The soft-stop tier for a runner-imposed ending (below); `null` on the natural-exit path. |
 | `shutdown`       | object, nullable  | Pre-attempt capability plus ProcessKit `ShutdownReport` observations; `null` when no soft stop was attempted. |
-| `read_error`     | boolean | `true` when the post-kill member read itself failed; see "Honest degradation on a teardown read failure" below. |
+| `read_error`     | boolean | `true` when the post-kill member read itself failed; see "Honest degradation on teardown confirmation failures" below. |
+| `kill_error`     | boolean | `true` when the hard kill itself returned an error; even a successful empty member read is then non-conclusive. |
 
 `remaining_pids` is a snapshot: on the Job Object and cgroup mechanisms a process
 leaves membership on exit, so it is empty after the kill; on the POSIX
@@ -264,7 +265,7 @@ could not return a `ShutdownReport`; the owning container's hard-kill backstop s
 runs. This is additive to schema v1 and leaves `soft_terminate` in place for existing
 consumers.
 
-**Honest degradation on a teardown read failure.** `members_before`/`remaining`/
+**Honest degradation on teardown confirmation failures.** `members_before`/`remaining`/
 `remaining_pids` are read from the live container (`ProcessGroup::members()`),
 which can itself fail (an OS-level enumeration error). Rather than let a read
 failure masquerade as a confirmed `0`/empty observation, each event carries an
@@ -272,10 +273,20 @@ explicit `read_error` flag: `false` on every successful read (the common case,
 unaffected by this), `true` when the read failed, in which case the numeric
 field(s) fall back to `0`/an empty array — not a fabricated fact, only the
 absence of one. A consumer that treats `cleanup_finished.remaining == 0` as
-"the tree is confirmed empty" must first check `read_error` is `false`; the
-runner also warns on stderr whenever this happens, though — as for
+"the tree is confirmed empty" must first check `read_error` is `false`.
+
+`cleanup_finished.kill_error` qualifies a separate operation: it is `true` when
+`ProcessGroup::kill_all()` itself returned an error. A subsequent member read can
+still succeed and return an empty list in that state — notably when ProcessKit drained
+the tree but could not thaw the container — so `remaining: 0`, `remaining_pids: []`,
+and `read_error: false` are not conclusive on their own. Confirmed-clean teardown
+requires `kill_error: false`, `read_error: false`, and `remaining: 0`. A successful
+hard kill followed by the same empty snapshot keeps both flags `false`. The field is
+always present and additive within schema v1; no existing field changed meaning.
+
+The runner also warns on stderr whenever this happens, though — as for
 `members_snapshot`'s own flag above — that warning reaches nobody in a detached
-run, so the flag in the stream, not the warning, is the contract. This mirrors
+run, so the flags in the stream, not the warning, are the contract. This mirrors
 `output_captured`'s `write_error` flag (both are explicit failure markers, never
 inferred from the accompanying data alone).
 
@@ -946,7 +957,9 @@ per-stream `write_error` flag was added this way within v1, as was the `timeout`
 event's `reason` field (when `--idle-timeout` joined `--timeout` on that event) and
 the `members_snapshot` event's own `reason` and `read_error` fields (when
 `--snapshot-interval` gave that event a second trigger, and a failed sample a way to
-report itself). Note what that does *not* mean: those two fields appear on **every**
+report itself), and `cleanup_finished.kill_error` (when a failed hard kill needed to
+stay distinguishable from a successful empty member read). Note what that does *not*
+mean: `reason` and `read_error` appear on **every**
 `members_snapshot`, including the single one a run without the flag emits, so the
 default stream's `members_snapshot` line is not byte-identical to what an earlier
 version wrote. That is precisely the additive case above — a reader consuming the

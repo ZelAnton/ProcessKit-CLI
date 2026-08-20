@@ -267,6 +267,7 @@ fn a_healthy_host_qualifies_and_leaves_nothing_behind() {
         "teardown began on a container that really held a process: {report}"
     );
     assert_eq!(cleanup["read_error"], false, "{report}");
+    assert_eq!(cleanup["kill_error"], false, "{report}");
     assert_eq!(cleanup["registry_record_removed"], true, "{report}");
     assert_eq!(cleanup["endpoint_released"], true, "{report}");
     assert_eq!(cleanup["scratch_removed"], true, "{report}");
@@ -423,6 +424,7 @@ fn a_requirement_gates_the_exit_code_and_nothing_else() {
         );
         for field in [
             "read_error",
+            "kill_error",
             "confirmed_empty",
             "teardown_snapshot_conclusive",
             "registry_record_removed",

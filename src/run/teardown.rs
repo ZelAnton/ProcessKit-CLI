@@ -487,13 +487,24 @@ fn hard_kill_warning(killed: Result<(), PkError>) -> Option<String> {
     })
 }
 
+/// The two public diagnostics derived from one hard-kill result: the existing
+/// foreground warning and the machine-readable failure qualifier. Keeping the pair
+/// behind one pure projection prevents either channel from silently forgetting an
+/// error the other reports.
+fn hard_kill_diagnostics(killed: Result<(), PkError>) -> (Option<String>, bool) {
+    let kill_error = killed.is_err();
+    let warning = hard_kill_warning(killed);
+    (warning, kill_error)
+}
+
 /// Hard-kill the container and mark teardown finished with a post-kill member
 /// snapshot. The hard kill is [`ProcessGroup::kill_all`] — the group's own kernel
 /// teardown, the same mechanism its drop would run — invoked explicitly so
 /// `remaining_pids` reflects the post-kill state rather than a pre-drop guess. A
 /// kill that reports a failure is non-fatal but no longer silent: it warns on
-/// stderr via [`hard_kill_warning`], which carries the reason the group's drop and
-/// the member read below can both miss. `soft` labels the soft-stop tier of a
+/// stderr via [`hard_kill_diagnostics`], which also sets `kill_error` on the event
+/// because the reason is something the group's drop and the member read below can
+/// both miss. `soft` labels the soft-stop tier of a
 /// runner-imposed ending, or `None` on the natural-exit path where no soft stop was
 /// attempted.
 ///
@@ -507,7 +518,8 @@ pub(super) fn emit_cleanup_finished(
     group: &ProcessGroup,
     teardown: Option<&GracefulTeardown>,
 ) {
-    if let Some(warning) = hard_kill_warning(group.kill_all()) {
+    let (hard_kill_warning, kill_error) = hard_kill_diagnostics(group.kill_all());
+    if let Some(warning) = hard_kill_warning {
         eprintln!("{warning}");
     }
     let members = group.members();
@@ -521,6 +533,7 @@ pub(super) fn emit_cleanup_finished(
         soft_terminate: teardown.map(|teardown| soft_terminate_label(teardown.soft)),
         shutdown: teardown.map(|teardown| teardown.shutdown.clone()),
         read_error,
+        kill_error,
     });
 }
 
@@ -1632,6 +1645,36 @@ mod tests {
             remaining_pids_or_unknown(Err(simulated)),
             (Vec::new(), true),
             "a read failure must not be indistinguishable from a confirmed-clean teardown"
+        );
+    }
+
+    /// The exact combination ProcessKit's refused-thaw error exposes: the hard kill
+    /// returns `Err`, then the independent member read succeeds with an empty list.
+    /// The snapshot remains a successful read (`read_error: false`), while the kill
+    /// has its own qualifier and therefore cannot serialize as confirmed clean. The
+    /// success baseline beside it pins that an ordinary kill plus the same empty
+    /// snapshot keeps both qualifiers false.
+    #[test]
+    fn failed_kill_with_an_empty_member_read_is_not_a_confirmed_clean_teardown() {
+        let (warning, kill_error) = hard_kill_diagnostics(Ok(()));
+        let (remaining_pids, read_error) = remaining_pids_or_unknown(Ok(Vec::new()));
+        assert!(warning.is_none());
+        assert!(!kill_error && !read_error && remaining_pids.is_empty());
+
+        let frozen = PkError::from(PkErrorReason::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "the cgroup is left FROZEN",
+        )));
+        let (warning, kill_error) = hard_kill_diagnostics(Err(frozen));
+        let (remaining_pids, read_error) = remaining_pids_or_unknown(Ok(Vec::new()));
+        assert!(
+            warning.is_some_and(|warning| warning.contains("left FROZEN")),
+            "the foreground diagnostic remains available"
+        );
+        assert!(kill_error, "the failed kill is machine-readable");
+        assert!(
+            !read_error && remaining_pids.is_empty(),
+            "the independent member read stays an honest successful-empty snapshot"
         );
     }
 

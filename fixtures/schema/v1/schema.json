@@ -238,9 +238,10 @@
             }
           ]
         },
-        "read_error": { "type": "boolean", "description": "true when the post-kill member read itself failed, in which case remaining/remaining_pids fall back to an empty snapshot, not a confirmed-clean teardown." }
+        "read_error": { "type": "boolean", "description": "true when the post-kill member read itself failed, in which case remaining/remaining_pids fall back to an empty snapshot, not a confirmed-clean teardown." },
+        "kill_error": { "type": "boolean", "description": "true when ProcessGroup::kill_all() returned an error. Even a successful empty post-kill member read is then non-conclusive; confirmed-clean teardown requires kill_error=false, read_error=false, and remaining=0." }
       },
-      "required": ["schema_version", "time", "event", "remaining", "remaining_pids", "soft_terminate", "shutdown", "read_error"],
+      "required": ["schema_version", "time", "event", "remaining", "remaining_pids", "soft_terminate", "shutdown", "read_error", "kill_error"],
       "additionalProperties": false
     },
     "limitHit": {

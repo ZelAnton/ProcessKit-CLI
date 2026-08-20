@@ -169,7 +169,8 @@ is what requires a new schema version — nothing below does.
    not "the new field may be absent": `members_snapshot` gained an always-present
    `reason` and an always-present `read_error`, `timeout` gained an always-present
    `reason`, and `cleanup_started`/`cleanup_finished` gained always-present
-   `read_error` flags, all within version 1. A reader must therefore consume the
+   `read_error` flags, and `cleanup_finished` gained an always-present `kill_error`
+   qualifier, all within version 1. A reader must therefore consume the
    fields it uses rather than pin an event's exact field set — validating with
    `additionalProperties: false` against a copy of a published document will fail
    on the next additive release (see "Machine-output schemas" below).
