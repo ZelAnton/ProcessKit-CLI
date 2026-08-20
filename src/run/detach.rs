@@ -63,15 +63,32 @@ const DETACH_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// `run --detach` cannot hang an orchestrator forever.
 const DETACH_START_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The largest complete JSONL record the startup handshake will inspect.
+/// Maximum size of one physical read while validating the first JSONL record.
 ///
-/// This is the same 1 MiB record ceiling as the built-in `events` reader. It is
-/// deliberately generous for `run_started` (including opt-in raw argv), while still
-/// making every startup poll constant in both I/O and memory after the stream starts
-/// accumulating snapshots. One extra byte is read below so a record whose payload is
-/// exactly this size can still carry its terminating LF.
-const DETACH_START_MARKER_MAX_LINE_BYTES: usize = 1024 * 1024;
-const DETACH_START_MARKER_PREFIX_BYTES: usize = DETACH_START_MARKER_MAX_LINE_BYTES + 1;
+/// This bounds read-ahead into later lifecycle traffic, not the `run_started` record
+/// itself. The producer has no serialized-record ceiling: opt-in raw argv must remain
+/// lossless, so any observer-side line limit could reject a command the CLI accepted.
+/// [`FirstJsonlRecord`] instead streams and validates that one record at any legitimate
+/// size, then presents EOF immediately after its LF. Later events therefore cost at
+/// most one fixed chunk of read-ahead, however large the stream becomes.
+const DETACH_START_MARKER_READ_CHUNK_BYTES: usize = 8 * 1024;
+
+/// Debug-only integration-test rendezvous for the final confirmation read.
+///
+/// The shipped release binary does not compile this hook. The through-the-binary test
+/// uses it to defer the ordinary final read until a completed detached runner's stream
+/// has been deterministically enlarged, then records the reader's examined/fetched
+/// byte counts. That proves the exact ordering and distinguishes this first-record
+/// reader from the old whole-file rescan without relying on scheduler timing or a
+/// snapshot production rate.
+#[cfg(debug_assertions)]
+const TEST_DETACH_FINAL_READ_GATE_ENV: &str = "PROCESSKIT_CLI_TEST_DETACH_FINAL_READ_GATE";
+#[cfg(debug_assertions)]
+const TEST_DETACH_FINAL_READ_READY: &str = "before-final-read";
+#[cfg(debug_assertions)]
+const TEST_DETACH_FINAL_READ_RELEASE: &str = "allow-final-read";
+#[cfg(debug_assertions)]
+const TEST_DETACH_FINAL_READ_COUNTS: &str = "final-read-counts";
 
 /// Hand this run to a detached copy of this binary and return once it has provably
 /// started — the whole of `--detach`.
@@ -341,6 +358,137 @@ fn disinherit_std_handles() {
     }
 }
 
+/// One bounded-I/O view of the first JSONL record.
+///
+/// Each call reads at most [`DETACH_START_MARKER_READ_CHUNK_BYTES`] from the file.
+/// Once an LF is found, bytes after it in that final chunk are discarded and every
+/// later call reports EOF. `serde_json::from_reader` can therefore validate the whole
+/// first value (including all ignored fields) and require its line terminator without
+/// ever walking the later event stream.
+struct FirstJsonlRecord<R> {
+    inner: R,
+    finished: bool,
+    complete: bool,
+    bytes_examined: usize,
+    bytes_fetched: usize,
+}
+
+impl<R> FirstJsonlRecord<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            finished: false,
+            complete: false,
+            bytes_examined: 0,
+            bytes_fetched: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for FirstJsonlRecord<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.finished || buffer.is_empty() {
+            return Ok(0);
+        }
+
+        let read_len = buffer.len().min(DETACH_START_MARKER_READ_CHUNK_BYTES);
+        let fetched = self.inner.read(&mut buffer[..read_len])?;
+        self.bytes_fetched += fetched;
+        if let Some(newline) = buffer[..fetched].iter().position(|byte| *byte == b'\n') {
+            let examined = newline + 1;
+            self.bytes_examined += examined;
+            self.complete = true;
+            self.finished = true;
+            Ok(examined)
+        } else {
+            self.bytes_examined += fetched;
+            Ok(fetched)
+        }
+    }
+}
+
+/// The only fields the startup handshake needs from the fully validated first record.
+/// Every other field is deserialized as `IgnoredAny`, so even a very large lossless raw
+/// argv is checked for valid JSON without being materialized a second time here.
+#[derive(serde::Deserialize)]
+struct StartMarker {
+    event: String,
+    run_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct StartMarkerObservation {
+    recorded: bool,
+    bytes_examined: usize,
+    bytes_fetched: usize,
+}
+
+/// Private rendezvous used only by the debug built-binary regression test.
+#[cfg(debug_assertions)]
+struct DetachFinalReadTestGate {
+    dir: std::path::PathBuf,
+}
+
+#[cfg(debug_assertions)]
+impl DetachFinalReadTestGate {
+    fn from_env() -> Option<Self> {
+        std::env::var_os(TEST_DETACH_FINAL_READ_GATE_ENV).map(|dir| Self { dir: dir.into() })
+    }
+
+    fn wait_for_release(&self, run_id: &str) -> Result<(), RunnerError> {
+        let ready = self.dir.join(TEST_DETACH_FINAL_READ_READY);
+        std::fs::write(&ready, b"ready").map_err(|err| {
+            RunnerError::new(
+                exit::SETUP,
+                format!(
+                    "could not publish the internal final-read test rendezvous for run \
+                     `{run_id}`: {err}"
+                ),
+            )
+        })?;
+
+        let release = self.dir.join(TEST_DETACH_FINAL_READ_RELEASE);
+        let deadline = Instant::now() + DETACH_START_TIMEOUT;
+        while !release.exists() {
+            if Instant::now() >= deadline {
+                return Err(RunnerError::new(
+                    exit::SETUP,
+                    format!(
+                        "the internal final-read test rendezvous for run `{run_id}` was not \
+                         released within {}",
+                        format_duration(DETACH_START_TIMEOUT)
+                    ),
+                ));
+            }
+            sleep(DETACH_POLL_INTERVAL);
+        }
+        Ok(())
+    }
+
+    fn record_counts(
+        &self,
+        run_id: &str,
+        observation: StartMarkerObservation,
+    ) -> Result<(), RunnerError> {
+        std::fs::write(
+            self.dir.join(TEST_DETACH_FINAL_READ_COUNTS),
+            format!(
+                "{} {}\n",
+                observation.bytes_examined, observation.bytes_fetched
+            ),
+        )
+        .map_err(|err| {
+            RunnerError::new(
+                exit::SETUP,
+                format!(
+                    "could not record the internal final-read byte counts for run `{run_id}`: \
+                     {err}"
+                ),
+            )
+        })
+    }
+}
+
 /// Block until the detached runner has provably started the run — or until it is
 /// clear that it never will.
 ///
@@ -356,15 +504,33 @@ fn disinherit_std_handles() {
 /// be exactly the silent, unsupervised process this command exists to avoid.
 fn await_started(detached: &mut Child, jsonl: &Path, run_id: &str) -> Result<(), RunnerError> {
     let deadline = Instant::now() + DETACH_START_TIMEOUT;
+    #[cfg(debug_assertions)]
+    let final_read_test_gate = DetachFinalReadTestGate::from_env();
     loop {
-        if run_started_recorded(jsonl, run_id) {
+        #[cfg(debug_assertions)]
+        let defer_to_final_read = final_read_test_gate.is_some();
+        #[cfg(not(debug_assertions))]
+        let defer_to_final_read = false;
+        if !defer_to_final_read && run_started_recorded(jsonl, run_id) {
             return Ok(());
         }
         match detached.try_wait() {
             // Gone. One last look at the stream settles whether it left because the
             // run failed to start, or because the whole run was already over.
             Ok(Some(status)) => {
-                return if run_started_recorded(jsonl, run_id) {
+                #[cfg(debug_assertions)]
+                let observation = if let Some(gate) = final_read_test_gate.as_ref() {
+                    gate.wait_for_release(run_id)?;
+                    let observation = observe_run_started(jsonl, run_id);
+                    gate.record_counts(run_id, observation)?;
+                    observation
+                } else {
+                    observe_run_started(jsonl, run_id)
+                };
+                #[cfg(not(debug_assertions))]
+                let observation = observe_run_started(jsonl, run_id);
+
+                return if observation.recorded {
                     Ok(())
                 } else {
                     Err(detached_start_failure(status, run_id, jsonl))
@@ -411,31 +577,36 @@ fn await_started(detached: &mut Child, jsonl: &Path, run_id: &str) -> Result<(),
 
 /// Whether the run's `run_started` event is readable in the events file yet.
 ///
-/// Reads only the fixed prefix that can contain one supported event record. The stream
-/// can grow quickly after `run_started` (notably with millisecond member snapshots),
-/// so rereading its later events would make startup polling scale with the lifetime of
-/// the run. A line is considered only when its terminating LF is present inside the
-/// prefix: a partially written final line, or a record larger than the supported
-/// boundary, is "not yet" rather than a matching JSON prefix. A missing or unreadable
-/// file is likewise "not yet": the detached copy truncates and reopens the same path
-/// as it starts.
+/// Delegates to [`observe_run_started`]; ordinary callers need only the verdict, while
+/// the deterministic built-binary regression also records the exact observation work.
 fn run_started_recorded(jsonl: &Path, run_id: &str) -> bool {
+    observe_run_started(jsonl, run_id).recorded
+}
+
+/// Validate exactly the first complete JSONL record and compare its marker fields.
+///
+/// A successful run writes `run_started` first. Reading any later record is therefore
+/// both unnecessary and dangerous: opt-in snapshots make the tail unbounded. The
+/// reader stops at the first LF and fully validates the JSON before accepting it, so a
+/// partial write or valid-looking prefix is never enough. There is deliberately no
+/// byte ceiling on that first record — the producer has none, and `--argv-raw` promises
+/// lossless argv — but ignored fields are streamed rather than materialized, keeping
+/// memory independent of both raw argv size and every later event. A missing or
+/// unreadable file remains "not yet": the detached copy truncates and reopens the same
+/// path as it starts.
+fn observe_run_started(jsonl: &Path, run_id: &str) -> StartMarkerObservation {
     let Ok(file) = File::open(jsonl) else {
-        return false;
+        return StartMarkerObservation::default();
     };
-    let mut prefix = Vec::with_capacity(DETACH_START_MARKER_PREFIX_BYTES);
-    if file
-        .take(DETACH_START_MARKER_PREFIX_BYTES as u64)
-        .read_to_end(&mut prefix)
-        .is_err()
-    {
-        return false;
+    let mut first_record = FirstJsonlRecord::new(file);
+    let marker = serde_json::from_reader::<_, StartMarker>(&mut first_record).ok();
+    StartMarkerObservation {
+        recorded: first_record.complete
+            && marker
+                .is_some_and(|marker| marker.event == "run_started" && marker.run_id == run_id),
+        bytes_examined: first_record.bytes_examined,
+        bytes_fetched: first_record.bytes_fetched,
     }
-    prefix
-        .split_inclusive(|byte| *byte == b'\n')
-        .filter_map(|line| line.strip_suffix(b"\n"))
-        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
-        .any(|event| event["event"] == "run_started" && event["run_id"] == run_id)
 }
 
 /// The error for a detached copy that exited without ever reporting a started run.
@@ -964,14 +1135,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The supported boundary includes the complete JSON payload *and* its LF. A
-    /// one-byte-larger record cannot place that LF inside the bounded prefix and must
-    /// therefore fail closed even though the prefix itself begins with valid-looking
-    /// `run_started` JSON.
+    /// The producer's lossless raw-argv contract, not an unrelated reader limit,
+    /// decides how large `run_started` may be. This uses the real event and emitter to
+    /// cross the former 1 MiB observer ceiling with escaping-heavy argv, then proves
+    /// the same record still needs both its exact run id and its terminating LF.
     #[test]
-    fn run_started_boundary_requires_the_complete_newline_terminated_record() {
+    fn producer_sized_raw_argv_marker_has_no_observer_ceiling() {
         let dir = std::env::temp_dir().join(format!(
-            "processkit-cli-run-unit-detach-boundary-{}-{}",
+            "processkit-cli-run-unit-detach-large-marker-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -981,41 +1152,57 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create the scratch dir");
         let jsonl = dir.join("events.jsonl");
 
-        let mut at_boundary =
-            run_started_line_of_size("run-boundary", DETACH_START_MARKER_MAX_LINE_BYTES);
-        at_boundary.push(b'\n');
-        std::fs::write(&jsonl, &at_boundary).expect("write the boundary record");
+        // Each decoded argument stays below POSIX's common per-argument limit, while
+        // the array as a whole and JSON escaping take the producer well beyond the
+        // old 1 MiB observer ceiling. The event producer itself imposes no limit.
+        let escaping_arg = OsString::from("\\\"\n\t".repeat(16 * 1024));
+        let raw_argv: Vec<_> = (0..20).map(|_| escaping_arg.clone()).collect();
+        let mut emitter = Emitter::create(&jsonl).expect("create the events file");
+        emitter.emit(&Event::RunStarted {
+            run_id: "run-large-raw-argv".to_string(),
+            labels: std::collections::BTreeMap::new(),
+            root_pid: Some(4242),
+            mechanism: "job_object",
+            abrupt_cleanup: "whole_tree",
+            cwd: None,
+            command: events::CommandInfo::for_argv(&raw_argv, true),
+        });
+        drop(emitter);
+
+        let complete = std::fs::read(&jsonl).expect("read the producer record");
         assert!(
-            run_started_recorded(&jsonl, "run-boundary"),
-            "a complete matching record at the supported boundary is recognized"
+            complete.len() > 1024 * 1024,
+            "the producer fixture must cross the removed observer ceiling: {} bytes",
+            complete.len()
+        );
+        assert!(
+            run_started_recorded(&jsonl, "run-large-raw-argv"),
+            "every complete marker the producer wrote remains observable"
         );
         assert!(
             !run_started_recorded(&jsonl, "another-run"),
-            "the boundary record still has to name the requested run"
+            "a large marker still has to name the requested run exactly"
         );
 
-        let partial = run_started_line_of_size("run-boundary", DETACH_START_MARKER_MAX_LINE_BYTES);
-        std::fs::write(&jsonl, partial).expect("write a partial boundary record");
-        assert!(
-            !run_started_recorded(&jsonl, "run-boundary"),
-            "a complete JSON value without its line terminator is still a partial line"
+        let mut partial = complete;
+        assert_eq!(
+            partial.pop(),
+            Some(b'\n'),
+            "the emitter terminates its record"
         );
-
-        let mut too_large =
-            run_started_line_of_size("run-boundary", DETACH_START_MARKER_MAX_LINE_BYTES + 1);
-        too_large.push(b'\n');
-        std::fs::write(&jsonl, too_large).expect("write the over-boundary record");
+        std::fs::write(&jsonl, partial).expect("write the incomplete producer record");
         assert!(
-            !run_started_recorded(&jsonl, "run-boundary"),
-            "a record whose LF is outside the prefix is not accepted by prefix coincidence"
+            !run_started_recorded(&jsonl, "run-large-raw-argv"),
+            "even a complete JSON value is not durable until its LF is present"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Later lifecycle traffic is outside the startup observation. Growing the file
-    /// by several complete prefixes leaves both the matching and run-id decisions
-    /// unchanged, exercising the fixed read independently of the stream's total size.
+    /// by several MiB leaves both the matching and run-id decisions unchanged. The
+    /// byte counters prove this reader examined only the first record and fetched at
+    /// most one fixed chunk beyond it, independently of the stream's total size.
     #[test]
     fn run_started_scan_is_independent_of_later_event_stream_growth() {
         let dir = std::env::temp_dir().join(format!(
@@ -1031,14 +1218,29 @@ mod tests {
 
         let mut stream = run_started_line_of_size("run-grown", 512);
         stream.push(b'\n');
+        let startup_record_bytes = stream.len();
         let snapshot = b"{\"schema_version\":1,\"event\":\"members_snapshot\",\"reason\":\"interval\",\"read_error\":false,\"members\":[]}\n";
-        while stream.len() <= DETACH_START_MARKER_PREFIX_BYTES * 3 {
+        while stream.len() <= 3 * 1024 * 1024 {
             stream.extend_from_slice(snapshot);
         }
         std::fs::write(&jsonl, &stream).expect("write the grown event stream");
+        let matching = observe_run_started(&jsonl, "run-grown");
         assert!(
-            run_started_recorded(&jsonl, "run-grown"),
+            matching.recorded,
             "later snapshots do not change the startup marker"
+        );
+        assert_eq!(
+            matching.bytes_examined, startup_record_bytes,
+            "the parser examines exactly the complete first record"
+        );
+        assert!(
+            matching.bytes_fetched <= startup_record_bytes + DETACH_START_MARKER_READ_CHUNK_BYTES,
+            "physical read-ahead is bounded to one chunk: {matching:?}"
+        );
+        assert!(
+            matching.bytes_fetched < stream.len() / 100,
+            "the grown tail is not fetched: {matching:?}, total={} bytes",
+            stream.len()
         );
         assert!(
             !run_started_recorded(&jsonl, "another-run"),
