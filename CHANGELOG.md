@@ -18,7 +18,10 @@ to a dated version section.
 -
 
 ### Fixed
--
+- `cleanup_finished` now carries an additive `kill_error` qualifier when the
+  container hard kill fails, so a successful empty member read can no longer
+  masquerade as confirmed-clean teardown. The hard-kill failure remains non-fatal:
+  foreground runs keep the stderr warning and the child's exit code stays unchanged.
 
 ## [0.3.2] - 2026-08-09
 

@@ -204,6 +204,15 @@ fn golden_fixture_validates_against_the_schema() {
         .collect();
     assert!(!events.is_empty(), "the golden fixture must not be empty");
     assert_events_match_schema(&events);
+
+    let cleanup = events
+        .iter()
+        .find(|event| event["event"] == "cleanup_finished")
+        .expect("a cleanup_finished event");
+    assert_eq!(
+        cleanup["kill_error"], false,
+        "a successful hard kill remains explicitly unflagged: {cleanup}"
+    );
 }
 
 /// Read the emitted event stream for `dir` and parse each non-empty line as JSON,

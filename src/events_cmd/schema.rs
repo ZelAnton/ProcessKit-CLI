@@ -965,7 +965,7 @@ mod tests {
     #[test]
     fn an_any_of_failure_is_explained_by_the_alternative_that_engaged() {
         let violations = checker().violations(&value(
-            r#"{"schema_version":1,"time":"2026-07-22T09:00:00.000Z","event":"cleanup_finished","remaining":0,"remaining_pids":[],"soft_terminate":null,"read_error":false,"shutdown":{"soft_stop_scope":"whole_tree","soft_signal":"teleported","members_before":null,"members_after":null,"drained_within_grace":null,"escalated":null,"elapsed_ms":null}}"#,
+            r#"{"schema_version":1,"time":"2026-07-22T09:00:00.000Z","event":"cleanup_finished","remaining":0,"remaining_pids":[],"soft_terminate":null,"read_error":false,"kill_error":false,"shutdown":{"soft_stop_scope":"whole_tree","soft_signal":"teleported","members_before":null,"members_after":null,"drained_within_grace":null,"escalated":null,"elapsed_ms":null}}"#,
         ));
         assert!(
             violations

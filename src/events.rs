@@ -184,12 +184,19 @@ pub enum Event {
     /// `remaining_pids` fall back to the same empty snapshot as before, but no
     /// longer stand unqualified as a confirmed-clean teardown (mirrors
     /// `cleanup_started`'s flag; `docs/schema.md`, "cleanup_finished").
+    /// `kill_error` independently records that `ProcessGroup::kill_all()` returned
+    /// an error. In that case even a successful, empty post-kill member read is not
+    /// proof of a clean teardown: the tree may have drained while the container
+    /// itself remained in an unclean state (for example, ProcessKit's refused-thaw
+    /// failure). A confirmed-clean result therefore requires both flags to be
+    /// `false` and `remaining` to be `0`.
     CleanupFinished {
         remaining: usize,
         remaining_pids: Vec<u32>,
         soft_terminate: Option<&'static str>,
         shutdown: Option<ShutdownInfo>,
         read_error: bool,
+        kill_error: bool,
     },
     /// A configured ProcessKit resource limit could not be applied. Emitted when a
     /// `run` given `--max-memory`/`--max-processes`/`--cpu-quota` asks for a cap the
@@ -1278,7 +1285,10 @@ mod tests {
                 remaining_pids: vec![],
                 soft_terminate: None,
                 shutdown: None,
+                // The ordinary successful-empty shape: neither the member read nor
+                // the hard kill needs an honest-degradation qualifier.
                 read_error: false,
+                kill_error: false,
             },
             // One `output_captured`: stdout captured in full (the `abc` vector),
             // stderr empty (the empty-string digest). Both complete — neither
@@ -1328,6 +1338,7 @@ mod tests {
                     elapsed_ms: Some(125),
                 }),
                 read_error: false,
+                kill_error: false,
             },
             Event::Cancelled {
                 source: "ctrl_c",

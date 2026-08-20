@@ -19,8 +19,9 @@
 //!   guarantee that mechanism carries;
 //! - the local control transport bound, answered an `inspect`, accepted a `cancel`,
 //!   and the run reached its terminal state;
-//! - teardown left a **confirmed** empty container — the emptiness was read, not
-//!   assumed (`read_error`), and no member remained;
+//! - teardown left a **confirmed** empty container — the hard kill succeeded
+//!   (`kill_error`), the emptiness was read rather than assumed (`read_error`), and
+//!   no member remained;
 //! - optionally, whether a whole-tree resource cap can be enforced here;
 //! - how long each phase took, so a slow host is diagnosable rather than a generic
 //!   failure.
@@ -276,8 +277,11 @@ pub struct CleanupFacts {
     /// makes `remaining: 0` mean something: a `0` from a failed read is a gap, not a
     /// confirmed-empty container (`docs/schema.md`, "cleanup_finished").
     pub read_error: bool,
-    /// Confirmed empty: the reads succeeded **and** nothing remained. The
-    /// conjunction is the point — either half alone would be an unearned claim.
+    /// Whether `cleanup_finished.kill_error` reported that the hard kill itself
+    /// failed. A successful empty member read does not override this qualifier.
+    pub kill_error: bool,
+    /// Confirmed empty: the hard kill and reads succeeded **and** nothing remained.
+    /// The conjunction is the point — any one fact alone would be an unearned claim.
     pub confirmed_empty: bool,
     /// Whether a **non-empty** post-teardown snapshot would have been conclusive
     /// evidence that something survived.
@@ -813,9 +817,12 @@ impl Session {
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
         });
-        // Both halves have to be there *and* agree: a missing teardown event is not a
-        // clean teardown, it is an unreported one.
-        let confirmed_empty = !read_error && remaining == Some(0) && cleanup_started.is_some();
+        let kill_error = cleanup_finished
+            .and_then(|value| value.get("kill_error"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let confirmed_empty =
+            cleanup_is_confirmed(cleanup_started.is_some(), remaining, read_error, kill_error);
 
         let endpoint_released = self.endpoint_released(run);
         let conclusive = self.teardown_snapshot_is_conclusive();
@@ -824,6 +831,7 @@ impl Session {
             remaining,
             remaining_pids,
             read_error,
+            kill_error,
             confirmed_empty,
             teardown_snapshot_conclusive: conclusive,
             registry_record_removed: true,
@@ -832,6 +840,9 @@ impl Session {
         });
 
         let mut problems = Vec::new();
+        if let Some(problem) = hard_kill_problem(kill_error) {
+            problems.push(problem);
+        }
         match (read_error, remaining) {
             (true, _) => problems.push(
                 "the container's members could not be read during teardown, so it was never \
@@ -1479,6 +1490,33 @@ fn classify_resource_outcome(code: Option<i32>, events: &[Value]) -> ResourceOut
     }
 }
 
+/// Whether the cleanup event pair establishes an empty container.
+///
+/// Pure because the refused-thaw combination cannot be produced reliably by a host
+/// test: `kill_error` may be true while the independent member read succeeds with
+/// `remaining == 0`. Every required fact participates explicitly so a new caller
+/// cannot accidentally recover the old "empty snapshot alone is enough" rule.
+fn cleanup_is_confirmed(
+    cleanup_started_present: bool,
+    remaining: Option<u64>,
+    read_error: bool,
+    kill_error: bool,
+) -> bool {
+    cleanup_started_present && remaining == Some(0) && !read_error && !kill_error
+}
+
+/// The phase failure paired with a machine-readable hard-kill qualifier.
+///
+/// Pure for the same fault-injection reason as [`cleanup_is_confirmed`]: no host test
+/// can reliably force ProcessKit's refused-thaw path, but a qualifier that only
+/// changed the report without failing qualification would still certify that host.
+fn hard_kill_problem(kill_error: bool) -> Option<String> {
+    kill_error.then(|| {
+        "the container hard kill reported a failure, so teardown was never confirmed clean"
+            .to_string()
+    })
+}
+
 /// The refusal a `limit_hit` event describes, as the report's `detail` states it.
 ///
 /// Both of the event's fields are read: `limit` names *which* cap could not be
@@ -1637,9 +1675,10 @@ fn render_human(report: &DoctorReport) -> String {
     }
     if let Some(cleanup) = &report.cleanup {
         out.push_str(&format!(
-            "  cleanup:    confirmed empty: {} (read error: {}, remaining: {}{}); record removed: \
+            "  cleanup:    confirmed empty: {} (kill error: {}, read error: {}, remaining: {}{}); record removed: \
              {}, endpoint released: {}, scratch removed: {}\n",
             cleanup.confirmed_empty,
+            cleanup.kill_error,
             cleanup.read_error,
             cleanup
                 .remaining
@@ -1739,6 +1778,21 @@ mod tests {
         assert_eq!(
             classify_resource_outcome(Some(0), &[]),
             ResourceOutcome::Installed
+        );
+    }
+
+    #[test]
+    fn a_failed_hard_kill_cannot_be_confirmed_by_an_empty_member_snapshot() {
+        assert!(cleanup_is_confirmed(true, Some(0), false, false));
+        assert!(hard_kill_problem(false).is_none());
+        assert!(
+            !cleanup_is_confirmed(true, Some(0), false, true),
+            "a kill error stays non-conclusive even when the member read succeeded empty"
+        );
+        assert!(
+            hard_kill_problem(true)
+                .is_some_and(|problem| problem.contains("never confirmed clean")),
+            "the same qualifier must fail host qualification, not only change its report"
         );
     }
 

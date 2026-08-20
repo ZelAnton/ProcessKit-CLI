@@ -236,9 +236,13 @@
           "type": "boolean",
           "description": "Whether **either** member read failed during teardown (`cleanup_started.read_error` or `cleanup_finished.read_error`). This is what makes a `remaining: 0` mean something: a zero from a failed read is a gap, not a confirmed-empty container. `true` fails the phase on every mechanism."
         },
+        "kill_error": {
+          "type": "boolean",
+          "description": "Whether `cleanup_finished.kill_error` reported that the hard kill itself failed. A successful empty post-kill member read does not override this qualifier; `true` fails the phase on every mechanism."
+        },
         "confirmed_empty": {
           "type": "boolean",
-          "description": "The reads succeeded **and** nothing remained. The conjunction is the point — either half alone would be an unearned claim. Reported independently of the phase verdict, which is mechanism-aware (see `remaining` and `teardown_snapshot_conclusive`)."
+          "description": "The hard kill and reads succeeded **and** nothing remained. The conjunction is the point — any one fact alone would be an unearned claim. Reported independently of the phase verdict, which is mechanism-aware (see `remaining` and `teardown_snapshot_conclusive`)."
         },
         "teardown_snapshot_conclusive": {
           "type": "boolean",
@@ -262,6 +266,7 @@
         "remaining",
         "remaining_pids",
         "read_error",
+        "kill_error",
         "confirmed_empty",
         "teardown_snapshot_conclusive",
         "registry_record_removed",

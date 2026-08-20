@@ -363,7 +363,10 @@ emits, in order:
 3. Either the natural-exit path (`root_exited`, `cleanup_started`,
    `cleanup_finished`) or a runner-imposed ending's reason event (`timeout`,
    `cancelled`, or `killed`) followed by the same `cleanup_started` /
-   `cleanup_finished` pair.
+   `cleanup_finished` pair. Treat a zero/empty `cleanup_finished` snapshot as
+   confirmed only when both `read_error` and `kill_error` are `false`: a failed
+   hard kill can be followed by a successful empty member read without establishing
+   that the container itself was left clean.
 4. `resource_summary` — what the tree consumed, inserted between the ending event of
    step 3 and its `cleanup_started`. Exactly one, on **every** run that spawned the
    child: no flag turns it on and no platform turns it off (a `limit_evidence`, when a
