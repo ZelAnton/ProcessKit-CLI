@@ -122,7 +122,7 @@ impl Sha256 {
         compress(&mut self.h, &block);
 
         let mut out = [0u8; 32];
-        for (word, chunk) in self.h.iter().zip(out.chunks_exact_mut(4)) {
+        for (word, chunk) in self.h.iter().zip(out.as_chunks_mut::<4>().0) {
             chunk.copy_from_slice(&word.to_be_bytes());
         }
         out
@@ -151,7 +151,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// The SHA-256 compression function over one 64-byte block (FIPS 180-4 §6.2.2).
 fn compress(h: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 64];
-    for (word, src) in w.iter_mut().zip(block.chunks_exact(4)) {
+    for (word, src) in w.iter_mut().zip(block.as_chunks::<4>().0) {
         *word = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);
     }
     for i in 16..64 {
