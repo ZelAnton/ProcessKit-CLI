@@ -362,13 +362,20 @@ fn disinherit_std_handles() {
 
 /// One bounded-I/O view of the first JSONL record.
 ///
-/// Each call reads at most [`DETACH_START_MARKER_READ_CHUNK_BYTES`] from the file.
+/// The internal fixed-size buffer is load-bearing: `serde_json::from_reader` asks a
+/// plain [`Read`] for one byte at a time, so merely limiting its requested slice would
+/// otherwise turn every JSON byte into a physical file read. This reader instead fills
+/// one bounded chunk from the file and serves those byte-wise requests from memory.
 /// Once an LF is found, bytes after it in that final chunk are discarded and every
-/// later call reports EOF. `serde_json::from_reader` can therefore validate the whole
-/// first value (including all ignored fields) and require its line terminator without
-/// ever walking the later event stream.
+/// later call reports EOF. The deserializer can therefore validate the whole first
+/// value (including all ignored fields) and require its line terminator without ever
+/// walking the later event stream.
 struct FirstJsonlRecord<R> {
     inner: R,
+    buffer: [u8; DETACH_START_MARKER_READ_CHUNK_BYTES],
+    cursor: usize,
+    buffered: usize,
+    line_end: Option<usize>,
     finished: bool,
     complete: bool,
     bytes_examined: usize,
@@ -379,6 +386,10 @@ impl<R> FirstJsonlRecord<R> {
     fn new(inner: R) -> Self {
         Self {
             inner,
+            buffer: [0; DETACH_START_MARKER_READ_CHUNK_BYTES],
+            cursor: 0,
+            buffered: 0,
+            line_end: None,
             finished: false,
             complete: false,
             bytes_examined: 0,
@@ -388,24 +399,41 @@ impl<R> FirstJsonlRecord<R> {
 }
 
 impl<R: Read> Read for FirstJsonlRecord<R> {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        if self.finished || buffer.is_empty() {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if self.finished || output.is_empty() {
             return Ok(0);
         }
 
-        let read_len = buffer.len().min(DETACH_START_MARKER_READ_CHUNK_BYTES);
-        let fetched = self.inner.read(&mut buffer[..read_len])?;
-        self.bytes_fetched += fetched;
-        if let Some(newline) = buffer[..fetched].iter().position(|byte| *byte == b'\n') {
-            let examined = newline + 1;
-            self.bytes_examined += examined;
-            self.complete = true;
-            self.finished = true;
-            Ok(examined)
-        } else {
-            self.bytes_examined += fetched;
-            Ok(fetched)
+        if self.cursor == self.buffered {
+            let fetched = self.inner.read(&mut self.buffer)?;
+            self.bytes_fetched += fetched;
+            self.cursor = 0;
+            self.buffered = fetched;
+            self.line_end = self.buffer[..fetched]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|newline| newline + 1);
+            if fetched == 0 {
+                self.finished = true;
+                return Ok(0);
+            }
         }
+
+        let available_end = self.line_end.unwrap_or(self.buffered);
+        let copied = output.len().min(available_end - self.cursor);
+        output[..copied].copy_from_slice(&self.buffer[self.cursor..self.cursor + copied]);
+        self.cursor += copied;
+        self.bytes_examined += copied;
+
+        if self
+            .line_end
+            .is_some_and(|line_end| self.cursor == line_end)
+        {
+            self.finished = true;
+            self.complete = true;
+        }
+
+        Ok(copied)
     }
 }
 
@@ -863,6 +891,21 @@ mod tests {
     use crate::events::Event;
 
     use super::*;
+
+    /// Reader whose call count exposes whether the layer above it actually batches
+    /// I/O. `serde_json`'s byte-at-a-time access would make this count track the
+    /// record's byte length if [`FirstJsonlRecord`] did not buffer internally.
+    struct CountingReader<R> {
+        inner: R,
+        reads: usize,
+    }
+
+    impl<R: Read> Read for CountingReader<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            self.inner.read(buffer)
+        }
+    }
 
     /// Build an argv vector from string literals, as `std::env::args_os` would
     /// hand it to [`detached_argv`] (everything after `argv[0]`).
@@ -1443,6 +1486,52 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The first-record boundary needs two independent bounds: arbitrary producer-sized
+    /// records remain valid, while physical reads scale with fixed chunks rather than
+    /// with serde_json's one-byte requests. Keeping a substantial tail in the same
+    /// source also proves the final chunk is the only permitted read-ahead.
+    #[test]
+    fn first_record_reader_batches_serde_byte_requests_into_fixed_chunks() {
+        let mut stream = run_started_line_of_size(
+            "run-chunked",
+            DETACH_START_MARKER_READ_CHUNK_BYTES * 3 + 137,
+        );
+        stream.push(b'\n');
+        let first_record_bytes = stream.len();
+        stream.extend(std::iter::repeat_n(
+            b'x',
+            DETACH_START_MARKER_READ_CHUNK_BYTES * 8,
+        ));
+
+        let counting = CountingReader {
+            inner: std::io::Cursor::new(stream),
+            reads: 0,
+        };
+        let mut first_record = FirstJsonlRecord::new(counting);
+        let marker = serde_json::from_reader::<_, StartMarker>(&mut first_record)
+            .expect("deserialize the complete first record");
+
+        assert_eq!(marker.event, "run_started");
+        assert_eq!(marker.run_id, "run-chunked");
+        assert!(first_record.complete, "the LF completed the first record");
+        assert_eq!(first_record.bytes_examined, first_record_bytes);
+
+        let expected_reads = first_record_bytes.div_ceil(DETACH_START_MARKER_READ_CHUNK_BYTES);
+        assert_eq!(
+            first_record.inner.reads, expected_reads,
+            "underlying reads follow fixed chunks, not the JSON byte count"
+        );
+        assert_eq!(
+            first_record.bytes_fetched,
+            expected_reads * DETACH_START_MARKER_READ_CHUNK_BYTES,
+            "the deterministic source fills every bounded physical read"
+        );
+        assert!(
+            first_record.bytes_fetched <= first_record_bytes + DETACH_START_MARKER_READ_CHUNK_BYTES,
+            "only the final fixed chunk may read ahead into the tail"
+        );
     }
 
     /// Later lifecycle traffic is outside the startup observation. Growing the file
