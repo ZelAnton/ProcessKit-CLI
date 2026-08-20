@@ -11,6 +11,8 @@ mod common;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(debug_assertions)]
+use std::process::Child;
 use std::process::{Command, Output, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -2648,6 +2650,49 @@ fn script_program(path: &Path) -> Vec<String> {
     }
 }
 
+/// A launcher paused at the debug binary's final detach-confirmation rendezvous.
+/// Releasing and killing it in `Drop` keeps a failed assertion from leaving the
+/// launcher blocked; its detached child has already exited before the rendezvous is
+/// published, so there is no run tree left for this guard to orphan.
+#[cfg(debug_assertions)]
+struct GatedDetachLauncher {
+    child: Option<Child>,
+    release: PathBuf,
+}
+
+#[cfg(debug_assertions)]
+impl GatedDetachLauncher {
+    fn new(child: Child, release: PathBuf) -> Self {
+        Self {
+            child: Some(child),
+            release,
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("the launcher is still owned")
+    }
+
+    fn wait_with_output(mut self) -> Output {
+        self.child
+            .take()
+            .expect("the launcher is still owned")
+            .wait_with_output()
+            .expect("wait for the gated detach launcher")
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for GatedDetachLauncher {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.release, b"release");
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// The headline contract of `--detach`: the call returns once the run has *started*,
 /// not once the child has *finished* — and it returns `0` for the start, whatever the
 /// child later does.
@@ -2759,6 +2804,156 @@ fn detach_returns_once_the_run_has_started_while_a_foreground_run_waits_for_the_
     );
 
     let _ = std::fs::remove_dir_all(&baseline_dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Deterministically put a substantially grown lifecycle stream in front of the
+/// built launcher's **real final confirmation read**.
+///
+/// The debug binary defers its early observations for this one test. After its
+/// detached copy has exited it publishes `before-final-read`, then blocks. At that
+/// synchronization point the producer has closed a complete stream, so the fixture
+/// can insert a fixed number of schema-shaped interval snapshots immediately before
+/// `runner_exit` with no concurrent writer and no production-rate assumption. Only
+/// then is the final read released. Its sidecar byte counts are the differential
+/// proof: the bounded implementation fetches only the first record plus fixed
+/// read-ahead; the old `read_to_string` implementation would fetch the whole grown
+/// file and fail the assertion.
+#[cfg(debug_assertions)]
+#[test]
+fn detached_final_confirmation_reads_only_the_first_record_of_a_grown_stream() {
+    const INTERVAL_SNAPSHOT_COUNT: usize = 16 * 1024;
+
+    let dir = scratch("detach-gated-final-read");
+    let registry = detach_registry(&dir);
+    let gate = dir.join("final-read-gate");
+    std::fs::create_dir_all(&gate).expect("create the final-read gate");
+    let ready = gate.join("before-final-read");
+    let release = gate.join("allow-final-read");
+    let counts = gate.join("final-read-counts");
+
+    // Raw argv is opt-in and escaping-heavy so the first record comes from the real
+    // producer's least compact legitimate shape. The child may reject this extra
+    // token; startup, not its later code, is the contract under test.
+    let escaping_arg = "\\\"\n\t".repeat(1024);
+    let child = vec![bin().to_string(), "--version".to_string(), escaping_arg];
+    let mut command = common::command_with_flags(
+        &dir,
+        &[
+            ("PROCESSKIT_CLI_REGISTRY_DIR", registry.as_path()),
+            ("PROCESSKIT_CLI_TEST_DETACH_FINAL_READ_GATE", gate.as_path()),
+        ],
+        &[
+            "--run-id",
+            "detach-gated-final-read",
+            "--detach",
+            "--argv-raw",
+        ],
+        child,
+    );
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut launcher = GatedDetachLauncher::new(
+        command.spawn().expect("spawn the gated detach launcher"),
+        release.clone(),
+    );
+
+    wait_until(|| ready.exists(), DETACH_OBSERVE_TIMEOUT);
+    assert!(
+        launcher
+            .child_mut()
+            .try_wait()
+            .expect("observe the gated launcher")
+            .is_none(),
+        "the rendezvous is before the launcher's real final confirmation read"
+    );
+
+    let path = events_path(&dir);
+    let original = std::fs::read(&path).expect("read the completed producer stream");
+    assert_eq!(
+        original.last(),
+        Some(&b'\n'),
+        "the detached producer closed a complete JSONL stream"
+    );
+    let original_events = read_events_so_far(&dir);
+    assert_eq!(
+        original_events.first().map(|event| &event["event"]),
+        Some(&Value::String("run_started".to_string())),
+        "the successful producer puts run_started first"
+    );
+    assert_eq!(
+        original_events.last().map(|event| &event["event"]),
+        Some(&Value::String("runner_exit".to_string())),
+        "the rendezvous is published only after the detached producer exits"
+    );
+
+    let first_record_bytes = original
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|index| index + 1)
+        .expect("the producer wrote a first record");
+    let terminal_start = original[..original.len() - 1]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|index| index + 1)
+        .expect("runner_exit follows earlier lifecycle events");
+    let mut snapshot = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "time": "2026-08-20T18:00:00.000Z",
+        "event": "members_snapshot",
+        "reason": "interval",
+        "read_error": false,
+        "members": []
+    }))
+    .expect("serialize the deterministic interval snapshot");
+    snapshot.push(b'\n');
+
+    let mut grown =
+        Vec::with_capacity(original.len() + INTERVAL_SNAPSHOT_COUNT.saturating_mul(snapshot.len()));
+    grown.extend_from_slice(&original[..terminal_start]);
+    for _ in 0..INTERVAL_SNAPSHOT_COUNT {
+        grown.extend_from_slice(&snapshot);
+    }
+    grown.extend_from_slice(&original[terminal_start..]);
+    assert!(
+        grown.len() > first_record_bytes * 100,
+        "the deterministic tail is substantial: first={first_record_bytes}, total={}",
+        grown.len()
+    );
+    std::fs::write(&path, &grown).expect("install the grown stream before final read");
+
+    // This file is the synchronization action, not a sleep: only after it exists can
+    // the built launcher execute the final `observe_run_started` call.
+    std::fs::write(&release, b"release").expect("release the final confirmation read");
+    let out = launcher.wait_with_output();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the real final read confirms the grown stream's marker; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let measured = std::fs::read_to_string(&counts).expect("read final observation counts");
+    let measured: Vec<usize> = measured
+        .split_whitespace()
+        .map(|value| value.parse().expect("a byte count"))
+        .collect();
+    assert_eq!(
+        measured.len(),
+        2,
+        "examined and fetched counts are recorded"
+    );
+    assert_eq!(
+        measured[0], first_record_bytes,
+        "the final confirmation examines exactly the complete first record"
+    );
+    assert!(
+        measured[1] >= measured[0] && measured[1] < grown.len() / 4,
+        "fixed read-ahead, not the whole grown stream: examined={}, fetched={}, total={}",
+        measured[0],
+        measured[1],
+        grown.len()
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

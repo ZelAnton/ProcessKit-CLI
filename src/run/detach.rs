@@ -19,10 +19,14 @@
 //! in `src/events.rs` untouched by this feature.
 
 use std::ffi::{OsStr, OsString};
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use std::process::{Child, ExitStatus, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
+
+use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
 
 use crate::cli::RunArgs;
 use crate::duration_fmt::format_duration;
@@ -60,6 +64,33 @@ const DETACH_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// that a heavily loaded host is not mistaken for a wedged runner, finite so that
 /// `run --detach` cannot hang an orchestrator forever.
 const DETACH_START_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum size of one physical read while validating the first JSONL record.
+///
+/// This bounds read-ahead into later lifecycle traffic, not the `run_started` record
+/// itself. The producer has no serialized-record ceiling: opt-in raw argv must remain
+/// lossless, so any observer-side line limit could reject a command the CLI accepted.
+/// [`FirstJsonlRecord`] instead streams and validates that one record at any legitimate
+/// size, then presents EOF immediately after its LF. Later events therefore cost at
+/// most one fixed chunk of read-ahead, however large the stream becomes.
+const DETACH_START_MARKER_READ_CHUNK_BYTES: usize = 8 * 1024;
+
+/// Debug-only integration-test rendezvous for the final confirmation read.
+///
+/// The shipped release binary does not compile this hook. The through-the-binary test
+/// uses it to defer the ordinary final read until a completed detached runner's stream
+/// has been deterministically enlarged, then records the reader's examined/fetched
+/// byte counts. That proves the exact ordering and distinguishes this first-record
+/// reader from the old whole-file rescan without relying on scheduler timing or a
+/// snapshot production rate.
+#[cfg(debug_assertions)]
+const TEST_DETACH_FINAL_READ_GATE_ENV: &str = "PROCESSKIT_CLI_TEST_DETACH_FINAL_READ_GATE";
+#[cfg(debug_assertions)]
+const TEST_DETACH_FINAL_READ_READY: &str = "before-final-read";
+#[cfg(debug_assertions)]
+const TEST_DETACH_FINAL_READ_RELEASE: &str = "allow-final-read";
+#[cfg(debug_assertions)]
+const TEST_DETACH_FINAL_READ_COUNTS: &str = "final-read-counts";
 
 /// Hand this run to a detached copy of this binary and return once it has provably
 /// started — the whole of `--detach`.
@@ -329,6 +360,254 @@ fn disinherit_std_handles() {
     }
 }
 
+/// One bounded-I/O view of the first JSONL record.
+///
+/// Each call reads at most [`DETACH_START_MARKER_READ_CHUNK_BYTES`] from the file.
+/// Once an LF is found, bytes after it in that final chunk are discarded and every
+/// later call reports EOF. `serde_json::from_reader` can therefore validate the whole
+/// first value (including all ignored fields) and require its line terminator without
+/// ever walking the later event stream.
+struct FirstJsonlRecord<R> {
+    inner: R,
+    finished: bool,
+    complete: bool,
+    bytes_examined: usize,
+    bytes_fetched: usize,
+}
+
+impl<R> FirstJsonlRecord<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            finished: false,
+            complete: false,
+            bytes_examined: 0,
+            bytes_fetched: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for FirstJsonlRecord<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.finished || buffer.is_empty() {
+            return Ok(0);
+        }
+
+        let read_len = buffer.len().min(DETACH_START_MARKER_READ_CHUNK_BYTES);
+        let fetched = self.inner.read(&mut buffer[..read_len])?;
+        self.bytes_fetched += fetched;
+        if let Some(newline) = buffer[..fetched].iter().position(|byte| *byte == b'\n') {
+            let examined = newline + 1;
+            self.bytes_examined += examined;
+            self.complete = true;
+            self.finished = true;
+            Ok(examined)
+        } else {
+            self.bytes_examined += fetched;
+            Ok(fetched)
+        }
+    }
+}
+
+/// The only fields the startup handshake retains from the strictly validated first record.
+struct StartMarker {
+    event: String,
+    run_id: String,
+}
+
+/// Consume a JSON value recursively without retaining it.
+///
+/// This deliberately uses `deserialize_any`, not `IgnoredAny`: serde_json's optimized
+/// ignored-value path skips UTF-8 and Unicode-surrogate validation inside strings. A
+/// normal string visit performs both checks. Recursing through maps and sequences keeps
+/// validation streaming — the full first record is never materialized as a `Value`, and
+/// bytes after the first LF never reach the deserializer.
+#[derive(Clone, Copy)]
+struct StrictDiscard;
+
+impl<'de> DeserializeSeed<'de> for StrictDiscard {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for StrictDiscard {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("any strictly valid JSON value")
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element_seed(StrictDiscard)?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        while map.next_key_seed(StrictDiscard)?.is_some() {
+            map.next_value_seed(StrictDiscard)?;
+        }
+        Ok(())
+    }
+}
+
+struct StartMarkerVisitor;
+
+impl<'de> Visitor<'de> for StartMarkerVisitor {
+    type Value = StartMarker;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a run_started marker object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut event = None;
+        let mut run_id = None;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "event" => {
+                    if event.is_some() {
+                        return Err(serde::de::Error::duplicate_field("event"));
+                    }
+                    event = Some(map.next_value()?);
+                }
+                "run_id" => {
+                    if run_id.is_some() {
+                        return Err(serde::de::Error::duplicate_field("run_id"));
+                    }
+                    run_id = Some(map.next_value()?);
+                }
+                _ => map.next_value_seed(StrictDiscard)?,
+            }
+        }
+
+        Ok(StartMarker {
+            event: event.ok_or_else(|| serde::de::Error::missing_field("event"))?,
+            run_id: run_id.ok_or_else(|| serde::de::Error::missing_field("run_id"))?,
+        })
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for StartMarker {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(StartMarkerVisitor)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct StartMarkerObservation {
+    recorded: bool,
+    bytes_examined: usize,
+    bytes_fetched: usize,
+}
+
+/// Private rendezvous used only by the debug built-binary regression test.
+#[cfg(debug_assertions)]
+struct DetachFinalReadTestGate {
+    dir: std::path::PathBuf,
+}
+
+#[cfg(debug_assertions)]
+impl DetachFinalReadTestGate {
+    fn from_env() -> Option<Self> {
+        std::env::var_os(TEST_DETACH_FINAL_READ_GATE_ENV).map(|dir| Self { dir: dir.into() })
+    }
+
+    fn wait_for_release(&self, run_id: &str) -> Result<(), RunnerError> {
+        let ready = self.dir.join(TEST_DETACH_FINAL_READ_READY);
+        std::fs::write(&ready, b"ready").map_err(|err| {
+            RunnerError::new(
+                exit::SETUP,
+                format!(
+                    "could not publish the internal final-read test rendezvous for run \
+                     `{run_id}`: {err}"
+                ),
+            )
+        })?;
+
+        let release = self.dir.join(TEST_DETACH_FINAL_READ_RELEASE);
+        let deadline = Instant::now() + DETACH_START_TIMEOUT;
+        while !release.exists() {
+            if Instant::now() >= deadline {
+                return Err(RunnerError::new(
+                    exit::SETUP,
+                    format!(
+                        "the internal final-read test rendezvous for run `{run_id}` was not \
+                         released within {}",
+                        format_duration(DETACH_START_TIMEOUT)
+                    ),
+                ));
+            }
+            sleep(DETACH_POLL_INTERVAL);
+        }
+        Ok(())
+    }
+
+    fn record_counts(
+        &self,
+        run_id: &str,
+        observation: StartMarkerObservation,
+    ) -> Result<(), RunnerError> {
+        std::fs::write(
+            self.dir.join(TEST_DETACH_FINAL_READ_COUNTS),
+            format!(
+                "{} {}\n",
+                observation.bytes_examined, observation.bytes_fetched
+            ),
+        )
+        .map_err(|err| {
+            RunnerError::new(
+                exit::SETUP,
+                format!(
+                    "could not record the internal final-read byte counts for run `{run_id}`: \
+                     {err}"
+                ),
+            )
+        })
+    }
+}
+
 /// Block until the detached runner has provably started the run — or until it is
 /// clear that it never will.
 ///
@@ -344,15 +623,33 @@ fn disinherit_std_handles() {
 /// be exactly the silent, unsupervised process this command exists to avoid.
 fn await_started(detached: &mut Child, jsonl: &Path, run_id: &str) -> Result<(), RunnerError> {
     let deadline = Instant::now() + DETACH_START_TIMEOUT;
+    #[cfg(debug_assertions)]
+    let final_read_test_gate = DetachFinalReadTestGate::from_env();
     loop {
-        if run_started_recorded(jsonl, run_id) {
+        #[cfg(debug_assertions)]
+        let defer_to_final_read = final_read_test_gate.is_some();
+        #[cfg(not(debug_assertions))]
+        let defer_to_final_read = false;
+        if !defer_to_final_read && run_started_recorded(jsonl, run_id) {
             return Ok(());
         }
         match detached.try_wait() {
             // Gone. One last look at the stream settles whether it left because the
             // run failed to start, or because the whole run was already over.
             Ok(Some(status)) => {
-                return if run_started_recorded(jsonl, run_id) {
+                #[cfg(debug_assertions)]
+                let observation = if let Some(gate) = final_read_test_gate.as_ref() {
+                    gate.wait_for_release(run_id)?;
+                    let observation = observe_run_started(jsonl, run_id);
+                    gate.record_counts(run_id, observation)?;
+                    observation
+                } else {
+                    observe_run_started(jsonl, run_id)
+                };
+                #[cfg(not(debug_assertions))]
+                let observation = observe_run_started(jsonl, run_id);
+
+                return if observation.recorded {
                     Ok(())
                 } else {
                     Err(detached_start_failure(status, run_id, jsonl))
@@ -399,20 +696,37 @@ fn await_started(detached: &mut Child, jsonl: &Path, run_id: &str) -> Result<(),
 
 /// Whether the run's `run_started` event is readable in the events file yet.
 ///
-/// Reads the whole (still tiny) file and looks for the one line that names this run:
-/// the stream is written line-by-line with a flush per event, so a partially written
-/// last line is possible and is simply not valid JSON yet — such a line is skipped and
-/// re-read on the next poll rather than treated as an answer. A missing or unreadable
-/// file is "not yet", never an error: the detached copy truncates and reopens the same
-/// path as it starts.
+/// Delegates to [`observe_run_started`]; ordinary callers need only the verdict, while
+/// the deterministic built-binary regression also records the exact observation work.
 fn run_started_recorded(jsonl: &Path, run_id: &str) -> bool {
-    let Ok(stream) = std::fs::read_to_string(jsonl) else {
-        return false;
+    observe_run_started(jsonl, run_id).recorded
+}
+
+/// Validate exactly the first complete JSONL record and compare its marker fields.
+///
+/// A successful run writes `run_started` first. Reading any later record is therefore
+/// both unnecessary and dangerous: opt-in snapshots make the tail unbounded. The
+/// reader stops at the first LF and fully validates the JSON before accepting it, so a
+/// partial write or valid-looking prefix is never enough. There is deliberately no
+/// byte ceiling on that first record — the producer has none, and `--argv-raw` promises
+/// lossless argv — but unneeded nested values are strictly consumed and discarded instead
+/// of being collected into a complete in-memory tree. Memory may follow the largest
+/// escaped string serde_json validates, but never the number of argv elements or any later
+/// event. A missing or unreadable file remains "not yet": the detached copy truncates and
+/// reopens the same path as it starts.
+fn observe_run_started(jsonl: &Path, run_id: &str) -> StartMarkerObservation {
+    let Ok(file) = File::open(jsonl) else {
+        return StartMarkerObservation::default();
     };
-    stream
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .any(|event| event["event"] == "run_started" && event["run_id"] == run_id)
+    let mut first_record = FirstJsonlRecord::new(file);
+    let marker = serde_json::from_reader::<_, StartMarker>(&mut first_record).ok();
+    StartMarkerObservation {
+        recorded: first_record.complete
+            && marker
+                .is_some_and(|marker| marker.event == "run_started" && marker.run_id == run_id),
+        bytes_examined: first_record.bytes_examined,
+        bytes_fetched: first_record.bytes_fetched,
+    }
 }
 
 /// The error for a detached copy that exited without ever reporting a started run.
@@ -561,6 +875,56 @@ mod tests {
         argv.iter()
             .map(|token| token.to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// Build a schema-conforming `run_started` payload at an exact byte size. An
+    /// ASCII `cwd` is the adjustable field, so increasing it by one character always
+    /// increases the serialized record by exactly one byte.
+    fn run_started_line_of_size(run_id: &str, size: usize) -> Vec<u8> {
+        let mut event = serde_json::json!({
+            "schema_version": 1,
+            "time": "2026-08-20T18:00:00.000Z",
+            "event": "run_started",
+            "run_id": run_id,
+            "labels": {},
+            "root_pid": 4242,
+            "mechanism": "job_object",
+            "abrupt_cleanup": "whole_tree",
+            "cwd": "",
+            "command": {
+                "redacted": true,
+                "argv": null,
+                "argv_sha256": null,
+                "hint": null
+            }
+        });
+        let base = serde_json::to_vec(&event).expect("serialize the base run_started record");
+        let padding = size
+            .checked_sub(base.len())
+            .expect("the requested record size fits the fixed fields");
+        event["cwd"] = serde_json::Value::String("x".repeat(padding));
+        let line = serde_json::to_vec(&event).expect("serialize the padded run_started record");
+        assert_eq!(line.len(), size, "the test fixture has an exact boundary");
+        line
+    }
+
+    /// One real OS-string value that cannot be represented directly as Unicode.
+    /// The event producer must turn it into its documented reversible JSON string,
+    /// and the startup observer must accept that valid wire representation.
+    #[cfg(unix)]
+    fn non_unicode_argv_element() -> OsString {
+        use std::os::unix::ffi::OsStringExt;
+
+        OsString::from_vec(b"non-unicode-\xff".to_vec())
+    }
+
+    /// Windows argv is WTF-16, so an unpaired surrogate is the corresponding real
+    /// non-Unicode OS-string shape on this platform.
+    #[cfg(windows)]
+    fn non_unicode_argv_element() -> OsString {
+        use std::os::windows::ffi::OsStringExt;
+
+        OsString::from_wide(&[u16::from(b'n'), u16::from(b'o'), u16::from(b'n'), 0xD800])
     }
 
     /// The rewrite is exactly three edits: drop `--detach`, add the resolved
@@ -905,6 +1269,228 @@ mod tests {
         assert!(
             !run_started_recorded(&partial, "run-1"),
             "an incomplete line is not an answer"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Marker extraction must not turn malformed bytes in a field it does not use
+    /// into successful proof of startup. The record otherwise carries the exact
+    /// event and run id the handshake expects and is terminated by LF.
+    #[test]
+    fn invalid_utf8_in_nested_argv_is_not_a_start_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "processkit-cli-run-unit-detach-strict-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the epoch")
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).expect("create the scratch dir");
+        let jsonl = dir.join("events.jsonl");
+
+        let mut invalid_utf8 =
+            br#"{"event":"run_started","run_id":"run-strict","command":{"argv":["before-"#.to_vec();
+        invalid_utf8.push(0xFF);
+        invalid_utf8.extend_from_slice(br#"-after"]}}"#);
+        invalid_utf8.push(b'\n');
+        std::fs::write(&jsonl, invalid_utf8).expect("write the invalid UTF-8 record");
+        assert!(
+            !run_started_recorded(&jsonl, "run-strict"),
+            "raw invalid UTF-8 in ignored command.argv must fail closed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Even well-formed UTF-8 bytes are not strict JSON strings when their `\u`
+    /// escapes contain an unpaired surrogate. This is a separate regression from
+    /// raw invalid UTF-8 because serde_json's ignored-value fast path skipped both
+    /// checks independently.
+    #[test]
+    fn invalid_unicode_surrogates_in_nested_argv_are_not_start_markers() {
+        let dir = std::env::temp_dir().join(format!(
+            "processkit-cli-run-unit-detach-invalid-surrogate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the epoch")
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).expect("create the scratch dir");
+        let jsonl = dir.join("events.jsonl");
+
+        let invalid_surrogates: &[&[u8]] = &[
+            br#"{"event":"run_started","run_id":"run-strict","command":{"argv":["\uD800"]}}"#,
+            br#"{"event":"run_started","run_id":"run-strict","command":{"argv":["\uDC00"]}}"#,
+            br#"{"event":"run_started","run_id":"run-strict","command":{"argv":["\uD800\u0041"]}}"#,
+        ];
+        for invalid in invalid_surrogates {
+            let mut line = invalid.to_vec();
+            line.push(b'\n');
+            std::fs::write(&jsonl, line).expect("write the invalid surrogate record");
+            assert!(
+                !run_started_recorded(&jsonl, "run-strict"),
+                "an invalid Unicode surrogate sequence in command.argv must fail closed: {}",
+                String::from_utf8_lossy(invalid)
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A real non-Unicode OS argv element is not malformed JSON: the producer's
+    /// reversible NUL-marked encoding remains a valid marker and must not be rejected
+    /// by the stricter observer.
+    #[test]
+    fn producer_lossless_non_unicode_argv_remains_a_valid_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "processkit-cli-run-unit-detach-non-unicode-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the epoch")
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).expect("create the scratch dir");
+        let jsonl = dir.join("events.jsonl");
+        let raw_argv = [non_unicode_argv_element()];
+
+        let mut emitter = Emitter::create(&jsonl).expect("create the events file");
+        emitter.emit(&Event::RunStarted {
+            run_id: "run-non-unicode".to_string(),
+            labels: std::collections::BTreeMap::new(),
+            root_pid: Some(4242),
+            mechanism: "job_object",
+            abrupt_cleanup: "whole_tree",
+            cwd: None,
+            command: events::CommandInfo::for_argv(&raw_argv, true),
+        });
+        drop(emitter);
+
+        assert!(
+            run_started_recorded(&jsonl, "run-non-unicode"),
+            "the real producer encodes non-Unicode OS argv as strict, reversible JSON"
+        );
+        assert!(
+            !run_started_recorded(&jsonl, "another-run"),
+            "lossless argv does not weaken exact run-id matching"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The producer's lossless raw-argv contract, not an unrelated reader limit,
+    /// decides how large `run_started` may be. This uses the real event and emitter to
+    /// cross the former 1 MiB observer ceiling with escaping-heavy argv, then proves
+    /// the same record still needs both its exact run id and its terminating LF.
+    #[test]
+    fn producer_sized_raw_argv_marker_has_no_observer_ceiling() {
+        let dir = std::env::temp_dir().join(format!(
+            "processkit-cli-run-unit-detach-large-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the epoch")
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).expect("create the scratch dir");
+        let jsonl = dir.join("events.jsonl");
+
+        // Each decoded argument stays below POSIX's common per-argument limit, while
+        // the array as a whole and JSON escaping take the producer well beyond the
+        // old 1 MiB observer ceiling. The event producer itself imposes no limit.
+        let escaping_arg = OsString::from("\\\"\n\t".repeat(16 * 1024));
+        let raw_argv: Vec<_> = (0..20).map(|_| escaping_arg.clone()).collect();
+        let mut emitter = Emitter::create(&jsonl).expect("create the events file");
+        emitter.emit(&Event::RunStarted {
+            run_id: "run-large-raw-argv".to_string(),
+            labels: std::collections::BTreeMap::new(),
+            root_pid: Some(4242),
+            mechanism: "job_object",
+            abrupt_cleanup: "whole_tree",
+            cwd: None,
+            command: events::CommandInfo::for_argv(&raw_argv, true),
+        });
+        drop(emitter);
+
+        let complete = std::fs::read(&jsonl).expect("read the producer record");
+        assert!(
+            complete.len() > 1024 * 1024,
+            "the producer fixture must cross the removed observer ceiling: {} bytes",
+            complete.len()
+        );
+        assert!(
+            run_started_recorded(&jsonl, "run-large-raw-argv"),
+            "every complete marker the producer wrote remains observable"
+        );
+        assert!(
+            !run_started_recorded(&jsonl, "another-run"),
+            "a large marker still has to name the requested run exactly"
+        );
+
+        let mut partial = complete;
+        assert_eq!(
+            partial.pop(),
+            Some(b'\n'),
+            "the emitter terminates its record"
+        );
+        std::fs::write(&jsonl, partial).expect("write the incomplete producer record");
+        assert!(
+            !run_started_recorded(&jsonl, "run-large-raw-argv"),
+            "even a complete JSON value is not durable until its LF is present"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Later lifecycle traffic is outside the startup observation. Growing the file
+    /// by several MiB leaves both the matching and run-id decisions unchanged. The
+    /// byte counters prove this reader examined only the first record and fetched at
+    /// most one fixed chunk beyond it, independently of the stream's total size.
+    #[test]
+    fn run_started_scan_is_independent_of_later_event_stream_growth() {
+        let dir = std::env::temp_dir().join(format!(
+            "processkit-cli-run-unit-detach-grown-stream-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the epoch")
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).expect("create the scratch dir");
+        let jsonl = dir.join("events.jsonl");
+
+        let mut stream = run_started_line_of_size("run-grown", 512);
+        stream.push(b'\n');
+        let startup_record_bytes = stream.len();
+        let snapshot = b"{\"schema_version\":1,\"event\":\"members_snapshot\",\"reason\":\"interval\",\"read_error\":false,\"members\":[]}\n";
+        while stream.len() <= 3 * 1024 * 1024 {
+            stream.extend_from_slice(snapshot);
+        }
+        std::fs::write(&jsonl, &stream).expect("write the grown event stream");
+        let matching = observe_run_started(&jsonl, "run-grown");
+        assert!(
+            matching.recorded,
+            "later snapshots do not change the startup marker"
+        );
+        assert_eq!(
+            matching.bytes_examined, startup_record_bytes,
+            "the parser examines exactly the complete first record"
+        );
+        assert!(
+            matching.bytes_fetched <= startup_record_bytes + DETACH_START_MARKER_READ_CHUNK_BYTES,
+            "physical read-ahead is bounded to one chunk: {matching:?}"
+        );
+        assert!(
+            matching.bytes_fetched < stream.len() / 100,
+            "the grown tail is not fetched: {matching:?}, total={} bytes",
+            stream.len()
+        );
+        assert!(
+            !run_started_recorded(&jsonl, "another-run"),
+            "later snapshots cannot weaken the requested run-id match"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
