@@ -26,6 +26,8 @@ use std::process::{Child, ExitStatus, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
+
 use crate::cli::RunArgs;
 use crate::duration_fmt::format_duration;
 use crate::error_envelope::ErrorKind;
@@ -407,13 +409,130 @@ impl<R: Read> Read for FirstJsonlRecord<R> {
     }
 }
 
-/// The only fields the startup handshake needs from the fully validated first record.
-/// Every other field is deserialized as `IgnoredAny`, so even a very large lossless raw
-/// argv is checked for valid JSON without being materialized a second time here.
-#[derive(serde::Deserialize)]
+/// The only fields the startup handshake retains from the strictly validated first record.
 struct StartMarker {
     event: String,
     run_id: String,
+}
+
+/// Consume a JSON value recursively without retaining it.
+///
+/// This deliberately uses `deserialize_any`, not `IgnoredAny`: serde_json's optimized
+/// ignored-value path skips UTF-8 and Unicode-surrogate validation inside strings. A
+/// normal string visit performs both checks. Recursing through maps and sequences keeps
+/// validation streaming — the full first record is never materialized as a `Value`, and
+/// bytes after the first LF never reach the deserializer.
+#[derive(Clone, Copy)]
+struct StrictDiscard;
+
+impl<'de> DeserializeSeed<'de> for StrictDiscard {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for StrictDiscard {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("any strictly valid JSON value")
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element_seed(StrictDiscard)?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        while map.next_key_seed(StrictDiscard)?.is_some() {
+            map.next_value_seed(StrictDiscard)?;
+        }
+        Ok(())
+    }
+}
+
+struct StartMarkerVisitor;
+
+impl<'de> Visitor<'de> for StartMarkerVisitor {
+    type Value = StartMarker;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a run_started marker object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut event = None;
+        let mut run_id = None;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "event" => {
+                    if event.is_some() {
+                        return Err(serde::de::Error::duplicate_field("event"));
+                    }
+                    event = Some(map.next_value()?);
+                }
+                "run_id" => {
+                    if run_id.is_some() {
+                        return Err(serde::de::Error::duplicate_field("run_id"));
+                    }
+                    run_id = Some(map.next_value()?);
+                }
+                _ => map.next_value_seed(StrictDiscard)?,
+            }
+        }
+
+        Ok(StartMarker {
+            event: event.ok_or_else(|| serde::de::Error::missing_field("event"))?,
+            run_id: run_id.ok_or_else(|| serde::de::Error::missing_field("run_id"))?,
+        })
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for StartMarker {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(StartMarkerVisitor)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -590,10 +709,11 @@ fn run_started_recorded(jsonl: &Path, run_id: &str) -> bool {
 /// reader stops at the first LF and fully validates the JSON before accepting it, so a
 /// partial write or valid-looking prefix is never enough. There is deliberately no
 /// byte ceiling on that first record — the producer has none, and `--argv-raw` promises
-/// lossless argv — but ignored fields are streamed rather than materialized, keeping
-/// memory independent of both raw argv size and every later event. A missing or
-/// unreadable file remains "not yet": the detached copy truncates and reopens the same
-/// path as it starts.
+/// lossless argv — but unneeded nested values are strictly consumed and discarded instead
+/// of being collected into a complete in-memory tree. Memory may follow the largest
+/// escaped string serde_json validates, but never the number of argv elements or any later
+/// event. A missing or unreadable file remains "not yet": the detached copy truncates and
+/// reopens the same path as it starts.
 fn observe_run_started(jsonl: &Path, run_id: &str) -> StartMarkerObservation {
     let Ok(file) = File::open(jsonl) else {
         return StartMarkerObservation::default();
@@ -786,6 +906,25 @@ mod tests {
         let line = serde_json::to_vec(&event).expect("serialize the padded run_started record");
         assert_eq!(line.len(), size, "the test fixture has an exact boundary");
         line
+    }
+
+    /// One real OS-string value that cannot be represented directly as Unicode.
+    /// The event producer must turn it into its documented reversible JSON string,
+    /// and the startup observer must accept that valid wire representation.
+    #[cfg(unix)]
+    fn non_unicode_argv_element() -> OsString {
+        use std::os::unix::ffi::OsStringExt;
+
+        OsString::from_vec(b"non-unicode-\xff".to_vec())
+    }
+
+    /// Windows argv is WTF-16, so an unpaired surrogate is the corresponding real
+    /// non-Unicode OS-string shape on this platform.
+    #[cfg(windows)]
+    fn non_unicode_argv_element() -> OsString {
+        use std::os::windows::ffi::OsStringExt;
+
+        OsString::from_wide(&[u16::from(b'n'), u16::from(b'o'), u16::from(b'n'), 0xD800])
     }
 
     /// The rewrite is exactly three edits: drop `--detach`, add the resolved
@@ -1130,6 +1269,113 @@ mod tests {
         assert!(
             !run_started_recorded(&partial, "run-1"),
             "an incomplete line is not an answer"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Marker extraction must not turn malformed bytes in a field it does not use
+    /// into successful proof of startup. The record otherwise carries the exact
+    /// event and run id the handshake expects and is terminated by LF.
+    #[test]
+    fn invalid_utf8_in_nested_argv_is_not_a_start_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "processkit-cli-run-unit-detach-strict-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the epoch")
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).expect("create the scratch dir");
+        let jsonl = dir.join("events.jsonl");
+
+        let mut invalid_utf8 =
+            br#"{"event":"run_started","run_id":"run-strict","command":{"argv":["before-"#.to_vec();
+        invalid_utf8.push(0xFF);
+        invalid_utf8.extend_from_slice(br#"-after"]}}"#);
+        invalid_utf8.push(b'\n');
+        std::fs::write(&jsonl, invalid_utf8).expect("write the invalid UTF-8 record");
+        assert!(
+            !run_started_recorded(&jsonl, "run-strict"),
+            "raw invalid UTF-8 in ignored command.argv must fail closed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Even well-formed UTF-8 bytes are not strict JSON strings when their `\u`
+    /// escapes contain an unpaired surrogate. This is a separate regression from
+    /// raw invalid UTF-8 because serde_json's ignored-value fast path skipped both
+    /// checks independently.
+    #[test]
+    fn invalid_unicode_surrogates_in_nested_argv_are_not_start_markers() {
+        let dir = std::env::temp_dir().join(format!(
+            "processkit-cli-run-unit-detach-invalid-surrogate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the epoch")
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).expect("create the scratch dir");
+        let jsonl = dir.join("events.jsonl");
+
+        let invalid_surrogates: &[&[u8]] = &[
+            br#"{"event":"run_started","run_id":"run-strict","command":{"argv":["\uD800"]}}"#,
+            br#"{"event":"run_started","run_id":"run-strict","command":{"argv":["\uDC00"]}}"#,
+            br#"{"event":"run_started","run_id":"run-strict","command":{"argv":["\uD800\u0041"]}}"#,
+        ];
+        for invalid in invalid_surrogates {
+            let mut line = invalid.to_vec();
+            line.push(b'\n');
+            std::fs::write(&jsonl, line).expect("write the invalid surrogate record");
+            assert!(
+                !run_started_recorded(&jsonl, "run-strict"),
+                "an invalid Unicode surrogate sequence in command.argv must fail closed: {}",
+                String::from_utf8_lossy(invalid)
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A real non-Unicode OS argv element is not malformed JSON: the producer's
+    /// reversible NUL-marked encoding remains a valid marker and must not be rejected
+    /// by the stricter observer.
+    #[test]
+    fn producer_lossless_non_unicode_argv_remains_a_valid_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "processkit-cli-run-unit-detach-non-unicode-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the epoch")
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).expect("create the scratch dir");
+        let jsonl = dir.join("events.jsonl");
+        let raw_argv = [non_unicode_argv_element()];
+
+        let mut emitter = Emitter::create(&jsonl).expect("create the events file");
+        emitter.emit(&Event::RunStarted {
+            run_id: "run-non-unicode".to_string(),
+            labels: std::collections::BTreeMap::new(),
+            root_pid: Some(4242),
+            mechanism: "job_object",
+            abrupt_cleanup: "whole_tree",
+            cwd: None,
+            command: events::CommandInfo::for_argv(&raw_argv, true),
+        });
+        drop(emitter);
+
+        assert!(
+            run_started_recorded(&jsonl, "run-non-unicode"),
+            "the real producer encodes non-Unicode OS argv as strict, reversible JSON"
+        );
+        assert!(
+            !run_started_recorded(&jsonl, "another-run"),
+            "lossless argv does not weaken exact run-id matching"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
