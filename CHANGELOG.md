@@ -15,6 +15,17 @@ to a dated version section.
 -
 
 ### Changed
+-
+
+### Fixed
+-
+
+## [0.3.3] - 2026-08-22
+
+### Added
+-
+
+### Changed
 - **`processkit` 3.3.4** is now resolved by both committed lockfiles while the
   manifest's `"3.3"` requirement and MSRV remain unchanged. The new upstream
   `TeardownCause` vocabulary is explicitly recorded as not projected: this CLI
@@ -1302,7 +1313,8 @@ to a dated version section.
   inheriting the registry's full path, so deeply nested macOS CI/workspace paths
   cannot exceed `sockaddr_un::sun_path` and silently disable `inspect`.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.2.2...v0.3.0
