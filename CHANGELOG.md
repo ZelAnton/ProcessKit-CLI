@@ -15,7 +15,15 @@ to a dated version section.
 -
 
 ### Changed
--
+- **`processkit` 3.3.4** is now resolved by both committed lockfiles while the
+  manifest's `"3.3"` requirement and MSRV remain unchanged. The new upstream
+  `TeardownCause` vocabulary is explicitly recorded as not projected: this CLI
+  races its own timeout/cancel deadlines and uses `ProcessGroup::start` (a
+  launch-only surface), while direct `stop`, `kill_all`, and `members_info`
+  operations expose `ErrorReason::Io`; no `ErrorReason::Teardown` value reaches
+  this runner's exit-code decision or widens its machine contract. `members_info`
+  read failures continue through the existing honest `read_error` degradation,
+  including Windows metadata-snapshot failures.
 
 ### Fixed
 - `cleanup_finished` now carries an additive `kill_error` qualifier when the

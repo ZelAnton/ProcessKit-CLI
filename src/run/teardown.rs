@@ -348,10 +348,12 @@ fn snapshot_members_or_unknown(infos: Result<Vec<MemberInfo>, PkError>) -> (Vec<
 
 /// Snapshot the container's members — enriched with `ppid`/executable
 /// `name`/`start_time` via [`ProcessGroup::members_info`] wherever the platform
-/// can report them (`events::Member::from_info`) — and emit `members_snapshot`. A
-/// read failure is a diagnostics gap, not a run failure; it shares the same error
-/// contract as the bare-PID `members()` this replaced (`ErrorReason::Io` only — a
-/// single vanished member is skipped, not an error).
+/// can report them (`events::Member::from_info`) — and emit `members_snapshot`.
+/// A read failure is a diagnostics gap, not a run failure. ProcessKit 3.3.4 reports
+/// `ErrorReason::Io` when membership cannot be read or, on Windows, when the
+/// process-metadata snapshot cannot be created or completely enumerated; a single
+/// member vanishing between enumeration and metadata read is still skipped, not an
+/// error.
 ///
 /// **A failed read is recorded, not dropped (T-298).** The event is emitted either
 /// way: on failure [`snapshot_members_or_unknown`] substitutes an empty member list
@@ -802,6 +804,14 @@ fn describe_teardown<T: TeardownDescription>(teardown: T, grace: Option<Duration
 /// A locate/start failure is [`exit::SPAWN`] — the child never ran; every other
 /// backend/containment failure is [`exit::BACKEND`]. A child's own exit is never
 /// routed through here (it is an [`Outcome`], not an [`Err`]).
+///
+/// ProcessKit 3.3.4's [`PkErrorReason::Teardown`] is not reachable on this path:
+/// `ProcessGroup::start` is launch-only, while this runner races timeout/cancel
+/// endings itself rather than arming the high-level `Command` teardown machinery.
+/// The direct `ProcessGroup::stop`, `kill_all`, and `members_info` calls are handled
+/// in their own diagnostic paths and expose `PkErrorReason::Io`, not `Teardown`.
+/// The wildcard therefore remains a launch-failure classification, and no teardown
+/// error expands the runner's `BACKEND` exit-code behavior.
 ///
 /// The failure mode is read off the borrowed [`PkErrorReason`] (ProcessKit 3
 /// boxes it behind the pointer-sized [`PkError`] wrapper). The wildcard arm's

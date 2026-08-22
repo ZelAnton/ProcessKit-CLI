@@ -346,6 +346,15 @@ const NOT_PROJECTED: &[(&str, &str)] = &[
          they carry is `Display` output, not an identifier",
     ),
     (
+        "processkit::TeardownCause",
+        "this CLI does not use ProcessKit's higher-level terminal teardown consumers: its \
+         `--timeout`/`--idle-timeout`/signal deadlines are raced by the runner, and the \
+         `ProcessGroup::start` launch-only path never arms `Command::timeout`, \
+         `Command::inactivity_timeout`, or `Command::cancel_on`; direct `stop`, `kill_all`, and \
+         `members_info` failures are documented as `ErrorReason::Io`. Consequently no stable \
+         `TeardownCause` identifier reaches a CLI machine contract",
+    ),
+    (
         "processkit::ProcessEvent",
         "the streaming per-process event API is unused: this runner reads outcomes and container \
          state directly, and its JSONL vocabulary is its own",
