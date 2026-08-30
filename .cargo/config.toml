@@ -1,0 +1,20 @@
+# Windows: put the C runtime inside the executable.
+#
+# The `*-pc-windows-msvc` targets link the C runtime as a DLL by default, so the
+# published .exe needs the Microsoft Visual C++ Redistributable on the machine
+# that runs it. A static C runtime removes that requirement.
+#
+# This is safe here because no crate in the dependency graph compiles C or C++
+# code: every `-sys` crate in the lockfile is a binding without a native build
+# (`windows-sys`, `linux-raw-sys`, `js-sys`). Two different C runtimes therefore
+# cannot meet inside one binary.
+#
+# The cost is a larger executable, and a C runtime that a system update cannot
+# replace. Both are acceptable for a command line tool that people download as
+# a single file.
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

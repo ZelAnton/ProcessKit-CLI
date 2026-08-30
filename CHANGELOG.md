@@ -15,7 +15,10 @@ to a dated version section.
 -
 
 ### Changed
--
+- **Windows executables now carry the C runtime inside them.** The published
+  `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc` binaries no longer need
+  the Microsoft Visual C++ Redistributable on the machine that runs them.
+  `.cargo/config.toml` sets `-C target-feature=+crt-static` for both targets.
 
 ### Fixed
 -
