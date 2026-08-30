@@ -15,6 +15,17 @@ to a dated version section.
 -
 
 ### Changed
+-
+
+### Fixed
+-
+
+## [0.3.4] - 2026-08-30
+
+### Added
+-
+
+### Changed
 - **Windows executables now carry the C runtime inside them.** The published
   `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc` binaries no longer need
   the Microsoft Visual C++ Redistributable on the machine that runs them.
@@ -1316,7 +1327,8 @@ to a dated version section.
   inheriting the registry's full path, so deeply nested macOS CI/workspace paths
   cannot exceed `sockaddr_un::sun_path` and silently disable `inspect`.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ZelAnton/ProcessKit-CLI/compare/v0.3.0...v0.3.1
