@@ -263,7 +263,7 @@ clap_mangen = "0.3"
 # line, over the golden fixture and a generated mutation corpus, so "the checker
 # in the binary agrees with a real JSON Schema engine" is a tested fact rather
 # than a claim.
-jsonschema = { version = "0.50.0", default-features = false }
+jsonschema = { version = "0.52.0", default-features = false }
 # Property-based test tier for the hand-rolled primitives (SHA-256 in
 # `src/hash.rs`, the `--timeout`/`--grace` duration grammar in `src/cli/parse.rs`,
 # and the `HINT_RULES` classifier in `src/events.rs`) — a regression net over
