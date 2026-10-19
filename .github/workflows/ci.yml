@@ -243,7 +243,7 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
         with:
           tool: cargo-llvm-cov
       # Instrument and run the tests once; the two `report` steps below reuse
@@ -263,7 +263,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Coverage HTML report
         run: cargo llvm-cov report --html --output-dir coverage-report
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-report-${{ matrix.os }}
           path: coverage-report
@@ -348,7 +348,7 @@ jobs:
           cat perf-comparison.md >> "$GITHUB_STEP_SUMMARY"
       - name: Upload benchmark history point
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: perf-history-${{ matrix.os }}
           path: |
@@ -481,7 +481,7 @@ jobs:
       # equivalent (`typos .`). Gating: every finding to date has been a
       # genuine misspelling fixed in the source, not a domain term needing an
       # exclusion (see `typos.toml`'s own comments).
-      - uses: crate-ci/typos@8a48f81b6c64dcfea44b3633223084c4be58ac5f # v1.49.0
+      - uses: crate-ci/typos@7f9d0819ca1c008ade73f4b41fa9d258d48f605b # v1.51.1
 
   docs-links:
     name: docs links (internal)
